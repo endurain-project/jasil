@@ -1,0 +1,55 @@
+name: Audit dependencies
+
+# Renovate keeps dependencies *fresh*; it does not tell you when a version you
+# are already pinned to turns out to be vulnerable. This job scans the resolved
+# lockfile against the OSV / PyPI advisory databases, on every dependency change
+# and on a schedule so a newly-published advisory against an unchanged pin is
+# still surfaced.
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths: &paths
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/audit-jasil.yml
+  pull_request:
+    paths: *paths
+  schedule:
+    # Daily, offset from the Renovate run so the two do not contend.
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: jasil (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # Audit the full resolved set - runtime dependencies plus every optional
+      # extra - because a host enabling ``jasil[sso]`` inherits those too.
+      # ``--no-emit-project`` drops the editable self-reference, which carries no
+      # hash and which pip-audit therefore rejects.
+      - name: Export the resolved dependency set
+        run: >-
+          uv export --frozen --all-extras --no-dev --no-emit-project
+          --format requirements-txt --output-file "$RUNNER_TEMP/requirements.txt"
+
+      - name: Scan for known vulnerabilities
+        run: uvx pip-audit --strict --requirement "$RUNNER_TEMP/requirements.txt" --disable-pip

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📚 Documentation
+    url: https://jasil.endurain.com
+    about: Please check our documentation before creating an issue.

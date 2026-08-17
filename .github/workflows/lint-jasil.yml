@@ -1,0 +1,65 @@
+name: Lint jasil
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths: &paths
+      - jasil/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/lint-jasil.yml
+  pull_request:
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-jasil:
+    name: jasil (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies
+        run: uv sync --frozen --only-group lint
+
+      - name: Lint check
+        run: uv run --no-sync ruff check .
+
+      - name: Format check
+        run: uv run --no-sync ruff format --check .
+
+  typecheck-jasil:
+    name: jasil (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies
+        # mypy needs the runtime dependencies (fastapi, sqlalchemy, ...) importable
+        # to resolve third-party types, the WebAuthn extra, and the typecheck
+        # group (mypy + stubs).
+        run: uv sync --frozen --no-dev --group typecheck --extra webauthn --no-install-project
+
+      - name: Type check
+        run: uv run --no-sync mypy

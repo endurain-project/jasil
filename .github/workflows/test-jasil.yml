@@ -1,0 +1,55 @@
+name: Test jasil
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths: &paths
+      - jasil/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/test-jasil.yml
+  pull_request:
+    branches:
+      - master
+      - main
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-jasil:
+    name: jasil (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-dev --group test --group lint --no-install-project
+
+      - name: Check auth import boundaries
+        run: uv run --no-sync lint-imports
+
+      - name: Run tests
+        run: uv run --no-sync pytest
+
+      # Re-run the suite against the RedisStateStore adapter (backed by an
+      # in-process fakeredis) so the distributed state-store backend gets the
+      # same coverage as the default in-memory store.
+      - name: Run tests (Redis state store)
+        env:
+          jasil_TEST_STATE_STORE: redis
+        run: uv run --no-sync pytest

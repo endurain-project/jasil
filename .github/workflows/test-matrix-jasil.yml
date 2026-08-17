@@ -1,0 +1,162 @@
+name: Test matrix jasil
+
+# Portability matrix on top of the fast default `test-jasil` job:
+#   * every supported Python (3.12, 3.13, 3.14) on the default SQLite backend;
+#   * the suite against real Postgres and MySQL servers (proving the ORM models
+#     and queries stay database-agnostic); and
+#   * a bare `import jasil` with only the base dependencies installed (no
+#     mfa / sso / redis / webauthn extras, no dev groups), proving the
+#     optional-feature modules import defensively.
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths: &paths
+      - jasil/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/test-matrix-jasil.yml
+      - .github/scripts/smoke_import.py
+  pull_request:
+    branches:
+      - master
+      - main
+    paths: *paths
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Every supported Python version on the default SQLite backend.
+  test-python-matrix:
+    name: jasil (py${{ matrix.python }} · sqlite)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-dev --group test --group lint --no-install-project --python ${{ matrix.python }}
+
+      - name: Check auth import boundaries
+        run: uv run --no-sync --python ${{ matrix.python }} lint-imports
+
+      - name: Run tests
+        run: uv run --no-sync --python ${{ matrix.python }} pytest
+
+  # 2. The suite against a real PostgreSQL server.
+  test-postgres:
+    name: jasil (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: jasil
+          POSTGRES_PASSWORD: jasil
+          POSTGRES_DB: jasil
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U jasil -d jasil"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      jasil_TEST_DATABASE_URL: postgresql+psycopg://jasil:jasil@localhost:5432/jasil
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies (with database drivers)
+        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
+
+      - name: Run tests
+        run: uv run --no-sync pytest
+
+  # 3. The suite against a real MySQL server.
+  test-mysql:
+    name: jasil (mysql)
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_USER: jasil
+          MYSQL_PASSWORD: jasil
+          MYSQL_DATABASE: jasil
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u root -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      jasil_TEST_DATABASE_URL: mysql+pymysql://jasil:jasil@localhost:3306/jasil
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Sync dependencies (with database drivers)
+        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
+
+      - name: Run tests
+        run: uv run --no-sync pytest
+
+  # 4. Bare import with only the base dependencies (no extras, no dev groups):
+  #    proves `import jasil` and router assembly work without mfa/sso/redis.
+  import-base-deps:
+    name: jasil (bare import, no extras)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Install base dependencies only (no optional extras, no dev groups)
+        # --no-dev installs the base runtime dependencies + the project only;
+        # the mfa / sso / redis / webauthn extras and all other dependency
+        # groups stay out.
+        run: uv sync --frozen --no-dev
+
+      # Run from outside the repository root so the local ``jasil/`` package
+      # directory cannot shadow the installed distribution: otherwise this would
+      # validate the working tree rather than what a user actually gets.
+      - name: Import jasil and assemble the router without optional extras
+        run: |
+          set -euo pipefail
+          cp -r .venv "$RUNNER_TEMP/base-venv"
+          cd "$RUNNER_TEMP"
+          VIRTUAL_ENV="$RUNNER_TEMP/base-venv" uv run --no-project python "$GITHUB_WORKSPACE/.github/scripts/smoke_import.py"
