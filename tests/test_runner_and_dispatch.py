@@ -23,6 +23,18 @@ from jasil.subscribers import best_effort
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
 
+def stored_job(db) -> ProcessingJob:
+    """Re-read the job after the runner committed in a session of its own.
+
+    The runner deliberately works in short-lived sessions, so this one has to
+    end its read transaction to see those commits: MySQL defaults to REPEATABLE
+    READ, where an open transaction keeps the snapshot it started with. Asserting
+    on a stale snapshot is how a test passes for the wrong reason.
+    """
+    db.rollback()
+    return db.query(ProcessingJob).one()
+
+
 class FixedClock:
     def __init__(self, now: datetime = T0) -> None:
         self._now = now
@@ -89,7 +101,7 @@ class TestJobRunner:
 
         runner.run_once()
 
-        assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_COMPLETED
+        assert stored_job(db).status == jobs_crud.STATUS_COMPLETED
 
     def test_a_failing_handler_reschedules_the_job(self, runner, registry, db):
         def _boom(_event):
@@ -100,7 +112,7 @@ class TestJobRunner:
 
         runner.run_once()
 
-        assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_PENDING
+        assert stored_job(db).status == jobs_crud.STATUS_PENDING
 
     def test_a_failing_handler_dead_letters_once_attempts_are_exhausted(self, runner, registry, db):
         def _boom(_event):
@@ -111,7 +123,7 @@ class TestJobRunner:
 
         runner.run_once()
 
-        assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_DEAD_LETTER
+        assert stored_job(db).status == jobs_crud.STATUS_DEAD_LETTER
 
     def test_a_job_with_no_registered_handler_fails_rather_than_vanishing(self, runner, db):
         """A subscriber removed from the code while jobs are still queued must
@@ -120,7 +132,7 @@ class TestJobRunner:
 
         runner.run_once()
 
-        job = db.query(ProcessingJob).one()
+        job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
         assert "no durable handler" in job.last_error
 

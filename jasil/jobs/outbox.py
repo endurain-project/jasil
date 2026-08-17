@@ -17,6 +17,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 import jasil.pruning as jasil_pruning
+from jasil._core.dialects import supports_skip_locked
 from jasil.events import Event
 from jasil.jobs.models import EventOutbox
 
@@ -68,9 +69,10 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
     """
     Fetch the oldest not-yet-relayed outbox rows, locking them for this relayer.
 
-    On PostgreSQL the rows are claimed with ``FOR UPDATE SKIP LOCKED`` so
-    concurrent relayers across replicas take disjoint batches (no single-runner
-    lock needed); on SQLite the clause is omitted (tests are single-threaded).
+    On a database with row-level locking the rows are claimed with ``FOR UPDATE
+    SKIP LOCKED`` so concurrent relayers across replicas take disjoint batches
+    (no single-runner lock needed); elsewhere the clause is omitted and the
+    idempotent fan-out is what keeps an overlap harmless.
 
     Args:
         limit: Maximum number of rows to return.
@@ -80,8 +82,8 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
         Unrelayed outbox rows, oldest-first.
     """
     stmt = select(EventOutbox).where(EventOutbox.relayed_at.is_(None)).order_by(EventOutbox.created_at).limit(limit)
-    if db.bind is not None and db.bind.dialect.name == "postgresql":
-        stmt = stmt.with_for_update(skip_locked=True)  # pragma: no cover - Postgres-only path
+    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+        stmt = stmt.with_for_update(skip_locked=True)
     return list(db.execute(stmt).scalars().all())
 
 

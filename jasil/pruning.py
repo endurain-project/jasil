@@ -12,6 +12,8 @@ from typing import Any
 from sqlalchemy import ColumnExpressionArgument, delete, select
 from sqlalchemy.orm import Session
 
+from jasil._core.dialects import supports_skip_locked
+
 # Rows deleted per batch when pruning; bounded so each delete transaction
 # stays short.
 PRUNE_BATCH_SIZE = 1000
@@ -41,10 +43,10 @@ def bounded_delete(
     total = 0
     for _ in range(PRUNE_MAX_BATCHES):
         id_stmt = select(model.id).where(*conditions).limit(batch_size)
-        if db.bind is not None and db.bind.dialect.name == "postgresql":
+        if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
             # Concurrent prunes step over each other's claimed page rather
             # than blocking on it.
-            id_stmt = id_stmt.with_for_update(skip_locked=True)  # pragma: no cover - Postgres-only path
+            id_stmt = id_stmt.with_for_update(skip_locked=True)
         ids = list(db.execute(id_stmt).scalars().all())
         if not ids:
             break

@@ -12,7 +12,8 @@ import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session
 import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
 import jasil.pruning as jasil_pruning
+from jasil._core.dialects import supports_skip_locked
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
 
@@ -120,8 +122,8 @@ def claim_jobs(
         .order_by(ProcessingJob.available_at)
         .limit(limit)
     )
-    if db.bind is not None and db.bind.dialect.name == "postgresql":
-        id_stmt = id_stmt.with_for_update(skip_locked=True)  # pragma: no cover - Postgres-only path
+    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+        id_stmt = id_stmt.with_for_update(skip_locked=True)
     job_ids = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()  # end the transaction so FOR UPDATE locks are released
@@ -256,8 +258,8 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
         .where(ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.lease_expires_at < now)
         .limit(limit)
     )
-    if db.bind is not None and db.bind.dialect.name == "postgresql":
-        id_stmt = id_stmt.with_for_update(skip_locked=True)  # pragma: no cover - Postgres-only path
+    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+        id_stmt = id_stmt.with_for_update(skip_locked=True)
     job_ids = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()
@@ -451,7 +453,12 @@ def delete_completed_jobs_before(
 
 def _insert_ignoring_duplicate(values: dict, db: Session):
     """
-    Build a dialect-appropriate ``INSERT ... ON CONFLICT DO NOTHING`` statement.
+    Build a dialect-appropriate "insert, or do nothing if it exists" statement.
+
+    The ``(event_id, subscriber_id)`` unique constraint is what makes a durable
+    subscriber an idempotent consumer, so a duplicate enqueue must be a silent
+    no-op on **every** supported database — not an ``IntegrityError`` the relay
+    would have to catch.
 
     Args:
         values: Column values for the new row.
@@ -460,10 +467,23 @@ def _insert_ignoring_duplicate(values: dict, db: Session):
     Returns:
         An executable insert statement that ignores a duplicate
         ``(event_id, subscriber_id)``.
+
+    Raises:
+        RuntimeError: On a dialect with no supported conflict clause, rather
+            than emitting a plain INSERT that would raise on the second enqueue.
     """
     dialect = db.bind.dialect.name if db.bind is not None else ""
     if dialect == "postgresql":  # pragma: no cover - exercised on Postgres, not in SQLite tests
         return pg_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
     if dialect == "sqlite":
         return sqlite_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    return insert(ProcessingJob).values(**values)  # pragma: no cover - defensive fallback
+    if dialect == "mysql":  # pragma: no cover - exercised on MySQL, not in SQLite tests
+        # MySQL has no ON CONFLICT DO NOTHING. Assigning a column to *itself*
+        # is the standard no-op form; ``INSERT IGNORE`` would also swallow
+        # unrelated errors such as truncation.
+        statement = mysql_insert(ProcessingJob).values(**values)
+        return statement.on_duplicate_key_update(event_id=ProcessingJob.event_id)
+    raise RuntimeError(
+        f"JASIL's durable jobs need an insert-or-ignore clause, which dialect {dialect!r} does not provide. "
+        "Supported: postgresql, mysql, sqlite."
+    )

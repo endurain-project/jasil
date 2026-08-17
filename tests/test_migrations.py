@@ -7,6 +7,8 @@ difference would only surface in production. ``test_the_migration_matches_the_mo
 is the guard for that.
 """
 
+from typing import ClassVar
+
 import pytest
 from sqlalchemy import create_engine, inspect
 
@@ -17,10 +19,20 @@ pytest.importorskip("alembic", reason="migrations require the 'migrations' extra
 
 
 @pytest.fixture
-def engine():
-    engine = create_engine("sqlite://")
+def engine(mapped_base, database_url):
+    engine = create_engine(database_url)
+    _drop_everything(engine, mapped_base)
     yield engine
+    # A real server is shared across the run, so leave nothing behind.
+    _drop_everything(engine, mapped_base)
     engine.dispose()
+
+
+def _drop_everything(engine, mapped_base) -> None:
+    """Remove JASIL's tables and its Alembic version table, if present."""
+    mapped_base.metadata.drop_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f"DROP TABLE IF EXISTS {migrations.VERSION_TABLE}")
 
 
 def _schema(engine) -> dict[str, dict]:
@@ -67,32 +79,46 @@ class TestUpgrade:
 
 
 class TestNoDrift:
+    # The migration adds one index the ORM cannot declare: a PostgreSQL-only GIN
+    # index on ``event_metadata`` (jsonb_path_ops) for ``@>`` correlation
+    # queries. SQLite cannot build it, so it is created in the migration rather
+    # than in ``__table_args__`` — an intentional difference, not drift.
+    DIALECT_ONLY_INDEXES: ClassVar[frozenset[str]] = frozenset({"idx_event_log_metadata_gin"})
+
     def test_the_migration_matches_the_models(self, engine, mapped_base):
         """A migrated database and a ``create_all`` database must be identical.
 
         Drift here means tests (create_all) and production (migrations) run
-        against different schemas.
+        against different schemas. Both halves run against the *same* database in
+        turn, so this holds on whichever backend the suite is pointed at.
         """
         migrations.upgrade(engine)
         migrated = _schema(engine)
+        _drop_everything(engine, mapped_base)
 
-        created_engine = create_engine("sqlite://")
-        mapped_base.metadata.create_all(created_engine)
-        created = _schema(created_engine)
-        created_engine.dispose()
+        mapped_base.metadata.create_all(engine)
+        created = _schema(engine)
 
         assert migrated == created
 
     def test_the_indexes_match_the_models(self, engine, mapped_base):
         migrations.upgrade(engine)
         migrated = _indexes(engine)
+        _drop_everything(engine, mapped_base)
 
-        created_engine = create_engine("sqlite://")
-        mapped_base.metadata.create_all(created_engine)
-        created = _indexes(created_engine)
-        created_engine.dispose()
+        mapped_base.metadata.create_all(engine)
+        created = _indexes(engine)
 
-        assert migrated == created
+        assert {table: names - self.DIALECT_ONLY_INDEXES for table, names in migrated.items()} == created
+
+    def test_postgres_gets_the_metadata_gin_index(self, engine):
+        """It is what makes ``event_metadata @> '{...}'`` usable on a large trail."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("GIN indexes are PostgreSQL-only")
+
+        migrations.upgrade(engine)
+
+        assert "idx_event_log_metadata_gin" in _indexes(engine)["event_log"]
 
     def test_the_unique_constraint_survives_the_migration(self, engine):
         """``(event_id, subscriber_id)`` uniqueness is the idempotent-consumer
