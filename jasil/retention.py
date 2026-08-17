@@ -3,11 +3,10 @@
 The event_log (F7) and durable-job (F8) tables are append-only: every event
 writes an ``event_log`` row, the relay stamps ``event_outbox`` rows, and each
 ``(event, subscriber)`` pair produces a ``processing_jobs`` row. Left alone they
-grow without bound — and activities, the highest-volume event producer, fill them
-fastest. This module prunes rows past their retention window on a schedule
-(``EVENT_LOG_RETENTION_DAYS`` for the event_log trail, ``JOBS_RETENTION_DAYS`` for
-the durable-job tables — each configured and disabled independently), deleting
-only what is safe to lose:
+grow without bound, fastest in whichever subsystem publishes most. This module
+prunes rows past their retention window on a schedule (one window for the
+event_log trail, another for the durable-job tables — each configured and
+disabled independently), deleting only what is safe to lose:
 
 * every ``event_log`` row (best-effort, safe-to-lose observability trail),
 * relayed ``event_outbox`` rows (already fanned out into jobs), and

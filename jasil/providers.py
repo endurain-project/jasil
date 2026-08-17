@@ -48,9 +48,10 @@ class StateProvider(Protocol):
     The single seam through which domain code reads and writes short-lived
     shared state, so a store never needs to know whether it is backed by a
     process-local dict (``local``) or Redis (``distributed``). Beyond plain
-    key/value access it exposes the few *atomic* primitives the auth/MFA/ticket
-    stores need (``set_if_absent``, ``get_and_delete``, ``record_tiered_failure``)
-    so their correctness does not depend on the backend.
+    key/value access it exposes the few *atomic* primitives that login-throttling
+    and single-use-token stores need (``set_if_absent``, ``get_and_delete``,
+    ``record_tiered_failure``) so their correctness does not depend on the
+    backend.
     """
 
     def get(self, key: str) -> bytes | None: ...
@@ -74,23 +75,22 @@ class StateProvider(Protocol):
 class StorageProvider(Protocol):
     """Opaque byte-blob storage addressed by a key within a named *area*.
 
-    An area is a domain-owned namespace (e.g. ``"activity_thumbnails"``,
-    ``"user_images"``) so one backend serves every subsystem: locally it maps to
-    a subdirectory, on S3 to a key prefix. The DB stores only the key (the area
-    is a fixed constant of the calling domain); ``url`` is computed at
-    serialization time so migrating local -> S3 needs no data migration.
+    An area is a domain-owned namespace (e.g. ``"avatars"``, ``"exports"``) so
+    one backend serves every subsystem: locally it maps to a subdirectory, on S3
+    to a key prefix. The database stores only the key (the area is a fixed
+    constant of the calling domain); ``url`` is computed at serialization time so
+    migrating local -> S3 needs no data migration.
 
-    Most subsystems only ever write a blob and later serve it via ``url`` (e.g.
-    thumbnails), but some need the bytes back in-process (e.g. bundling an
-    activity's stored source file into a profile export); ``get`` is that read
-    path, returning ``None`` when the blob is absent.
+    Most subsystems only ever write a blob and later serve it via ``url``, but
+    some need the bytes back in-process (e.g. bundling stored files into an
+    export); ``get`` is that read path, returning ``None`` when the blob is
+    absent.
 
     ``list_keys`` exists for the subsystems whose keys are *not* derivable from a
-    domain id. Thumbnails and retained source files can address every blob they
-    own from an activity id alone; activity media cannot, because its keys carry
-    a random component. Without a prefix listing that subsystem would have to
-    reach past the provider to the filesystem to clean up after a deleted
-    activity, which is exactly what this port exists to prevent.
+    domain id — for instance when a key carries a random component. Without a
+    prefix listing, such a subsystem would have to reach past the provider to the
+    filesystem to clean up after a deleted record, which is exactly what this
+    provider exists to prevent.
     """
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...

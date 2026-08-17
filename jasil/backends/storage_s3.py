@@ -2,7 +2,7 @@
 
 Only imported by the composition root when ``STORAGE_URI`` uses the ``s3://``
 scheme, so local deployments never load ``boto3``. Install it with the ``s3``
-extra (``pip install endurain[s3]``).
+extra (``pip install jasil[s3]``).
 """
 
 from typing import Any

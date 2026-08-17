@@ -64,7 +64,7 @@ class HttpGeocoding:
         *,
         api_key: str | None = None,
         min_interval_seconds: float = 0.0,
-        user_agent: str = "Endurain (ReverseGeocoding)",
+        user_agent: str = "jasil (ReverseGeocoding)",
     ) -> None:
         self._service = service
         self._base_url = base_url
@@ -168,9 +168,9 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
     reason = network.host_rejection_reason(host, allowed_hosts=allowed_hosts, purpose="reverse_geocoding")
     if reason is not None:
         logger.warning(
-            f"Reverse-geocoding host {host!r} {reason}; reverse geocoding is disabled "
-            "and activities will have no location. A self-hosted instance on a private "
-            "network must be allow-listed via SSRF_ALLOWED_HOSTS."
+            f"Reverse-geocoding host {host!r} {reason}; reverse geocoding is disabled. "
+            "A self-hosted instance on a private network must be allow-listed via "
+            "the SSRF allowlist."
         )
         return None
     scheme = "https" if use_https else "http"

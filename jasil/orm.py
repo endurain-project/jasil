@@ -51,6 +51,7 @@ __all__ = [
     "get_sessionmaker",
     "is_models_mapped",
     "is_sessionmaker_configured",
+    "jasil_table_names",
     "map_models",
     "mapper_registry",
     "reset",
@@ -81,6 +82,15 @@ _MODEL_MODULES: tuple[str, ...] = (
     "jasil.event_log.models",
     "jasil.jobs.models",
 )
+
+#: Tables JASIL owns. The migrations scope every operation to these, so a host
+#: sharing the registry never has its own tables added, dropped, or diffed.
+_TABLE_NAMES: frozenset[str] = frozenset({"event_log", "processing_jobs", "event_outbox"})
+
+
+def jasil_table_names() -> frozenset[str]:
+    """Return the names of the tables JASIL owns."""
+    return _TABLE_NAMES
 
 
 def get_active_base() -> type[DeclarativeBase]:

@@ -64,7 +64,7 @@ class EventLogFailure(BaseModel):
         handler_name: The subscriber(s) that processed the event.
         error_message: The failure reason.
         retry_count: Processing attempts so far.
-        event_metadata: Correlation context (request_id, user_id, activity_id).
+        event_metadata: Correlation context (request_id, plus any host-defined keys).
         created_at: When the event was published.
         completed_at: When processing finished.
     """

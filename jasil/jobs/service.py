@@ -31,8 +31,8 @@ _REAP_INTERVAL_SECONDS = 60
 # Bound how many outbox batches one relay pass drains before yielding.
 _MAX_RELAY_BATCHES = 100
 
-_RELAY_JOB_ID = "endurain_outbox_relay"
-_REAP_JOB_ID = "endurain_job_reaper"
+_RELAY_JOB_ID = "jasil_outbox_relay"
+_REAP_JOB_ID = "jasil_job_reaper"
 
 _worker: BackgroundWorker | None = None
 

@@ -10,8 +10,8 @@ deployment (or one where ``redis`` is not installed — it is the optional
 ``distributed`` extra) loads zero Redis.
 
 ``get_shared_client`` memoizes clients so the process owns *one* connection per
-distinct ``(uri, decode_responses)`` pair: in the common case (only ``REDIS_URL``
-configured) the auth/MFA/ticket state and the event bus share a single
+distinct ``(uri, decode_responses)`` pair: in the common case (a single Redis URL
+configured) the keyed state and the event bus share a single
 ``decode_responses=True`` client, while the byte-oriented ``StateProvider`` gets
 its own ``decode_responses=False`` client.
 """

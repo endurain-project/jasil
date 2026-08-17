@@ -25,10 +25,10 @@ class EventLog(Base):
     Attributes:
         id: The envelope ``event_id`` (UUIDv4 string); stable across retries
             so it also serves as the deduplication key.
-        event_type: The domain-event channel, e.g. ``activity.created``.
-        event_source: Where the event originated, e.g. ``api:store_activity``.
+        event_type: The domain-event channel, e.g. ``order.created``.
+        event_source: Where the event originated, e.g. ``api:create_order``.
         event_payload: The domain payload, passed through untouched.
-        event_metadata: Correlation context (request_id, user_id, activity_id).
+        event_metadata: Correlation context (request_id, plus any host-defined keys).
         status: Lifecycle state — published, processing, completed, failed, or
             dead_letter for bus-delivered events; queued (terminal) for events
             handed to the durable job queue.
@@ -60,12 +60,12 @@ class EventLog(Base):
     event_type: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
-        comment="Domain-event channel, e.g. activity.created",
+        comment="Domain-event channel, e.g. order.created",
     )
     event_source: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        comment="Where the event originated, e.g. api:store_activity",
+        comment="Where the event originated, e.g. api:create_order",
     )
     event_payload: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
@@ -75,7 +75,7 @@ class EventLog(Base):
     event_metadata: Mapped[dict[str, Any] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
-        comment="Correlation context (request_id, user_id, activity_id)",
+        comment="Correlation context (request_id, plus any host-defined keys)",
     )
     status: Mapped[str] = mapped_column(
         String(20),

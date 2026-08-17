@@ -7,8 +7,8 @@ one to a process- or node-local implementation.
 
 Two consistency rules are enforced:
 
-- **Cross-process backends** — ephemeral *state* (rate-limit, auth-security,
-  MFA, websocket tickets) and the *event* bus — must not resolve to
+- **Cross-process backends** — ephemeral *state* (rate limiting, login
+  throttling, single-use tokens) and the *event* bus — must not resolve to
   process-local memory when the topology requires shared state (the
   ``distributed`` profile or more than one web worker); the stores/bus would
   diverge silently across processes. Both share the ``memory://`` / ``redis://``
@@ -149,7 +149,7 @@ def check_state_consistency(
     A deployment that requires shared state (the ``distributed`` profile or more
     than one web worker) but resolves a cross-process backend to process-local
     memory is fatally misconfigured: ephemeral state (rate-limit counters, login
-    lockout, pending-MFA) and the in-process event bus would silently diverge
+    lockout, single-use tokens) and the in-process event bus would silently diverge
     across processes. State stores and the event bus share the ``memory://`` /
     ``redis://`` vocabulary, so both are validated here.
 
@@ -198,7 +198,7 @@ def check_storage_consistency(
     """Return a fatal issue when distributed storage resolves to local disk.
 
     Under the ``distributed`` profile replicas run on separate nodes that do not
-    share a filesystem, so blob storage (thumbnails, media) must be object
+    share a filesystem, so blob storage must be object
     storage. A multi-worker ``local`` deployment shares one host disk, so local
     storage stays valid there and is not flagged.
 
@@ -238,7 +238,7 @@ def check_lock_consistency(
     ``distributed`` profile or any multi-worker deployment
     (:attr:`DeploymentTopology.requires_shared_state`) — an in-process
     ``noop://`` lock coordinates nothing, so every process would run every
-    interval job (Strava/Garmin sync, token sweeps, thumbnail backfill). The
+    interval job (an upstream sync, a token sweep, a backfill). The
     profile-aware default already resolves to ``postgres-advisory://`` in that
     case, so this only trips on an explicit ``LOCK_URI=noop://`` override. A
     single-process ``local`` deployment has nothing to coordinate, so ``noop``

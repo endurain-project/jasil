@@ -1,9 +1,10 @@
 """SSRF guard for operator-configured outbound hosts.
 
-Vendored from Endurain's ``core.network``, trimmed to the outbound half. The
-inbound half (proxy-aware client-IP extraction, ``TRUSTED_PROXIES`` resolution)
-is a web-framework concern and deliberately did not come across: JASIL serves no
-requests, and keeping it out is what lets this module stay free of ``fastapi``.
+Vendored from a host application's network helpers, trimmed to the outbound
+half. The inbound half (proxy-aware client-IP extraction, trusted-proxy
+resolution) is a web-framework concern and deliberately did not come across:
+JASIL serves no requests, and keeping it out is what lets this module stay free
+of ``fastapi``.
 
 The allowlist is passed in rather than read from a global, so the host owns the
 policy and the guard stays a pure function.

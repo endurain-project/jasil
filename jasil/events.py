@@ -5,7 +5,7 @@ pipeline can route, trace, correlate, dedup, and retry without knowing the
 domain.
 
 Channel names (``event_type`` values) are **owned by the domain that publishes
-them**, not defined here — e.g. the activities module owns ``activity.created``.
+them**, not defined here — e.g. the orders module owns ``order.created``.
 Keeping them out of the substrate stops this generic layer from accumulating
 domain knowledge; a producer and its subscribers import the same domain-side
 constant so they cannot drift on the string. Convention: ``<domain>.<fact>`` in
@@ -39,10 +39,12 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-# --- Standard metadata keys (correlation context, not domain data) ---
+# --- Standard metadata key (correlation context, not domain data) ---
+#
+# Only the correlation id is defined here. Domain keys (user id, tenant id, the
+# id of whatever the event is about) are the *host's* to name, and travel in the
+# same ``metadata`` dict without JASIL needing to know them.
 META_REQUEST_ID = "request_id"
-META_USER_ID = "user_id"
-META_ACTIVITY_ID = "activity_id"
 
 #: Version assumed for an event that carries none — every event written before
 #: ``schema_version`` existed. Persisted rows default to this on read.
@@ -55,11 +57,11 @@ class Event:
 
     Attributes:
         event_id: UUIDv4 identifying this event instance; stable across retries.
-        event_type: Dot-notation channel, e.g. ``activity.created``.
-        source: Where the event originated, e.g. ``api:store_activity``.
+        event_type: Dot-notation channel, e.g. ``order.created``.
+        source: Where the event originated, e.g. ``api:create_order``.
         timestamp: ISO-8601 UTC timestamp of the first publish (not the retry).
         payload: Domain data, homogeneous per ``event_type``.
-        metadata: Correlation context (request_id, user_id, activity_id, ...).
+        metadata: Correlation context (request_id, plus any host-defined keys).
         retry_count: Processing attempts so far; 0 on first publish.
         schema_version: Which version of ``payload``'s shape this event carries,
             owned by the publishing domain. Defaults to
@@ -89,9 +91,9 @@ def new_event(
     """Mint an :class:`Event`, generating ``event_id`` and ``timestamp``.
 
     Args:
-        event_type: The channel/type, e.g. ``activity.created``.
+        event_type: The channel/type, e.g. ``order.created``.
         payload: Domain data for the event.
-        source: Origin label, e.g. ``api:store_activity``.
+        source: Origin label, e.g. ``api:create_order``.
         metadata: Optional correlation context.
         event_id: Optional explicit id (defaults to a fresh UUIDv4); reuse the
             original id when re-publishing a retry so tracing stays stable.

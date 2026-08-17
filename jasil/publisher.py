@@ -24,8 +24,7 @@ swallowed so publishing never breaks the producer's own work. The outbox is not
 committed in the same transaction as the domain change (the ingestion path commits
 per-CRUD), so a crash between the domain commit and the outbox write can drop an
 event. Every subscriber must therefore have a reconciliation net — a backfill or
-sweeper that re-derives missed work (the thumbnail subsystem's hourly backfill is
-the reference). A future unit-of-work refactor can upgrade this to a genuinely
+sweeper that re-derives missed work). A future unit-of-work refactor can upgrade this to a genuinely
 atomic outbox; until then, "durable" means *retryable once written*, not *never
 lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
@@ -74,9 +73,9 @@ def publish(
     """Publish a domain event through the active platform, best-effort.
 
     Args:
-        event_type: The domain-owned channel, e.g. ``activity.created``.
+        event_type: The domain-owned channel, e.g. ``order.created``.
         payload: Domain data for the event (homogeneous per ``event_type``).
-        source: Origin label, e.g. ``api:store_activity``.
+        source: Origin label, e.g. ``api:create_order``.
         metadata: Optional correlation context; merged with the ambient request
             id when one is set on the current request.
         db: The producer's SQLAlchemy session. When provided and durable jobs are
@@ -133,9 +132,9 @@ def publish_committing(
       dispatched on the bus and any dispatch failure is logged and swallowed.
 
     Args:
-        event_type: The domain-owned channel, e.g. ``activity.created``.
+        event_type: The domain-owned channel, e.g. ``order.created``.
         payload: Domain data for the event.
-        source: Origin label, e.g. ``api:store_activity``.
+        source: Origin label, e.g. ``api:create_order``.
         metadata: Optional correlation context; merged with the ambient request id.
         db: The producer's SQLAlchemy session (holds the uncommitted domain change).
         commit: Zero-arg callable that commits the caller's unit of work.
@@ -147,7 +146,7 @@ def publish_committing(
         # Atomic path: stage the outbox row inside the caller's transaction, then
         # commit the domain change and the outbox row together. A failure here
         # leaves the transaction uncommitted so the caller rolls back atomically
-        # (no partial activity, no orphaned event).
+        # (no partial domain change, no orphaned event).
         try:
             platform = platform_runtime.get_active_platform()
             event = _mint(event_type, payload, source, metadata, schema_version)
@@ -203,7 +202,7 @@ def publish_many_committing(
         event_type: The domain-owned channel shared by every event in the batch.
         payloads: One payload per event. An empty sequence still runs ``commit``
             so the caller's unit of work is committed exactly once either way.
-        source: Origin label, e.g. ``api:delete_all_strava_activities``.
+        source: Origin label, e.g. ``api:bulk_delete``.
         metadata_for: Optional per-payload correlation metadata builder.
         db: The producer's SQLAlchemy session (holds the uncommitted change).
         commit: Zero-arg callable that commits the caller's unit of work.

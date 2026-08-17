@@ -14,7 +14,7 @@ import pytest
 
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
-from jasil.events import META_ACTIVITY_ID, META_USER_ID, new_event
+from jasil.events import new_event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -233,36 +233,36 @@ class TestBestEffortSubscriber:
         best_effort(_boom)(new_event("activity.created", {}, source="test"))
 
     def test_the_failure_is_logged_with_correlation_context(self, caplog):
+        """The whole metadata dict is logged: which keys matter is host-defined,
+        so the library must not pick favourites."""
+
         def _boom(_event):
             raise RuntimeError("subscriber exploded")
 
         event = new_event(
-            "activity.created",
+            "order.created",
             {},
             source="test",
-            metadata={META_ACTIVITY_ID: 7, META_USER_ID: 42},
+            metadata={"request_id": "req-1", "tenant_id": 42},
         )
 
         with caplog.at_level("ERROR"):
             best_effort(_boom)(event)
 
         record = caplog.records[-1]
-        assert record.event_type == "activity.created"
-        assert record.activity_id == 7
-        assert record.user_id == 42
+        assert record.event_type == "order.created"
+        assert record.event_metadata == {"request_id": "req-1", "tenant_id": 42}
 
-    def test_correlation_keys_fall_back_to_the_payload(self, caplog):
-        """Producers put ids in the payload as often as in the metadata."""
+    def test_the_subscriber_name_is_logged(self, caplog):
+        """It is what identifies which subscriber failed."""
 
-        def _boom(_event):
+        def my_handler(_event):
             raise RuntimeError("boom")
 
-        event = new_event("activity.created", {META_ACTIVITY_ID: 9}, source="test")
-
         with caplog.at_level("ERROR"):
-            best_effort(_boom)(event)
+            best_effort(my_handler)(new_event("order.created", {}, source="test"))
 
-        assert caplog.records[-1].activity_id == 9
+        assert caplog.records[-1].subscriber == "my_handler"
 
     def test_it_preserves_the_wrapped_handler_name(self):
         """The name is what identifies the subscriber in logs."""

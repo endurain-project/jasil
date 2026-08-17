@@ -123,8 +123,8 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
     storage_uri = settings.resolved_storage_uri
     scheme, _, rest = storage_uri.partition("://")
     if scheme == "local":
-        # Root the backend at DATA_DIR; each storage *area* (thumbnails, media,
-        # user images, ...) is a subdirectory under it.
+        # Root the backend at the configured data dir; each storage *area* is a
+        # subdirectory under it.
         return LocalStorage(rest or settings.data_dir)
     if scheme == "s3":
         # Imported lazily: boto3 is the optional `s3` extra and is absent from the
@@ -173,8 +173,8 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     key, or a host that fails SSRF validation disables the capability rather than
     preventing the application from starting.
 
-    Because a disabled capability is otherwise invisible — activities simply have
-    no city/town/country and nothing says why — every outcome is logged at
+    Because a disabled capability is otherwise invisible — lookups simply return
+    nothing and nothing says why — every outcome is logged at
     startup, including the successful one. An operator who set the config and saw
     no locations appear can tell from one line whether the setting was rejected
     and for what reason.

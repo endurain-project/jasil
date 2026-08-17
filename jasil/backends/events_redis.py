@@ -6,20 +6,21 @@ is an ``XADD`` onto one stream; a background consumer thread reads through a
 consumer group (``XREADGROUP``) and dispatches each event to the subscribers
 registered for its ``event_type``, acking (``XACK``) after the handlers run.
 
-Endurain ships one image, so every replica registers the same subscribers. A
-single consumer group therefore gives "each derived computation runs once per
-event across the cluster" (competing consumers), while in-process fan-out to all
-handlers of an ``event_type`` still happens on whichever replica claims the entry.
+A deployment normally ships one image, so every replica registers the same
+subscribers. A single consumer group therefore gives "each derived computation
+runs once per event across the cluster" (competing consumers), while in-process
+fan-out to all handlers of an ``event_type`` still happens on whichever replica
+claims the entry.
 
 Delivery is at-least-once: an entry is acked only after its handlers succeed, so
 a failed handler (or a malformed envelope) leaves the entry pending rather than
 dropping it. This bus is the *best-effort* delivery path and has no in-bus retry
 or reclaim of its own: an entry orphaned by a crashed consumer (which would need
 ``XAUTOCLAIM``/``XPENDING`` to recover) stays pending. For at-least-once delivery
-with per-subscriber retry, backoff, dead-letter, and replay, enable durable jobs
-(``JOBS_ENABLED``): publishing then routes through the
-transactional outbox and ``processing_jobs`` instead of this bus. For the
-thumbnail use case the hourly scheduler backfill is the reconciliation net.
+with per-subscriber retry, backoff, dead-letter, and replay, enable durable jobs:
+publishing then routes through the transactional outbox and ``processing_jobs``
+instead of this bus, and each subscriber's own reconciliation sweep is the
+safety net.
 """
 
 import json
@@ -38,8 +39,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from jasil.providers import EventRecorder
 
-_DEFAULT_STREAM = "endurain:events"
-_DEFAULT_GROUP = "endurain"
+_DEFAULT_STREAM = "jasil:events"
+_DEFAULT_GROUP = "jasil"
 _STREAM_MAXLEN = 10_000  # approximate cap so acked entries don't grow unbounded
 _READ_BATCH = 10
 _BLOCK_MS = 1_000  # XREADGROUP block window; bounds how quickly stop() is observed

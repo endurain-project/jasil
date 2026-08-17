@@ -310,7 +310,7 @@ forbidden_modules = [
 ]
 
 # Only the composition root selects a backend. Everything else resolves
-# capabilities through the ports, so any backend can be swapped or omitted.
+# capabilities through the providers, so any backend can be swapped or omitted.
 # ``jasil.container`` and ``jasil.deps`` are the wiring layer and are excluded:
 # the former selects the backends, the latter hands the assembled Platform to
 # routes.
@@ -328,8 +328,8 @@ source_modules = [
     "jasil.jobs",
     "jasil.node",
     "jasil.orm",
-    "jasil.profile",
     "jasil.providers",
+    "jasil.profile",
     "jasil.pruning",
     "jasil.publisher",
     "jasil.redis",
@@ -350,8 +350,8 @@ ignore_imports = ["jasil.runtime -> jasil.container"]
 name = "The substrate reaches jobs only through the publisher"
 type = "forbidden"
 source_modules = [
-    "jasil.async_bridge",
     "jasil.backends",
+    "jasil.async_bridge",
     "jasil.capabilities",
     "jasil.correlation",
     "jasil.deps",
@@ -359,8 +359,8 @@ source_modules = [
     "jasil.event_versioning",
     "jasil.events",
     "jasil.node",
-    "jasil.profile",
     "jasil.providers",
+    "jasil.profile",
     "jasil.pruning",
     "jasil.redis",
     "jasil.runtime",

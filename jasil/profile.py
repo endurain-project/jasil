@@ -19,7 +19,7 @@ from enum import StrEnum
 
 
 class DeploymentProfile(StrEnum):
-    """How an Endurain deployment is shaped.
+    """How a deployment is shaped.
 
     Attributes:
         LOCAL: Single process/node — in-memory state, local disk, in-process

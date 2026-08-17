@@ -12,7 +12,7 @@ import functools
 import logging
 from collections.abc import Callable
 
-from jasil.events import META_ACTIVITY_ID, META_USER_ID, Event
+from jasil.events import Event
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +21,9 @@ def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
     """Wrap a raising event handler into a swallowing bus subscriber.
 
     The returned subscriber logs and absorbs **any** exception, so derived work
-    (thumbnails, geocoding, notifications, cleanup) can never fail the request or
-    consumer that produced the event. The wrapped handler stays available for
-    durable-job registration, where failures must propagate to drive retry and
-    dead-lettering.
+    can never fail the request or consumer that produced the event. The wrapped
+    handler stays available for durable-job registration, where failures must
+    propagate to drive retry and dead-lettering.
 
     Usage::
 
@@ -51,8 +50,9 @@ def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
                     "event_type": event.event_type,
                     "event_id": event.event_id,
                     "subscriber": handler.__name__,
-                    "activity_id": event.metadata.get(META_ACTIVITY_ID) or event.payload.get(META_ACTIVITY_ID),
-                    "user_id": event.metadata.get(META_USER_ID) or event.payload.get(META_USER_ID),
+                    # The whole correlation dict: which keys matter is the host's
+                    # to decide, so none are singled out here.
+                    "event_metadata": event.metadata,
                 },
             )
 

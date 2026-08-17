@@ -37,14 +37,14 @@ class ProcessingJob(Base):
         id: Job identifier (UUIDv4 string).
         event_id: The originating envelope ``event_id`` — correlation and, with
             ``subscriber_id``, the idempotent-consumer dedup key.
-        event_type: The domain-event channel, e.g. ``activity.created``.
+        event_type: The domain-event channel, e.g. ``order.created``.
         subscriber_id: The durable subscriber this job runs, e.g.
-            ``activity_thumbnail.generate``.
-        source: Where the originating event came from, e.g. ``api:store_activity``.
+            ``invoice.render``.
+        source: Where the originating event came from, e.g. ``api:create_order``.
         payload: The domain payload the subscriber consumes.
         schema_version: The payload-shape version, carried from the envelope so a
             worker on a different build can upgrade or refuse it.
-        job_metadata: Correlation context (request_id, user_id, activity_id).
+        job_metadata: Correlation context (request_id, plus any host-defined keys).
         status: Lifecycle state: pending, claimed, completed, or dead_letter.
         attempts: Processing attempts so far; incremented when the job is claimed.
         max_attempts: Attempt ceiling before the job is dead-lettered.
@@ -81,17 +81,17 @@ class ProcessingJob(Base):
     event_type: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
-        comment="Domain-event channel, e.g. activity.created",
+        comment="Domain-event channel, e.g. order.created",
     )
     subscriber_id: Mapped[str] = mapped_column(
         String(200),
         nullable=False,
-        comment="Durable subscriber this job runs, e.g. activity_thumbnail.generate",
+        comment="Durable subscriber this job runs, e.g. invoice.render",
     )
     source: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        comment="Where the originating event came from, e.g. api:store_activity",
+        comment="Where the originating event came from, e.g. api:create_order",
     )
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
@@ -108,7 +108,7 @@ class ProcessingJob(Base):
     job_metadata: Mapped[dict[str, Any] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
-        comment="Correlation context (request_id, user_id, activity_id)",
+        comment="Correlation context (request_id, plus any host-defined keys)",
     )
     status: Mapped[str] = mapped_column(
         String(20),
@@ -191,14 +191,14 @@ class EventOutbox(Base):
     Attributes:
         id: Outbox row identifier (UUIDv4).
         event_id: The envelope event_id carried onto the fanned-out jobs.
-        event_type: The domain-event channel, e.g. ``activity.created``.
-        source: Where the event originated, e.g. ``api:store_activity``.
+        event_type: The domain-event channel, e.g. ``order.created``.
+        source: Where the event originated, e.g. ``api:create_order``.
         timestamp: The envelope's ISO-8601 publish timestamp.
         payload: The domain payload.
         schema_version: The payload-shape version, so a relay/worker on a
             different build can upgrade or refuse the payload rather than
             silently misreading it.
-        event_metadata: Correlation context (request_id, user_id, activity_id).
+        event_metadata: Correlation context (request_id, plus any host-defined keys).
         created_at: When the event was written to the outbox.
         relayed_at: When the relay fanned the event out; ``NULL`` while pending.
     """
@@ -222,12 +222,12 @@ class EventOutbox(Base):
     event_type: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
-        comment="Domain-event channel, e.g. activity.created",
+        comment="Domain-event channel, e.g. order.created",
     )
     source: Mapped[str] = mapped_column(
         String(50),
         nullable=False,
-        comment="Where the event originated, e.g. api:store_activity",
+        comment="Where the event originated, e.g. api:create_order",
     )
     timestamp: Mapped[str] = mapped_column(
         String(40),
@@ -249,7 +249,7 @@ class EventOutbox(Base):
     event_metadata: Mapped[dict[str, Any] | None] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),
         nullable=True,
-        comment="Correlation context (request_id, user_id, activity_id)",
+        comment="Correlation context (request_id, plus any host-defined keys)",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

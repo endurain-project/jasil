@@ -5,7 +5,7 @@ Only imported by the composition root when ``LOCK_URI`` selects
 deployments never load it. ``try_acquire`` is non-blocking
 (``pg_try_advisory_lock``) and holds one dedicated connection open for the
 lock's lifetime, releasing it with ``pg_advisory_unlock`` on exit — so at most
-one replica runs a coordinated job (e.g. the thumbnail backfill) at a time.
+one replica runs a coordinated job (e.g. a nightly backfill) at a time.
 
 The lock lives on the main database, so no extra infrastructure is required; the
 lock name is hashed to a signed 64-bit key because ``pg_advisory_lock`` keys are
@@ -29,7 +29,7 @@ def advisory_key(name: str) -> int:
     """Map a lock name to a signed 64-bit key for ``pg_advisory_lock``.
 
     Args:
-        name: The logical lock name (e.g. ``thumbnail_backfill``).
+        name: The logical lock name (e.g. ``nightly_backfill``).
 
     Returns:
         A deterministic signed 64-bit integer, so every replica derives the same

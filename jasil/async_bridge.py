@@ -8,7 +8,8 @@ genuinely async I/O from a synchronous context:
 * an in-process event-bus subscriber, which runs inline on whatever thread called
   ``publish`` (a request thread, the scheduler, or a durable-job worker).
 
-When such code must perform async I/O — pushing a websocket message is the
+When such code must perform async I/O — pushing a message over a live connection
+is the
 motivating case — it hands the coroutine to :func:`dispatch`, which schedules it
 on the **main** event loop captured at application startup via
 :func:`asyncio.run_coroutine_threadsafe`. This keeps the async work on the one
