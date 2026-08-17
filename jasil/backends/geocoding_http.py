@@ -18,8 +18,6 @@ import time
 from collections.abc import Sequence
 from urllib.parse import urlencode
 
-import requests
-
 import jasil._core.network as network
 from jasil.providers import GeocodedPlace
 
@@ -134,6 +132,11 @@ class HttpGeocoding:
         logger.debug(f"Reverse-geocoding ({latitude}, {longitude}) via {self._service}")
         self._throttle()
         try:
+            # Imported lazily: ``requests`` is the optional `geocoding` extra, and
+            # the composition root imports this module unconditionally for
+            # ``NullGeocoding``.
+            import requests
+
             response = requests.get(
                 self._build_url(latitude, longitude),
                 headers={"User-Agent": self._user_agent},

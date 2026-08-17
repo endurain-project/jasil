@@ -95,8 +95,9 @@ test = [
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.1.0",
     # The state and event-bus backends are tested hermetically against fakeredis.
+    # The [lua] extra is required: the tiered-lockout path runs a Lua script.
     "redis>=5.0.0",
-    "fakeredis>=2.21.0",
+    "fakeredis[lua]>=2.21.0",
     # The remaining backends and integrations are all exercised by the suite.
     "boto3>=1.34.0",
     "apscheduler>=3.10",
@@ -196,9 +197,11 @@ source = ["jasil"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]
-# Starts at zero because ``tests/`` is still empty. Ratchet this up as the suite
-# lands — target 90, matching safeuploads. Never lower it to make a build pass.
-fail_under = 0
+# Ratcheted to just under the current figure: high enough that a real regression
+# fails the build, low enough not to trip on incidental churn. Raise it as the
+# suite grows — target 90, matching safeuploads. Never lower it to make a build
+# pass.
+fail_under = 73
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",
@@ -269,6 +272,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "S105", "S106", "S107"]  # allow assert and password-like test strings
 "jasil/__init__.py" = ["RUF022"]  # __all__ is intentionally grouped by category, not globally sorted
+".github/scripts/*.py" = ["T201", "W291"]  # CI helpers report on stdout; regex carries an intentional escaped space
 
 [tool.ruff.format]
 quote-style = "double"

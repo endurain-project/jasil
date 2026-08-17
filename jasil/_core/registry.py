@@ -41,10 +41,14 @@ class ConfigSlot[T]:
         self._default_factory = default_factory
         self._missing_message = missing_message
         self._value: T | None = default_factory() if default_factory is not None else None
+        # Tracked separately from ``_value``: a defaulted slot always *has* a
+        # value, so holding one cannot answer "did the host configure this?".
+        self._configured = False
 
     def configure(self, value: T) -> None:
         """Install ``value`` for the process."""
         self._value = value
+        self._configured = True
 
     def get(self) -> T:
         """Return the installed value.
@@ -58,9 +62,14 @@ class ConfigSlot[T]:
         return value
 
     def is_configured(self) -> bool:
-        """Return whether a value is currently installed."""
-        return self._value is not None
+        """Return whether the host explicitly configured a value.
+
+        A defaulted slot reports ``False`` until :meth:`configure` is called,
+        even though :meth:`get` already returns its default.
+        """
+        return self._configured
 
     def reset(self) -> None:
         """Restore the default (defaulted slot) or clear the value (required slot)."""
         self._value = self._default_factory() if self._default_factory is not None else None
+        self._configured = False
