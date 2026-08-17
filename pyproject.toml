@@ -1,0 +1,352 @@
+[project]
+name = "jasil"
+version = "0.1.0"
+description = "Just Another Substrate & Infrastructure Library"
+authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
+license = {text = "MIT"}
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.12,<4.0"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+# Deliberately minimal: the ports are pure, and every backend that needs a
+# client (redis / boto3 / requests) lives behind an extra below.
+dependencies = [
+    "sqlalchemy>=2.0.49",
+    "pydantic>=2.12.5",
+]
+
+[project.urls]
+Homepage = "https://jasil.endurain.com/"
+Documentation = "https://jasil.endurain.com/"
+Repository = "https://github.com/endurain-project/jasil"
+Changelog = "https://github.com/endurain-project/jasil/blob/main/CHANGELOG.md"
+Issues = "https://github.com/endurain-project/jasil/issues"
+Security = "https://github.com/endurain-project/jasil/blob/main/SECURITY.md"
+
+# Optional backends and integrations. A single-process deployment (memory state,
+# local storage, in-process bus, noop lock) needs none of these; the composition
+# root imports each backend lazily, so an unselected backend's dependency is
+# never loaded.
+[project.optional-dependencies]
+# Distributed state store and Redis-Streams event bus.
+redis = [
+    "redis>=5.0.0",
+]
+# S3-compatible object storage backend.
+s3 = [
+    "boto3>=1.34.0",
+]
+# PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
+# this extra exists so a host can pull a driver from the same declaration.
+postgres = [
+    "psycopg[binary]>=3.2",
+]
+# Durable jobs: the outbox relay and lease-expiry schedules.
+jobs = [
+    "apscheduler>=3.10",
+]
+# FastAPI `Depends` helpers exposing the platform providers to routes.
+fastapi = [
+    "fastapi>=0.136.0",
+]
+# HTTP reverse-geocoding backend (nominatim / photon / geocode.maps.co).
+geocoding = [
+    "requests>=2.32.4",
+]
+# Alembic migrations for JASIL's companion tables (jasil.migrations).
+migrations = [
+    "alembic>=1.13",
+]
+# Convenience: every optional backend at once.
+all = [
+    "redis>=5.0.0",
+    "boto3>=1.34.0",
+    "psycopg[binary]>=3.2",
+    "apscheduler>=3.10",
+    "fastapi>=0.136.0",
+    "requests>=2.32.4",
+    "alembic>=1.13",
+]
+
+[dependency-groups]
+typecheck = [
+    "mypy>=1.20.2",
+    "types-requests",
+    "boto3-stubs[s3]",
+]
+lint = [
+    "ruff>=0.15.12",
+    "import-linter>=2.5",
+]
+test = [
+    "faker>=40.15.0",
+    "hypothesis>=6.150.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    # The state and event-bus backends are tested hermetically against fakeredis.
+    "redis>=5.0.0",
+    "fakeredis>=2.21.0",
+    # The remaining backends and integrations are all exercised by the suite.
+    "boto3>=1.34.0",
+    "apscheduler>=3.10",
+    "fastapi>=0.136.0",
+    "requests>=2.32.4",
+    "responses>=0.25.0",
+    # The migrations suite drives the packaged Alembic revisions.
+    "alembic>=1.13",
+]
+# Real database drivers for the CI database matrix. The default test run uses
+# in-memory SQLite (built into Python) and needs neither; set
+# JASIL_TEST_DATABASE_URL to run the suite against another backend.
+test-db = [
+    "psycopg[binary]>=3.2",
+    "pymysql>=1.1",
+]
+dev = [
+    "hatch>=1.16.5",
+    {include-group = "lint"},
+    {include-group = "test"},
+    {include-group = "typecheck"},
+]
+docs = [
+    "mkdocs-material>=9.6.0",
+    "mkdocstrings[python]>=0.29.0",
+]
+
+[tool.uv]
+# A floor plus a minor-series ceiling rather than an exact pin: an exact
+# ``==`` match makes every uv patch release a hard build failure (locally and on
+# the CI runner) for no reproducibility gain — the lockfile is what pins the
+# dependency set.
+required-version = ">=0.12.5,<0.13"
+# Supply-chain cooldown: refuse dependency versions published in the last 30
+# days, so a compromised release has time to be caught before it can enter a
+# build.
+exclude-newer = "30 days"
+
+# Cooldown exemptions ("0 days" = no cooldown for this package). The global
+# cooldown above also delays *security* fixes, which is the wrong trade for a
+# package with a published advisory: the audit workflow fails while the fix sits
+# behind the window. Exempt only the specific packages that need a fix now, so
+# the cooldown keeps protecting everything else. Remove an entry once its fix is
+# older than the window.
+[tool.uv.exclude-newer-package]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["jasil"]
+
+[tool.hatch.build.targets.sdist]
+# The package plus the files a downstream consumer (or a distro packager)
+# needs to audit the release: licence, changelog, and security policy.
+include = [
+    "jasil",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "README.md",
+    "SECURITY.md",
+]
+
+[tool.hatch.envs.default]
+type = "virtual"
+path = ".venv"
+
+[tool.hatch.envs.default.scripts]
+lint = "ruff check . --fix"
+format = "ruff format ."
+lint-check = "ruff check ."
+format-check = "ruff format --check ."
+lint-imports = "lint-imports"
+test = "pytest"
+typecheck = "mypy"
+validate = ["lint", "format", "test", "typecheck"]
+check = ["lint-check", "format-check", "lint-imports", "test", "typecheck"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--tb=short --strict-markers --cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["jasil"]
+omit = ["*/tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+# Starts at zero because ``tests/`` is still empty. Ratchet this up as the suite
+# lands — target 90, matching safeuploads. Never lower it to make a build pass.
+fail_under = 0
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.mypy]
+python_version = "3.12"
+incremental = false
+check_untyped_defs = true
+mypy_path = ["."]
+files = ["jasil"]
+# The Alembic env script and revision files are convention-driven (executed by
+# Alembic, not imported) and are not type-checked. The ORM model modules bind to
+# a runtime-resolved base (Option B: the host owns the base), so they cannot be
+# statically typed and are excluded here (and treated as untyped by importers via
+# the follow_imports override below).
+exclude = ["tests/", "jasil/migrations/env\\.py$", "jasil/migrations/versions/", "jasil/.*/models\\.py$"]
+
+[[tool.mypy.overrides]]
+module = [
+    "apscheduler",
+    "apscheduler.*",
+    "redis",
+    "redis.exceptions",
+    "alembic",
+    "alembic.*",
+]
+ignore_missing_imports = true
+
+# ORM model modules bind to a host-owned base resolved at runtime, so they are
+# not statically typed; importers see their classes as ``Any``.
+[[tool.mypy.overrides]]
+module = [
+    "jasil.event_log.models",
+    "jasil.jobs.models",
+]
+follow_imports = "skip"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = ["."]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "S",      # flake8-bandit (security)
+    "A",      # flake8-builtins
+    "T20",    # flake8-print
+    "SIM",    # flake8-simplify
+    "RUF",    # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not perform function calls in argument defaults (FastAPI Depends)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "S107"]  # allow assert and password-like test strings
+"jasil/__init__.py" = ["RUF022"]  # __all__ is intentionally grouped by category, not globally sorted
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+# ---------------------------------------------------------------------------
+# import-linter: architectural import contracts (run via ``lint-imports``).
+# These encode invariants already stated in the module docstrings, so they
+# cannot rot.
+# ---------------------------------------------------------------------------
+[tool.importlinter]
+root_package = "jasil"
+
+# The capability ports and the event envelope are the host-facing boundary: pure
+# value types and protocols. They must never reach down into a concrete backend,
+# or ``import jasil`` would drag an optional dependency (redis / boto3 /
+# requests) in with it.
+[[tool.importlinter.contracts]]
+name = "Pure ports stay pure"
+type = "forbidden"
+source_modules = [
+    "jasil.providers",
+    "jasil.events",
+    "jasil.profile",
+    "jasil.capabilities",
+]
+forbidden_modules = [
+    "jasil.backends",
+    "jasil.container",
+    "jasil.jobs",
+    "jasil.event_log",
+]
+
+# Only the composition root selects a backend. Everything else resolves
+# capabilities through the ports, so any backend can be swapped or omitted.
+[[tool.importlinter.contracts]]
+name = "Backends stay optional (only the composition root selects them)"
+type = "forbidden"
+source_modules = [
+    "jasil.async_bridge",
+    "jasil.capabilities",
+    "jasil.deps",
+    "jasil.event_log",
+    "jasil.event_versioning",
+    "jasil.events",
+    "jasil.jobs",
+    "jasil.node",
+    "jasil.profile",
+    "jasil.providers",
+    "jasil.pruning",
+    "jasil.publisher",
+    "jasil.redis",
+    "jasil.retention",
+    "jasil.runtime",
+    "jasil.subscribers",
+]
+forbidden_modules = ["jasil.backends"]
+
+# The substrate reaches the durable-jobs layer through the publisher facade
+# only, so a deployment that never enables the outbox never loads it.
+[[tool.importlinter.contracts]]
+name = "The substrate reaches jobs only through the publisher"
+type = "forbidden"
+source_modules = [
+    "jasil.async_bridge",
+    "jasil.backends",
+    "jasil.capabilities",
+    "jasil.deps",
+    "jasil.event_log",
+    "jasil.event_versioning",
+    "jasil.events",
+    "jasil.node",
+    "jasil.profile",
+    "jasil.providers",
+    "jasil.pruning",
+    "jasil.redis",
+    "jasil.runtime",
+    "jasil.subscribers",
+]
+forbidden_modules = ["jasil.jobs"]
