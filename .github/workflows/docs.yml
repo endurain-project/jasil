@@ -37,10 +37,13 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
-      # jasil has required runtime deps (fastapi, sqlalchemy, ...) that
-      # mkdocstrings must import to render the API reference, so sync the default
-      # dependencies plus the docs group and install the project itself.
+      # mkdocstrings imports the package to render the API reference, so sync the
+      # default dependencies plus the docs group and install the project itself.
       - name: Sync documentation dependencies
         run: uv sync --frozen --group docs
 

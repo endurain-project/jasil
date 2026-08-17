@@ -217,9 +217,10 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
         else:
             host, use_https = geo.photon_host, geo.photon_use_https
         # Logs its own reason when it rejects the host.
-        base_url = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts)
-        if base_url is None:
+        resolved = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts)
+        if resolved is None:
             return NullGeocoding()
+        base_url = resolved
         api_key = None
 
     logger.info(f"Reverse geocoding enabled via {provider} ({base_url}), rate limit {geo.rate_limit}/s")

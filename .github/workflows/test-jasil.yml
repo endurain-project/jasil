@@ -36,11 +36,15 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies
         run: uv sync --frozen --no-dev --group test --group lint --no-install-project
 
-      - name: Check auth import boundaries
+      - name: Check import boundaries
         run: uv run --no-sync lint-imports
 
       - name: Run tests

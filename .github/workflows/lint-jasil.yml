@@ -33,6 +33,10 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies
         run: uv sync --frozen --only-group lint
@@ -54,12 +58,16 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies
-        # mypy needs the runtime dependencies (fastapi, sqlalchemy, ...) importable
-        # to resolve third-party types, the WebAuthn extra, and the typecheck
-        # group (mypy + stubs).
-        run: uv sync --frozen --no-dev --group typecheck --extra webauthn --no-install-project
+        # mypy needs every runtime dependency importable to resolve third-party
+        # types — including the ones behind an extra (redis, boto3, fastapi,
+        # requests, apscheduler, alembic) — plus the typecheck group (mypy + stubs).
+        run: uv sync --frozen --no-dev --group typecheck --all-extras --no-install-project
 
       - name: Type check
         run: uv run --no-sync mypy

@@ -5,8 +5,8 @@ name: Test matrix jasil
 #   * the suite against real Postgres and MySQL servers (proving the ORM models
 #     and queries stay database-agnostic); and
 #   * a bare `import jasil` with only the base dependencies installed (no
-#     mfa / sso / redis / webauthn extras, no dev groups), proving the
-#     optional-feature modules import defensively.
+#     optional extras, no dev groups), proving every backend client really is
+#     imported lazily.
 
 on:
   push:
@@ -50,11 +50,15 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies
         run: uv sync --frozen --no-dev --group test --group lint --no-install-project --python ${{ matrix.python }}
 
-      - name: Check auth import boundaries
+      - name: Check import boundaries
         run: uv run --no-sync --python ${{ matrix.python }} lint-imports
 
       - name: Run tests
@@ -88,6 +92,10 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies (with database drivers)
         run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
@@ -124,6 +132,10 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Sync dependencies (with database drivers)
         run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
@@ -132,7 +144,7 @@ jobs:
         run: uv run --no-sync pytest
 
   # 4. Bare import with only the base dependencies (no extras, no dev groups):
-  #    proves `import jasil` and router assembly work without mfa/sso/redis.
+  #    proves `import jasil` and platform assembly work with zero extras installed.
   import-base-deps:
     name: jasil (bare import, no extras)
     runs-on: ubuntu-latest
@@ -144,11 +156,14 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
 
       - name: Install base dependencies only (no optional extras, no dev groups)
         # --no-dev installs the base runtime dependencies + the project only;
-        # the mfa / sso / redis / webauthn extras and all other dependency
-        # groups stay out.
+        # every optional extra and all other dependency groups stay out.
         run: uv sync --frozen --no-dev
 
       # Run from outside the repository root so the local ``jasil/`` package

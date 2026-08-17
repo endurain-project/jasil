@@ -80,10 +80,11 @@ class HttpGeocoding:
 
     def _build_url(self, latitude: float, longitude: float) -> str:
         """Build the reverse-geocode URL for the configured service."""
+        params: dict[str, str | float]
         if self._service == "photon":
             params = {"lat": latitude, "lon": longitude}
         elif self._service == "geocode":
-            params = {"lat": latitude, "lon": longitude, "api_key": self._api_key}
+            params = {"lat": latitude, "lon": longitude, "api_key": self._api_key or ""}
         else:  # nominatim
             params = {"format": "jsonv2", "lat": latitude, "lon": longitude}
         return f"{self._base_url}?{urlencode(params)}"
