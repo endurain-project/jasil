@@ -295,6 +295,8 @@ source_modules = [
     "jasil.events",
     "jasil.profile",
     "jasil.capabilities",
+    "jasil.correlation",
+    "jasil.settings",
 ]
 forbidden_modules = [
     "jasil.backends",
@@ -305,18 +307,23 @@ forbidden_modules = [
 
 # Only the composition root selects a backend. Everything else resolves
 # capabilities through the ports, so any backend can be swapped or omitted.
+# ``jasil.container`` and ``jasil.deps`` are the wiring layer and are excluded:
+# the former selects the backends, the latter hands the assembled Platform to
+# routes.
 [[tool.importlinter.contracts]]
 name = "Backends stay optional (only the composition root selects them)"
 type = "forbidden"
 source_modules = [
+    "jasil._core",
     "jasil.async_bridge",
     "jasil.capabilities",
-    "jasil.deps",
+    "jasil.correlation",
     "jasil.event_log",
     "jasil.event_versioning",
     "jasil.events",
     "jasil.jobs",
     "jasil.node",
+    "jasil.orm",
     "jasil.profile",
     "jasil.providers",
     "jasil.pruning",
@@ -324,9 +331,14 @@ source_modules = [
     "jasil.redis",
     "jasil.retention",
     "jasil.runtime",
+    "jasil.settings",
     "jasil.subscribers",
 ]
 forbidden_modules = ["jasil.backends"]
+# ``jasil.runtime`` names ``Platform`` only in a TYPE_CHECKING block, so no
+# runtime dependency on the composition root (or the backends it selects)
+# exists. Every indirect violation below routes through this one edge.
+ignore_imports = ["jasil.runtime -> jasil.container"]
 
 # The substrate reaches the durable-jobs layer through the publisher facade
 # only, so a deployment that never enables the outbox never loads it.
@@ -337,6 +349,7 @@ source_modules = [
     "jasil.async_bridge",
     "jasil.backends",
     "jasil.capabilities",
+    "jasil.correlation",
     "jasil.deps",
     "jasil.event_log",
     "jasil.event_versioning",
@@ -347,6 +360,30 @@ source_modules = [
     "jasil.pruning",
     "jasil.redis",
     "jasil.runtime",
+    "jasil.settings",
     "jasil.subscribers",
 ]
 forbidden_modules = ["jasil.jobs"]
+ignore_imports = ["jasil.runtime -> jasil.container"]
+
+# The vendored helpers are leaf utilities: they may be imported by anything but
+# must not reach back up into the substrate, or they stop being safely reusable.
+[[tool.importlinter.contracts]]
+name = "Vendored _core utilities stay low-level"
+type = "forbidden"
+source_modules = ["jasil._core"]
+forbidden_modules = [
+    "jasil.backends",
+    "jasil.capabilities",
+    "jasil.container",
+    "jasil.deps",
+    "jasil.event_log",
+    "jasil.events",
+    "jasil.jobs",
+    "jasil.orm",
+    "jasil.providers",
+    "jasil.publisher",
+    "jasil.retention",
+    "jasil.runtime",
+    "jasil.settings",
+]

@@ -9,20 +9,21 @@ deduplicated rather than serialized. All of this is inert unless ``JOBS_ENABLED`
 is set.
 """
 
+import logging
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-import core.config as core_config
-import core.database as core_database
-import core.logger as core_logger
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.registry as jobs_registry
 import jasil.jobs.relay as jobs_relay
 import jasil.node as platform_node
+import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil.jobs.runner import JobRunner
 from jasil.jobs.worker import BackgroundWorker
+from jasil.settings import get_settings
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # How often the scheduler relays the outbox and reaps expired leases (seconds).
 _RELAY_INTERVAL_SECONDS = 5
@@ -49,17 +50,17 @@ def build_runner() -> JobRunner:
         A runner wired to the durable-subscriber registry, the platform clock,
         and the main-database session factory.
     """
-    settings = core_config.settings
+    jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
     return JobRunner(
         registry=jobs_registry.registry,
         clock=platform.clock,
-        session_factory=core_database.SessionLocal,
+        session_factory=jasil_orm.get_sessionmaker(),
         worker_id=_worker_id(),
-        lease_seconds=settings.JOBS_LEASE_SECONDS,
-        batch_size=settings.JOBS_BATCH_SIZE,
-        backoff_base_seconds=settings.JOBS_BACKOFF_BASE_SECONDS,
-        backoff_max_seconds=settings.JOBS_BACKOFF_MAX_SECONDS,
+        lease_seconds=jobs.lease_seconds,
+        batch_size=jobs.batch_size,
+        backoff_base_seconds=jobs.backoff_base_seconds,
+        backoff_max_seconds=jobs.backoff_max_seconds,
     )
 
 
@@ -76,9 +77,9 @@ def start_job_worker() -> None:
     global _worker
     if _worker is not None:
         return
-    _worker = BackgroundWorker(build_runner(), poll_interval_seconds=core_config.settings.JOBS_POLL_INTERVAL_SECONDS)
+    _worker = BackgroundWorker(build_runner(), poll_interval_seconds=get_settings().jobs.poll_interval_seconds)
     _worker.start()
-    logger.info("Durable job worker started", extra=core_logger.context(console=True))
+    logger.info("Durable job worker started")
 
 
 def stop_job_worker() -> None:
@@ -96,7 +97,7 @@ def stop_job_worker() -> None:
         return
     _worker.stop()
     _worker = None
-    logger.info("Durable job worker stopped", extra=core_logger.context(console=True))
+    logger.info("Durable job worker stopped")
 
 
 def relay_outbox_scheduled() -> None:
@@ -113,15 +114,15 @@ def relay_outbox_scheduled() -> None:
     Returns:
         None.
     """
-    settings = core_config.settings
+    jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
     for _ in range(_MAX_RELAY_BATCHES):
         relayed = jobs_relay.relay_outbox_once(
             registry=jobs_registry.registry,
             clock=platform.clock,
-            session_factory=core_database.SessionLocal,
-            max_attempts=settings.JOBS_MAX_ATTEMPTS,
-            batch_size=settings.JOBS_BATCH_SIZE,
+            session_factory=jasil_orm.get_sessionmaker(),
+            max_attempts=jobs.max_attempts,
+            batch_size=jobs.batch_size,
         )
         if relayed == 0:
             break
@@ -141,7 +142,7 @@ def reap_expired_jobs_scheduled() -> None:
         None.
     """
     platform = platform_runtime.get_active_platform()
-    with core_database.SessionLocal() as db:
+    with jasil_orm.get_sessionmaker()() as db:
         reclaimed = jobs_crud.reclaim_expired_leases(now=platform.clock.now(), db=db)
     if reclaimed:
         logger.info(f"Reaped {reclaimed} expired job lease(s)")

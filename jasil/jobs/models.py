@@ -16,7 +16,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
-from core.database import Base
+from jasil.orm import get_active_base
+
+# Binds to the host-owned declarative base at map_models() time.
+Base = get_active_base()
 
 
 class ProcessingJob(Base):

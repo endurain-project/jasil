@@ -31,18 +31,18 @@ lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
 """
 
+import logging
 from collections.abc import Callable, Sequence
 from typing import Any
 
-import core.config as core_config
-import core.logger as core_logger
-import core.middleware_request_id as core_middleware_request_id
+import jasil.correlation as correlation
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
+from jasil.settings import get_settings
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def _mint(
@@ -54,7 +54,7 @@ def _mint(
 ) -> Event:
     """Build the event envelope, stamping the ambient request id for correlation."""
     merged: dict = {}
-    request_id = core_middleware_request_id.get_request_id()
+    request_id = correlation.get_correlation_id()
     if request_id:
         merged[META_REQUEST_ID] = request_id
     if metadata:
@@ -178,7 +178,7 @@ def _durable_delivery_enabled(event_type: str) -> bool:
     subscriber is registered for the event type; otherwise the best-effort bus
     path is used.
     """
-    return core_config.settings.JOBS_ENABLED and bool(jobs_registry.registry.subscribers_for(event_type))
+    return get_settings().jobs.enabled and bool(jobs_registry.registry.subscribers_for(event_type))
 
 
 def publish_many_committing(

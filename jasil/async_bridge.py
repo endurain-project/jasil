@@ -24,13 +24,12 @@ domain layer or any backend, so it is safe for any module to depend on.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Coroutine
 from concurrent.futures import Future
 from typing import Any
 
-import core.logger as core_logger
-
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _main_loop: asyncio.AbstractEventLoop | None = None
 

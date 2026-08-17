@@ -7,12 +7,12 @@ separate container. Reaping expired leases is a scheduled job, not part of this
 loop.
 """
 
+import logging
 import threading
 
-import core.logger as core_logger
 from jasil.jobs.runner import JobRunner
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _STOP_JOIN_TIMEOUT = 5.0
 
@@ -33,7 +33,7 @@ def run_worker(runner: JobRunner, *, poll_interval_seconds: float, stop: threadi
     Returns:
         None.
     """
-    logger.info("Durable job worker started", extra=core_logger.context(console=True))
+    logger.info("Durable job worker started")
     while not stop.is_set():
         try:
             processed = runner.run_once()
@@ -42,7 +42,7 @@ def run_worker(runner: JobRunner, *, poll_interval_seconds: float, stop: threadi
             processed = 0
         if processed == 0:
             stop.wait(poll_interval_seconds)
-    logger.info("Durable job worker stopped", extra=core_logger.context(console=True))
+    logger.info("Durable job worker stopped")
 
 
 class BackgroundWorker:

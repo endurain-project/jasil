@@ -29,15 +29,15 @@ No new machinery is needed for either: durable handlers already raise on failure
 and the runner already retries and then dead-letters.
 """
 
+import logging
 from collections.abc import Callable
 from typing import ClassVar
 
 from pydantic import BaseModel
 
-import core.logger as core_logger
 from jasil.events import Event
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedEventVersionError(Exception):
@@ -91,12 +91,12 @@ def parse_payload[T: VersionedPayload](model: type[T], event: Event) -> T:
     if version > target:
         logger.error(
             "Refusing an event written by a newer build",
-            extra=core_logger.context(
-                event_type=event.event_type,
-                event_id=event.event_id,
-                event_version=version,
-                supported_version=target,
-            ),
+            extra={
+                "event_type": event.event_type,
+                "event_id": event.event_id,
+                "event_version": version,
+                "supported_version": target,
+            },
         )
         raise UnsupportedEventVersionError(
             f"{event.event_type} payload is version {version}; this build understands {target}"
@@ -106,12 +106,12 @@ def parse_payload[T: VersionedPayload](model: type[T], event: Event) -> T:
     if version < target:
         logger.info(
             "Upgrading an event payload written by an older build",
-            extra=core_logger.context(
-                event_type=event.event_type,
-                event_id=event.event_id,
-                event_version=version,
-                supported_version=target,
-            ),
+            extra={
+                "event_type": event.event_type,
+                "event_id": event.event_id,
+                "event_version": version,
+                "supported_version": target,
+            },
         )
         payload = _upgrade(model, payload, version, target, event)
 

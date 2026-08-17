@@ -13,16 +13,16 @@ lock name is hashed to a signed 64-bit key because ``pg_advisory_lock`` keys are
 """
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import text
 
-import core.database as core_database
-import core.logger as core_logger
+import jasil.orm as jasil_orm
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def advisory_key(name: str) -> int:
@@ -51,8 +51,8 @@ class PgAdvisoryLock:
 
     @classmethod
     def from_main_database(cls) -> "PgAdvisoryLock":
-        """Build against the application's main SQLAlchemy engine."""
-        return cls(core_database.engine)
+        """Build against the engine the host's session factory is bound to."""
+        return cls(jasil_orm.get_engine())
 
     @contextmanager
     def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Iterator[bool]:

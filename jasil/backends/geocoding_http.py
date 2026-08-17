@@ -12,6 +12,7 @@ redirects are refused on every request so a permitted host cannot 3xx-pivot onto
 an internal target.
 """
 
+import logging
 import threading
 import time
 from collections.abc import Sequence
@@ -19,11 +20,10 @@ from urllib.parse import urlencode
 
 import requests
 
-import core.logger as core_logger
 import jasil._core.network as network
 from jasil.providers import GeocodedPlace
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Egress timeout for a single reverse-geocode request (seconds).
 _TIMEOUT_SECONDS = 10
@@ -145,10 +145,7 @@ class HttpGeocoding:
             response.raise_for_status()
             return self._parse(response.json())
         except Exception as err:
-            logger.error(
-                f"Reverse-geocoding via {self._service} failed - {err}",
-                extra=core_logger.context(console=True),
-            )
+            logger.error(f"Reverse-geocoding via {self._service} failed - {err}")
             return None
 
 
@@ -170,8 +167,7 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
         logger.warning(
             f"Reverse-geocoding host {host!r} {reason}; reverse geocoding is disabled "
             "and activities will have no location. A self-hosted instance on a private "
-            "network must be allow-listed via SSRF_ALLOWED_HOSTS.",
-            extra=core_logger.context(console=True),
+            "network must be allow-listed via SSRF_ALLOWED_HOSTS."
         )
         return None
     scheme = "https" if use_https else "http"

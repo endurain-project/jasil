@@ -1,0 +1,30 @@
+# OS
+.DS_Store
+Thumbs.db
+.vscode/
+.env
+.venv/
+
+# Python
+__pycache__/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+coverage.xml
+.pytest_cache/
+*.log
+.mypy_cache/
+
+# local dev docs
+devdocs/
+
+# local dev scripts
+devscripts/
+
+# built documentation site (mkdocs)
+site/
+
+# build artifacts
+dist/
+*.egg-info/

@@ -13,14 +13,13 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-import core.logger as core_logger
 import jasil.jobs.crud as jobs_crud
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.providers import ClockProvider
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -103,7 +102,7 @@ class JobRunner:
                 logger.error(
                     "Durable job could not be finalized",
                     exc_info=error,
-                    extra=core_logger.context(job_id=snapshot.id, subscriber=snapshot.subscriber_id),
+                    extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                 )
         return len(snapshots)
 
@@ -148,13 +147,13 @@ class JobRunner:
             level,
             "Durable job failed",
             exc_info=error,
-            extra=core_logger.context(
-                job_id=job.id,
-                subscriber=job.subscriber_id,
-                event_type=job.event_type,
-                attempts=job.attempts,
-                job_status=status or "unknown",
-            ),
+            extra={
+                "job_id": job.id,
+                "subscriber": job.subscriber_id,
+                "event_type": job.event_type,
+                "attempts": job.attempts,
+                "job_status": status or "unknown",
+            },
         )
 
     def _event_from(self, job: ClaimedJob) -> Event:

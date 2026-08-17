@@ -7,18 +7,18 @@ swallows/logs any storage error, so a database hiccup never breaks event
 processing — observability is best-effort by design.
 """
 
+import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 from sqlalchemy.orm import Session
 
-import core.logger as core_logger
 import jasil.event_log.crud as event_log_crud
-from core.database import SessionLocal
+import jasil.orm as jasil_orm
 from jasil.events import Event
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class EventLogRecorder:
@@ -109,7 +109,7 @@ class EventLogRecorder:
             None.
         """
         try:
-            with SessionLocal() as db:
+            with jasil_orm.get_sessionmaker()() as db:
                 write(db)
         except Exception as error:  # observability must never break event processing
             logger.warning(f"event_log {operation} failed: {error!r}")

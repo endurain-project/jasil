@@ -20,17 +20,17 @@ replicas via the platform ``LockProvider`` and is inert when both windows are
 ``<= 0`` (retention disabled — keep every row forever).
 """
 
+import logging
 from datetime import datetime, timedelta
 
-import core.config as core_config
-import core.database as core_database
-import core.logger as core_logger
 import jasil.event_log.crud as event_log_crud
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
+import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil.settings import get_settings
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Single-runner lock name: the deletes are idempotent, but the lock keeps the
 # work from being duplicated across replicas.
@@ -48,8 +48,9 @@ def prune_expired_records() -> None:
     Returns:
         None.
     """
-    event_log_days = core_config.settings.EVENT_LOG_RETENTION_DAYS
-    jobs_days = core_config.settings.JOBS_RETENTION_DAYS
+    settings = get_settings()
+    event_log_days = settings.event_log.retention_days
+    jobs_days = settings.jobs.retention_days
     if event_log_days <= 0 and jobs_days <= 0:
         return
 
@@ -79,14 +80,14 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
 
     if event_log_days > 0:
         cutoff = now - timedelta(days=event_log_days)
-        with core_database.SessionLocal() as db:
+        with jasil_orm.get_sessionmaker()() as db:
             events = event_log_crud.delete_events_before(cutoff, db=db)
 
     if jobs_days > 0:
         cutoff = now - timedelta(days=jobs_days)
-        with core_database.SessionLocal() as db:
+        with jasil_orm.get_sessionmaker()() as db:
             outbox = jobs_outbox.delete_relayed_before(cutoff, db=db)
-        with core_database.SessionLocal() as db:
+        with jasil_orm.get_sessionmaker()() as db:
             jobs = jobs_crud.delete_completed_jobs_before(cutoff, db=db)
 
     if events or outbox or jobs:

@@ -16,11 +16,9 @@ so ``local``, ``distributed``, and ``custom`` all build the same way — the
 profile just picks memory-vs-Redis and local-fs-vs-S3 defaults.
 """
 
+import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
-import core.config as core_config
-import core.logger as core_logger
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
@@ -40,11 +38,9 @@ from jasil.providers import (
     StateProvider,
     StorageProvider,
 )
+from jasil.settings import JasilSettings, get_settings
 
-if TYPE_CHECKING:
-    from core.config import Settings
-
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 #: Reverse-geocoding services this build knows how to talk to.
 _GEOCODING_SERVICES = ("nominatim", "photon", "geocode")
@@ -79,20 +75,23 @@ class Platform:
     recorder: EventRecorder | None
 
 
-def build_platform(settings: "Settings") -> Platform:
+def build_platform(settings: JasilSettings | None = None) -> Platform:
     """Assemble the ``Platform`` for the configured deployment profile.
 
     Args:
-        settings: The application settings (deployment profile + capability config).
+        settings: The configuration to build from. Defaults to the settings the
+            host installed via ``jasil.settings.configure``.
 
     Returns:
         A frozen ``Platform`` wiring each provider to its selected backend.
 
     Raises:
-        ValueError: When a capability URI uses an unsupported scheme.
+        ValueError: When a capability URI uses an unsupported scheme, or is unset
+            under a profile that has no default for it.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
-    profile = settings.DEPLOYMENT_PROFILE
+    settings = settings if settings is not None else get_settings()
+    profile = settings.profile
     # Build the recorder once and share it: the event bus records the lifecycle
     # of best-effort (bus-delivered) events, while the publish facade uses the
     # same recorder to record 'published' for durable (outbox-delivered) events
@@ -110,7 +109,7 @@ def build_platform(settings: "Settings") -> Platform:
     )
 
 
-def _build_state(settings: "Settings") -> StateProvider:
+def _build_state(settings: JasilSettings) -> StateProvider:
     state_uri = settings.resolved_state_uri
     scheme, _, _ = state_uri.partition("://")
     if scheme == "memory":
@@ -120,13 +119,13 @@ def _build_state(settings: "Settings") -> StateProvider:
     raise ValueError(f"Unsupported STATE_URI scheme: {scheme or state_uri!r}")
 
 
-def _build_storage(settings: "Settings") -> StorageProvider:
+def _build_storage(settings: JasilSettings) -> StorageProvider:
     storage_uri = settings.resolved_storage_uri
     scheme, _, rest = storage_uri.partition("://")
     if scheme == "local":
         # Root the backend at DATA_DIR; each storage *area* (thumbnails, media,
         # user images, ...) is a subdirectory under it.
-        return LocalStorage(rest or settings.DATA_DIR)
+        return LocalStorage(rest or settings.data_dir)
     if scheme == "s3":
         # Imported lazily: boto3 is the optional `s3` extra and is absent from the
         # default image, so a top-level import would break non-S3 deployments.
@@ -136,7 +135,7 @@ def _build_storage(settings: "Settings") -> StorageProvider:
     raise ValueError(f"Unsupported STORAGE_URI scheme: {scheme or storage_uri!r}")
 
 
-def _build_events(settings: "Settings", recorder: EventRecorder | None) -> EventBusProvider:
+def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> EventBusProvider:
     events_uri = settings.resolved_events_uri
     scheme, _, _ = events_uri.partition("://")
     if scheme == "memory":
@@ -146,8 +145,8 @@ def _build_events(settings: "Settings", recorder: EventRecorder | None) -> Event
     raise ValueError(f"Unsupported EVENTS_URI scheme: {scheme or events_uri!r}")
 
 
-def _build_event_recorder(settings: "Settings") -> EventRecorder | None:
-    if not settings.EVENT_LOG_ENABLED:
+def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
+    if not settings.event_log.enabled:
         return None
     # Imported lazily: the recorder pulls in the ORM/session layer, which the
     # pure providers/events modules deliberately do not depend on.
@@ -156,7 +155,7 @@ def _build_event_recorder(settings: "Settings") -> EventRecorder | None:
     return EventLogRecorder()
 
 
-def _build_lock(settings: "Settings") -> LockProvider:
+def _build_lock(settings: JasilSettings) -> LockProvider:
     lock_uri = settings.resolved_lock_uri
     scheme, _, _ = lock_uri.partition("://")
     if scheme == "noop":
@@ -166,7 +165,7 @@ def _build_lock(settings: "Settings") -> LockProvider:
     raise ValueError(f"Unsupported LOCK_URI scheme: {scheme or lock_uri!r}")
 
 
-def _build_geocoding(settings: "Settings") -> GeocodingProvider:
+def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     """Resolve the reverse-geocoding backend, falling back to a no-op.
 
     Unlike the other capabilities this never raises on a bad configuration:
@@ -187,50 +186,42 @@ def _build_geocoding(settings: "Settings") -> GeocodingProvider:
         The configured :class:`HttpGeocoding`, or :class:`NullGeocoding` when
         geocoding is unconfigured or misconfigured.
     """
-    min_interval = 1.0 / settings.REVERSE_GEO_RATE_LIMIT if settings.REVERSE_GEO_RATE_LIMIT > 0 else 0.0
-    user_agent = f"Endurain/{core_config.API_VERSION} (ReverseGeocoding)"
-    provider = settings.REVERSE_GEO_PROVIDER
+    geo = settings.geocoding
+    min_interval = 1.0 / geo.rate_limit if geo.rate_limit > 0 else 0.0
+    provider = geo.provider
 
     if provider not in _GEOCODING_SERVICES:
         logger.warning(
-            f"REVERSE_GEO_PROVIDER {provider!r} is not a supported service "
-            f"(expected one of: {', '.join(_GEOCODING_SERVICES)}); "
-            "reverse geocoding is disabled and activities will have no location",
-            extra=core_logger.context(console=True),
+            f"geocoding.provider {provider!r} is not a supported service "
+            f"(expected one of: {', '.join(_GEOCODING_SERVICES)}); reverse geocoding is disabled"
         )
         return NullGeocoding()
 
     if provider == "geocode":
-        if settings.GEOCODES_MAPS_API == "changeme":
+        if not geo.api_key:
             logger.warning(
-                "REVERSE_GEO_PROVIDER is 'geocode' but GEOCODES_MAPS_API is still the "
-                "'changeme' placeholder; reverse geocoding is disabled and activities "
-                "will have no location",
-                extra=core_logger.context(console=True),
+                "geocoding.provider is 'geocode' but no geocoding.api_key is set; reverse geocoding is disabled"
             )
             return NullGeocoding()
         # Fixed, vendor-operated host — nothing operator-supplied to validate.
         base_url = "https://geocode.maps.co/reverse"
-        api_key = settings.GEOCODES_MAPS_API
+        api_key = geo.api_key
     else:
         if provider == "nominatim":
-            host, use_https = settings.NOMINATIM_API_HOST, settings.NOMINATIM_API_USE_HTTPS
+            host, use_https = geo.nominatim_host, geo.nominatim_use_https
         else:
-            host, use_https = settings.PHOTON_API_HOST, settings.PHOTON_API_USE_HTTPS
+            host, use_https = geo.photon_host, geo.photon_use_https
         # Logs its own reason when it rejects the host.
-        base_url = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.SSRF_ALLOWED_HOSTS)
+        base_url = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts)
         if base_url is None:
             return NullGeocoding()
         api_key = None
 
-    logger.info(
-        f"Reverse geocoding enabled via {provider} ({base_url}), rate limit {settings.REVERSE_GEO_RATE_LIMIT}/s",
-        extra=core_logger.context(console=True),
-    )
+    logger.info(f"Reverse geocoding enabled via {provider} ({base_url}), rate limit {geo.rate_limit}/s")
     return HttpGeocoding(
         provider,
         base_url,
         api_key=api_key,
         min_interval_seconds=min_interval,
-        user_agent=user_agent,
+        user_agent=geo.user_agent,
     )

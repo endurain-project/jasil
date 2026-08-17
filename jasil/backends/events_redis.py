@@ -23,17 +23,17 @@ thumbnail use case the hourly scheduler backfill is the reconciliation net.
 """
 
 import json
+import logging
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-import core.logger as core_logger
 import jasil.node as platform_node
 import jasil.redis as platform_redis
 from jasil.events import INITIAL_SCHEMA_VERSION, Event
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from jasil.providers import EventRecorder

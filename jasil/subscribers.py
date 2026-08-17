@@ -9,12 +9,12 @@ could drift in what it logged and which exceptions it caught.
 """
 
 import functools
+import logging
 from collections.abc import Callable
 
-import core.logger as core_logger
 from jasil.events import META_ACTIVITY_ID, META_USER_ID, Event
 
-logger = core_logger.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
@@ -47,13 +47,13 @@ def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
             logger.error(
                 "Event subscriber failed",
                 exc_info=err,
-                extra=core_logger.context(
-                    event_type=event.event_type,
-                    event_id=event.event_id,
-                    subscriber=handler.__name__,
-                    activity_id=event.metadata.get(META_ACTIVITY_ID) or event.payload.get(META_ACTIVITY_ID),
-                    user_id=event.metadata.get(META_USER_ID) or event.payload.get(META_USER_ID),
-                ),
+                extra={
+                    "event_type": event.event_type,
+                    "event_id": event.event_id,
+                    "subscriber": handler.__name__,
+                    "activity_id": event.metadata.get(META_ACTIVITY_ID) or event.payload.get(META_ACTIVITY_ID),
+                    "user_id": event.metadata.get(META_USER_ID) or event.payload.get(META_USER_ID),
+                },
             )
 
     return _subscriber
