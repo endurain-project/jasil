@@ -110,7 +110,15 @@ class TestGeocodingResolution:
     def test_it_is_disabled_by_default(self):
         assert isinstance(container._build_geocoding(_settings()), NullGeocoding)
 
+    def test_leaving_it_unconfigured_is_quiet(self, caplog):
+        """An optional capability nobody asked for must not warn at every startup."""
+        with caplog.at_level("WARNING"):
+            container._build_geocoding(_settings())
+
+        assert caplog.text == ""
+
     def test_an_unsupported_provider_disables_it(self, caplog):
+        """A non-empty typo *is* worth warning about \u2014 someone meant to enable it."""
         with caplog.at_level("WARNING"):
             provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(provider="mapquest")))
 

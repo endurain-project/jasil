@@ -23,9 +23,6 @@ def set_active_platform(platform: "Platform") -> None:
 
     Args:
         platform: The assembled platform substrate.
-
-    Raises:
-        None.
     """
     global _active_platform
     _active_platform = platform

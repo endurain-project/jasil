@@ -65,15 +65,7 @@ def build_runner() -> JobRunner:
 
 
 def start_job_worker() -> None:
-    """
-    Start the in-process job worker (idempotent).
-
-    Args:
-        None.
-
-    Returns:
-        None.
-    """
+    """Start the in-process job worker (idempotent)."""
     global _worker
     if _worker is not None:
         return
@@ -83,15 +75,7 @@ def start_job_worker() -> None:
 
 
 def stop_job_worker() -> None:
-    """
-    Stop the in-process job worker if it is running.
-
-    Args:
-        None.
-
-    Returns:
-        None.
-    """
+    """Stop the in-process job worker if it is running."""
     global _worker
     if _worker is None:
         return
@@ -101,18 +85,11 @@ def stop_job_worker() -> None:
 
 
 def relay_outbox_scheduled() -> None:
-    """
-    Relay the outbox into per-subscriber jobs.
+    """Relay the outbox into per-subscriber jobs.
 
     Runs on every replica; ``FOR UPDATE SKIP LOCKED`` gives each relayer a
     disjoint batch and the idempotent fan-out dedups any overlap, so no
     single-runner lock is needed.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
     jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
@@ -129,17 +106,10 @@ def relay_outbox_scheduled() -> None:
 
 
 def reap_expired_jobs_scheduled() -> None:
-    """
-    Requeue or dead-letter jobs with expired leases.
+    """Requeue or dead-letter jobs with expired leases.
 
     Runs on every replica; ``reclaim_expired_leases`` uses ``FOR UPDATE SKIP
     LOCKED`` so concurrent reapers reclaim disjoint rows.
-
-    Args:
-        None.
-
-    Returns:
-        None.
     """
     platform = platform_runtime.get_active_platform()
     with jasil_orm.get_sessionmaker()() as db:

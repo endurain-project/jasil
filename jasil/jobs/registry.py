@@ -63,15 +63,7 @@ class JobHandlerRegistry:
         return tuple(self._by_event_type.get(event_type, ()))
 
     def clear(self) -> None:
-        """
-        Remove every registration (used to reset state between tests).
-
-        Args:
-            None.
-
-        Returns:
-            None.
-        """
+        """Remove every registration (used to reset state between tests)."""
         self._handlers.clear()
         self._by_event_type.clear()
 

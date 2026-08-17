@@ -190,6 +190,11 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     min_interval = 1.0 / geo.rate_limit if geo.rate_limit > 0 else 0.0
     provider = geo.provider
 
+    if not provider:
+        # Unset means "not wanted", not "misconfigured" — so this stays quiet.
+        logger.debug("Reverse geocoding is not configured; using the no-op backend")
+        return NullGeocoding()
+
     if provider not in _GEOCODING_SERVICES:
         logger.warning(
             f"geocoding.provider {provider!r} is not a supported service "
