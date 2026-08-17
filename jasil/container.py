@@ -27,7 +27,6 @@ from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
-from jasil.backends.route_map_static import StaticRouteMapRenderer
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -38,7 +37,6 @@ from jasil.providers import (
     EventRecorder,
     GeocodingProvider,
     LockProvider,
-    RouteMapRendererProvider,
     StateProvider,
     StorageProvider,
 )
@@ -78,7 +76,6 @@ class Platform:
     lock: LockProvider
     clock: ClockProvider
     geocoding: GeocodingProvider
-    route_map_renderer: RouteMapRendererProvider
     recorder: EventRecorder | None
 
 
@@ -109,7 +106,6 @@ def build_platform(settings: "Settings") -> Platform:
         lock=_build_lock(settings),
         clock=SystemClock(),
         geocoding=_build_geocoding(settings),
-        route_map_renderer=StaticRouteMapRenderer(),
         recorder=recorder,
     )
 
@@ -222,7 +218,7 @@ def _build_geocoding(settings: "Settings") -> GeocodingProvider:
         else:
             host, use_https = settings.PHOTON_API_HOST, settings.PHOTON_API_USE_HTTPS
         # Logs its own reason when it rejects the host.
-        base_url = build_reverse_endpoint(host, use_https=use_https)
+        base_url = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.SSRF_ALLOWED_HOSTS)
         if base_url is None:
             return NullGeocoding()
         api_key = None

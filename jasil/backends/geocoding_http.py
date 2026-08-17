@@ -6,20 +6,21 @@ egress validation, redirect refusal, rate limiting, and never raising — is
 identical and is written once here.
 
 Security (OWASP A10 — SSRF): the upstream host is operator-configured, so it is
-validated through :func:`core.network.host_rejection_reason` — the same address
-denylist and ``SSRF_ALLOWED_HOSTS`` allowlist the OIDC client uses — before the
-first request, and redirects are refused on every request so a permitted host
-cannot 3xx-pivot onto an internal target.
+validated through :func:`jasil._core.network.host_rejection_reason` — the same
+address denylist and allowlist escape hatch — before the first request, and
+redirects are refused on every request so a permitted host cannot 3xx-pivot onto
+an internal target.
 """
 
 import threading
 import time
+from collections.abc import Sequence
 from urllib.parse import urlencode
 
 import requests
 
 import core.logger as core_logger
-import core.network as core_network
+import jasil._core.network as network
 from jasil.providers import GeocodedPlace
 
 logger = core_logger.get_logger(__name__)
@@ -151,20 +152,20 @@ class HttpGeocoding:
             return None
 
 
-def build_reverse_endpoint(host: str, *, use_https: bool) -> str | None:
+def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()) -> str | None:
     """Validate an operator-configured host and build its reverse endpoint URL.
 
     Args:
         host: The configured bare ``host[:port]`` authority.
         use_https: Whether to address the host over HTTPS.
+        allowed_hosts: Hostnames and CIDRs exempt from the SSRF address denylist,
+            so a self-hosted instance on a private network stays reachable.
 
     Returns:
         The ``{scheme}://{host}/reverse`` URL, or ``None`` when the host failed
-        SSRF validation (the reason is logged). A self-hosted instance on a
-        private network is reachable by adding it to ``SSRF_ALLOWED_HOSTS``,
-        which this check honours.
+        SSRF validation (the reason is logged).
     """
-    reason = core_network.host_rejection_reason(host, purpose="reverse_geocoding")
+    reason = network.host_rejection_reason(host, allowed_hosts=allowed_hosts, purpose="reverse_geocoding")
     if reason is not None:
         logger.warning(
             f"Reverse-geocoding host {host!r} {reason}; reverse geocoding is disabled "
