@@ -16,6 +16,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
+from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH
 from jasil.orm import get_active_base
 
 # Binds to the host-owned declarative base at map_models() time.
@@ -74,22 +76,22 @@ class ProcessingJob(Base):
         comment="Job identifier (UUIDv4)",
     )
     event_id: Mapped[str] = mapped_column(
-        String(36),
+        String(MAX_EVENT_ID_LENGTH),
         nullable=False,
         comment="Originating envelope event_id (correlation + dedup with subscriber_id)",
     )
     event_type: Mapped[str] = mapped_column(
-        String(100),
+        String(MAX_EVENT_TYPE_LENGTH),
         nullable=False,
         comment="Domain-event channel, e.g. order.created",
     )
     subscriber_id: Mapped[str] = mapped_column(
-        String(200),
+        String(MAX_SUBSCRIBER_ID_LENGTH),
         nullable=False,
         comment="Durable subscriber this job runs, e.g. invoice.render",
     )
     source: Mapped[str] = mapped_column(
-        String(50),
+        String(MAX_SOURCE_LENGTH),
         nullable=False,
         comment="Where the originating event came from, e.g. api:create_order",
     )
@@ -215,17 +217,17 @@ class EventOutbox(Base):
         comment="Outbox row identifier (UUIDv4)",
     )
     event_id: Mapped[str] = mapped_column(
-        String(36),
+        String(MAX_EVENT_ID_LENGTH),
         nullable=False,
         comment="Envelope event_id carried onto the fanned-out jobs",
     )
     event_type: Mapped[str] = mapped_column(
-        String(100),
+        String(MAX_EVENT_TYPE_LENGTH),
         nullable=False,
         comment="Domain-event channel, e.g. order.created",
     )
     source: Mapped[str] = mapped_column(
-        String(50),
+        String(MAX_SOURCE_LENGTH),
         nullable=False,
         comment="Where the event originated, e.g. api:create_order",
     )

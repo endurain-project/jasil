@@ -10,9 +10,14 @@ code therefore runs subscribers in-process or out-of-process in a worker.
 from collections import defaultdict
 from collections.abc import Callable
 
-from jasil.events import Event
+from jasil._core.limits import check_length
+from jasil.events import MAX_EVENT_TYPE_LENGTH, Event
 
 JobHandler = Callable[[Event], None]
+
+#: Width of the ``processing_jobs.subscriber_id`` column, imported by the model
+#: so the two cannot drift.
+MAX_SUBSCRIBER_ID_LENGTH = 200
 
 
 class JobHandlerRegistry:
@@ -33,7 +38,15 @@ class JobHandlerRegistry:
 
         Returns:
             None.
+
+        Raises:
+            ValueError: When ``event_type`` or ``subscriber_id`` is longer than
+                the ``processing_jobs`` column it is written to. Checked at
+                registration — startup — rather than when the relay first tries
+                to enqueue a job, where the failure would be far from its cause.
         """
+        check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
+        check_length(subscriber_id, field="subscriber_id", limit=MAX_SUBSCRIBER_ID_LENGTH)
         self._handlers[subscriber_id] = handler
         if subscriber_id not in self._by_event_type[event_type]:
             self._by_event_type[event_type].append(subscriber_id)

@@ -14,6 +14,9 @@ from jasil.event_versioning import (
 )
 from jasil.events import (
     INITIAL_SCHEMA_VERSION,
+    MAX_EVENT_ID_LENGTH,
+    MAX_EVENT_TYPE_LENGTH,
+    MAX_SOURCE_LENGTH,
     META_REQUEST_ID,
     Event,
     new_event,
@@ -67,6 +70,36 @@ class TestNewEvent:
 
         with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
             event.event_type = "other"  # type: ignore[misc]
+
+
+class TestEnvelopeLengthLimits:
+    """Identifiers are checked at mint, not at write.
+
+    An over-long value raises a truncation error on PostgreSQL/MySQL and none at
+    all on SQLite — and the publish seam swallows delivery failures, so the event
+    would simply vanish with an opaque driver error in the log.
+    """
+
+    def test_an_over_long_event_type_is_refused(self):
+        with pytest.raises(ValueError, match="event_type is 101 characters"):
+            new_event("e" * 101, {}, source="test")
+
+    def test_an_over_long_source_is_refused(self):
+        with pytest.raises(ValueError, match="source is 51 characters"):
+            new_event("a.b", {}, source="s" * 51)
+
+    def test_an_over_long_explicit_event_id_is_refused(self):
+        with pytest.raises(ValueError, match="event_id is 37 characters"):
+            new_event("a.b", {}, source="test", event_id="i" * 37)
+
+    def test_a_generated_event_id_always_fits(self):
+        assert len(new_event("a.b", {}, source="test").event_id) == MAX_EVENT_ID_LENGTH
+
+    def test_values_at_the_limit_are_accepted(self):
+        event = new_event("e" * MAX_EVENT_TYPE_LENGTH, {}, source="s" * MAX_SOURCE_LENGTH)
+
+        assert len(event.event_type) == MAX_EVENT_TYPE_LENGTH
+        assert len(event.source) == MAX_SOURCE_LENGTH
 
 
 class Payload(VersionedPayload):

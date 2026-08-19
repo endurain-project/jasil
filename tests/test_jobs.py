@@ -13,10 +13,10 @@ import pytest
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.relay as jobs_relay
-from jasil.events import new_event
+from jasil.events import MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH, new_event
 from jasil.jobs.backoff import backoff_seconds
 from jasil.jobs.models import EventOutbox, ProcessingJob
-from jasil.jobs.registry import JobHandlerRegistry
+from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH, JobHandlerRegistry
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 SUBSCRIBER = "thumbnails.generate"
@@ -95,6 +95,39 @@ class TestEnqueue:
         job = _enqueue(event, db, available_at=T0 + timedelta(hours=1))
 
         assert as_utc(job.available_at) > T0
+
+    def test_identifiers_at_the_column_limit_round_trip(self, db):
+        """Proves the limits the mint-time checks enforce really are the widths.
+
+        SQLite ignores a VARCHAR length, so this only bites on the Postgres and
+        MySQL matrix jobs — which is exactly where it needs to.
+        """
+        event = new_event("e" * MAX_EVENT_TYPE_LENGTH, {"k": "v"}, source="s" * MAX_SOURCE_LENGTH)
+
+        job = _enqueue(event, db, subscriber="b" * MAX_SUBSCRIBER_ID_LENGTH)
+
+        assert job is not None
+        assert len(job.event_type) == MAX_EVENT_TYPE_LENGTH
+        assert len(job.subscriber_id) == MAX_SUBSCRIBER_ID_LENGTH
+
+
+class TestSubscriberRegistration:
+    def test_an_over_long_subscriber_id_is_refused(self):
+        """Caught at startup rather than when the relay first fans the event out."""
+        with pytest.raises(ValueError, match="subscriber_id is 201 characters"):
+            JobHandlerRegistry().register("a.b", "s" * 201, lambda _e: None)
+
+    def test_an_over_long_event_type_is_refused(self):
+        with pytest.raises(ValueError, match="event_type is 101 characters"):
+            JobHandlerRegistry().register("e" * 101, "sub", lambda _e: None)
+
+    def test_identifiers_at_the_limit_are_accepted(self):
+        registry = JobHandlerRegistry()
+        subscriber_id = "s" * MAX_SUBSCRIBER_ID_LENGTH
+
+        registry.register("a.b", subscriber_id, lambda _e: None)
+
+        assert registry.subscribers_for("a.b") == (subscriber_id,)
 
 
 class TestClaim:

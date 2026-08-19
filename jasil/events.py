@@ -39,6 +39,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from jasil._core.limits import check_length
+
 # --- Standard metadata key (correlation context, not domain data) ---
 #
 # Only the correlation id is defined here. Domain keys (user id, tenant id, the
@@ -49,6 +51,22 @@ META_REQUEST_ID = "request_id"
 #: Version assumed for an event that carries none — every event written before
 #: ``schema_version`` existed. Persisted rows default to this on read.
 INITIAL_SCHEMA_VERSION = 1
+
+# --- Envelope field limits ---
+#
+# The width of the columns these fields are stored in (``event_log``,
+# ``event_outbox``, ``processing_jobs`` all carry them), declared here because
+# :func:`new_event` is where a value has to be rejected to be rejected usefully:
+# by the time it reaches a write, the publish seam has already swallowed the
+# failure. The models below import these, so the check can never drift from the
+# column it is protecting.
+
+#: ``event_id`` is a UUIDv4 string; only an explicitly supplied id can exceed it.
+MAX_EVENT_ID_LENGTH = 36
+#: ``event_type`` — the routing key, e.g. ``order.created``.
+MAX_EVENT_TYPE_LENGTH = 100
+#: ``source`` — the origin label, e.g. ``api:create_order``.
+MAX_SOURCE_LENGTH = 50
 
 
 @dataclass(frozen=True)
@@ -102,9 +120,17 @@ def new_event(
 
     Returns:
         A frozen :class:`Event` with a fresh id and UTC timestamp.
+
+    Raises:
+        ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
+            than the column it is persisted in.
     """
+    resolved_event_id = event_id or str(uuid.uuid4())
+    check_length(resolved_event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)
+    check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
+    check_length(source, field="source", limit=MAX_SOURCE_LENGTH)
     return Event(
-        event_id=event_id or str(uuid.uuid4()),
+        event_id=resolved_event_id,
         event_type=event_type,
         source=source,
         timestamp=datetime.now(UTC).isoformat(),

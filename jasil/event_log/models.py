@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
 from jasil.orm import get_active_base
 
 # Binds to the host-owned declarative base at map_models() time.
@@ -53,17 +54,17 @@ class EventLog(Base):
     )
 
     id: Mapped[str] = mapped_column(
-        String(36),
+        String(MAX_EVENT_ID_LENGTH),
         primary_key=True,
         comment="Envelope event_id (UUIDv4); stable across retries",
     )
     event_type: Mapped[str] = mapped_column(
-        String(100),
+        String(MAX_EVENT_TYPE_LENGTH),
         nullable=False,
         comment="Domain-event channel, e.g. order.created",
     )
     event_source: Mapped[str] = mapped_column(
-        String(50),
+        String(MAX_SOURCE_LENGTH),
         nullable=False,
         comment="Where the event originated, e.g. api:create_order",
     )

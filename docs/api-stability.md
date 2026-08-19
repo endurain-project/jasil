@@ -20,7 +20,7 @@ modules:
 | Module | Surface |
 |---|---|
 | `jasil.providers` | The capability protocols and their method signatures. |
-| `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`. |
+| `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `parse_profile`, `classify_state_uri`, topology helpers. |
 | `jasil.settings` | The settings dataclasses and `configure` / `get_settings`. |
@@ -30,7 +30,7 @@ modules:
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `get_state`. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
-| `jasil.jobs.registry` | `JobHandlerRegistry` and the process-wide `registry`. |
+| `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `stamp`, `head_revision`, `db_revision`, `verify_schema_current`. |
 

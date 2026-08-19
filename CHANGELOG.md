@@ -60,6 +60,11 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 
 - One immutable `Event` envelope with an ISO-8601 UTC timestamp, a UUIDv4 id
   stable across retries, and a caller-owned `metadata` dict.
+- `event_id`, `event_type` and `source` are length-checked when the envelope is
+  minted, and `subscriber_id` when a durable subscriber registers, so a value
+  too long for the column it is persisted in raises at the producing call site
+  instead of failing at the write — where PostgreSQL and MySQL raise, SQLite
+  does not, and the publish seam swallows the failure either way.
 - Payload schema versioning: `VersionedPayload` carries a `SCHEMA_VERSION` and
   per-step `UPGRADERS`. A payload written by an older build is walked forward
   one version at a time; one written by a *newer* build is refused rather than
