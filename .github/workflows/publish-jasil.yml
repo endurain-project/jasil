@@ -110,8 +110,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release-metadata
-          uvx cyclonedx-py environment "$RUNNER_TEMP/smoke" \
-            --output-format json --outfile release-metadata/jasil-sbom.cdx.json
+          uvx --from cyclonedx-bom cyclonedx-py environment "$RUNNER_TEMP/smoke" \
+            --output-format json --output-file release-metadata/jasil-sbom.cdx.json
 
       - name: Generate checksums
         run: |

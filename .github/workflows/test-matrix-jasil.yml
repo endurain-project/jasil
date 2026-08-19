@@ -164,7 +164,9 @@ jobs:
       - name: Install base dependencies only (no optional extras, no dev groups)
         # --no-dev installs the base runtime dependencies + the project only;
         # every optional extra and all other dependency groups stay out.
-        run: uv sync --frozen --no-dev
+        # --no-editable installs jasil as a real distribution (not a path back
+        # into the checkout), so the smoke test actually validates an install.
+        run: uv sync --frozen --no-dev --no-editable
 
       # Run from outside the repository root so the local ``jasil/`` package
       # directory cannot shadow the installed distribution: otherwise this would
