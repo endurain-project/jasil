@@ -51,7 +51,8 @@ def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
                     "event_id": event.event_id,
                     "subscriber": handler.__name__,
                     # The whole correlation dict: which keys matter is the host's
-                    # to decide, so none are singled out here.
+                    # to decide, so none are singled out here. This is why
+                    # ``metadata`` must never carry a secret.
                     "event_metadata": event.metadata,
                 },
             )

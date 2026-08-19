@@ -73,6 +73,13 @@ MAX_SOURCE_LENGTH = 50
 class Event:
     """Envelope wrapping every event in the system.
 
+    ``payload`` and ``metadata`` are stored and transmitted verbatim: both are
+    written to ``event_outbox`` and ``processing_jobs``, to ``event_log`` when the
+    trail is enabled, and serialized onto the Redis stream on the ``redis://``
+    bus — and ``metadata`` is additionally logged in full when a best-effort
+    subscriber fails. Neither is size-capped. So carry identifiers, not secrets
+    and not blobs; see the events documentation for the full contract.
+
     Attributes:
         event_id: UUIDv4 identifying this event instance; stable across retries.
         event_type: Dot-notation channel, e.g. ``order.created``.

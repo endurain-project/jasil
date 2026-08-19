@@ -11,8 +11,9 @@ single worker is still correct. Callers pass an explicit ``now`` (from the
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
-from sqlalchemy import func, select, update
+from sqlalchemy import CursorResult, func, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -43,6 +44,7 @@ def enqueue_job(
     now: datetime,
     db: Session,
     available_at: datetime | None = None,
+    commit: bool = True,
 ) -> ProcessingJob | None:
     """
     Enqueue one durable job for ``(event, subscriber_id)``, idempotently.
@@ -59,6 +61,9 @@ def enqueue_job(
         now: Current instant (used for created/updated/available timestamps).
         db: Active database session.
         available_at: Earliest claim instant; defaults to ``now``.
+        commit: When True, commit immediately; when False, flush only and leave
+            the row in the caller's open transaction (the relay fans a whole
+            batch out under one commit).
 
     Returns:
         The inserted job, or ``None`` when a job for this ``(event, subscriber)``
@@ -82,7 +87,10 @@ def enqueue_job(
         "updated_at": now,
     }
     db.execute(_insert_ignoring_duplicate(values, db))
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     # Returns the row only when this call inserted it: a skipped conflict leaves
     # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
     return db.get(ProcessingJob, job_id)
@@ -99,11 +107,13 @@ def claim_jobs(
     """
     Atomically claim up to ``limit`` due jobs, taking a time-bounded lease.
 
-    Selects ``pending`` rows whose ``available_at`` has passed, locking them with
-    ``FOR UPDATE SKIP LOCKED`` on PostgreSQL so concurrent workers claim disjoint
-    sets, then marks them ``claimed`` (incrementing ``attempts`` and stamping the
-    lease). The attempt is counted at claim time so a worker that crashes
-    mid-run still consumes an attempt, bounding crash loops.
+    Selects ``pending`` rows whose ``available_at`` has passed and marks them
+    ``claimed`` (incrementing ``attempts`` and stamping the lease). Where the
+    dialect supports it the rows are locked with ``FOR UPDATE SKIP LOCKED`` so
+    concurrent workers select disjoint sets; where it does not, the update is a
+    compare-and-set on ``status = 'pending'`` and only the worker that wins the
+    race is handed the rows. The attempt is counted at claim time so a worker that
+    crashes mid-run still consumes an attempt, bounding crash loops.
 
     Args:
         worker_id: Identifier of the claiming worker (the lease holder).
@@ -113,7 +123,7 @@ def claim_jobs(
         db: Active database session.
 
     Returns:
-        The claimed jobs, oldest-available first.
+        The jobs this call actually claimed, oldest-available first.
     """
     id_stmt = (
         select(ProcessingJob.id)
@@ -129,7 +139,12 @@ def claim_jobs(
         return []
     db.execute(
         update(ProcessingJob)
-        .where(ProcessingJob.id.in_(job_ids))
+        .where(
+            ProcessingJob.id.in_(job_ids),
+            # Compare-and-set. Without SKIP LOCKED two workers can select the same
+            # ids, and only the one that still finds them pending may take them.
+            ProcessingJob.status == STATUS_PENDING,
+        )
         .values(
             status=STATUS_CLAIMED,
             attempts=ProcessingJob.attempts + 1,
@@ -141,7 +156,18 @@ def claim_jobs(
     )
     db.commit()
     claimed = (
-        db.execute(select(ProcessingJob).where(ProcessingJob.id.in_(job_ids)).order_by(ProcessingJob.available_at))
+        db.execute(
+            select(ProcessingJob)
+            .where(
+                ProcessingJob.id.in_(job_ids),
+                ProcessingJob.status == STATUS_CLAIMED,
+                # The lease we just stamped: rows a competing worker won carry its
+                # id, and returning them would run their subscriber twice.
+                ProcessingJob.locked_by == worker_id,
+                ProcessingJob.locked_at == now,
+            )
+            .order_by(ProcessingJob.available_at)
+        )
         .scalars()
         .all()
     )
@@ -250,7 +276,7 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
         limit: Maximum number of expired leases to reclaim in one pass.
 
     Returns:
-        The number of jobs reclaimed (requeued plus dead-lettered).
+        The number of jobs this call reclaimed (requeued plus dead-lettered).
     """
     id_stmt = (
         select(ProcessingJob.id)
@@ -263,39 +289,50 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     if not job_ids:
         db.commit()
         return 0
-    db.execute(
-        update(ProcessingJob)
-        .where(
-            ProcessingJob.id.in_(job_ids),
-            ProcessingJob.attempts >= ProcessingJob.max_attempts,
-        )
-        .values(
-            status=STATUS_DEAD_LETTER,
-            last_error="lease expired; max attempts exhausted",
-            completed_at=now,
-            updated_at=now,
-            locked_by=None,
-            lease_expires_at=None,
-        )
+    # Both updates re-assert ``status = 'claimed'``: without SKIP LOCKED two
+    # reapers can select the same rows, and the loser must not overwrite the
+    # requeue the winner already performed.
+    dead_lettered = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id.in_(job_ids),
+                ProcessingJob.status == STATUS_CLAIMED,
+                ProcessingJob.attempts >= ProcessingJob.max_attempts,
+            )
+            .values(
+                status=STATUS_DEAD_LETTER,
+                last_error="lease expired; max attempts exhausted",
+                completed_at=now,
+                updated_at=now,
+                locked_by=None,
+                lease_expires_at=None,
+            )
+        ),
     )
-    db.execute(
-        update(ProcessingJob)
-        .where(
-            ProcessingJob.id.in_(job_ids),
-            ProcessingJob.attempts < ProcessingJob.max_attempts,
-        )
-        .values(
-            status=STATUS_PENDING,
-            last_error="lease expired; requeued",
-            available_at=now,
-            updated_at=now,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-        )
+    requeued = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(
+                ProcessingJob.id.in_(job_ids),
+                ProcessingJob.status == STATUS_CLAIMED,
+                ProcessingJob.attempts < ProcessingJob.max_attempts,
+            )
+            .values(
+                status=STATUS_PENDING,
+                last_error="lease expired; requeued",
+                available_at=now,
+                updated_at=now,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+            )
+        ),
     )
     db.commit()
-    return len(job_ids)
+    return dead_lettered.rowcount + requeued.rowcount
 
 
 def get_job(job_id: str, db: Session) -> ProcessingJob | None:

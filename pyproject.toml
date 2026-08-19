@@ -201,7 +201,7 @@ omit = ["*/tests/*", "*/__pycache__/*"]
 # fails the build, low enough not to trip on incidental churn. Raise it as the
 # suite grows — target 90, matching safeuploads. Never lower it to make a build
 # pass.
-fail_under = 73
+fail_under = 88
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",

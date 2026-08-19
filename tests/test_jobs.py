@@ -133,6 +133,21 @@ class TestClaim:
         assert len(claimed) == 1
         assert claimed[0].status == jobs_crud.STATUS_CLAIMED
         assert claimed[0].attempts == 1
+
+    def test_every_returned_job_carries_this_workers_lease(self, db, event):
+        """A row a competing worker won must never come back from our claim.
+
+        Where the dialect has no ``SKIP LOCKED`` both workers select the same ids
+        and the update is a compare-and-set, so the losing worker has to be handed
+        nothing rather than rows stamped with someone else's lease.
+        """
+        _enqueue(event, db)
+
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+
+        assert [job.locked_by for job in claimed] == ["w1"]
+        assert as_utc(claimed[0].locked_at) == T0
+        assert as_utc(claimed[0].lease_expires_at) == T0 + timedelta(seconds=60)
         assert claimed[0].locked_by == "w1"
         assert as_utc(claimed[0].lease_expires_at) == T0 + timedelta(seconds=60)
 
@@ -299,6 +314,15 @@ class TestLeaseReclamation:
 
         assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_DEAD_LETTER
 
+    def test_a_second_pass_reclaims_nothing(self, db, event):
+        """The count is rows this call changed, so a losing reaper reports zero."""
+        _enqueue(event, db, max_attempts=3)
+        jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+        expiry = T0 + timedelta(seconds=61)
+        jobs_crud.reclaim_expired_leases(now=expiry, db=db)
+
+        assert jobs_crud.reclaim_expired_leases(now=expiry, db=db) == 0
+
     def test_reclaiming_records_why(self, db, event):
         _enqueue(event, db, max_attempts=3)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
@@ -388,6 +412,26 @@ class TestOutboxRelay:
         )
 
         assert db.query(EventOutbox).one().relayed_at is not None
+        assert db.query(ProcessingJob).count() == 0
+
+    def test_a_failure_mid_pass_relays_nothing(self, db, session_factory, event, clock, registry, monkeypatch):
+        """The pass is one transaction, so a crash cannot leave a row stamped but
+        un-fanned-out — which would drop the event permanently."""
+        registry.register("activity.created", "a", lambda _e: None)
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(jobs_relay.jobs_crud, "enqueue_job", explode)
+
+        with pytest.raises(RuntimeError):
+            jobs_relay.relay_outbox_once(
+                registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+            )
+
+        db.rollback()
+        assert db.query(EventOutbox).one().relayed_at is None
         assert db.query(ProcessingJob).count() == 0
 
     def test_the_batch_size_bounds_a_pass(self, db, session_factory, clock, registry):

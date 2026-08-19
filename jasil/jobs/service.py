@@ -1,12 +1,12 @@
 """Wiring for durable job processing — worker lifecycle and scheduled maintenance.
 
-Consumed by ``main`` (start/stop the in-process worker) and the scheduler (relay
-the outbox into jobs; reap expired leases). The relay, reaper, and worker all run
-on every process and coordinate through ``SELECT ... FOR UPDATE SKIP LOCKED`` plus
-the idempotent job fan-out (dedup on ``event_id + subscriber_id``), so replicas
-scale horizontally without a single-runner lock — duplicate work is skipped or
-deduplicated rather than serialized. All of this is inert unless ``JOBS_ENABLED``
-is set.
+Consumed by application startup (start/stop the in-process worker) and the
+scheduler (relay the outbox into jobs; reap expired leases). The relay, reaper,
+and worker all run on every process and coordinate through ``SELECT ... FOR
+UPDATE SKIP LOCKED`` plus compare-and-set claims and the idempotent job fan-out
+(dedup on ``event_id + subscriber_id``), so replicas scale horizontally without a
+single-runner lock — duplicate work is skipped or deduplicated rather than
+serialized. All of this is inert unless durable jobs are enabled.
 """
 
 import logging
@@ -87,9 +87,9 @@ def stop_job_worker() -> None:
 def relay_outbox_scheduled() -> None:
     """Relay the outbox into per-subscriber jobs.
 
-    Runs on every replica; ``FOR UPDATE SKIP LOCKED`` gives each relayer a
-    disjoint batch and the idempotent fan-out dedups any overlap, so no
-    single-runner lock is needed.
+    Runs on every replica; each pass claims its batch with ``FOR UPDATE SKIP
+    LOCKED`` held across the fan-out, and the idempotent fan-out dedups any
+    overlap where the dialect cannot lock, so no single-runner lock is needed.
     """
     jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
@@ -108,8 +108,9 @@ def relay_outbox_scheduled() -> None:
 def reap_expired_jobs_scheduled() -> None:
     """Requeue or dead-letter jobs with expired leases.
 
-    Runs on every replica; ``reclaim_expired_leases`` uses ``FOR UPDATE SKIP
-    LOCKED`` so concurrent reapers reclaim disjoint rows.
+    Runs on every replica; ``reclaim_expired_leases`` combines ``FOR UPDATE SKIP
+    LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
+    disjoint rows and a loser never overwrites the winner's requeue.
     """
     platform = platform_runtime.get_active_platform()
     with jasil_orm.get_sessionmaker()() as db:

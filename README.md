@@ -25,6 +25,13 @@ capability backends, an event pipeline, durable jobs, and observability.
 A core install depends on **`sqlalchemy` and `pydantic` only**. Every backend
 client lives behind an extra and is imported lazily, so a single-process
 deployment never loads `redis`, `boto3`, or `requests`.
+
+> **JASIL is synchronous.** Every provider, subscriber, and the durable-jobs
+> layer is blocking Python, and the ORM integration expects a synchronous
+> `sessionmaker` — there is no `AsyncSession` support. On an async framework,
+> call into JASIL from a worker thread (a `def` FastAPI route or dependency does
+> this for you). See [the docs](https://jasil.endurain.com/#one-thing-it-cannot-do-yet).
+
 ## Install
 
 ```bash
@@ -126,6 +133,10 @@ uv run ruff check .        # lint
 uv run mypy                # type check
 uv run lint-imports        # architectural import contracts
 ```
+
+## Documentation
+
+<https://jasil.endurain.com/>
 
 ## Licence
 

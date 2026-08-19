@@ -33,6 +33,37 @@ Event types and payload shapes are **owned by the publishing domain**, not
 defined here. JASIL only knows the envelope. The one metadata key it defines is
 `META_REQUEST_ID`; everything else in `metadata` is yours to name.
 
+### What not to put in one
+
+An event is not a private in-memory message. Know where the two open fields end
+up before you fill them:
+
+| Field | Where it goes |
+|---|---|
+| `payload` | Written verbatim to `event_outbox` and `processing_jobs`, to `event_log` when the trail is enabled, and serialized onto the Redis stream on the `redis://` bus. |
+| `metadata` | The same three tables and the same stream — **and** into log records, whole, whenever a best-effort subscriber fails. |
+
+So:
+
+**No secrets.** No tokens, passwords, API keys, or session identifiers. A
+correlation id is fine; a bearer token is not. Metadata in particular is logged
+in full by [`best_effort`](#subscribing), so anything you put there should be
+safe to read in a log aggregator.
+
+**Think about personal data.** Whatever you publish inherits the retention window
+of the tables it lands in, not the retention rules of the record it describes —
+and a dead-lettered job keeps its payload until an operator clears it. Publishing
+an id and having the subscriber re-read the row keeps deletion in one place.
+
+**Keep it small.** JASIL does not cap payload size: the value is stored as JSON
+in every row it reaches, and each durable subscriber gets its own copy. Reference
+a blob through the [storage provider](providers-and-backends.md) rather than
+inlining it.
+
+Identifiers *are* bounded, because they are indexed columns: `event_type` is
+capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
+Going over raises at `new_event` rather than failing at the write.
+
 ## Publishing
 
 ```python

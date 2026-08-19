@@ -1,12 +1,18 @@
 """The outbox relay — turns published events into per-subscriber durable jobs.
 
-Runs on every replica (scheduled): ``list_unrelayed`` claims a batch with
-``SELECT ... FOR UPDATE SKIP LOCKED`` so concurrent relayers take disjoint rows
-without a single-runner lock. For each unrelayed outbox row it enqueues one job
-per durable subscriber of the event type and stamps the row relayed. The fan-out
-is idempotent (jobs dedup on ``event_id + subscriber_id``), so a crash between
-enqueue and stamping — or any overlap between relayers — simply re-relays
-harmlessly on the next pass.
+Runs on every replica (scheduled). One pass is one transaction: ``list_unrelayed``
+claims a batch with ``SELECT ... FOR UPDATE SKIP LOCKED``, each row is fanned out
+into one job per durable subscriber of its event type and stamped relayed, and
+the whole batch commits at the end. Holding the transaction for the fan-out is
+what makes the lock mean anything — released at the select, it would leave every
+relayer racing over the same rows.
+
+That gives concurrent relayers disjoint batches without a single-runner lock.
+Where the dialect has no ``SKIP LOCKED`` the batches can overlap, and two other
+properties keep it harmless: the fan-out is idempotent (jobs dedup on
+``event_id + subscriber_id``) and the stamp is a plain overwrite. The same two
+properties cover a crash mid-pass, which rolls the batch back and re-relays it on
+the next one — at-least-once, never at-most-once.
 """
 
 from collections.abc import Callable
@@ -43,12 +49,12 @@ def relay_outbox_once(
     batch_size: int,
 ) -> int:
     """
-    Relay one batch of unrelayed outbox rows into durable jobs.
+    Relay one batch of unrelayed outbox rows into durable jobs, in one transaction.
 
     Args:
         registry: The durable-subscriber registry (event type -> subscribers).
         clock: Time source for job/outbox timestamps.
-        session_factory: Opens a fresh session per unit of work.
+        session_factory: Opens the session the pass runs in.
         max_attempts: Attempt ceiling stamped on each enqueued job.
         batch_size: Maximum number of outbox rows to relay in this pass.
 
@@ -56,13 +62,15 @@ def relay_outbox_once(
         The number of outbox rows relayed.
     """
     with session_factory() as db:
-        snapshots = [_snapshot(row) for row in jobs_outbox.list_unrelayed(limit=batch_size, db=db)]
-    for snapshot in snapshots:
-        event = _event_from(snapshot)
-        with session_factory() as db:
+        rows = jobs_outbox.list_unrelayed(limit=batch_size, db=db)
+        snapshots = [_snapshot(row) for row in rows]
+        now = clock.now()
+        for snapshot in snapshots:
+            event = _event_from(snapshot)
             for subscriber_id in registry.subscribers_for(event.event_type):
-                jobs_crud.enqueue_job(event, subscriber_id, max_attempts=max_attempts, now=clock.now(), db=db)
-            jobs_outbox.mark_relayed(snapshot.id, now=clock.now(), db=db)
+                jobs_crud.enqueue_job(event, subscriber_id, max_attempts=max_attempts, now=now, db=db, commit=False)
+            jobs_outbox.mark_relayed(snapshot.id, now=now, db=db, commit=False)
+        db.commit()
     return len(snapshots)
 
 

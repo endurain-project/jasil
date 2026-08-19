@@ -66,7 +66,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   minted, and `subscriber_id` when a durable subscriber registers, so a value
   too long for the column it is persisted in raises at the producing call site
   instead of failing at the write — where PostgreSQL and MySQL raise, SQLite
-  does not, and the publish seam swallows the failure either way.
+  does not, and the publish seam swallows the failure either way. `payload` and
+  `metadata` are deliberately *not* capped; see the events documentation for what
+  belongs in them.
 - Payload schema versioning: `VersionedPayload` carries a `SCHEMA_VERSION` and
   per-step `UPGRADERS`. A payload written by an older build is walked forward
   one version at a time; one written by a *newer* build is refused rather than

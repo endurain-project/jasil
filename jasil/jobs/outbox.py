@@ -70,13 +70,16 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
     Fetch the oldest not-yet-relayed outbox rows, locking them for this relayer.
 
     On a database with row-level locking the rows are claimed with ``FOR UPDATE
-    SKIP LOCKED`` so concurrent relayers across replicas take disjoint batches
-    (no single-runner lock needed); elsewhere the clause is omitted and the
-    idempotent fan-out is what keeps an overlap harmless.
+    SKIP LOCKED``, so concurrent relayers across replicas take disjoint batches
+    (no single-runner lock needed) — but only for as long as the caller holds the
+    transaction. :func:`jasil.jobs.relay.relay_outbox_once` therefore keeps it
+    open across the whole fan-out. Where the clause is unavailable the batches can
+    overlap, and the idempotent fan-out is what keeps that harmless.
 
     Args:
         limit: Maximum number of rows to return.
-        db: Active database session.
+        db: Active database session, whose transaction must stay open for as long
+            as the claim needs to hold.
 
     Returns:
         Unrelayed outbox rows, oldest-first.
@@ -87,7 +90,7 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
     return list(db.execute(stmt).scalars().all())
 
 
-def mark_relayed(outbox_id: str, *, now: datetime, db: Session) -> None:
+def mark_relayed(outbox_id: str, *, now: datetime, db: Session, commit: bool = True) -> None:
     """
     Stamp an outbox row as relayed.
 
@@ -95,12 +98,18 @@ def mark_relayed(outbox_id: str, *, now: datetime, db: Session) -> None:
         outbox_id: The outbox row id.
         now: Current instant.
         db: Active database session.
+        commit: When True, commit immediately; when False, flush only and leave
+            the stamp in the caller's open transaction, so a whole relayed batch
+            lands under one commit.
 
     Returns:
         None.
     """
     db.execute(update(EventOutbox).where(EventOutbox.id == outbox_id).values(relayed_at=now))
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
 
 def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = jasil_pruning.PRUNE_BATCH_SIZE) -> int:

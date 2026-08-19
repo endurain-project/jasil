@@ -49,6 +49,22 @@ files. You build a settings object from whatever source you like and install it.
 **It does not own a web framework.** Nothing in the core imports FastAPI. The
 `Depends` helpers are behind an extra you may ignore entirely.
 
+## One thing it cannot do yet
+
+!!! warning "JASIL is synchronous"
+    Every provider method, every subscriber, and the whole durable-jobs layer is
+    ordinary blocking Python, and the ORM integration expects a synchronous
+    `sessionmaker`. There is no `AsyncSession` support and no async provider
+    variant.
+
+    On an async framework you can still use JASIL, but calls into it have to run
+    on a worker thread (FastAPI does that automatically for a `def` route or
+    dependency, and `anyio.to_thread.run_sync` does it explicitly). If your
+    application is built on `AsyncSession` throughout, the event log and durable
+    jobs will not fit without a second, synchronous engine.
+
+    Async support is a candidate for a later release; it is not in `0.1.0`.
+
 ## Quick start
 
 ```python
