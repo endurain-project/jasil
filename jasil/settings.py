@@ -146,6 +146,14 @@ class JasilSettings:
 
     Attributes:
         profile: The deployment shape; supplies the capability-URI defaults.
+        web_workers: How many web-server worker processes the host runs. Only the
+            *count* matters: four workers under the ``local`` profile are still
+            four processes, and process-local state cannot be shared between them,
+            so this drives the consistency checks as much as the profile does.
+        enforce_deployment_consistency: Refuse to build a platform whose wiring
+            contradicts its topology (see :mod:`jasil.capabilities`). Set False to
+            log the issues as warnings instead — useful on a development machine
+            running the distributed profile without Redis.
         data_dir: Root directory for the local storage backend.
         state_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``.
         storage_uri: ``local://`` or ``s3://``.
@@ -158,6 +166,8 @@ class JasilSettings:
     """
 
     profile: DeploymentProfile = DeploymentProfile.LOCAL
+    web_workers: int = 1
+    enforce_deployment_consistency: bool = True
     data_dir: str = "data"
     state_uri: str | None = None
     storage_uri: str | None = None

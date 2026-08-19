@@ -5,7 +5,7 @@ The recording helpers write the event lifecycle: ``record_published`` /
 events (via the recorder in :mod:`jasil.event_log.recorder`), and ``record_queued``
 for events handed to the durable job queue (via the publish facade). The
 ``get_event_log_summary`` helper powers the admin dashboard. Every query here is
-portable SQL so the same code runs on PostgreSQL in production and SQLite in tests.
+portable SQL so the same code runs on PostgreSQL, MySQL and SQLite.
 """
 
 from collections import defaultdict
@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 
 import jasil.event_log.schema as event_log_schema
 import jasil.pruning as jasil_pruning
+from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.timestamps import age_seconds
 from jasil.event_log.models import EventLog
 from jasil.events import Event
 
@@ -25,9 +27,6 @@ _STATUS_PROCESSING = "processing"
 _STATUS_COMPLETED = "completed"
 _STATUS_FAILED = "failed"
 _STATUS_DEAD_LETTER = "dead_letter"
-
-# Cap stored failure text so a pathological exception cannot bloat a row.
-_MAX_ERROR_LEN = 4000
 
 # ``handler_name`` is the comma-joined list of every subscriber that ran for the
 # event, so its length grows with the number of subscribers — unbounded from this
@@ -184,7 +183,7 @@ def mark_failed(
         .values(
             status=_STATUS_FAILED,
             handler_name=_fit_handler_name(handler_name),
-            error_message=error_message[:_MAX_ERROR_LEN],
+            error_message=error_message[:MAX_STORED_ERROR_LENGTH],
             processing_time_ms=processing_time_ms,
             completed_at=func.now(),
         )
@@ -294,7 +293,7 @@ def _summarize_pending(db: Session, now: datetime) -> list[event_log_schema.Even
             event_type=event_type,
             status=status,
             count=count,
-            oldest_seconds=_age_seconds(oldest, now),
+            oldest_seconds=age_seconds(oldest, now),
         )
         for event_type, status, count, oldest in rows
     ]
@@ -343,21 +342,3 @@ def delete_events_before(cutoff: datetime, *, db: Session, batch_size: int = jas
         The total number of rows deleted.
     """
     return jasil_pruning.bounded_delete(EventLog, EventLog.created_at < cutoff, db=db, batch_size=batch_size)
-
-
-def _age_seconds(moment: datetime | None, now: datetime) -> float | None:
-    """
-    Compute the age in seconds of ``moment`` relative to ``now``.
-
-    Args:
-        moment: The earlier instant (may be timezone-naive from SQLite).
-        now: The reference instant (timezone-aware, UTC).
-
-    Returns:
-        Age in seconds, or None when ``moment`` is None.
-    """
-    if moment is None:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return (now - moment).total_seconds()

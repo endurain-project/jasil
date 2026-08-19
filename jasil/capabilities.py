@@ -1,33 +1,37 @@
 """Startup capability report and deployment-consistency checks.
 
-Renders how each infrastructure capability (state, storage, events, lock,
-clock) is wired for a human-readable startup log, and detects fatal
-inconsistencies — a deployment that *requires* a shared backend but resolves
-one to a process- or node-local implementation.
+Renders how each infrastructure capability (state, storage, events, lock, clock)
+is wired for a human-readable startup log, and detects fatal inconsistencies — a
+deployment that *requires* a shared backend but resolves one to a process- or
+node-local implementation.
 
-Two consistency rules are enforced:
+Three consistency rules are enforced:
 
-- **Cross-process backends** — ephemeral *state* (rate limiting, login
-  throttling, single-use tokens) and the *event* bus — must not resolve to
-  process-local memory when the topology requires shared state (the
-  ``distributed`` profile or more than one web worker); the stores/bus would
-  diverge silently across processes. Both share the ``memory://`` / ``redis://``
-  vocabulary and are validated by :func:`check_state_consistency`.
+- **Cross-process backends** — ephemeral *state* (rate limiting, throttling,
+  single-use tokens) and the *event* bus — must not resolve to process-local
+  memory when the topology requires shared state (the ``distributed`` profile or
+  more than one web worker); the stores and the bus would diverge silently across
+  processes. Both share the ``memory://`` / ``redis://`` vocabulary and are
+  validated by :func:`check_state_consistency`.
 - **Cross-node storage** must not resolve to the local filesystem under the
   ``distributed`` profile, where replicas run on separate nodes with no shared
-  disk. A multi-worker *local* deployment shares one host disk, so local
-  storage stays valid there. Validated by :func:`check_storage_consistency`.
+  disk. A multi-worker *local* deployment shares one host disk, so local storage
+  stays valid there. Validated by :func:`check_storage_consistency`.
 - **The coordination lock** must not resolve to the in-process ``noop`` lock
-  whenever the deployment runs more than one process (the ``distributed``
-  profile or any multi-worker deployment), or every process would run every
-  scheduled job. Validated by :func:`check_lock_consistency`.
+  whenever the deployment runs more than one process (the ``distributed`` profile
+  or any multi-worker deployment), or every process would run every scheduled
+  job. Validated by :func:`check_lock_consistency`.
 
 The *clock* is always the system clock, so its default is never a fatal choice
 here.
 
-Pure module — imports only ``jasil.profile``. The actual logging is
-performed by the caller (``main.startup_event``) so this stays side-effect free
-and trivially testable.
+:func:`check_deployment_consistency` applies all three to a
+:class:`~jasil.settings.JasilSettings`, and ``jasil.container.build_platform``
+calls it at startup: an inconsistency raises unless the host sets
+``enforce_deployment_consistency=False``, which downgrades it to a warning.
+
+Pure module — no infrastructure imports, so every check runs before a single
+backend has been constructed.
 """
 
 from collections.abc import Sequence
@@ -40,6 +44,10 @@ from jasil.profile import (
     classify_state_uri,
     resolve_topology,
 )
+from jasil.settings import JasilSettings
+
+# Shown in the report when a capability URI was left to the profile.
+_PROFILE_DEFAULT = "profile default"
 
 
 @dataclass(frozen=True)
@@ -47,9 +55,10 @@ class StateSource:
     """A configured source of ephemeral state.
 
     Attributes:
-        label: The setting name backing this state (e.g. ``STATE_URI``).
+        label: The setting backing this state (e.g. ``state_uri``).
         uri: The effective storage URI.
-        applies: Whether this source is active (e.g. rate limiting may be off).
+        applies: Whether this source is active — a capability the host disabled
+            cannot be misconfigured.
     """
 
     label: str
@@ -88,7 +97,7 @@ class CapabilityReport:
         """Render the report as a multi-line, aligned string."""
         header = (
             f"Deployment profile: {self.topology.profile.value} "
-            f"(WEB_WORKERS={self.topology.web_workers}, "
+            f"(web_workers={self.topology.web_workers}, "
             f"requires_shared_state={self.topology.requires_shared_state})"
         )
         width = max((len(row.name) for row in self.rows), default=0)
@@ -96,77 +105,112 @@ class CapabilityReport:
         return "\n".join([header, *lines])
 
 
-def build_capability_report(
-    *,
-    profile: DeploymentProfile,
-    web_workers: int,
-    primary_state: StateSource,
-    storage_backend: str,
-    storage_source: str,
-    events_backend: str,
-    events_source: str,
-    lock_backend: str,
-    lock_source: str,
-) -> CapabilityReport:
+def _scheme_of(uri: str) -> str:
+    """Return a URI's scheme, or the whole value when it carries none."""
+    scheme, separator, _ = uri.partition("://")
+    return scheme if separator else uri
+
+
+def _source_of(configured: str | None, label: str) -> str:
+    """Name what supplied a capability URI: the host's setting, or the profile."""
+    return label if configured else _PROFILE_DEFAULT
+
+
+def build_capability_report(settings: JasilSettings) -> CapabilityReport:
     """Build the observational capability report for startup logging.
 
     Args:
-        profile: The deployment profile.
-        web_workers: Configured worker count.
-        primary_state: The state source shown on the ``state`` row (the resolved
-            auth-security store — the most security-critical shared state).
-        storage_backend: The resolved blob-storage backend (``local`` or ``s3``).
-        storage_source: The setting backing blob storage today.
-        events_backend: The resolved event-bus backend (``in-process`` or ``redis``).
-        events_source: The setting backing the event bus today.
-        lock_backend: The resolved coordination-lock backend (``none`` or ``pg``).
-        lock_source: The setting backing the coordination lock today.
+        settings: The configuration the platform is being built from.
 
     Returns:
-        A ``CapabilityReport`` reflecting today's effective wiring. Only the
-        clock is a static row.
+        A ``CapabilityReport`` reflecting the effective wiring: the backend each
+        capability resolved to, and whether that came from an explicit setting or
+        from the deployment profile's default.
+
+    Raises:
+        ValueError: When a capability URI is unset under a profile that has no
+            default for it.
     """
-    topology = resolve_topology(profile, web_workers)
     rows = (
-        CapabilityRow("state", primary_state.backend.value, primary_state.label),
-        CapabilityRow("storage", storage_backend, storage_source),
-        CapabilityRow("events", events_backend, events_source),
-        CapabilityRow("lock", lock_backend, lock_source),
-        CapabilityRow("clock", "system", "profile default"),
+        CapabilityRow("state", _scheme_of(settings.resolved_state_uri), _source_of(settings.state_uri, "state_uri")),
+        CapabilityRow(
+            "storage", _scheme_of(settings.resolved_storage_uri), _source_of(settings.storage_uri, "storage_uri")
+        ),
+        CapabilityRow(
+            "events", _scheme_of(settings.resolved_events_uri), _source_of(settings.events_uri, "events_uri")
+        ),
+        CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
+        CapabilityRow("clock", "system", "always the system clock"),
     )
-    return CapabilityReport(topology=topology, rows=rows)
+    return CapabilityReport(topology=resolve_topology(settings.profile, settings.web_workers), rows=rows)
+
+
+def check_deployment_consistency(settings: JasilSettings) -> list[str]:
+    """Return every fatal wiring inconsistency in ``settings`` (empty when sound).
+
+    The entry point ``build_platform`` uses: it resolves the capability URIs the
+    profile would actually build from, then applies all three rules to them.
+
+    Args:
+        settings: The configuration the platform is being built from.
+
+    Returns:
+        Human-readable issue messages; empty when the wiring is consistent.
+
+    Raises:
+        ValueError: When a capability URI is unset under a profile that has no
+            default for it.
+    """
+    profile = settings.profile
+    web_workers = settings.web_workers
+    return [
+        *check_state_consistency(
+            profile=profile,
+            web_workers=web_workers,
+            state_sources=(
+                StateSource(label="state_uri", uri=settings.resolved_state_uri),
+                StateSource(label="events_uri", uri=settings.resolved_events_uri),
+            ),
+        ),
+        *check_storage_consistency(
+            profile=profile,
+            storage_uri=settings.resolved_storage_uri,
+            storage_label="storage_uri",
+        ),
+        *check_lock_consistency(
+            profile=profile,
+            web_workers=web_workers,
+            lock_uri=settings.resolved_lock_uri,
+            lock_label="lock_uri",
+        ),
+    ]
 
 
 def check_state_consistency(
     *,
     profile: DeploymentProfile,
     web_workers: int,
-    environment: str,
     state_sources: Sequence[StateSource],
 ) -> list[str]:
     """Return fatal issues for cross-process backends (empty when consistent).
 
     A deployment that requires shared state (the ``distributed`` profile or more
     than one web worker) but resolves a cross-process backend to process-local
-    memory is fatally misconfigured: ephemeral state (rate-limit counters, login
-    lockout, single-use tokens) and the in-process event bus would silently diverge
+    memory is fatally misconfigured: ephemeral state (rate-limit counters, lockout
+    gates, single-use tokens) and the in-process event bus would silently diverge
     across processes. State stores and the event bus share the ``memory://`` /
     ``redis://`` vocabulary, so both are validated here.
 
     Args:
         profile: The deployment profile.
         web_workers: Configured worker count.
-        environment: Runtime environment; ``development`` is never fatal.
         state_sources: The active cross-process backends to validate (the
             resolved state and event-bus URIs).
 
     Returns:
-        A list of human-readable issue messages; empty when consistent. The
-        caller (``core.config``) raises at ``Settings`` construction when
-        non-empty, so misconfiguration is caught at boot.
+        Human-readable issue messages; empty when consistent. The ``custom``
+        profile is exempt — it promises no defaults, so nothing can contradict one.
     """
-    if environment == "development":
-        return []
     if profile is DeploymentProfile.CUSTOM:
         return []
     topology = resolve_topology(profile, web_workers)
@@ -181,7 +225,7 @@ def check_state_consistency(
         )
         issues.append(
             f"{source.label} resolves to {reason}, but "
-            f"DEPLOYMENT_PROFILE={profile.value} with WEB_WORKERS={topology.web_workers} "
+            f"profile={profile.value} with web_workers={topology.web_workers} "
             f"requires a backend shared across processes. Point it at Redis "
             f"(redis://...) or run a single worker under the local profile."
         )
@@ -191,34 +235,31 @@ def check_state_consistency(
 def check_storage_consistency(
     *,
     profile: DeploymentProfile,
-    environment: str,
     storage_uri: str,
     storage_label: str,
 ) -> list[str]:
     """Return a fatal issue when distributed storage resolves to local disk.
 
     Under the ``distributed`` profile replicas run on separate nodes that do not
-    share a filesystem, so blob storage must be object
-    storage. A multi-worker ``local`` deployment shares one host disk, so local
-    storage stays valid there and is not flagged.
+    share a filesystem, so blob storage must be object storage. A multi-worker
+    ``local`` deployment shares one host disk, so local storage stays valid there
+    and is not flagged.
 
     Args:
         profile: The deployment profile.
-        environment: Runtime environment; ``development`` is never fatal.
         storage_uri: The resolved blob-storage URI.
         storage_label: The setting backing blob storage (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The caller
-        (``core.config``) raises at ``Settings`` construction when non-empty.
+        A single-item issue list when misconfigured; empty otherwise.
     """
-    if environment == "development" or profile is not DeploymentProfile.DISTRIBUTED:
+    if profile is not DeploymentProfile.DISTRIBUTED:
         return []
     if not storage_uri.strip().lower().startswith("local://"):
         return []
     return [
         f"{storage_label} resolves to the local filesystem, but "
-        f"DEPLOYMENT_PROFILE={profile.value} runs replicas on separate nodes that do "
+        f"profile={profile.value} runs replicas on separate nodes that do "
         f"not share a disk. Point it at object storage (s3://bucket/...)."
     ]
 
@@ -227,35 +268,33 @@ def check_lock_consistency(
     *,
     profile: DeploymentProfile,
     web_workers: int,
-    environment: str,
     lock_uri: str,
     lock_label: str,
 ) -> list[str]:
     """Return a fatal issue when a multi-process deployment uses a no-op lock.
 
-    The coordination lock makes scheduled/backfill jobs single-runner across
+    The coordination lock makes scheduled and backfill work single-runner across
     processes. Whenever a deployment runs more than one process — the
     ``distributed`` profile or any multi-worker deployment
-    (:attr:`DeploymentTopology.requires_shared_state`) — an in-process
-    ``noop://`` lock coordinates nothing, so every process would run every
-    interval job (an upstream sync, a token sweep, a backfill). The
+    (:attr:`~jasil.profile.DeploymentTopology.requires_shared_state`) — an
+    in-process ``noop://`` lock coordinates nothing, so every process would run
+    every interval job (the retention prune, a backfill, an upstream sync). The
     profile-aware default already resolves to ``postgres-advisory://`` in that
-    case, so this only trips on an explicit ``LOCK_URI=noop://`` override. A
+    case, so this only trips on an explicit ``lock_uri="noop://"`` override. A
     single-process ``local`` deployment has nothing to coordinate, so ``noop``
     stays valid there.
 
     Args:
         profile: The deployment profile.
         web_workers: Configured worker count.
-        environment: Runtime environment; ``development`` is never fatal.
         lock_uri: The resolved coordination-lock URI.
         lock_label: The setting backing the lock (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The caller
-        (``core.config``) raises at ``Settings`` construction when non-empty.
+        A single-item issue list when misconfigured; empty otherwise. The
+        ``custom`` profile is exempt — it promises no defaults.
     """
-    if environment == "development" or profile is DeploymentProfile.CUSTOM:
+    if profile is DeploymentProfile.CUSTOM:
         return []
     topology = resolve_topology(profile, web_workers)
     if not topology.requires_shared_state:
@@ -264,7 +303,7 @@ def check_lock_consistency(
         return []
     return [
         f"{lock_label} resolves to an in-process no-op lock, but "
-        f"DEPLOYMENT_PROFILE={profile.value} with WEB_WORKERS={topology.web_workers} "
+        f"profile={profile.value} with web_workers={topology.web_workers} "
         f"runs multiple processes that would each run scheduled jobs. Point it at "
         f"the shared database lock (postgres-advisory://)."
     ]

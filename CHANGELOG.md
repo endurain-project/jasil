@@ -54,7 +54,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   would diverge silently — the failure the profile system exists to prevent.
 - A startup capability report showing how each capability resolved and why, plus
   consistency checks that reject a multi-process topology wired to
-  process-local state.
+  process-local state. `build_platform()` runs both before it constructs a single
+  backend; set `enforce_deployment_consistency=False` to downgrade a refusal to a
+  warning.
 
 **Events**
 

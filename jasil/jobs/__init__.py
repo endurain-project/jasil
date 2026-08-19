@@ -1,4 +1,4 @@
-"""Durable job queue — Postgres is the source of truth for derived work.
+"""Durable job queue — the database is the source of truth for derived work.
 
 Each unit of derived work (one subscriber reacting to one event) is a row in the
 ``processing_jobs`` table. A worker claims pending rows with a lease, runs the

@@ -28,8 +28,8 @@ class ProcessingJob(Base):
     """
     One row per unit of durable derived work: a subscriber reacting to an event.
 
-    Postgres is the source of truth. A worker claims a ``pending`` row (taking a
-    time-bounded lease), runs the subscriber, and either marks it ``completed``
+    The database is the source of truth. A worker claims a ``pending`` row (taking
+    a time-bounded lease), runs the subscriber, and either marks it ``completed``
     or — on failure — reschedules it back to ``pending`` with a later
     ``available_at`` (exponential backoff) until ``attempts`` reaches
     ``max_attempts``, at which point it becomes ``dead_letter``. A reaper returns

@@ -50,7 +50,7 @@ class TestStateResolution:
 
     def test_an_unknown_scheme_is_refused(self):
         """Failing to start beats silently running on the wrong backend."""
-        with pytest.raises(ValueError, match="Unsupported STATE_URI scheme"):
+        with pytest.raises(ValueError, match="Unsupported state_uri scheme"):
             container._build_state(_settings(state_uri="mysql://db"))
 
 
@@ -69,7 +69,7 @@ class TestStorageResolution:
         assert "/unused" not in str(storage._base)
 
     def test_an_unknown_scheme_is_refused(self):
-        with pytest.raises(ValueError, match="Unsupported STORAGE_URI scheme"):
+        with pytest.raises(ValueError, match="Unsupported storage_uri scheme"):
             container._build_storage(_settings(storage_uri="ftp://files"))
 
 
@@ -83,7 +83,7 @@ class TestEventsResolution:
         assert isinstance(bus, RedisStreamEventBus)
 
     def test_an_unknown_scheme_is_refused(self):
-        with pytest.raises(ValueError, match="Unsupported EVENTS_URI scheme"):
+        with pytest.raises(ValueError, match="Unsupported events_uri scheme"):
             container._build_events(_settings(events_uri="kafka://broker"), None)
 
 
@@ -97,7 +97,7 @@ class TestLockResolution:
         assert isinstance(lock, PgAdvisoryLock)
 
     def test_an_unknown_scheme_is_refused(self):
-        with pytest.raises(ValueError, match="Unsupported LOCK_URI scheme"):
+        with pytest.raises(ValueError, match="Unsupported lock_uri scheme"):
             container._build_lock(_settings(lock_uri="zookeeper://"))
 
 
@@ -236,7 +236,7 @@ class TestBuildPlatform:
             _settings(
                 profile=DeploymentProfile.DISTRIBUTED,
                 state_uri="redis://c:6379/0",
-                storage_uri="local://",
+                storage_uri="s3://bucket",
                 events_uri="redis://c:6379/1",
                 lock_uri="postgres-advisory://",
             )
@@ -246,3 +246,42 @@ class TestBuildPlatform:
         assert isinstance(platform.events, RedisStreamEventBus)
         assert isinstance(platform.lock, PgAdvisoryLock)
         assert platform.profile is DeploymentProfile.DISTRIBUTED
+
+
+class TestDeploymentConsistencyGate:
+    """``build_platform`` refuses wiring that would diverge across processes.
+
+    The individual rules live in :mod:`jasil.capabilities`; what matters here is
+    that the composition root actually applies them, and applies them *before*
+    constructing a backend, so the failure names the setting rather than surfacing
+    as a connection error further down.
+    """
+
+    def test_an_inconsistent_wiring_stops_the_build(self, tmp_path):
+        with pytest.raises(ValueError, match="deployment wiring is inconsistent"):
+            container.build_platform(_settings(data_dir=str(tmp_path), web_workers=4))
+
+    def test_the_message_names_every_offending_setting(self, tmp_path):
+        with pytest.raises(ValueError) as failure:
+            container.build_platform(_settings(data_dir=str(tmp_path), web_workers=4))
+
+        assert "state_uri" in str(failure.value)
+        assert "events_uri" in str(failure.value)
+        assert "lock_uri" in str(failure.value)
+
+    def test_it_can_be_downgraded_to_a_warning(self, tmp_path, caplog):
+        """A development machine may knowingly run a multi-worker memory setup."""
+        with caplog.at_level("WARNING"):
+            platform = container.build_platform(
+                _settings(data_dir=str(tmp_path), web_workers=4, enforce_deployment_consistency=False)
+            )
+
+        assert isinstance(platform.state, MemoryState)
+        assert "Inconsistent deployment wiring" in caplog.text
+
+    def test_a_consistent_deployment_logs_the_capability_report(self, tmp_path, caplog):
+        with caplog.at_level("INFO"):
+            container.build_platform(_settings(data_dir=str(tmp_path)))
+
+        assert "JASIL platform capabilities" in caplog.text
+        assert "Deployment profile: local" in caplog.text

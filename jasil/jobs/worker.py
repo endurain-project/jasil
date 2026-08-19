@@ -10,11 +10,10 @@ loop.
 import logging
 import threading
 
+from jasil._core.threads import signal_and_join
 from jasil.jobs.runner import JobRunner
 
 logger = logging.getLogger(__name__)
-
-_STOP_JOIN_TIMEOUT = 5.0
 
 
 def run_worker(runner: JobRunner, *, poll_interval_seconds: float, stop: threading.Event) -> None:
@@ -86,7 +85,5 @@ class BackgroundWorker:
         Returns:
             None.
         """
-        self._stop.set()
         thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=_STOP_JOIN_TIMEOUT)
+        signal_and_join(thread, self._stop)

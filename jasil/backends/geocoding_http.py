@@ -71,10 +71,9 @@ class HttpGeocoding:
         self._api_key = api_key
         self._min_interval = min_interval_seconds
         self._user_agent = user_agent
-        # Throttle state is per-instance, guarded by its own lock. It used to be
-        # three module-level globals in core.config mutated from the domain
-        # service, which made the rate limit both untestable and impossible to
-        # reason about with more than one caller.
+        # Throttle state is per-instance, guarded by its own lock, so two
+        # configured backends cannot interfere and a test can drive the rate
+        # limit deterministically.
         self._throttle_lock = threading.Lock()
         self._last_call = 0.0
 

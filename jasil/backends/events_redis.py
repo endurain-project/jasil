@@ -1,7 +1,7 @@
 """Redis Streams ``EventBusProvider`` backend.
 
-Only imported by the composition root when ``EVENTS_URI`` (or the shared
-``REDIS_URL``) selects Redis, so ``local`` deployments never load it. Publishing
+Only imported by the composition root when ``events_uri`` selects Redis, so
+``local`` deployments never load it. Publishing
 is an ``XADD`` onto one stream; a background consumer thread reads through a
 consumer group (``XREADGROUP``) and dispatches each event to the subscribers
 registered for its ``event_type``, acking (``XACK``) after the handlers run.
@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 import jasil.node as platform_node
 import jasil.redis as platform_redis
+from jasil._core.threads import signal_and_join
 from jasil.events import INITIAL_SCHEMA_VERSION, Event
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,6 @@ _DEFAULT_GROUP = "jasil"
 _STREAM_MAXLEN = 10_000  # approximate cap so acked entries don't grow unbounded
 _READ_BATCH = 10
 _BLOCK_MS = 1_000  # XREADGROUP block window; bounds how quickly stop() is observed
-_STOP_JOIN_TIMEOUT = 5.0
 
 
 def serialize_event(event: Event) -> dict[str, str]:
@@ -139,10 +139,8 @@ class RedisStreamEventBus:
 
     def stop(self) -> None:
         """Signal the consumer thread and wait briefly for it to finish."""
-        self._stop.set()
         thread, self._thread = self._thread, None
-        if thread is not None:
-            thread.join(timeout=_STOP_JOIN_TIMEOUT)
+        signal_and_join(thread, self._stop)
 
     def _ensure_group(self) -> None:
         try:

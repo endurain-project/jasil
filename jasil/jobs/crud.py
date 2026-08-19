@@ -1,11 +1,11 @@
-"""CRUD for ``processing_jobs`` — the durable, Postgres-as-truth work queue.
+"""CRUD for ``processing_jobs`` — the durable, database-as-truth work queue.
 
-Every query is portable so the same code runs on PostgreSQL in production and
-SQLite in tests. The claim uses ``SELECT ... FOR UPDATE SKIP LOCKED`` on
-PostgreSQL (concurrent workers never grab the same row); on SQLite the clause is
-omitted, which is correct because tests are single-threaded. Callers pass an
-explicit ``now`` (from the ``ClockProvider``) so lease, backoff, and reaping are
-deterministic under test.
+Every query is portable, so the same code runs on PostgreSQL, MySQL and SQLite.
+The claim takes ``SELECT ... FOR UPDATE SKIP LOCKED`` wherever the dialect
+supports it (see :func:`jasil._core.dialects.supports_skip_locked`) so concurrent
+workers never grab the same row; where it does not, the clause is omitted and a
+single worker is still correct. Callers pass an explicit ``now`` (from the
+``ClockProvider``) so lease, backoff, and reaping are deterministic under test.
 """
 
 import uuid
@@ -22,6 +22,8 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
 import jasil.pruning as jasil_pruning
 from jasil._core.dialects import supports_skip_locked
+from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.timestamps import age_seconds
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
 
@@ -29,9 +31,6 @@ STATUS_PENDING = "pending"
 STATUS_CLAIMED = "claimed"
 STATUS_COMPLETED = "completed"
 STATUS_DEAD_LETTER = "dead_letter"
-
-# Cap stored failure text so a pathological exception cannot bloat a row.
-_MAX_ERROR_LEN = 4000
 
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
@@ -204,7 +203,7 @@ def mark_job_failed(
     job = db.get(ProcessingJob, job_id)
     if job is None:
         return ""
-    truncated = error_message[:_MAX_ERROR_LEN]
+    truncated = error_message[:MAX_STORED_ERROR_LENGTH]
     if job.attempts >= job.max_attempts:
         db.execute(
             update(ProcessingJob)
@@ -370,7 +369,7 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         claimed=totals.get(STATUS_CLAIMED, 0),
         completed=totals.get(STATUS_COMPLETED, 0),
         dead_letter=totals.get(STATUS_DEAD_LETTER, 0),
-        oldest_pending_seconds=_age_seconds(oldest_pending, now),
+        oldest_pending_seconds=age_seconds(oldest_pending, now),
         by_subscriber=by_subscriber,
         recent_dead_letter=[jobs_schema.DeadLetterJob.model_validate(job) for job in dead_letter_jobs],
     )
@@ -411,15 +410,6 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
     )
     db.commit()
     return True
-
-
-def _age_seconds(moment: datetime | None, now: datetime) -> float | None:
-    """Age of ``moment`` relative to ``now`` in seconds (SQLite returns naive datetimes)."""
-    if moment is None:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return (now - moment).total_seconds()
 
 
 def delete_completed_jobs_before(

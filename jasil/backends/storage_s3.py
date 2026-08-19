@@ -1,6 +1,6 @@
 """S3-compatible ``StorageProvider`` backend.
 
-Only imported by the composition root when ``STORAGE_URI`` uses the ``s3://``
+Only imported by the composition root when ``storage_uri`` uses the ``s3://``
 scheme, so local deployments never load ``boto3``. Install it with the ``s3``
 extra (``pip install jasil[s3]``).
 """
@@ -51,7 +51,7 @@ class S3Storage:
         parsed = urlparse(uri)
         bucket = parsed.netloc
         if not bucket:
-            raise ValueError(f"S3 STORAGE_URI is missing a bucket: {uri!r}")
+            raise ValueError(f"An s3 storage_uri is missing a bucket: {uri!r}")
         params = parse_qs(parsed.query)
         client = boto3.client(
             "s3",

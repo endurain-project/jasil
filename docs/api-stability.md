@@ -27,7 +27,9 @@ modules:
 | `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `Base`. |
 | `jasil.correlation` | `configure_provider`, `get_correlation_id`, `set_correlation_id`. |
 | `jasil.container` | `Platform`, `build_platform`. |
+| `jasil.capabilities` | `check_deployment_consistency` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `get_state`. |
+| `jasil.async_bridge` | `dispatch`, `set_main_loop`, `capture_running_loop`, `get_main_loop`. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |

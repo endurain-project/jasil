@@ -13,6 +13,7 @@ import pytest
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.relay as jobs_relay
+from jasil._core.timestamps import as_utc
 from jasil.events import MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH, new_event
 from jasil.jobs.backoff import backoff_seconds
 from jasil.jobs.models import EventOutbox, ProcessingJob
@@ -20,15 +21,6 @@ from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH, JobHandlerRegistry
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 SUBSCRIBER = "thumbnails.generate"
-
-
-def as_utc(value: datetime) -> datetime:
-    """Normalise a stored timestamp to aware UTC.
-
-    SQLite has no timezone type, so timestamps round-trip naive; Postgres returns
-    them aware. Comparisons go through this so the suite is correct on both.
-    """
-    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 class FixedClock:

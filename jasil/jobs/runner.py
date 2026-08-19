@@ -9,11 +9,11 @@ with backoff, or dead-letters it once the attempt ceiling is reached.
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil._core.timestamps import as_utc
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
@@ -178,13 +178,6 @@ class JobRunner:
             payload=dict(job.payload),
             metadata=dict(job.job_metadata) if job.job_metadata else None,
             attempts=job.attempts,
-            timestamp=_iso(job.created_at),
+            timestamp=as_utc(job.created_at).isoformat(),
             schema_version=job.schema_version,
         )
-
-
-def _iso(moment: datetime) -> str:
-    """Render an enqueue timestamp as ISO-8601 UTC (SQLite returns naive datetimes)."""
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return moment.isoformat()

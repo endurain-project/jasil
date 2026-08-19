@@ -68,8 +68,8 @@ each writes only its own scratch data.
 
 ## Consistency checks
 
-Beyond the URI defaults, JASIL validates the *combination* at startup and refuses
-inconsistent wiring:
+Beyond the URI defaults, `build_platform()` validates the *combination* before it
+constructs a single backend, and refuses inconsistent wiring:
 
 **Cross-process state.** Ephemeral state and the event bus must not resolve to
 process-local memory when the topology requires shared state — the `distributed`
@@ -86,32 +86,56 @@ when more than one process could run the same scheduled job.
 
 Note that **worker count matters as much as profile**. A `local` deployment with
 four web workers is four processes, and process-local memory cannot be shared
-between them:
+between them, so tell JASIL how many you run:
 
 ```python
-from jasil.profile import DeploymentProfile, resolve_topology
+jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
+# ValueError: JASIL's deployment wiring is inconsistent:
+#   - state_uri resolves to process-local memory, but profile=local with
+#     web_workers=4 requires a backend shared across processes. ...
+```
 
-resolve_topology(DeploymentProfile.LOCAL, web_workers=4).requires_shared_state
-# True
+The `custom` profile opts out of the state and lock rules: it promises no
+defaults, so there is nothing for a setting to contradict.
+
+On a development machine you may knowingly want an inconsistent setup — the
+distributed profile without Redis, say. Set
+`enforce_deployment_consistency=False` and each issue is logged as a warning
+instead:
+
+```python
+jasil_settings.JasilSettings(web_workers=4, enforce_deployment_consistency=False)
+```
+
+If you want the issues without building a platform, call the check directly:
+
+```python
+from jasil.capabilities import check_deployment_consistency
+
+for issue in check_deployment_consistency(settings):
+    print(issue)
 ```
 
 ## The startup report
 
-`jasil.capabilities` renders how each capability actually resolved, for the
-startup log:
+`build_platform()` logs how each capability actually resolved, at `INFO`:
 
 ```
-Deployment profile: local (WEB_WORKERS=1, requires_shared_state=False)
-  state   -> memory       (source: STATE_URI)
-  storage -> local        (source: STORAGE_URI)
-  events  -> in-process   (source: EVENTS_URI)
-  lock    -> none         (source: LOCK_URI)
-  clock   -> system       (source: static)
+JASIL platform capabilities:
+Deployment profile: local (web_workers=1, requires_shared_state=False)
+  state   -> memory  (source: profile default)
+  storage -> local   (source: profile default)
+  events  -> memory  (source: profile default)
+  lock    -> noop    (source: profile default)
+  clock   -> system  (source: always the system clock)
 ```
 
-Worth logging at every startup. A capability that quietly resolved to the wrong
-backend is otherwise invisible until it causes a bug that reproduces only under
-load, or only on one replica.
+The `source` column separates what you chose from what you inherited. A
+capability that quietly resolved to the wrong backend is otherwise invisible
+until it causes a bug that reproduces only under load, or only on one replica.
+
+Call `jasil.capabilities.build_capability_report(settings).render()` yourself if
+you want it somewhere other than the log.
 
 ## Moving from local to distributed
 

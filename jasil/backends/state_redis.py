@@ -1,8 +1,7 @@
 """Redis-backed ``StateProvider`` backend.
 
-Only imported by the composition root when ``STATE_URI`` (or the shared
-``REDIS_URL``) selects Redis, so the ``local`` profile keeps using the in-memory
-backend. Backed by a ``decode_responses=False`` client so values round-trip as
+Only imported by the composition root when ``state_uri`` selects Redis, so the
+``local`` profile keeps using the in-memory backend. Backed by a ``decode_responses=False`` client so values round-trip as
 raw ``bytes`` per the ``StateProvider`` contract; ``incr`` uses Redis ``INCRBY`` for
 atomic, cross-process counters (rate-limit, lockout) that a single-process dict
 cannot provide.

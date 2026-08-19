@@ -3,22 +3,28 @@
 ``build_platform`` resolves each capability (state, storage, events, lock,
 clock) to a concrete backend based on the deployment profile and returns a
 frozen ``Platform`` holding the providers. It is called once at startup and
-attached to ``app.state.platform`` and published process-wide via
-``jasil.runtime`` so both request and non-request code resolve the same
-instance.
+published process-wide via ``jasil.runtime`` so both request and non-request
+code resolve the same instance.
 
 Every capability resolves its backend by URI scheme, independently of the
-profile: ``memory``/``redis`` for ``STATE_URI``; ``local``/``s3`` for
-``STORAGE_URI``; ``memory``/``redis`` for ``EVENTS_URI``; ``noop``/
-``postgres-advisory`` for ``LOCK_URI``. The deployment profile only shapes the
-*defaults* those URIs resolve to (see ``core.config`` ``resolved_*`` properties),
-so ``local``, ``distributed``, and ``custom`` all build the same way — the
-profile just picks memory-vs-Redis and local-fs-vs-S3 defaults.
+profile: ``memory``/``redis`` for the state URI; ``local``/``s3`` for the storage
+URI; ``memory``/``redis`` for the events URI; ``noop``/``postgres-advisory`` for
+the lock URI. The deployment profile only shapes the *defaults* those URIs
+resolve to (see the ``resolved_*`` properties on
+:class:`~jasil.settings.JasilSettings`), so ``local``, ``distributed``, and
+``custom`` all build the same way — the profile just picks memory-vs-Redis and
+local-fs-vs-S3 defaults.
+
+Before anything is constructed, the resolved wiring is checked against the
+deployment topology (see :mod:`jasil.capabilities`): a combination that would
+silently diverge across processes or nodes stops the build rather than becoming a
+production mystery.
 """
 
 import logging
 from dataclasses import dataclass
 
+import jasil.capabilities as capabilities
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
@@ -86,11 +92,14 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
         A frozen ``Platform`` wiring each provider to its selected backend.
 
     Raises:
-        ValueError: When a capability URI uses an unsupported scheme, or is unset
-            under a profile that has no default for it.
+        ValueError: When a capability URI uses an unsupported scheme, is unset
+            under a profile that has no default for it, or when the resolved
+            wiring contradicts the deployment topology.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
+    _check_deployment_consistency(settings)
+    logger.info("JASIL platform capabilities:\n%s", capabilities.build_capability_report(settings).render())
     profile = settings.profile
     # Build the recorder once and share it: the event bus records the lifecycle
     # of best-effort (bus-delivered) events, while the publish facade uses the
@@ -109,6 +118,27 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
     )
 
 
+def _check_deployment_consistency(settings: JasilSettings) -> None:
+    """Stop a build whose wiring contradicts its topology, unless the host opted out.
+
+    Checked before any backend is constructed, so the failure names the setting
+    rather than surfacing later as a connection error — or, worse, as a
+    deployment that starts happily and diverges across replicas.
+    """
+    issues = capabilities.check_deployment_consistency(settings)
+    if not issues:
+        return
+    if not settings.enforce_deployment_consistency:
+        for issue in issues:
+            logger.warning(f"Inconsistent deployment wiring: {issue}")
+        return
+    detail = "\n  - ".join(issues)
+    raise ValueError(
+        f"JASIL's deployment wiring is inconsistent:\n  - {detail}\n"
+        "Fix the setting, or pass enforce_deployment_consistency=False to downgrade this to a warning."
+    )
+
+
 def _build_state(settings: JasilSettings) -> StateProvider:
     state_uri = settings.resolved_state_uri
     scheme, _, _ = state_uri.partition("://")
@@ -116,7 +146,7 @@ def _build_state(settings: JasilSettings) -> StateProvider:
         return MemoryState()
     if scheme in ("redis", "rediss", "unix"):
         return RedisState.from_uri(state_uri)
-    raise ValueError(f"Unsupported STATE_URI scheme: {scheme or state_uri!r}")
+    raise ValueError(f"Unsupported state_uri scheme: {scheme or state_uri!r}")
 
 
 def _build_storage(settings: JasilSettings) -> StorageProvider:
@@ -132,7 +162,7 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
         from jasil.backends.storage_s3 import S3Storage
 
         return S3Storage.from_uri(storage_uri)
-    raise ValueError(f"Unsupported STORAGE_URI scheme: {scheme or storage_uri!r}")
+    raise ValueError(f"Unsupported storage_uri scheme: {scheme or storage_uri!r}")
 
 
 def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> EventBusProvider:
@@ -142,7 +172,7 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
         return InProcessEventBus(recorder=recorder)
     if scheme in ("redis", "rediss", "unix"):
         return RedisStreamEventBus.from_uri(events_uri, recorder=recorder)
-    raise ValueError(f"Unsupported EVENTS_URI scheme: {scheme or events_uri!r}")
+    raise ValueError(f"Unsupported events_uri scheme: {scheme or events_uri!r}")
 
 
 def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
@@ -162,7 +192,7 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
         return NoopLock()
     if scheme == "postgres-advisory":
         return PgAdvisoryLock.from_main_database()
-    raise ValueError(f"Unsupported LOCK_URI scheme: {scheme or lock_uri!r}")
+    raise ValueError(f"Unsupported lock_uri scheme: {scheme or lock_uri!r}")
 
 
 def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:

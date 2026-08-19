@@ -1,8 +1,12 @@
-"""Deployment profile, topology, and the capability report."""
+"""Deployment profile, topology, the capability report, and the consistency checks."""
 
 import pytest
 
-from jasil.capabilities import StateSource, build_capability_report
+from jasil.capabilities import (
+    StateSource,
+    build_capability_report,
+    check_deployment_consistency,
+)
 from jasil.profile import (
     DeploymentProfile,
     DeploymentTopology,
@@ -11,6 +15,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
+from jasil.settings import JasilSettings
 
 
 class TestParseProfile:
@@ -86,32 +91,22 @@ class TestTopology:
 
 class TestStateSource:
     def test_the_backend_is_classified_from_the_uri(self):
-        assert StateSource(label="STATE_URI", uri="redis://c:6379").backend is StateBackendKind.REDIS
+        assert StateSource(label="state_uri", uri="redis://c:6379").backend is StateBackendKind.REDIS
 
     def test_a_source_applies_by_default(self):
-        assert StateSource(label="STATE_URI", uri="memory://").applies is True
+        assert StateSource(label="state_uri", uri="memory://").applies is True
 
 
 class TestCapabilityReport:
     @pytest.fixture
     def report(self):
-        return build_capability_report(
-            profile=DeploymentProfile.LOCAL,
-            web_workers=1,
-            primary_state=StateSource(label="STATE_URI", uri="memory://"),
-            storage_backend="local",
-            storage_source="STORAGE_URI",
-            events_backend="in-process",
-            events_source="EVENTS_URI",
-            lock_backend="none",
-            lock_source="LOCK_URI",
-        )
+        return build_capability_report(JasilSettings())
 
     def test_every_capability_appears_exactly_once(self, report):
         names = [row.name for row in report.rows]
 
         assert sorted(names) == sorted(set(names))
-        assert {"storage", "events", "lock", "clock"} <= set(names)
+        assert {"state", "storage", "events", "lock", "clock"} == set(names)
 
     def test_the_clock_row_is_always_present(self, report):
         """The clock is the one capability with no alternative backend."""
@@ -119,11 +114,31 @@ class TestCapabilityReport:
 
         assert len(clock_rows) == 1
 
+    def test_it_reports_the_backend_each_uri_resolved_to(self, report):
+        backends = {row.name: row.backend for row in report.rows}
+
+        assert backends["state"] == "memory"
+        assert backends["storage"] == "local"
+        assert backends["lock"] == "noop"
+
+    def test_an_unset_uri_is_attributed_to_the_profile(self, report):
+        """An operator needs to see which values they chose and which they inherited."""
+        sources = {row.name: row.source for row in report.rows}
+
+        assert sources["state"] == "profile default"
+
+    def test_an_explicit_uri_is_attributed_to_its_setting(self):
+        report = build_capability_report(JasilSettings(state_uri="memory://"))
+
+        sources = {row.name: row.source for row in report.rows}
+
+        assert sources["state"] == "state_uri"
+
     def test_rendering_includes_the_topology_header(self, report):
         rendered = report.render()
 
         assert "Deployment profile: local" in rendered
-        assert "WEB_WORKERS=1" in rendered
+        assert "web_workers=1" in rendered
         assert "requires_shared_state=False" in rendered
 
     def test_rendering_lists_every_row(self, report):
@@ -133,3 +148,79 @@ class TestCapabilityReport:
         for row in report.rows:
             assert row.backend in rendered
             assert row.source in rendered
+
+
+class TestDeploymentConsistency:
+    """The combination has to be checked, not just each URI on its own.
+
+    Each of these wirings is individually legal and starts fine; what makes it
+    fatal is the topology it is paired with, and the symptom (state that exists on
+    one replica but not another, a scheduled job running four times) never points
+    back at the setting that caused it.
+    """
+
+    def test_the_default_local_profile_is_consistent(self):
+        assert check_deployment_consistency(JasilSettings()) == []
+
+    def test_multiple_workers_on_memory_state_are_refused(self):
+        issues = check_deployment_consistency(JasilSettings(web_workers=4))
+
+        assert any("state_uri resolves to process-local memory" in issue for issue in issues)
+
+    def test_multiple_workers_on_an_in_process_bus_are_refused(self):
+        issues = check_deployment_consistency(JasilSettings(web_workers=4))
+
+        assert any("events_uri resolves to process-local memory" in issue for issue in issues)
+
+    def test_multiple_workers_on_a_no_op_lock_are_refused(self):
+        """Otherwise every worker runs every scheduled job."""
+        issues = check_deployment_consistency(JasilSettings(web_workers=4))
+
+        assert any("lock_uri resolves to an in-process no-op lock" in issue for issue in issues)
+
+    def test_multiple_workers_on_local_disk_are_allowed(self):
+        """Workers share one host's disk; only separate nodes do not."""
+        issues = check_deployment_consistency(JasilSettings(web_workers=4))
+
+        assert not any("storage_uri" in issue for issue in issues)
+
+    def test_distributed_on_local_disk_is_refused(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                profile=DeploymentProfile.DISTRIBUTED,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                storage_uri="local://",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert any("storage_uri resolves to the local filesystem" in issue for issue in issues)
+
+    def test_a_fully_wired_distributed_deployment_is_consistent(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                profile=DeploymentProfile.DISTRIBUTED,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                storage_uri="s3://bucket",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert issues == []
+
+    def test_the_custom_profile_opts_out(self):
+        """``custom`` promises no defaults, so nothing here can contradict one."""
+        issues = check_deployment_consistency(
+            JasilSettings(
+                profile=DeploymentProfile.CUSTOM,
+                web_workers=8,
+                state_uri="memory://",
+                events_uri="memory://",
+                storage_uri="local://",
+                lock_uri="noop://",
+            )
+        )
+
+        assert issues == []

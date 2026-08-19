@@ -169,7 +169,7 @@ jobs:
       # Run from outside the repository root so the local ``jasil/`` package
       # directory cannot shadow the installed distribution: otherwise this would
       # validate the working tree rather than what a user actually gets.
-      - name: Import jasil and assemble the router without optional extras
+      - name: Import jasil and assemble the platform without optional extras
         run: |
           set -euo pipefail
           cp -r .venv "$RUNNER_TEMP/base-venv"

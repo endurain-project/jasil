@@ -36,6 +36,8 @@ fields.
 | Field | Default | Meaning |
 |---|---|---|
 | `profile` | `DeploymentProfile.LOCAL` | The deployment shape. Supplies capability-URI defaults. |
+| `web_workers` | `1` | How many web-server worker processes you run. Drives the [consistency checks](deployment-profiles.md#consistency-checks) as much as the profile does. |
+| `enforce_deployment_consistency` | `True` | Refuse to build a platform whose wiring contradicts its topology. `False` logs the issues as warnings instead. |
 | `data_dir` | `"data"` | Root directory for the local storage backend. |
 | `state_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
 | `storage_uri` | `None` | `local://` or `s3://`. |

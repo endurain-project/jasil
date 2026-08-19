@@ -32,6 +32,7 @@ layer only knows the generic envelope.
 
 import logging
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import Any
 
 import jasil.correlation as correlation
@@ -39,6 +40,7 @@ import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
+from jasil.providers import EventRecorder
 from jasil.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,41 @@ def _mint(
     if metadata:
         merged.update(metadata)
     return new_event(event_type, payload, source=source, metadata=merged, schema_version=schema_version)
+
+
+def _stage_in_outbox(
+    recorder: EventRecorder | None,
+    event: Event,
+    *,
+    db: Any,
+    now: datetime,
+    commit: bool,
+) -> None:
+    """Write one event to the outbox, recording it ``queued`` in the event_log.
+
+    The event_log row is terminal for a durable event: the bus records its own
+    lifecycle, the outbox path does not go through the bus, and per-subscriber
+    execution is tracked in ``processing_jobs`` instead. Without it the
+    observability dashboard would go dark the moment durable jobs were enabled.
+    """
+    if recorder is not None:
+        recorder.record_queued(event)
+    jobs_outbox.add_to_outbox(event, now=now, db=db, commit=commit)
+
+
+def _publish_on_bus(
+    event_type: str,
+    payload: dict,
+    source: str,
+    metadata: dict | None,
+    schema_version: int,
+) -> None:
+    """Dispatch one event on the bus, logging and swallowing any failure."""
+    try:
+        platform = platform_runtime.get_active_platform()
+        platform.events.publish(_mint(event_type, payload, source, metadata, schema_version))
+    except Exception as err:
+        logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
 
 
 def publish(
@@ -91,13 +128,7 @@ def publish(
         platform = platform_runtime.get_active_platform()
         event = _mint(event_type, payload, source, metadata, schema_version)
         if db is not None and _durable_delivery_enabled(event_type):
-            # Record a terminal 'queued' row so durable events stay visible in the
-            # event_log dashboard without counting as perpetually pending (the bus
-            # records its own lifecycle; the outbox path does not go through the
-            # bus). Per-subscriber execution is tracked in the Jobs dashboard.
-            if platform.recorder is not None:
-                platform.recorder.record_queued(event)
-            jobs_outbox.add_to_outbox(event, now=platform.clock.now(), db=db)
+            _stage_in_outbox(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
         else:
             platform.events.publish(event)
     except Exception as err:
@@ -142,32 +173,15 @@ def publish_committing(
     Returns:
         None.
     """
-    if db is not None and _durable_delivery_enabled(event_type):
-        # Atomic path: stage the outbox row inside the caller's transaction, then
-        # commit the domain change and the outbox row together. A failure here
-        # leaves the transaction uncommitted so the caller rolls back atomically
-        # (no partial domain change, no orphaned event).
-        try:
-            platform = platform_runtime.get_active_platform()
-            event = _mint(event_type, payload, source, metadata, schema_version)
-            if platform.recorder is not None:
-                platform.recorder.record_queued(event)
-            jobs_outbox.add_to_outbox(event, now=platform.clock.now(), db=db, commit=False)
-        except Exception as err:
-            logger.error(f"Failed to stage event {event_type} in the domain transaction: {err}", exc_info=err)
-            raise
-        commit()
-    else:
-        # Best-effort path: the domain row is the source of truth, so commit it
-        # first, then dispatch on the bus post-commit (swallowing failures — the
-        # subscriber's reconciliation net recovers anything dropped).
-        commit()
-        try:
-            platform = platform_runtime.get_active_platform()
-            event = _mint(event_type, payload, source, metadata, schema_version)
-            platform.events.publish(event)
-        except Exception as err:
-            logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
+    publish_many_committing(
+        event_type,
+        [payload],
+        source=source,
+        metadata_for=lambda _payload: metadata,
+        db=db,
+        commit=commit,
+        schema_version=schema_version,
+    )
 
 
 def _durable_delivery_enabled(event_type: str) -> bool:
@@ -185,7 +199,7 @@ def publish_many_committing(
     payloads: Sequence[dict],
     *,
     source: str,
-    metadata_for: Callable[[dict], dict] | None = None,
+    metadata_for: Callable[[dict], dict | None] | None = None,
     db: Any,
     commit: Callable[[], None],
     schema_version: int = INITIAL_SCHEMA_VERSION,
@@ -210,17 +224,17 @@ def publish_many_committing(
     Returns:
         None.
     """
+    metadata_of = metadata_for if metadata_for is not None else (lambda _payload: None)
     if db is not None and _durable_delivery_enabled(event_type):
+        # Atomic path: stage every outbox row inside the caller's transaction, so
+        # a failure here leaves it uncommitted and the caller rolls back as a
+        # whole — no partial domain change, no orphaned event.
         try:
             platform = platform_runtime.get_active_platform()
             now = platform.clock.now()
             for payload in payloads:
-                event = _mint(
-                    event_type, payload, source, metadata_for(payload) if metadata_for else None, schema_version
-                )
-                if platform.recorder is not None:
-                    platform.recorder.record_queued(event)
-                jobs_outbox.add_to_outbox(event, now=now, db=db, commit=False)
+                event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+                _stage_in_outbox(platform.recorder, event, db=db, now=now, commit=False)
         except Exception as err:
             logger.error(
                 f"Failed to stage {len(payloads)} {event_type} event(s) in the domain transaction: {err}", exc_info=err
@@ -229,14 +243,8 @@ def publish_many_committing(
         commit()
     else:
         # Best-effort path: the domain change is the source of truth, so commit it
-        # first, then dispatch each event on the bus (swallowing failures).
+        # first, then dispatch each event on the bus (swallowing failures — the
+        # subscriber's reconciliation net recovers anything dropped).
         commit()
         for payload in payloads:
-            try:
-                platform = platform_runtime.get_active_platform()
-                event = _mint(
-                    event_type, payload, source, metadata_for(payload) if metadata_for else None, schema_version
-                )
-                platform.events.publish(event)
-            except Exception as err:
-                logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
+            _publish_on_bus(event_type, payload, source, metadata_of(payload), schema_version)

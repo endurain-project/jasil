@@ -10,8 +10,8 @@ the rest of the platform substrate builds on:
 
 It also classifies a storage URI as memory- or Redis-backed so callers can
 check the effective wiring against the required shape. Keeping this logic free
-of infrastructure imports lets ``core.config`` consume it during ``Settings``
-construction without import cycles.
+of infrastructure imports is what lets :mod:`jasil.settings` and
+:mod:`jasil.capabilities` build on it without an import cycle.
 """
 
 from dataclasses import dataclass

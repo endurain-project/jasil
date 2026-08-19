@@ -1,6 +1,6 @@
 """PostgreSQL advisory-lock ``LockProvider`` backend.
 
-Only imported by the composition root when ``LOCK_URI`` selects
+Only imported by the composition root when ``lock_uri`` selects
 ``postgres-advisory://`` (the distributed-profile default), so single-process
 deployments never load it. ``try_acquire`` is non-blocking
 (``pg_try_advisory_lock``) and holds one dedicated connection open for the
