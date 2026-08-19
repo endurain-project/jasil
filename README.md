@@ -141,3 +141,7 @@ uv run lint-imports        # architectural import contracts
 ## Licence
 
 MIT — see [LICENSE.md](LICENSE.md).
+
+<div align="center">
+  <sub>Built with ❤️ from Portugal | Part of the <a href="https://github.com/endurain-project">Endurain</a> ecosystem</sub>
+</div>
