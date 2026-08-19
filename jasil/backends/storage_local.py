@@ -21,7 +21,11 @@ class LocalStorage:
         self._url_prefix = url_prefix.rstrip("/")
 
     def _ensure_safe_segment(self, value: str, label: str) -> None:
-        """Reject absolute or parent-traversal area/key values (no filesystem access)."""
+        """Reject empty, absolute, or parent-traversal area/key values (no filesystem access)."""
+        if not value:
+            # An empty segment collapses the path onto the base directory itself,
+            # so ``save("", "")`` would try to write over it.
+            raise ValueError(f"Storage {label} must not be empty")
         if value.startswith(("/", "\\")) or ".." in Path(value).parts:
             raise ValueError(f"Storage {label} escapes base directory: {value!r}")
 
@@ -57,7 +61,8 @@ class LocalStorage:
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
         self._ensure_safe_segment(area, "area")
-        self._ensure_safe_segment(prefix, "prefix")
+        if prefix:
+            self._ensure_safe_segment(prefix, "prefix")
         base = self._base.resolve()
         area_dir = (base / area).resolve()
         if not area_dir.is_relative_to(base) or not area_dir.is_dir():

@@ -110,6 +110,36 @@ with platform.lock.try_acquire("nightly-backfill") as acquired:
 Nothing above changes when you move to Redis and S3 — only the
 [configuration](configuration.md) does.
 
+On shutdown, `platform.close()` stops the event-bus consumer and closes the
+shared Redis clients. It never raises. The durable-job worker and your engine are
+yours to stop — the platform does not own either.
+
+## Testing against it
+
+JASIL installs several things process-wide, and a suite has to put every one of
+them back between cases. `jasil.testing` is that fixture, so you do not have to
+work out the list:
+
+```python
+import jasil.testing as jasil_testing
+
+
+@pytest.fixture(autouse=True)
+def jasil(tmp_path):
+    platform = jasil_testing.install_test_platform(tmp_path)
+    yield platform
+    jasil_testing.reset_all()
+```
+
+`install_test_platform` roots local storage inside `tmp_path`, installs a
+`FixedClock` so lease expiry, retry backoff and retention windows can be
+exercised without sleeping, and — the part that is easy to forget — *publishes*
+the platform, without which every `publish` raises.
+
+Map the models once for the whole session, though. `reset_all` deliberately
+leaves the declarative base alone: JASIL's model modules capture it at import
+time, so clearing it would strand every model already imported.
+
 ## Where to go next
 
 - [Configuration](configuration.md) — the settings object and every capability URI.

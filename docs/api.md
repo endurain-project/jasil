@@ -74,6 +74,10 @@ Generated from the source docstrings.
 
 ::: jasil.pruning
 
+## Test helpers
+
+::: jasil.testing
+
 ## Migrations
 
 ::: jasil.migrations

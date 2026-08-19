@@ -18,11 +18,14 @@ its own ``decode_responses=False`` client.
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from redis import Redis
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
 
@@ -157,12 +160,34 @@ def get_shared_client(
         return client
 
 
+def close_shared_clients() -> None:
+    """
+    Close every memoized client's connections, then discard them.
+
+    Called from :meth:`jasil.container.Platform.close` so a process that shuts a
+    platform down does not leave sockets open. A client that fails to close is
+    logged and dropped anyway: shutdown must not raise.
+
+    Returns:
+        None.
+    """
+    with _shared_clients_lock:
+        for (uri, _decode), client in _shared_clients.items():
+            try:
+                client.close()
+            except Exception as error:
+                scheme, _, _ = uri.partition("://")
+                logger.warning(f"Failed to close the shared {scheme or 'redis'} client: {error!r}")
+        _shared_clients.clear()
+
+
 def reset_shared_clients() -> None:
     """
-    Discard the memoized shared clients.
+    Discard the memoized shared clients *without* closing them.
 
-    Intended for tests that patch client creation; production code never needs
-    to evict the process-wide clients.
+    For tests that inject a fake client, where closing would be meaningless or
+    would break a fixture still holding it. Production shutdown wants
+    :func:`close_shared_clients`.
 
     Raises:
         None.

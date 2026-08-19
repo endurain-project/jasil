@@ -1,0 +1,58 @@
+name: CodeQL
+
+# Static security analysis, complementing the other gates: `ruff`'s bandit rules
+# catch single-line patterns, while CodeQL follows data across functions and
+# modules — the taint flows (an operator-supplied host reaching a request, a path
+# segment reaching the filesystem) that this library is specifically careful
+# about. The schedule matters as much as the push trigger: new queries ship
+# regularly and find things in code that has not changed.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  schedule:
+    # Weekly, offset from the dependency audit so the two do not contend.
+    - cron: '15 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Python
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to upload the results to the repository's security tab.
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Python needs no build step, so `autobuild` is deliberately skipped.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: python
+          # Beyond the default suite: adds the lower-precision queries, which is
+          # the right trade for a security-sensitive library reviewed by a human.
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: "/language:python"

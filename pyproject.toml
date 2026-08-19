@@ -7,7 +7,7 @@ license = {text = "MIT"}
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.12,<4.0"
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
@@ -391,3 +391,36 @@ forbidden_modules = [
     "jasil.runtime",
     "jasil.settings",
 ]
+
+# ``jasil.testing`` exists for a *host's* test suite. It reaches for the
+# composition root (and so for the backends), so a library module importing it
+# would drag all of that into a plain ``import jasil``.
+[[tool.importlinter.contracts]]
+name = "The test helpers are for hosts, not for the library"
+type = "forbidden"
+source_modules = [
+    "jasil._core",
+    "jasil.async_bridge",
+    "jasil.backends",
+    "jasil.capabilities",
+    "jasil.container",
+    "jasil.correlation",
+    "jasil.deps",
+    "jasil.event_log",
+    "jasil.event_versioning",
+    "jasil.events",
+    "jasil.jobs",
+    "jasil.migrations",
+    "jasil.node",
+    "jasil.orm",
+    "jasil.profile",
+    "jasil.providers",
+    "jasil.pruning",
+    "jasil.publisher",
+    "jasil.redis",
+    "jasil.retention",
+    "jasil.runtime",
+    "jasil.settings",
+    "jasil.subscribers",
+]
+forbidden_modules = ["jasil.testing"]

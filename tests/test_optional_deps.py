@@ -80,6 +80,23 @@ def test_the_composition_root_imports_without_any_extra():
     assert result.stdout.strip() == "", f"importing the container loaded: {result.stdout.strip()}"
 
 
+def test_the_test_helpers_import_without_any_extra():
+    """A host's suite installs JASIL the same way its production code does.
+
+    ``jasil.testing`` reaches the composition root, so it inherits that module's
+    exposure to every backend client.
+    """
+    result = _run(f"""
+        import sys
+        import jasil.testing
+        loaded = [name for name in {OPTIONAL_DISTRIBUTIONS!r} if name in sys.modules]
+        print(",".join(loaded))
+    """)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "", f"importing the test helpers loaded: {result.stdout.strip()}"
+
+
 def test_redis_module_does_not_import_redis_until_an_attribute_is_used():
     """``jasil.redis`` is the sole owner of the redis client and loads it lazily.
 

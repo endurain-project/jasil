@@ -25,6 +25,7 @@ import logging
 from dataclasses import dataclass
 
 import jasil.capabilities as capabilities
+import jasil.redis as platform_redis
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
@@ -79,6 +80,26 @@ class Platform:
     clock: ClockProvider
     geocoding: GeocodingProvider
     recorder: EventRecorder | None
+
+    def close(self) -> None:
+        """Release what the platform owns: the bus consumer and the Redis clients.
+
+        Call once on shutdown, after the host has stopped producing events. Only
+        the two capabilities that hold something beyond the process are affected —
+        the rest are pure or borrow the host's engine, which the host closes.
+
+        Two things it deliberately does *not* stop, because the platform does not
+        own them: the durable-job worker and its scheduled maintenance (see
+        ``jasil.jobs.service.stop_job_worker``), and the database engine.
+
+        Safe to call more than once, and never raises: a failure to shut a
+        connection down must not mask whatever prompted the shutdown.
+        """
+        try:
+            self.events.stop()
+        except Exception as error:
+            logger.warning(f"Failed to stop the event bus during shutdown: {error!r}")
+        platform_redis.close_shared_clients()
 
 
 def build_platform(settings: JasilSettings | None = None) -> Platform:

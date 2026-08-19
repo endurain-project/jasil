@@ -52,3 +52,14 @@ def get_state() -> "StateProvider":
         RuntimeError: When no platform has been published yet.
     """
     return get_active_platform().state
+
+
+def reset() -> None:
+    """Unpublish the active platform.
+
+    For tests that build a platform per case; production publishes once at
+    startup and never resets. This does not close the platform — call
+    :meth:`jasil.container.Platform.close` first if it owns live connections.
+    """
+    global _active_platform
+    _active_platform = None

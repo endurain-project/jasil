@@ -207,6 +207,20 @@ class TestLocalStorage:
         with pytest.raises(ValueError, match="escapes base directory"):
             storage.list_keys("../etc")
 
+    @pytest.mark.parametrize("field", ["area", "key"])
+    def test_an_empty_segment_is_refused(self, storage, field):
+        """An empty segment collapses the path onto the storage root itself."""
+        args = {"area": "thumbnails", "key": "1.webp", field: ""}
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            storage.save(args["area"], args["key"], b"x")
+
+    def test_an_empty_key_prefix_still_lists_the_area(self, storage):
+        """The prefix is optional, unlike the area and the key."""
+        storage.save("thumbnails", "1.webp", b"x")
+
+        assert storage.list_keys("thumbnails", "") == ["1.webp"]
+
 
 class TestRuntimeHandle:
     def test_reading_the_platform_before_startup_explains_the_fix(self, monkeypatch):

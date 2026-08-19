@@ -162,14 +162,26 @@ def host_rejection_reason(
     silently redirect the request elsewhere — ``"evil.example.com/x"`` becomes
     ``"https://evil.example.com/x/reverse"``, whose hostname check passes.
 
-    This is a *time-of-check* guard. Callers wanting full TOCTOU safety should
-    also pin the resolved public IP and dial it directly with the original Host
-    header.
+    **This is a time-of-check guard, and callers use it once.** The geocoding
+    backend validates its host while the composition root assembles the platform,
+    then dials the resulting URL for the life of the process — so a name that
+    resolves publicly at startup and privately afterwards is not caught. What is
+    caught is the case that matters for an operator-supplied setting: a host that
+    was already internal when it was configured. Refusing redirects (which the
+    geocoding backend does) closes the other easy pivot. Full TOCTOU safety would
+    mean pinning the resolved public IP and dialing it with the original Host
+    header on every request.
+
+    Resolution is also unbounded: :func:`socket.getaddrinfo` takes no timeout, so
+    an unresponsive resolver stalls whoever called this. At startup that shows up
+    as a slow boot rather than a hung request.
 
     Args:
         host: The configured host authority, or ``None``.
         allowed_hosts: Hostnames and CIDRs exempt from the address denylist, for
-            reaching a self-hosted service on a private network.
+            reaching a self-hosted service on a private network. An entry that is
+            a *hostname* exempts every address it resolves to — including a cloud
+            metadata endpoint — so prefer a CIDR where you can.
         purpose: Optional short tag identifying the outbound call, used only for
             audit logging.
 

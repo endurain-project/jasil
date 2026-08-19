@@ -118,6 +118,14 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - FastAPI dependency helpers behind the `fastapi` extra.
 - `jasil.async_bridge`, for synchronous code that must hand work to the main
   event loop.
+- `jasil.testing` — `FixedClock`, `install_test_platform`, and `reset_all`, so a
+  host's suite does not have to rediscover which process-wide slots JASIL
+  installs. `reset_all` deliberately leaves the ORM mapping in place; model
+  modules capture the declarative base at import time.
+- `Platform.close()` releases what the platform owns — the event-bus consumer
+  thread and the shared Redis clients — and never raises, so a shutdown failure
+  cannot mask whatever prompted the shutdown. The durable-job worker and the
+  host's engine are stopped separately, because the platform does not own them.
 
 **Packaging**
 

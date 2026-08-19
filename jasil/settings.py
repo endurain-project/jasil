@@ -122,7 +122,9 @@ class NetworkSettings:
     Attributes:
         ssrf_allowed_hosts: Hostnames and CIDRs exempt from the SSRF address
             denylist, so a self-hosted service on a private network stays
-            reachable. Every use is logged.
+            reachable. Every use is logged. Prefer a CIDR: a *hostname* entry
+            exempts every address that name resolves to, including a cloud
+            metadata endpoint.
     """
 
     ssrf_allowed_hosts: tuple[str, ...] = ()

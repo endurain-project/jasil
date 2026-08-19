@@ -102,21 +102,39 @@ jobs:
           cd "$RUNNER_TEMP"
           VIRTUAL_ENV="$smoke_venv" uv run --no-project python "$GITHUB_WORKSPACE/.github/scripts/smoke_import.py"
 
+      # An SBOM of what the *distribution* actually pulls in, taken from the
+      # clean venv the smoke test just installed the wheel into. Running it
+      # against the build environment instead would describe this workflow's own
+      # toolchain — ruff, mypy, pytest — which is not what a consumer inherits.
       - name: Generate SBOM (CycloneDX)
-        run: uvx cyclonedx-py environment --output-format json --outfile dist/jasil-sbom.cdx.json
+        run: |
+          set -euo pipefail
+          mkdir -p release-metadata
+          uvx cyclonedx-py environment "$RUNNER_TEMP/smoke" \
+            --output-format json --outfile release-metadata/jasil-sbom.cdx.json
 
       - name: Generate checksums
         run: |
           set -euo pipefail
-          cd dist
-          sha256sum ./* > SHA256SUMS
-          cat SHA256SUMS
+          sha256sum dist/* > release-metadata/SHA256SUMS
+          cat release-metadata/SHA256SUMS
 
+      # ``dist/`` holds the wheel and the sdist and nothing else: the publish job
+      # attests everything it downloads, so a stray checksum or SBOM file there
+      # would end up in the attestation.
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: jasil-dist
           path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: jasil-release-metadata
+          path: release-metadata/
           if-no-files-found: error
           retention-days: 90
 
