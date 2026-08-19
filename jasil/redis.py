@@ -58,7 +58,7 @@ def delete_matching_keys(
     Args:
         redis_client: Redis client used for deletion.
         key_pattern: Redis glob-style key pattern.
-        scan_count: Requested Redis SCAN batch size.
+        scan_count: Requested Redis SCAN batch size, and the size of each DELETE.
 
     Returns:
         Number of keys deleted.
@@ -66,18 +66,16 @@ def delete_matching_keys(
     Raises:
         RedisError: When Redis scan or delete fails.
     """
+    # The scan is drained before anything is deleted. SCAN's cursor is defined
+    # over the keyspace hash table, so deleting mid-scan can shrink that table
+    # and make the cursor skip buckets — leaving matching keys behind, silently.
+    # Callers use this to invalidate a whole prefix, where a partial delete means
+    # stale data survives.
+    keys_to_delete: list[str] = list(redis_client.scan_iter(match=key_pattern, count=scan_count))
+
     deleted_count = 0
-    keys_to_delete: list[str] = []
-
-    for redis_key in redis_client.scan_iter(match=key_pattern, count=scan_count):
-        keys_to_delete.append(redis_key)
-        if len(keys_to_delete) >= scan_count:
-            deleted_count += redis_client.delete(*keys_to_delete)
-            keys_to_delete.clear()
-
-    if keys_to_delete:
-        deleted_count += redis_client.delete(*keys_to_delete)
-
+    for start in range(0, len(keys_to_delete), scan_count):
+        deleted_count += redis_client.delete(*keys_to_delete[start : start + scan_count])
     return deleted_count
 
 

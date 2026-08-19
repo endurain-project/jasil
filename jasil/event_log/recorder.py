@@ -2,7 +2,7 @@
 
 Implements the :class:`~jasil.providers.EventRecorder` protocol. The
 composition root injects one instance into the event bus when
-``EVENT_LOG_ENABLED`` is set. Each write opens its own short-lived session and
+``event_log.enabled`` is set. Each write opens its own short-lived session and
 swallows/logs any storage error, so a database hiccup never breaks event
 processing — observability is best-effort by design.
 """

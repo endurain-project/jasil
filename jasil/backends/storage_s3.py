@@ -12,6 +12,8 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from jasil._core.storage_keys import check_segment
+
 # HeadObject error codes that mean "the object is not there" (as opposed to auth,
 # region, throttling, or 5xx failures, which must surface rather than masquerade
 # as a missing blob). "404" is what S3 returns for HeadObject; the aliases cover
@@ -62,6 +64,11 @@ class S3Storage:
         return cls(client, bucket, parsed.path)
 
     def _object_key(self, area: str, key: str) -> str:
+        # ``..`` is a literal in an S3 key rather than a traversal, so an unchecked
+        # segment is stored under a nonsense key instead of being refused. The
+        # local backend rejects it, and one contract has to hold on both.
+        check_segment(area, "area")
+        check_segment(key, "key")
         return "/".join(part for part in (self._prefix, area, key) if part)
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
@@ -92,9 +99,12 @@ class S3Storage:
         self._client.delete_object(Bucket=self._bucket, Key=self._object_key(area, key))
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
-        object_prefix = self._object_key(area, prefix)
+        check_segment(area, "area")
+        if prefix:
+            check_segment(prefix, "prefix")
+        object_prefix = "/".join(part for part in (self._prefix, area, prefix) if part)
         # Strip back to the area root so the returned values are plain keys.
-        strip_from = len(self._object_key(area, "").rstrip("/")) + 1
+        strip_from = len("/".join(part for part in (self._prefix, area) if part)) + 1
         keys = []
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self._bucket, Prefix=object_prefix):

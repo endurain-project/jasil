@@ -228,6 +228,95 @@ class TestInProcessBus:
         bus.stop()
 
 
+class TestInProcessBusRecording:
+    """The ``local`` profile's observability path: dispatch is inline, so the
+    trail goes published -> completed in one call and the intermediate
+    ``processing`` state is never observed."""
+
+    class RecordingRecorder:
+        def __init__(self) -> None:
+            self.published = []
+            self.tracked = []
+            self.failed = []
+
+        def record_published(self, event):
+            self.published.append(event)
+
+        def record_queued(self, event):  # pragma: no cover - the bus never queues
+            raise AssertionError("the bus must not record 'queued'")
+
+        def track(self, event, *, worker_id, handler_name, record_processing=True):
+            recorder = self
+
+            class _Tracked:
+                def __enter__(self):
+                    recorder.tracked.append((worker_id, handler_name, record_processing))
+
+                def __exit__(self, exc_type, exc, traceback):
+                    if exc is not None:
+                        recorder.failed.append(event.event_id)
+                    return False
+
+            return _Tracked()
+
+    @pytest.fixture
+    def recorder(self):
+        return self.RecordingRecorder()
+
+    @pytest.fixture
+    def bus(self, recorder):
+        return InProcessEventBus(recorder=recorder)
+
+    def test_the_publication_is_recorded(self, bus, recorder):
+        event = new_event("activity.created", {}, source="test")
+
+        bus.publish(event)
+
+        assert recorder.published == [event]
+
+    def test_the_processing_row_is_skipped(self, bus, recorder):
+        """Inline dispatch never observes it, so writing it is a wasted round-trip."""
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert recorder.tracked[0][2] is False
+
+    def test_the_handler_names_are_recorded(self, bus, recorder):
+        def render_invoice(_event):
+            pass
+
+        def send_receipt(_event):
+            pass
+
+        bus.subscribe("activity.created", render_invoice)
+        bus.subscribe("activity.created", send_receipt)
+
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert recorder.tracked[0][1] == "render_invoice,send_receipt"
+
+    def test_no_subscribers_means_no_handler_name(self, bus, recorder):
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert recorder.tracked[0][1] is None
+
+    def test_the_subscribers_still_run(self, bus):
+        seen = []
+        bus.subscribe("activity.created", seen.append)
+
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert len(seen) == 1
+
+    def test_a_failure_is_recorded_and_still_propagates(self, bus, recorder):
+        event = new_event("activity.created", {}, source="test")
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            bus.publish(event)
+
+        assert recorder.failed == [event.event_id]
+
+
 class TestBestEffortSubscriber:
     def test_it_passes_the_event_through(self):
         seen = []

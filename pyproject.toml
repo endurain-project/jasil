@@ -198,10 +198,10 @@ omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]
 # Ratcheted to just under the current figure: high enough that a real regression
-# fails the build, low enough not to trip on incidental churn. Raise it as the
-# suite grows — target 90, matching safeuploads. Never lower it to make a build
-# pass.
-fail_under = 88
+# fails the build, low enough not to trip on incidental churn. Every module is
+# above 80% except the Alembic ``env.py``, which Alembic executes rather than
+# imports. Raise it as the suite grows; never lower it to make a build pass.
+fail_under = 97
 exclude_lines = [
     "pragma: no cover",
     "def __repr__",

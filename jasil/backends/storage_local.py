@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from jasil._core.storage_keys import check_segment
+
 
 class LocalStorage:
     """``StorageProvider`` storing blobs as files under a per-area subdirectory.
@@ -20,19 +22,10 @@ class LocalStorage:
         self._base = Path(base_dir)
         self._url_prefix = url_prefix.rstrip("/")
 
-    def _ensure_safe_segment(self, value: str, label: str) -> None:
-        """Reject empty, absolute, or parent-traversal area/key values (no filesystem access)."""
-        if not value:
-            # An empty segment collapses the path onto the base directory itself,
-            # so ``save("", "")`` would try to write over it.
-            raise ValueError(f"Storage {label} must not be empty")
-        if value.startswith(("/", "\\")) or ".." in Path(value).parts:
-            raise ValueError(f"Storage {label} escapes base directory: {value!r}")
-
     def _resolve(self, area: str, key: str) -> Path:
         """Resolve ``(area, key)`` to an absolute path, rejecting traversal outside base."""
-        self._ensure_safe_segment(area, "area")
-        self._ensure_safe_segment(key, "key")
+        check_segment(area, "area")
+        check_segment(key, "key")
         base = self._base.resolve()
         candidate = (base / area / key).resolve()
         if not candidate.is_relative_to(base):
@@ -60,9 +53,9 @@ class LocalStorage:
             path.unlink()
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
-        self._ensure_safe_segment(area, "area")
+        check_segment(area, "area")
         if prefix:
-            self._ensure_safe_segment(prefix, "prefix")
+            check_segment(prefix, "prefix")
         base = self._base.resolve()
         area_dir = (base / area).resolve()
         if not area_dir.is_relative_to(base) or not area_dir.is_dir():
@@ -78,6 +71,6 @@ class LocalStorage:
         return sorted(keys)
 
     def url(self, area: str, key: str, expires_in: int = 3600) -> str:
-        self._ensure_safe_segment(area, "area")
-        self._ensure_safe_segment(key, "key")
+        check_segment(area, "area")
+        check_segment(key, "key")
         return f"{self._url_prefix}/{area}/{key}"

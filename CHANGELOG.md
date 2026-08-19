@@ -31,8 +31,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   backends are held to one shared conformance test suite for exactly that reason.
 - `StorageProvider` — opaque blob storage addressed by `(area, key)`, backed by
   the local filesystem (`local://`) or S3-compatible object storage (`s3://`).
-  Every area and key is validated against path traversal before touching the
-  filesystem.
+  Both backends refuse the same addresses — empty, absolute, or containing a
+  `..` component — before touching a disk or a client, so the contract a caller
+  sees does not change with the deployment. Held to one shared conformance suite
+  for that reason.
 - `EventBusProvider` — synchronous in-process dispatch (`memory://`) or Redis
   Streams with a consumer group (`redis://`), giving competing-consumer
   semantics across replicas.

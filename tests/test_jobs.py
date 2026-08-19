@@ -452,3 +452,101 @@ class TestOutboxRelay:
         db.rollback()
 
         assert db.query(EventOutbox).count() == 0
+
+
+class TestJobsSummary:
+    """The durable-jobs dashboard — how an operator sees the queue.
+
+    ``get_jobs_summary`` windows on the wall clock rather than an injected one,
+    so these rows are enqueued at the real "now" instead of at ``T0``.
+    """
+
+    @pytest.fixture
+    def now(self):
+        """A recent instant with no sub-second part.
+
+        MySQL's default ``DATETIME`` has no fractional-seconds precision and
+        *rounds* on write, so a timestamp carrying microseconds can come back a
+        whole second in the future — and then ``available_at <= now`` never
+        matches and nothing is ever claimable.
+        """
+        return datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=1)
+
+    def test_an_empty_queue_summarises_to_nothing(self, db):
+        summary = jobs_crud.get_jobs_summary(db)
+
+        assert summary.total_jobs == 0
+        assert summary.by_subscriber == []
+        assert summary.recent_dead_letter == []
+        assert summary.oldest_pending_seconds is None
+
+    def test_the_window_is_reported_back(self, db):
+        assert jobs_crud.get_jobs_summary(db, hours=6).window_hours == 6
+
+    def test_jobs_are_counted_by_status(self, db, event, now):
+        _enqueue(event, db, subscriber="a", now=now)
+        _enqueue(event, db, subscriber="b", now=now)
+        jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)
+
+        summary = jobs_crud.get_jobs_summary(db)
+
+        assert summary.total_jobs == 2
+        assert summary.claimed == 1
+        assert summary.pending == 1
+
+    def test_each_subscriber_gets_its_own_row(self, db, event, now):
+        """A backlog is almost always one subscriber's, not the whole queue's."""
+        _enqueue(event, db, subscriber="thumbnails.generate", now=now)
+        _enqueue(event, db, subscriber="invoice.render", now=now)
+
+        summary = jobs_crud.get_jobs_summary(db)
+
+        assert [row.subscriber_id for row in summary.by_subscriber] == ["invoice.render", "thumbnails.generate"]
+        assert all(row.event_type == "activity.created" for row in summary.by_subscriber)
+
+    def test_a_completed_job_is_counted_as_such(self, db, event, now):
+        job = _enqueue(event, db, now=now)
+        jobs_crud.mark_job_completed(job.id, now=now, db=db)
+
+        summary = jobs_crud.get_jobs_summary(db)
+
+        assert summary.completed == 1
+        assert summary.by_subscriber[0].completed == 1
+
+    def test_jobs_outside_the_window_are_excluded(self, db, event, now):
+        _enqueue(event, db, now=now - timedelta(days=2))
+
+        assert jobs_crud.get_jobs_summary(db, hours=1).total_jobs == 0
+
+    def test_the_oldest_pending_age_is_reported(self, db, event, now):
+        """The number that says whether the queue is keeping up."""
+        _enqueue(event, db, now=now - timedelta(minutes=10))
+
+        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds > 500
+
+    def test_a_finished_queue_has_no_pending_age(self, db, event, now):
+        job = _enqueue(event, db, now=now)
+        jobs_crud.mark_job_completed(job.id, now=now, db=db)
+
+        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds is None
+
+    def test_dead_letters_are_listed_for_inspection(self, db, event, now):
+        job = _enqueue(event, db, max_attempts=1, now=now)
+        jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)
+        jobs_crud.mark_job_failed(job.id, "upstream refused", base_seconds=1, max_seconds=1, now=now, db=db)
+
+        summary = jobs_crud.get_jobs_summary(db)
+
+        assert summary.dead_letter == 1
+        assert [entry.id for entry in summary.recent_dead_letter] == [job.id]
+        assert summary.recent_dead_letter[0].last_error == "upstream refused"
+
+    def test_the_dead_letter_list_is_capped(self, db, now):
+        for index in range(5):
+            job = _enqueue(new_event("activity.created", {"i": index}, source="test"), db, max_attempts=1, now=now)
+            jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=now, db=db)
+            jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=1, now=now, db=db)
+
+        summary = jobs_crud.get_jobs_summary(db, dead_letter_limit=2)
+
+        assert len(summary.recent_dead_letter) == 2

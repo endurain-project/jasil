@@ -30,16 +30,18 @@ logger = logging.getLogger(__name__)
 
 # Single-runner lock name: the deletes are idempotent, but the lock keeps the
 # work from being duplicated across replicas.
-_PRUNE_LOCK_NAME = "platform_retention_prune"
+_PRUNE_LOCK_NAME = "jasil_retention_prune"
 
 
 def prune_expired_records() -> None:
     """Prune substrate bookkeeping rows older than their retention windows.
 
-    Scheduled daily (and once at startup). Each window is applied independently:
-    ``EVENT_LOG_RETENTION_DAYS`` gates the event_log trail and
-    ``JOBS_RETENTION_DAYS`` gates the durable-job tables. No-ops when both are
-    disabled (``<= 0``) or when another replica already holds the prune lock.
+    JASIL does not schedule this — the host calls it, typically daily and once at
+    startup. Each window is applied independently:
+    ``JasilSettings.event_log.retention_days`` gates the event_log trail and
+    ``JasilSettings.jobs.retention_days`` gates the durable-job tables. No-ops
+    when both are disabled (``<= 0``) or when another replica already holds the
+    prune lock.
 
     Returns:
         None.
