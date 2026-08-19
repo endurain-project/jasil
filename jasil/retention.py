@@ -20,11 +20,17 @@ replicas via the platform ``LockProvider`` and is inert when both windows are
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil.settings import get_settings
+
+# Only for the annotation: apscheduler is the optional ``jobs`` extra, and a
+# deployment that prunes without durable jobs must still be able to import this.
+if TYPE_CHECKING:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +38,20 @@ logger = logging.getLogger(__name__)
 # work from being duplicated across replicas.
 _PRUNE_LOCK_NAME = "jasil_retention_prune"
 
+# How often the scheduled prune runs, and the id it is registered under.
+_PRUNE_INTERVAL_HOURS = 24
+_PRUNE_JOB_ID = "jasil_retention_prune"
+
 
 def prune_expired_records() -> None:
     """Prune substrate bookkeeping rows older than their retention windows.
 
-    JASIL does not schedule this — the host calls it, typically daily and once at
-    startup. Each window is applied independently:
-    ``JasilSettings.event_log.retention_days`` gates the event_log trail and
-    ``JasilSettings.jobs.retention_days`` gates the durable-job tables. No-ops
-    when both are disabled (``<= 0``) or when another replica already holds the
-    prune lock.
+    Call it yourself, or register it with
+    :func:`schedule_retention_maintenance`. Each window is applied
+    independently: ``JasilSettings.event_log.retention_days`` gates the event_log
+    trail and ``JasilSettings.jobs.retention_days`` gates the durable-job tables.
+    No-ops when both are disabled (``<= 0``) or when another replica already
+    holds the prune lock.
 
     Returns:
         None.
@@ -101,3 +111,35 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
         )
     else:
         logger.debug("Retention prune: nothing to delete")
+
+
+def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_startup: bool = True) -> None:
+    """
+    Register the recurring retention prune on the host's scheduler.
+
+    The counterpart of :func:`jasil.jobs.service.schedule_job_maintenance`, kept
+    separate because retention also prunes the event_log — so it applies to a
+    deployment that never enabled durable jobs.
+
+    Register it on every replica. The prune takes the platform's coordination
+    lock, so only one of them does the work per pass.
+
+    Args:
+        scheduler: The application scheduler to register the job on.
+        run_at_startup: Run one pass as soon as the scheduler starts. On by
+            default because a daily interval otherwise means a process that is
+            redeployed daily never prunes at all.
+
+    Returns:
+        None.
+    """
+    starts_now = {"next_run_time": datetime.now(UTC)} if run_at_startup else {}
+    scheduler.add_job(
+        prune_expired_records,
+        "interval",
+        hours=_PRUNE_INTERVAL_HOURS,
+        id=_PRUNE_JOB_ID,
+        replace_existing=True,
+        **starts_now,
+    )
+    logger.info("Scheduled JASIL retention pruning")

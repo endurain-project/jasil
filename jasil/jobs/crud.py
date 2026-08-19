@@ -24,6 +24,7 @@ import jasil.jobs.schema as jobs_schema
 import jasil.pruning as jasil_pruning
 from jasil._core.dialects import supports_skip_locked
 from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
@@ -87,10 +88,7 @@ def enqueue_job(
         "updated_at": now,
     }
     db.execute(_insert_ignoring_duplicate(values, db))
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+    commit_or_flush(db, commit)
     # Returns the row only when this call inserted it: a skipped conflict leaves
     # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
     return db.get(ProcessingJob, job_id)

@@ -105,10 +105,20 @@ jasil_settings.configure(
 ```
 
 ```python
-from jasil.retention import prune_expired_records
+import jasil.retention as jasil_retention
 
-prune_expired_records()  # schedule daily
+jasil_retention.schedule_retention_maintenance(scheduler)
 ```
+
+That registers a daily prune on your APScheduler instance and runs one pass as
+the scheduler starts — without the startup pass, a daily interval means a process
+that is redeployed daily never prunes at all. Pass `run_at_startup=False` to skip
+it, or call `jasil_retention.prune_expired_records()` yourself if you schedule
+work some other way.
+
+Register it on **every** replica, like the durable-job maintenance. The two are
+separate calls because retention also prunes the `event_log`, so it applies to a
+deployment that never enabled durable jobs.
 
 The two windows are independent, and `<= 0` disables either.
 

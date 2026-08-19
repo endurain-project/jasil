@@ -10,6 +10,7 @@ on:
       - tests/**
       - pyproject.toml
       - uv.lock
+      - .github/scripts/check_module_coverage.py
       - .github/workflows/test-jasil.yml
   pull_request:
     branches:
@@ -50,10 +51,8 @@ jobs:
       - name: Run tests
         run: uv run --no-sync pytest
 
-      # Re-run the suite against the RedisStateStore adapter (backed by an
-      # in-process fakeredis) so the distributed state-store backend gets the
-      # same coverage as the default in-memory store.
-      - name: Run tests (Redis state store)
-        env:
-          jasil_TEST_STATE_STORE: redis
-        run: uv run --no-sync pytest
+      # ``fail_under`` is an average, and an average hides its worst case: this
+      # package once reported 90% overall while the Redis event bus sat at 48%.
+      # Those are exactly the modules that only run in production.
+      - name: Check per-module coverage
+        run: uv run --no-sync python .github/scripts/check_module_coverage.py

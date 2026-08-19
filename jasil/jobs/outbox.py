@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 import jasil.pruning as jasil_pruning
 from jasil._core.dialects import supports_skip_locked
+from jasil._core.sessions import commit_or_flush
 from jasil.events import Event
 from jasil.jobs.models import EventOutbox
 
@@ -58,10 +59,7 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
             created_at=now,
         )
     )
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+    commit_or_flush(db, commit)
     return outbox_id
 
 
@@ -106,10 +104,7 @@ def mark_relayed(outbox_id: str, *, now: datetime, db: Session, commit: bool = T
         None.
     """
     db.execute(update(EventOutbox).where(EventOutbox.id == outbox_id).values(relayed_at=now))
-    if commit:
-        db.commit()
-    else:
-        db.flush()
+    commit_or_flush(db, commit)
 
 
 def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = jasil_pruning.PRUNE_BATCH_SIZE) -> int:

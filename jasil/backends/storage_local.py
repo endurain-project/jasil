@@ -61,13 +61,18 @@ class LocalStorage:
         if not area_dir.is_relative_to(base) or not area_dir.is_dir():
             return []
         keys = []
-        for candidate in area_dir.iterdir():
+        # Recursive, because ``save`` accepts a nested key and creates the
+        # directories for it. Listing only the top level would hide those blobs
+        # here while the S3 backend, whose listing is a flat prefix scan, returned
+        # them. ``rglob`` does not descend into symlinked directories.
+        for candidate in area_dir.rglob("*"):
             # Never follow a symlink out of the area directory.
             resolved = candidate.resolve()
             if not resolved.is_relative_to(area_dir) or not resolved.is_file():
                 continue
-            if candidate.name.startswith(prefix):
-                keys.append(candidate.name)
+            key = candidate.relative_to(area_dir).as_posix()
+            if key.startswith(prefix):
+                keys.append(key)
         return sorted(keys)
 
     def url(self, area: str, key: str, expires_in: int = 3600) -> str:

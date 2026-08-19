@@ -33,8 +33,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   the local filesystem (`local://`) or S3-compatible object storage (`s3://`).
   Both backends refuse the same addresses — empty, absolute, or containing a
   `..` component — before touching a disk or a client, so the contract a caller
-  sees does not change with the deployment. Held to one shared conformance suite
-  for that reason.
+  sees does not change with the deployment. `list_keys` is recursive on both, so
+  a nested key is listed wherever it is stored. Held to one shared conformance
+  suite for that reason.
 - `EventBusProvider` — synchronous in-process dispatch (`memory://`) or Redis
   Streams with a consumer group (`redis://`), giving competing-consumer
   semantics across replicas.
@@ -103,7 +104,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - An `event_log` table recording each event's lifecycle, written by the bus and
   the publish facade, with dashboard aggregates.
 - Retention pruning in bounded batches, on independently configurable windows.
-  In-flight rows and dead-letters are never pruned.
+  In-flight rows and dead-letters are never pruned. Register it with
+  `jasil.retention.schedule_retention_maintenance(scheduler)`, the counterpart of
+  `jasil.jobs.service.schedule_job_maintenance` — separate because retention also
+  covers the `event_log`, so it applies without durable jobs.
 
 **Host integration**
 

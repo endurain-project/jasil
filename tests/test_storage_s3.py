@@ -190,6 +190,16 @@ class TestListKeys:
 
         assert storage.list_keys(AREA) == []
 
+    def test_a_nested_key_is_listed_by_its_full_path(self, storage, stub):
+        """A flat prefix scan sees every depth, and the local backend must match."""
+        stub.add_response(
+            "list_objects_v2",
+            {"Contents": [{"Key": f"{PREFIX}/{AREA}/2026/01/a.webp"}]},
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}"},
+        )
+
+        assert storage.list_keys(AREA) == ["2026/01/a.webp"]
+
 
 class TestUrl:
     def test_it_presigns_the_composed_key(self, storage):

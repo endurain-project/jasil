@@ -8,6 +8,7 @@ import contextlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import jasil.jobs.outbox as jobs_outbox
 import jasil.retention as retention
@@ -132,6 +133,54 @@ class TestRetention:
         assert "1 event_log" in caplog.text
 
 
+class TestScheduleRetentionMaintenance:
+    """Retention is scheduled separately from durable jobs, because it also
+    prunes the event_log — a deployment that never enabled jobs still needs it."""
+
+    @pytest.fixture
+    async def scheduler(self):
+        """A started-but-paused scheduler.
+
+        It has to be started for jobs to reach the jobstore — a pending scheduler
+        just queues ``add_job`` calls, where ``replace_existing`` has no meaning.
+        Async, because ``AsyncIOScheduler.start`` binds the running loop, and
+        paused so nothing fires while the test inspects it.
+        """
+        scheduler = AsyncIOScheduler()
+        scheduler.start(paused=True)
+        yield scheduler
+        scheduler.shutdown(wait=False)
+
+    async def test_it_registers_the_prune(self, scheduler):
+        retention.schedule_retention_maintenance(scheduler)
+
+        assert [job.id for job in scheduler.get_jobs()] == [retention._PRUNE_JOB_ID]
+
+    async def test_the_registered_job_is_the_prune(self, scheduler):
+        retention.schedule_retention_maintenance(scheduler)
+
+        assert scheduler.get_jobs()[0].func is retention.prune_expired_records
+
+    async def test_registering_twice_replaces_rather_than_duplicates(self, scheduler):
+        """Otherwise a re-entrant startup would prune twice per interval."""
+        retention.schedule_retention_maintenance(scheduler)
+
+        retention.schedule_retention_maintenance(scheduler)
+
+        assert len(scheduler.get_jobs()) == 1
+
+    async def test_it_runs_once_at_startup_by_default(self, scheduler):
+        """A daily interval alone means a process redeployed daily never prunes."""
+        retention.schedule_retention_maintenance(scheduler)
+
+        assert scheduler.get_jobs()[0].next_run_time <= datetime.now(UTC)
+
+    async def test_the_startup_run_can_be_declined(self, scheduler):
+        retention.schedule_retention_maintenance(scheduler, run_at_startup=False)
+
+        assert scheduler.get_jobs()[0].next_run_time > datetime.now(UTC)
+
+
 class TestLocalStorage:
     @pytest.fixture
     def storage(self, tmp_path):
@@ -220,6 +269,41 @@ class TestLocalStorage:
         storage.save("thumbnails", "1.webp", b"x")
 
         assert storage.list_keys("thumbnails", "") == ["1.webp"]
+
+    def test_a_nested_key_round_trips(self, storage):
+        storage.save("thumbnails", "2026/01/1.webp", b"x")
+
+        assert storage.get("thumbnails", "2026/01/1.webp") == b"x"
+
+    def test_a_nested_key_is_listed_by_its_full_path(self, storage):
+        """``save`` creates the directories, so listing only the top level would
+        hide the blob here while S3, whose listing is a flat prefix scan,
+        returned it."""
+        storage.save("thumbnails", "2026/01/1.webp", b"x")
+        storage.save("thumbnails", "flat.webp", b"x")
+
+        assert storage.list_keys("thumbnails") == ["2026/01/1.webp", "flat.webp"]
+
+    def test_a_nested_key_can_be_filtered_by_its_leading_path(self, storage):
+        storage.save("thumbnails", "2026/01/1.webp", b"x")
+        storage.save("thumbnails", "2025/12/9.webp", b"x")
+
+        assert storage.list_keys("thumbnails", prefix="2026/") == ["2026/01/1.webp"]
+
+    def test_an_empty_directory_contributes_no_key(self, storage, tmp_path):
+        (tmp_path / "thumbnails" / "empty").mkdir(parents=True)
+
+        assert storage.list_keys("thumbnails") == []
+
+    def test_a_symlink_out_of_the_area_is_not_listed(self, storage, tmp_path):
+        """Following one would leak the existence of files outside the root."""
+        outside = tmp_path.parent / "secret.txt"
+        outside.write_text("secret")
+        area = tmp_path / "thumbnails"
+        area.mkdir(parents=True)
+        (area / "link.webp").symlink_to(outside)
+
+        assert storage.list_keys("thumbnails") == []
 
 
 class TestRuntimeHandle:

@@ -35,6 +35,7 @@ modules:
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
+| `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `stamp`, `head_revision`, `db_revision`, `verify_schema_current`. |
