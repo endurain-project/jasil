@@ -62,6 +62,8 @@ Generated from the source docstrings.
 
 ::: jasil.jobs.registry
 
+::: jasil.jobs.reconciliation
+
 ::: jasil.jobs.runner
 
 ::: jasil.jobs.service

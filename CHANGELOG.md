@@ -82,6 +82,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   counted at claim time, which is what bounds a crash loop.
 - On PostgreSQL, claiming and relaying use `FOR UPDATE SKIP LOCKED` so
   concurrent workers and relayers take disjoint batches with no coordinating lock.
+- `DurableSubscriberNet` declares the reconciliation net — a scheduled backfill,
+  or a documented exemption — that every subscriber writing durable derived state
+  owes, since delivery is at-least-once but not guaranteed. `assert_nets_complete`
+  holds the whole registry to it in one conformance test.
 
 **Observability**
 

@@ -31,6 +31,7 @@ modules:
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` and the process-wide `registry`. |
+| `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `stamp`, `head_revision`, `db_revision`, `verify_schema_current`. |
 
 ### Provider protocols

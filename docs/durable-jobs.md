@@ -100,6 +100,44 @@ overlaps with another replica's.
 This is a database constraint rather than relay logic on purpose: it holds under
 concurrency, restarts, and manual intervention.
 
+## Reconciliation nets
+
+Durable is not the same as guaranteed. A Redis-Streams consumer can drop a
+message, a provider can be briefly down, and some write paths persist rows
+without publishing anything at all. A subscriber that writes **durable** derived
+state therefore needs a scheduled backfill that re-derives whatever the create
+path missed.
+
+Declare one per subscriber:
+
+```python
+from jasil.jobs.reconciliation import DurableSubscriberNet
+
+NETS = [
+    DurableSubscriberNet("invoice.render", backfill=backfill_missing_invoices),
+    DurableSubscriberNet("cache.warm", backfill=None, exempt_reason="rebuilt on read"),
+]
+```
+
+Exactly one of `backfill` / `exempt_reason` must be set — neither is refused at
+construction. A subscriber with no net and no stated reason is one whose derived
+state goes missing silently, which is the failure the type exists to prevent.
+
+Hold every subscriber to it with one conformance test:
+
+```python
+import jasil.jobs.registry as jobs_registry
+from jasil.jobs.reconciliation import assert_nets_complete
+
+
+def test_every_durable_subscriber_declares_a_net():
+    assert_nets_complete(ALL_NETS, registry=jobs_registry.registry)
+```
+
+Import every subscriber module first, or the registry will be empty and the test
+will pass by vacuum. `undeclared_subscribers` is the same check as a plain query
+when you want to report the gap rather than fail on it.
+
 ## Running the workers
 
 ```python

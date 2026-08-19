@@ -62,6 +62,15 @@ class JobHandlerRegistry:
         """
         return tuple(self._by_event_type.get(event_type, ()))
 
+    def subscriber_ids(self) -> frozenset[str]:
+        """
+        Return every registered subscriber id, across all event types.
+
+        Returns:
+            The registered durable-subscriber ids.
+        """
+        return frozenset(self._handlers)
+
     def clear(self) -> None:
         """Remove every registration (used to reset state between tests)."""
         self._handlers.clear()

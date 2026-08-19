@@ -45,7 +45,8 @@ publish("order.created", {"order_id": 42}, source="api:create_order", db=db)
     Delivery failures are logged and swallowed. Your domain row is the source of
     truth, and a publish that breaks the request that produced it would be worse
     than a missed side effect. Every subscriber therefore needs a reconciliation
-    path — a backfill or sweeper that re-derives missed work.
+    path — a backfill or sweeper that re-derives missed work. See
+    [Reconciliation nets](durable-jobs.md#reconciliation-nets).
 
 The ambient correlation id is stamped automatically; see
 [Configuration](configuration.md#correlation-ids).
@@ -165,4 +166,4 @@ crash between them can drop an event.
 
 "Durable" means *retryable once written*, not *never lost*. Use
 `publish_committing` when you need the stronger guarantee, and give every
-subscriber a reconciliation path regardless.
+subscriber a [reconciliation net](durable-jobs.md#reconciliation-nets) regardless.
