@@ -10,18 +10,23 @@ serialized. All of this is inert unless durable jobs are enabled.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-import jasil.jobs.crud as jobs_crud
 import jasil.jobs.registry as jobs_registry
-import jasil.jobs.relay as jobs_relay
 import jasil.node as platform_node
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
-from jasil.jobs.runner import JobRunner
-from jasil.jobs.worker import BackgroundWorker
 from jasil.settings import get_settings
+
+# The runner, the worker, the relay and the job CRUD all reach a model bound to
+# the host's declarative base, so importing them at module scope would make
+# ``import jasil.jobs.service`` fail until ``jasil.orm.map_models`` had run. Each
+# function imports what it needs instead.
+if TYPE_CHECKING:
+    from jasil.jobs.runner import JobRunner
+    from jasil.jobs.worker import BackgroundWorker
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +39,7 @@ _MAX_RELAY_BATCHES = 100
 _RELAY_JOB_ID = "jasil_outbox_relay"
 _REAP_JOB_ID = "jasil_job_reaper"
 
-_worker: BackgroundWorker | None = None
+_worker: "BackgroundWorker | None" = None
 
 
 def _worker_id() -> str:
@@ -42,7 +47,7 @@ def _worker_id() -> str:
     return platform_node.process_identity()
 
 
-def build_runner() -> JobRunner:
+def build_runner() -> "JobRunner":
     """
     Build a :class:`JobRunner` from settings and the active platform.
 
@@ -50,6 +55,8 @@ def build_runner() -> JobRunner:
         A runner wired to the durable-subscriber registry, the platform clock,
         and the main-database session factory.
     """
+    from jasil.jobs.runner import JobRunner
+
     jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
     return JobRunner(
@@ -69,6 +76,8 @@ def start_job_worker() -> None:
     global _worker
     if _worker is not None:
         return
+    from jasil.jobs.worker import BackgroundWorker
+
     _worker = BackgroundWorker(build_runner(), poll_interval_seconds=get_settings().jobs.poll_interval_seconds)
     _worker.start()
     logger.info("Durable job worker started")
@@ -91,6 +100,8 @@ def relay_outbox_scheduled() -> None:
     LOCKED`` held across the fan-out, and the idempotent fan-out dedups any
     overlap where the dialect cannot lock, so no single-runner lock is needed.
     """
+    import jasil.jobs.relay as jobs_relay
+
     jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
     for _ in range(_MAX_RELAY_BATCHES):
@@ -112,6 +123,8 @@ def reap_expired_jobs_scheduled() -> None:
     LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
     disjoint rows and a loser never overwrites the winner's requeue.
     """
+    import jasil.jobs.crud as jobs_crud
+
     platform = platform_runtime.get_active_platform()
     with jasil_orm.get_sessionmaker()() as db:
         reclaimed = jobs_crud.reclaim_expired_leases(now=platform.clock.now(), db=db)

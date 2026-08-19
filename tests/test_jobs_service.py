@@ -15,6 +15,7 @@ import jasil.container as container
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
+import jasil.jobs.relay as jobs_relay
 import jasil.jobs.service as jobs_service
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
@@ -144,7 +145,7 @@ class TestScheduledRelay:
     def test_an_empty_outbox_costs_one_pass(self, platform, session_factory, monkeypatch):
         """It must stop at the first empty batch, not run the full bound."""
         passes = []
-        monkeypatch.setattr(jobs_service.jobs_relay, "relay_outbox_once", lambda **kwargs: passes.append(kwargs) or 0)
+        monkeypatch.setattr(jobs_relay, "relay_outbox_once", lambda **kwargs: passes.append(kwargs) or 0)
 
         jobs_service.relay_outbox_scheduled()
 
@@ -153,7 +154,7 @@ class TestScheduledRelay:
     def test_one_run_is_bounded(self, platform, session_factory, monkeypatch):
         """A pathological backlog must yield rather than monopolise the scheduler."""
         passes = []
-        monkeypatch.setattr(jobs_service.jobs_relay, "relay_outbox_once", lambda **kwargs: passes.append(kwargs) or 1)
+        monkeypatch.setattr(jobs_relay, "relay_outbox_once", lambda **kwargs: passes.append(kwargs) or 1)
 
         jobs_service.relay_outbox_scheduled()
 

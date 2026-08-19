@@ -20,10 +20,19 @@ Host applications:
        import jasil.orm as jasil_orm
        jasil_orm.map_models(Base)
 
-   This must happen **before** any JASIL database use — importing a JASIL model
-   module (or a CRUD module that imports one) beforehand is a configuration
-   error. A host that would rather not own a base may call ``map_models()`` with
-   no argument and use JASIL's convenience :data:`Base`.
+   This must happen **before any JASIL model module is imported**. The model
+   modules bind their classes to the active base at import time, so importing one
+   first is a configuration error and raises. A host that would rather not own a
+   base may call ``map_models()`` with no argument and use JASIL's convenience
+   :data:`Base`.
+
+   Two modules reach a model directly and therefore inherit that ordering
+   constraint: :mod:`jasil.jobs.crud` and :mod:`jasil.event_log.crud`. Import
+   them inside a function, or only after ``map_models`` has run. Every other
+   public entry point — :mod:`jasil.publisher`, :mod:`jasil.retention`,
+   :mod:`jasil.jobs.service`, :mod:`jasil.container`, :mod:`jasil.deps`,
+   :mod:`jasil.testing` — defers its model imports and is safe to import from
+   anywhere, at any point in the host's import graph.
 
 3. Register a session factory bound to their own engine::
 
@@ -104,8 +113,12 @@ def get_active_base() -> type[DeclarativeBase]:
     """
     if _active_base is None:
         raise RuntimeError(
-            "JASIL's models are not mapped yet. Call jasil.orm.map_models(YourBase) "
-            "once at startup, before any database use. Omit the base to use jasil.orm.Base."
+            "JASIL's models are not mapped yet. Call jasil.orm.map_models(YourBase) once at startup, "
+            "before importing any JASIL model module (omit the base to use jasil.orm.Base). "
+            "You are seeing this because something imported jasil.jobs.crud, jasil.event_log.crud, "
+            "or a model module directly at import time — move that import inside a function, or map "
+            "first. jasil.publisher, jasil.retention, jasil.jobs.service, jasil.container and "
+            "jasil.deps are always safe to import at module scope."
         )
     return _active_base
 

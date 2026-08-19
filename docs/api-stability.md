@@ -33,6 +33,8 @@ modules:
 | `jasil.async_bridge` | `dispatch`, `set_main_loop`, `capture_running_loop`, `get_main_loop`. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
+| `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |
+| `jasil.jobs.service` | `start_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `stamp`, `head_revision`, `db_revision`, `verify_schema_current`. |

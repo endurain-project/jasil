@@ -22,9 +22,6 @@ replicas via the platform ``LockProvider`` and is inert when both windows are
 import logging
 from datetime import datetime, timedelta
 
-import jasil.event_log.crud as event_log_crud
-import jasil.jobs.crud as jobs_crud
-import jasil.jobs.outbox as jobs_outbox
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil.settings import get_settings
@@ -75,6 +72,13 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
     Returns:
         None.
     """
+    # Imported here rather than at module scope: these bind to the host's
+    # declarative base, so a top-level import would make ``import jasil.retention``
+    # fail until ``jasil.orm.map_models`` had run.
+    import jasil.event_log.crud as event_log_crud
+    import jasil.jobs.crud as jobs_crud
+    import jasil.jobs.outbox as jobs_outbox
+
     events = outbox = jobs = 0
 
     if event_log_days > 0:

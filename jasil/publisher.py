@@ -36,7 +36,6 @@ from datetime import datetime
 from typing import Any
 
 import jasil.correlation as correlation
-import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
@@ -78,6 +77,12 @@ def _stage_in_outbox(
     execution is tracked in ``processing_jobs`` instead. Without it the
     observability dashboard would go dark the moment durable jobs were enabled.
     """
+    # Imported here rather than at module scope: the outbox model binds to the
+    # host's declarative base, so a top-level import would make ``import
+    # jasil.publisher`` fail until ``jasil.orm.map_models`` had run — and this is
+    # the module every producer imports.
+    import jasil.jobs.outbox as jobs_outbox
+
     if recorder is not None:
         recorder.record_queued(event)
     jobs_outbox.add_to_outbox(event, now=now, db=db, commit=commit)

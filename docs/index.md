@@ -114,6 +114,29 @@ On shutdown, `platform.close()` stops the event-bus consumer and closes the
 shared Redis clients. It never raises. The durable-job worker and your engine are
 yours to stop — the platform does not own either.
 
+## On FastAPI
+
+With the `fastapi` extra, `jasil.deps` exposes each capability as a dependency,
+so a route depends on a provider rather than importing a backend:
+
+```python
+from fastapi import Depends
+
+from jasil.deps import get_storage
+from jasil.providers import StorageProvider
+
+
+@app.post("/avatars/{user_id}")
+def upload_avatar(user_id: int, image: bytes, storage: StorageProvider = Depends(get_storage)):
+    return storage.save("avatars", f"{user_id}.webp", image)
+```
+
+The quick start above is all the wiring this needs: the dependencies fall back to
+the process-wide platform published by `set_active_platform`. Attach one to
+`app.state.platform` instead when a single process runs more than one platform —
+two apps mounted together, or a test client — since that binding is scoped to the
+app rather than to the process, and takes precedence when both are set.
+
 ## Testing against it
 
 JASIL installs several things process-wide, and a suite has to put every one of

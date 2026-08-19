@@ -108,6 +108,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - Option B ORM: the **host** owns the declarative base and the engine. JASIL maps
   its tables into the host's registry via `map_models(Base)` and takes a session
   factory via `configure_sessionmaker(...)`. JASIL never creates an engine.
+  `map_models` must run before `jasil.jobs.crud` or `jasil.event_log.crud` is
+  imported; every other public module — `jasil.publisher` above all, which every
+  producer imports at module scope — defers its model imports and is safe to
+  import from anywhere in the host's import graph.
 - `jasil.settings` — immutable, grouped configuration installed by the host.
   JASIL reads no environment variables and no secret files.
 - `jasil.correlation` — a pluggable correlation-id provider, defaulting to a
@@ -115,7 +119,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - Packaged Alembic revisions (`jasil[migrations]`) on their own version table,
   `jasil_alembic_version`, scoped to JASIL's tables so the host's Alembic
   history and tables are never touched.
-- FastAPI dependency helpers behind the `fastapi` extra.
+- FastAPI dependency helpers behind the `fastapi` extra, resolving
+  `app.state.platform` when the host attached one and otherwise the process-wide
+  platform, so the quick-start wiring needs nothing extra.
 - `jasil.async_bridge`, for synchronous code that must hand work to the main
   event loop.
 - `jasil.testing` — `FixedClock`, `install_test_platform`, and `reset_all`, so a

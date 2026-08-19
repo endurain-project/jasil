@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.publisher as publisher
 import jasil.runtime as runtime
@@ -229,7 +230,7 @@ class TestPublishCommitting:
         _enable_durable_jobs()
         jobs_registry.registry.register("activity.created", "s", lambda _e: None)
         monkeypatch.setattr(
-            publisher.jobs_outbox,
+            jobs_outbox,
             "add_to_outbox",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down")),
         )

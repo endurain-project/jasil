@@ -144,7 +144,7 @@ when you want to report the gap rather than fail on it.
 import jasil.jobs.service as jobs_service
 
 jobs_service.start_job_worker()  # in-process worker thread
-jobs_service.register_scheduled_jobs(scheduler)  # relay + reaper on APScheduler
+jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
 ```
 
 The relay and the reaper run on **every** replica. Both use `SKIP LOCKED`, and
