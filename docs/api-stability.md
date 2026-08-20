@@ -30,7 +30,7 @@ modules:
 | `jasil.capabilities` | `check_deployment_consistency` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `get_state`, `reset`. |
 | `jasil.testing` | `FixedClock`, `install_test_platform`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
-| `jasil.async_bridge` | `dispatch`, `set_main_loop`, `capture_running_loop`, `get_main_loop`. |
+| `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |

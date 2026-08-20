@@ -232,3 +232,36 @@ class TestDeleteMatchingKeys:
 
         assert deleted == 500
         assert client.keys("session:*") == []
+
+
+class TestGlobEscape:
+    """``delete_matching_keys`` takes a *pattern*, so a literal has to become one safely."""
+
+    @pytest.mark.parametrize(
+        ("literal", "escaped"),
+        [
+            ("session:", "session:"),
+            ("*", "\\*"),
+            ("a?b", "a\\?b"),
+            ("k[1]", "k\\[1\\]"),
+            ("back\\slash", "back\\\\slash"),
+            ("", ""),
+        ],
+    )
+    def test_every_metacharacter_is_escaped(self, literal, escaped):
+        assert platform_redis.glob_escape(literal) == escaped
+
+    def test_an_escaped_literal_matches_only_itself(self):
+        """The property that matters: Redis must read it back as the original text."""
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        client.set("a*b", "1")
+        client.set("axb", "2")
+
+        assert list(client.scan_iter(match=platform_redis.glob_escape("a*b"))) == ["a*b"]
+
+    def test_an_escaped_literal_cannot_widen_a_delete(self):
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        client.set("session:a", "1")
+
+        assert platform_redis.delete_matching_keys(client, f"{platform_redis.glob_escape('*')}*") == 0
+        assert client.exists("session:a") == 1

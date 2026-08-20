@@ -21,7 +21,13 @@ import pytest
 import responses
 
 import jasil._core.network as network
-from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
+from jasil.backends.geocoding_http import (
+    _MAX_RESPONSE_BYTES,
+    HttpGeocoding,
+    NullGeocoding,
+    _failure_detail,
+    build_reverse_endpoint,
+)
 from jasil.providers import GeocodedPlace, GeocodingProvider
 
 PUBLIC_IP = "93.184.216.34"
@@ -281,6 +287,81 @@ class TestFailuresNeverPropagate:
         monkeypatch.setitem(__import__("sys").modules, "requests", None)
 
         assert backend.reverse(38.7, -9.1) is None
+
+
+class TestTheFailureLogIsRedacted:
+    """``requests`` puts the request URL in its error messages, and one service
+    carries the API key in that URL's query string. So neither the message nor a
+    traceback may reach the log, however useful they would be.
+    """
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [401, 403, 429, 500])
+    def test_the_api_key_never_reaches_the_log(self, status, caplog):
+        backend = HttpGeocoding("geocode", "https://geo.test/reverse", api_key="super-secret-key")
+        responses.add(responses.GET, "https://geo.test/reverse", status=status, json={})
+
+        with caplog.at_level("ERROR"):
+            assert backend.reverse(38.7, -9.1) is None
+
+        assert "super-secret-key" not in caplog.text
+        assert "api_key" not in caplog.text
+
+    @responses.activate
+    def test_the_status_code_survives_the_redaction(self, caplog):
+        """An operator still has to be able to tell a 401 from a 429."""
+        backend = HttpGeocoding("nominatim", "https://geo.test/reverse")
+        responses.add(responses.GET, "https://geo.test/reverse", status=429, json={})
+
+        with caplog.at_level("ERROR"):
+            backend.reverse(38.7, -9.1)
+
+        assert "HTTP 429" in caplog.text
+
+    def test_a_failure_carrying_no_response_is_named_by_its_type(self):
+        assert _failure_detail(TimeoutError("connect timed out")) == "TimeoutError"
+
+    def test_a_failure_message_is_never_interpolated(self):
+        assert "connect timed out" not in _failure_detail(TimeoutError("connect timed out"))
+
+
+class TestTheResponseBodyIsCapped:
+    """The upstream is exactly the party the SSRF guard assumes may be hostile.
+
+    ``response.json()`` buffers whatever it is sent, and the request timeout
+    bounds each read rather than the whole transfer, so the size limit is the
+    only thing standing between a bad upstream and the process's memory.
+    """
+
+    @pytest.fixture
+    def backend(self):
+        return HttpGeocoding("nominatim", "https://geo.test/reverse")
+
+    @responses.activate
+    def test_an_oversized_body_resolves_to_none(self, backend, caplog):
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            body=b"x" * (_MAX_RESPONSE_BYTES + 1),
+            status=200,
+        )
+
+        with caplog.at_level("ERROR"):
+            assert backend.reverse(38.7, -9.1) is None
+
+        assert "ValueError" in caplog.text
+
+    @responses.activate
+    def test_a_large_but_permitted_body_is_still_parsed(self, backend):
+        padding = "P" * (_MAX_RESPONSE_BYTES // 2)
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            json={"address": {"country": "Portugal", "note": padding}},
+            status=200,
+        )
+
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(city=None, town=None, country="Portugal")
 
 
 class TestThrottling:

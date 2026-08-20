@@ -7,9 +7,12 @@ between iterations, so a join has to be given a timeout or a slow poll would
 block shutdown indefinitely.
 """
 
+import logging
 import threading
 
 __all__ = ["STOP_JOIN_TIMEOUT_SECONDS", "signal_and_join"]
+
+logger = logging.getLogger(__name__)
 
 #: How long to wait for a signalled thread to finish before giving up on it.
 #: Both loops check their stop event at least once a second, so this is generous;
@@ -31,5 +34,11 @@ def signal_and_join(
         timeout: Seconds to wait before returning regardless.
     """
     stop.set()
-    if thread is not None:
-        thread.join(timeout=timeout)
+    if thread is None:
+        return
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        # Abandoning it is the right call — it is a daemon thread and shutdown
+        # must not block — but doing so silently makes the next symptom
+        # (work that appears to run after shutdown) impossible to explain.
+        logger.warning(f"Thread {thread.name!r} did not stop within {timeout}s; continuing shutdown without it")

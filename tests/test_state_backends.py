@@ -115,6 +115,39 @@ class TestProviderConformance:
     def test_iter_keys_on_no_matches_is_empty(self, state):
         assert list(state.iter_keys("nothing:")) == []
 
+    @pytest.mark.parametrize("prefix", ["tenant:a*b:", "user:[1]:", "q?:", "back\\slash:"])
+    def test_a_prefix_is_matched_literally_and_not_as_a_glob(self, state, prefix):
+        """Redis reads a MATCH pattern as a glob; the memory backend uses ``startswith``.
+
+        A host that builds a prefix from a tenant or user id hands this method a
+        value it does not control the characters of. Unescaped, ``*`` and ``?``
+        widen the match onto keys the caller never named and ``[...]`` narrows it
+        onto ones that do not exist.
+        """
+        state.set(f"{prefix}kept", b"1")
+        state.set("tenant:aXb:other", b"2")
+        state.set("user:1:other", b"3")
+        state.set("qZ:other", b"4")
+        state.set("backslash:other", b"5")
+
+        assert sorted(state.iter_keys(prefix)) == [f"{prefix}kept"]
+
+    def test_delete_prefix_cannot_be_widened_into_the_whole_keyspace(self, state):
+        """``delete_prefix("*")`` deletes keys starting with a literal asterisk. Nothing else."""
+        state.set("session:a", b"1")
+        state.set("other:b", b"2")
+
+        assert state.delete_prefix("*") == 0
+        assert state.get("session:a") == b"1"
+        assert state.get("other:b") == b"2"
+
+    def test_delete_prefix_removes_a_key_holding_a_metacharacter(self, state):
+        state.set("tenant:a*b:one", b"1")
+        state.set("tenant:aXb:two", b"2")
+
+        assert state.delete_prefix("tenant:a*b:") == 1
+        assert state.get("tenant:aXb:two") == b"2"
+
     def test_a_ttl_bearing_value_is_readable_before_it_expires(self, state):
         state.set("k", b"value", ttl_seconds=60)
 

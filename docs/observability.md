@@ -42,8 +42,10 @@ Because the durable route bypasses the bus, an event handed to the outbox is
 recorded `queued` explicitly. Otherwise the dashboard would go dark exactly when
 durable jobs are switched on.
 
-`event_log_crud.get_event_log_summary(db)` gives counts by type and status,
-recent failures, and throughput over a window.
+`jasil.admin.get_event_log_summary()` gives counts by type and status,
+recent failures, and throughput over a window. It is the counterpart of
+`jasil.admin.get_jobs_summary()`, and like it takes no session — see
+[durable jobs](durable-jobs.md#dead-letters).
 
 ## Migrations
 

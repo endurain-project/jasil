@@ -156,15 +156,22 @@ Dead-lettered jobs are rare and human-actionable, so they are never pruned. Once
 the cause is fixed:
 
 ```python
-import jasil.jobs.crud as jobs_crud
+import jasil.admin as jasil_admin
 
-jobs_crud.replay_dead_letter_job(job_id, now=clock.now(), db=db)
+jasil_admin.replay_dead_letter_job(job_id)
 ```
 
 which returns the job to `pending` with a fresh attempt budget.
 
-`jobs_crud.get_jobs_summary(db)` gives counts by status, recent throughput, and
+`jasil_admin.get_jobs_summary()` gives counts by status, recent throughput, and
 the dead-letter list, for an operations dashboard.
+
+!!! note "Why `jasil.admin` and not `jasil.jobs.crud`"
+    The CRUD layer is where these queries live, but it is the wrong thing to wire
+    a route to: it reaches a model at import time (so it cannot be imported
+    before `map_models` has run) and every function commits the session it is
+    given. `jasil.admin` is importable from anywhere and takes no session, so an
+    admin route cannot accidentally hand JASIL its own open transaction.
 
 ## Tuning
 

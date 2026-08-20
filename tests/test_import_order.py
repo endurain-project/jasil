@@ -27,6 +27,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # means they must not touch a model until they are called.
 ALWAYS_IMPORTABLE = (
     "jasil",
+    "jasil.admin",
     "jasil.container",
     "jasil.deps",
     "jasil.jobs.registry",

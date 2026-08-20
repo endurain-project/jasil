@@ -135,13 +135,16 @@ class RedisState:
 
     @_translate_state_errors
     def delete_prefix(self, prefix: str) -> int:
-        return platform_redis.delete_matching_keys(self._client, f"{prefix}*")
+        # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
+        # in a caller's prefix would delete far beyond what it named.
+        return platform_redis.delete_matching_keys(self._client, f"{platform_redis.glob_escape(prefix)}*")
 
     @_translate_state_errors
     def iter_keys(self, prefix: str) -> Iterator[str]:
         # Materialised eagerly so a mid-scan Redis failure is translated here
         # rather than leaking out of a half-consumed generator.
-        keys = [key.decode() if isinstance(key, bytes) else key for key in self._client.scan_iter(match=f"{prefix}*")]
+        pattern = f"{platform_redis.glob_escape(prefix)}*"
+        keys = [key.decode() if isinstance(key, bytes) else key for key in self._client.scan_iter(match=pattern)]
         return iter(keys)
 
     @_translate_state_errors

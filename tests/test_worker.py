@@ -15,6 +15,7 @@ import threading
 
 import pytest
 
+from jasil._core.threads import signal_and_join
 from jasil.jobs.worker import BackgroundWorker, run_worker
 
 # Long enough that an unwanted poll would hang the test rather than pass slowly.
@@ -180,3 +181,34 @@ class TestBackgroundWorker:
 
         assert worker._thread is not None
         assert worker._runner.ran.wait(timeout=WAIT_TIMEOUT)
+
+
+class TestAWedgedThreadIsReported:
+    """Shutdown abandons a thread that will not stop, which is right \u2014 it is a
+    daemon and shutdown must not block. Doing it silently is what is wrong: the
+    next symptom is work that appears to keep running after shutdown, with
+    nothing in the log connecting the two.
+    """
+
+    def test_giving_up_on_a_thread_warns(self, caplog):
+        stop = threading.Event()
+        wedged = threading.Thread(target=lambda: stop.wait(WAIT_TIMEOUT), name="wedged-thread", daemon=True)
+        wedged.start()
+
+        with caplog.at_level("WARNING"):
+            signal_and_join(wedged, threading.Event(), timeout=0.01)
+
+        assert "wedged-thread" in caplog.text
+        assert "did not stop" in caplog.text
+        stop.set()
+        wedged.join(timeout=WAIT_TIMEOUT)
+
+    def test_a_thread_that_stops_in_time_is_quiet(self, caplog):
+        stop = threading.Event()
+        finished = threading.Thread(target=lambda: stop.wait(WAIT_TIMEOUT), name="tidy-thread", daemon=True)
+        finished.start()
+
+        with caplog.at_level("WARNING"):
+            signal_and_join(finished, stop, timeout=WAIT_TIMEOUT)
+
+        assert caplog.text == ""

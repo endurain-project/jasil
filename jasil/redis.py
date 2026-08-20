@@ -47,6 +47,31 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+# Redis matches ``SCAN``/``KEYS`` patterns with glob semantics (``stringmatchlen``),
+# where a backslash escapes the character after it.
+_GLOB_METACHARACTERS = frozenset("\\*?[]")
+
+
+def glob_escape(literal: str) -> str:
+    """
+    Escape literal text for use inside a Redis ``MATCH`` pattern.
+
+    A caller's literal key prefix is not a literal to Redis: ``*`` and ``?``
+    become wildcards and ``[...]`` a character class. Interpolated unescaped, a
+    prefix therefore matches keys the caller never named — ``delete_prefix("*")``
+    would empty the keyspace — while missing the ones it did. The in-memory
+    backend compares with ``str.startswith``, so escaping here is also what keeps
+    the two state backends behaviourally identical.
+
+    Args:
+        literal: The exact text to match.
+
+    Returns:
+        The same text with every glob metacharacter backslash-escaped.
+    """
+    return "".join(f"\\{character}" if character in _GLOB_METACHARACTERS else character for character in literal)
+
+
 def delete_matching_keys(
     redis_client: Any,
     key_pattern: str,

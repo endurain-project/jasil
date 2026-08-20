@@ -134,8 +134,12 @@ def publish(
         event = _mint(event_type, payload, source, metadata, schema_version)
         if db is not None and _durable_delivery_enabled(event_type):
             _stage_in_outbox(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
+            # Which route an event took is the first thing anyone asks when it
+            # appears not to have been processed, and nothing else records it.
+            logger.debug(f"Staged {event_type} ({event.event_id}) in the outbox for durable delivery")
         else:
             platform.events.publish(event)
+            logger.debug(f"Dispatched {event_type} ({event.event_id}) on the event bus")
     except Exception as err:
         logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
 

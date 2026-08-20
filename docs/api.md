@@ -74,6 +74,10 @@ Generated from the source docstrings.
 
 ::: jasil.pruning
 
+## Admin and dashboards
+
+::: jasil.admin
+
 ## Test helpers
 
 ::: jasil.testing
@@ -81,7 +85,3 @@ Generated from the source docstrings.
 ## Migrations
 
 ::: jasil.migrations
-
-## Async bridge
-
-::: jasil.async_bridge

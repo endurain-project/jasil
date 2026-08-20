@@ -128,8 +128,11 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - FastAPI dependency helpers behind the `fastapi` extra, resolving
   `app.state.platform` when the host attached one and otherwise the process-wide
   platform, so the quick-start wiring needs nothing extra.
-- `jasil.async_bridge`, for synchronous code that must hand work to the main
-  event loop.
+- `jasil.admin` — the operator-facing surface: `get_jobs_summary`,
+  `get_event_log_summary`, and `replay_dead_letter_job`, plus the response
+  schemas. Importable from anywhere in the host's import graph and takes no
+  session, so an admin route cannot hand JASIL its own open transaction. The
+  CRUD modules behind it stay internal.
 - `jasil.testing` — `FixedClock`, `install_test_platform`, and `reset_all`, so a
   host's suite does not have to rediscover which process-wide slots JASIL
   installs. `reset_all` deliberately leaves the ORM mapping in place; model
@@ -161,7 +164,14 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   must be a bare `host[:port]`, so one carrying a scheme or path cannot redirect
   a request elsewhere.
 - The geocoding backend refuses redirects, so a permitted host cannot 3xx-pivot
-  onto an internal target.
+  onto an internal target. Its response body is read under a size cap, and its
+  failures are logged by exception type and status code only: `requests` puts the
+  request URL in an error message, and that URL carries the API key.
+- The Redis state backend escapes glob metacharacters before turning a caller's
+  key prefix into a `SCAN`/`MATCH` pattern. Unescaped, a prefix holding `*`, `?`
+  or `[...]` matched keys the caller never named — `delete_prefix("*")` would
+  have emptied the keyspace — while the in-memory backend, which compares with
+  `startswith`, matched only the literal. The two backends now agree.
 - The local storage backend rejects absolute and parent-traversal area and key
   values before any filesystem access.
 

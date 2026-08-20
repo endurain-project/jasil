@@ -9,22 +9,56 @@ Security (OWASP A10 — SSRF): the upstream host is operator-configured, so it i
 validated through :func:`jasil._core.network.host_rejection_reason` — the same
 address denylist and allowlist escape hatch — before the first request, and
 redirects are refused on every request so a permitted host cannot 3xx-pivot onto
-an internal target.
+an internal target. The response body is read under a size cap, and failures are
+logged without their message, which would carry the request URL and with it the
+API key.
 """
 
+import json
 import logging
 import threading
 import time
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
 import jasil._core.network as network
 from jasil.providers import GeocodedPlace
 
+if TYPE_CHECKING:
+    import requests
+
 logger = logging.getLogger(__name__)
 
 # Egress timeout for a single reverse-geocode request (seconds).
 _TIMEOUT_SECONDS = 10
+
+# Cap on a reverse-geocode response body. A resolved place is a few kilobytes;
+# the limit is what stops an upstream that is hostile, compromised, or simply
+# broken from exhausting memory, because reading a response buffers whatever it
+# is sent and the timeout above bounds each read rather than the whole transfer.
+_MAX_RESPONSE_BYTES = 1024 * 1024
+
+# Read granularity while enforcing that cap.
+_READ_CHUNK_BYTES = 8192
+
+
+def _failure_detail(error: Exception) -> str:
+    """Describe a request failure without echoing its message.
+
+    ``requests`` puts the full request URL in an ``HTTPError`` message, and the
+    geocode.maps.co URL carries ``api_key`` in its query string — so neither the
+    message nor a traceback may reach the log. The type and status code are what
+    an operator actually needs to tell a 401 from a 429 from a timeout.
+
+    Args:
+        error: The exception raised while performing the request.
+
+    Returns:
+        A redacted, single-line description.
+    """
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    return f"{type(error).__name__} (HTTP {status})" if status is not None else type(error).__name__
 
 
 class NullGeocoding:
@@ -117,6 +151,29 @@ class HttpGeocoding:
                 time.sleep(wait)
             self._last_call = time.monotonic()
 
+    @staticmethod
+    def _read_capped(response: "requests.Response") -> bytes:
+        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES`.
+
+        Streamed rather than taken from ``response.content`` so an oversized body
+        is abandoned partway instead of being buffered in full first.
+
+        Args:
+            response: The streamed response to drain.
+
+        Returns:
+            The body bytes.
+
+        Raises:
+            ValueError: When the body exceeds the cap.
+        """
+        body = bytearray()
+        for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
+            body.extend(chunk)
+            if len(body) > _MAX_RESPONSE_BYTES:
+                raise ValueError(f"response body exceeded the {_MAX_RESPONSE_BYTES}-byte limit")
+        return bytes(body)
+
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None:
         """Reverse-geocode a coordinate, returning ``None`` on any failure.
 
@@ -137,18 +194,19 @@ class HttpGeocoding:
             # ``NullGeocoding``.
             import requests
 
-            response = requests.get(
+            with requests.get(
                 self._build_url(latitude, longitude),
                 headers={"User-Agent": self._user_agent},
                 timeout=_TIMEOUT_SECONDS,
                 # A permitted host must not 3xx-pivot the request onto an
                 # internal target (SSRF defense in depth, OWASP A10).
                 allow_redirects=False,
-            )
-            response.raise_for_status()
-            return self._parse(response.json())
-        except Exception as err:
-            logger.error(f"Reverse-geocoding via {self._service} failed - {err}")
+                stream=True,
+            ) as response:
+                response.raise_for_status()
+                return self._parse(json.loads(self._read_capped(response)))
+        except Exception as error:
+            logger.error(f"Reverse-geocoding via {self._service} failed - {_failure_detail(error)}")
             return None
 
 

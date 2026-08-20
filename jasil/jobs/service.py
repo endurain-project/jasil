@@ -78,9 +78,9 @@ def start_job_worker() -> None:
         return
     from jasil.jobs.worker import BackgroundWorker
 
+    # The loop logs its own start and stop, from the thread that actually runs it.
     _worker = BackgroundWorker(build_runner(), poll_interval_seconds=get_settings().jobs.poll_interval_seconds)
     _worker.start()
-    logger.info("Durable job worker started")
 
 
 def stop_job_worker() -> None:
@@ -90,7 +90,6 @@ def stop_job_worker() -> None:
         return
     _worker.stop()
     _worker = None
-    logger.info("Durable job worker stopped")
 
 
 def relay_outbox_scheduled() -> None:
@@ -104,6 +103,7 @@ def relay_outbox_scheduled() -> None:
 
     jobs = get_settings().jobs
     platform = platform_runtime.get_active_platform()
+    total = 0
     for _ in range(_MAX_RELAY_BATCHES):
         relayed = jobs_relay.relay_outbox_once(
             registry=jobs_registry.registry,
@@ -112,8 +112,13 @@ def relay_outbox_scheduled() -> None:
             max_attempts=jobs.max_attempts,
             batch_size=jobs.batch_size,
         )
+        total += relayed
         if relayed == 0:
             break
+    if total:
+        # Debug, not info: this runs every few seconds, and "an event was
+        # published but never processed" is the question it exists to answer.
+        logger.debug(f"Relayed {total} outbox row(s) into durable jobs")
 
 
 def reap_expired_jobs_scheduled() -> None:
@@ -129,7 +134,9 @@ def reap_expired_jobs_scheduled() -> None:
     with jasil_orm.get_sessionmaker()() as db:
         reclaimed = jobs_crud.reclaim_expired_leases(now=platform.clock.now(), db=db)
     if reclaimed:
-        logger.info(f"Reaped {reclaimed} expired job lease(s)")
+        # A warning, not an info: a lease only expires because the worker holding
+        # it died or overran, so this is the symptom of something else going wrong.
+        logger.warning(f"Reaped {reclaimed} expired job lease(s); a worker died mid-job or overran its lease")
 
 
 def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:

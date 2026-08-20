@@ -319,7 +319,7 @@ name = "Backends stay optional (only the composition root selects them)"
 type = "forbidden"
 source_modules = [
     "jasil._core",
-    "jasil.async_bridge",
+    "jasil.admin",
     "jasil.capabilities",
     "jasil.correlation",
     "jasil.event_log",
@@ -351,7 +351,6 @@ name = "The substrate reaches jobs only through the publisher"
 type = "forbidden"
 source_modules = [
     "jasil.backends",
-    "jasil.async_bridge",
     "jasil.capabilities",
     "jasil.correlation",
     "jasil.deps",
@@ -400,7 +399,7 @@ name = "The test helpers are for hosts, not for the library"
 type = "forbidden"
 source_modules = [
     "jasil._core",
-    "jasil.async_bridge",
+    "jasil.admin",
     "jasil.backends",
     "jasil.capabilities",
     "jasil.container",
