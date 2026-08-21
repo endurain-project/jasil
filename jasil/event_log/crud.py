@@ -1,5 +1,14 @@
 """CRUD for the event_log table — lifecycle writes and dashboard aggregates.
 
+**Internal.** Not covered by the API-stability contract, and it reaches a model
+at import time, so it cannot be imported before ``jasil.orm.map_models`` has run.
+Hosts wanting the dashboard aggregate should use :mod:`jasil.admin`, which is
+importable from anywhere and opens its own session.
+
+**Every write here commits the session it is given.** The recorder hands each one
+a short-lived session of its own; pass a session JASIL owns, not one carrying a
+caller's uncommitted work.
+
 The recording helpers write the event lifecycle: ``record_published`` /
 ``mark_processing`` / ``mark_completed`` / ``mark_failed`` for bus-delivered
 events (via the recorder in :mod:`jasil.event_log.recorder`), and ``record_queued``
@@ -16,7 +25,12 @@ from sqlalchemy.orm import Session
 
 import jasil.event_log.schema as event_log_schema
 import jasil.pruning as jasil_pruning
-from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.limits import (
+    MAX_HANDLER_NAME_LENGTH,
+    MAX_STORED_ERROR_LENGTH,
+    MAX_WORKER_ID_LENGTH,
+    fit_length,
+)
 from jasil._core.timestamps import age_seconds
 from jasil.event_log.models import EventLog
 from jasil.events import Event
@@ -27,32 +41,6 @@ _STATUS_PROCESSING = "processing"
 _STATUS_COMPLETED = "completed"
 _STATUS_FAILED = "failed"
 _STATUS_DEAD_LETTER = "dead_letter"
-
-# ``handler_name`` is the comma-joined list of every subscriber that ran for the
-# event, so its length grows with the number of subscribers — unbounded from this
-# module's point of view. It must be clamped to the column width here, at the
-# only layer that knows that width: overflowing it made PostgreSQL reject the
-# whole UPDATE with StringDataRightTruncation, and because event-log writes are
-# deliberately best-effort (swallowed by the recorder so observability never
-# breaks processing), the failure was silent. The handlers had already run, so
-# the work completed while the row stayed stuck at ``published`` forever.
-_MAX_HANDLER_NAME_LEN = 500
-_TRUNCATION_MARKER = "..."
-
-
-def _fit_handler_name(handler_name: str | None) -> str | None:
-    """Clamp the joined subscriber list to the ``handler_name`` column width.
-
-    Args:
-        handler_name: Comma-joined subscriber names, or ``None``.
-
-    Returns:
-        The value unchanged when it fits, otherwise a marked truncation so a
-        reader can tell the list was cut rather than assume it is complete.
-    """
-    if handler_name is None or len(handler_name) <= _MAX_HANDLER_NAME_LEN:
-        return handler_name
-    return handler_name[: _MAX_HANDLER_NAME_LEN - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
 
 
 def record_published(event: Event, db: Session) -> None:
@@ -126,7 +114,11 @@ def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
     db.execute(
         update(EventLog)
         .where(EventLog.id == event_id)
-        .values(status=_STATUS_PROCESSING, worker_id=worker_id, processed_at=func.now())
+        .values(
+            status=_STATUS_PROCESSING,
+            worker_id=fit_length(worker_id, MAX_WORKER_ID_LENGTH),
+            processed_at=func.now(),
+        )
     )
     db.commit()
 
@@ -149,7 +141,7 @@ def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: 
         .where(EventLog.id == event_id)
         .values(
             status=_STATUS_COMPLETED,
-            handler_name=_fit_handler_name(handler_name),
+            handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
             processing_time_ms=processing_time_ms,
             completed_at=func.now(),
         )
@@ -182,8 +174,8 @@ def mark_failed(
         .where(EventLog.id == event_id)
         .values(
             status=_STATUS_FAILED,
-            handler_name=_fit_handler_name(handler_name),
-            error_message=error_message[:MAX_STORED_ERROR_LENGTH],
+            handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
+            error_message=fit_length(error_message, MAX_STORED_ERROR_LENGTH),
             processing_time_ms=processing_time_ms,
             completed_at=func.now(),
         )

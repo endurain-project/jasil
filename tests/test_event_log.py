@@ -22,7 +22,7 @@ import pytest
 
 import jasil.event_log.crud as event_log_crud
 import jasil.orm as jasil_orm
-from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.limits import MAX_HANDLER_NAME_LENGTH, MAX_STORED_ERROR_LENGTH, MAX_WORKER_ID_LENGTH, fit_length
 from jasil.event_log.models import EventLog
 from jasil.event_log.recorder import EventLogRecorder
 from jasil.events import new_event
@@ -122,17 +122,21 @@ class TestHandlerNameClamping:
     """
 
     def test_a_name_that_fits_is_untouched(self):
-        assert event_log_crud._fit_handler_name("a,b,c") == "a,b,c"
+        assert fit_length("a,b,c", MAX_HANDLER_NAME_LENGTH) == "a,b,c"
 
     def test_no_name_stays_none(self):
-        assert event_log_crud._fit_handler_name(None) is None
+        assert fit_length(None, MAX_HANDLER_NAME_LENGTH) is None
 
     def test_a_long_list_is_marked_as_truncated(self):
         """A reader must be able to tell the list was cut, not assume it is complete."""
-        clamped = event_log_crud._fit_handler_name("subscriber," * 200)
+        clamped = fit_length("subscriber," * 200, MAX_HANDLER_NAME_LENGTH)
 
-        assert len(clamped) == 500
+        assert len(clamped) == MAX_HANDLER_NAME_LENGTH
         assert clamped.endswith("...")
+
+    def test_the_column_is_declared_at_the_same_width_it_is_clamped_to(self, mapped_base):
+        """The drift this constant was extracted to prevent."""
+        assert mapped_base.metadata.tables["event_log"].c.handler_name.type.length == MAX_HANDLER_NAME_LENGTH
 
     def test_a_clamped_name_round_trips_to_the_database(self, db):
         """The point of the clamp: the write must actually land."""
@@ -143,7 +147,24 @@ class TestHandlerNameClamping:
 
         row = _row(db, event.event_id)
         assert row.status == "completed"
-        assert len(row.handler_name) == 500
+        assert len(row.handler_name) == MAX_HANDLER_NAME_LENGTH
+
+
+class TestWorkerIdClamping:
+    """A host may supply its own consumer name to the bus, and it lands here."""
+
+    def test_a_long_worker_id_is_clamped_rather_than_lost(self, db):
+        event = _event()
+        event_log_crud.record_published(event, db)
+
+        event_log_crud.mark_processing(event.event_id, "w" * (MAX_WORKER_ID_LENGTH * 2), db)
+
+        row = _row(db, event.event_id)
+        assert row.status == "processing"
+        assert len(row.worker_id) == MAX_WORKER_ID_LENGTH
+
+    def test_the_column_is_declared_at_the_same_width_it_is_clamped_to(self, mapped_base):
+        assert mapped_base.metadata.tables["event_log"].c.worker_id.type.length == MAX_WORKER_ID_LENGTH
 
 
 class TestSummary:

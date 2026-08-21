@@ -1,6 +1,7 @@
 """Local-filesystem ``StorageProvider`` backend."""
 
 from pathlib import Path
+from urllib.parse import quote
 
 from jasil._core.storage_keys import check_segment
 
@@ -78,4 +79,7 @@ class LocalStorage:
     def url(self, area: str, key: str, expires_in: int = 3600) -> str:
         check_segment(area, "area")
         check_segment(key, "key")
-        return f"{self._url_prefix}/{area}/{key}"
+        # Percent-encoded, because a key is only validated against traversal: one
+        # holding ``?`` or ``#`` would otherwise end the path early, and ``%``
+        # would change it. ``/`` stays safe — a key may be nested.
+        return f"{self._url_prefix}/{quote(area, safe='/')}/{quote(key, safe='/')}"

@@ -239,6 +239,23 @@ class TestLocalStorage:
     def test_a_url_is_built_from_the_prefix(self, storage):
         assert storage.url("thumbnails", "1.webp") == "/media/thumbnails/1.webp"
 
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            ("a b.webp", "/media/thumbnails/a%20b.webp"),
+            ("a?b.webp", "/media/thumbnails/a%3Fb.webp"),
+            ("a#b.webp", "/media/thumbnails/a%23b.webp"),
+            ("100%.webp", "/media/thumbnails/100%25.webp"),
+        ],
+    )
+    def test_a_key_is_percent_encoded(self, storage, key, expected):
+        """``?`` would end the path early and ``%`` would change it; only traversal is validated."""
+        assert storage.url("thumbnails", key) == expected
+
+    def test_a_nested_key_keeps_its_separators(self, storage):
+        """``save`` accepts a nested key, so ``/`` is structure rather than data."""
+        assert storage.url("thumbnails", "2026/01/1.webp") == "/media/thumbnails/2026/01/1.webp"
+
     @pytest.mark.parametrize("bad", ["../escape", "/etc/passwd", "a/../../b"])
     @pytest.mark.parametrize("field", ["area", "key"])
     def test_path_traversal_is_refused(self, storage, bad, field):

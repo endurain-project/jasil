@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from jasil._core.limits import MAX_WORKER_ID_LENGTH
 from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
 from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH
 from jasil.orm import get_active_base
@@ -138,7 +139,7 @@ class ProcessingJob(Base):
         comment="Earliest instant the job may be claimed (backoff gate)",
     )
     locked_by: Mapped[str | None] = mapped_column(
-        String(100),
+        String(MAX_WORKER_ID_LENGTH),
         nullable=True,
         comment="Worker holding the current lease, when claimed",
     )

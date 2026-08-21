@@ -92,6 +92,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   the database, so a re-delivered event never runs a subscriber twice.
 - Lease reclamation returns work stranded by a crashed worker; an attempt is
   counted at claim time, which is what bounds a crash loop.
+- A worker's identity is bounded to the width of the lease column it is written
+  to. When a long hostname forces truncation it carries a digest of the full
+  value, so two machines sharing a hostname prefix never collapse onto one lease
+  holder — which would hand each of them the other's claimed rows.
 - On PostgreSQL, claiming and relaying use `FOR UPDATE SKIP LOCKED` so
   concurrent workers and relayers take disjoint batches with no coordinating lock.
 - `DurableSubscriberNet` declares the reconciliation net — a scheduled backfill,
@@ -103,6 +107,12 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 
 - An `event_log` table recording each event's lifecycle, written by the bus and
   the publish facade, with dashboard aggregates.
+- Every persisted width lives in one constant, imported by both the model that
+  declares the column and the code that bounds the value — so a check cannot
+  drift from the column it protects. Developer-authored identifiers are refused
+  when too long; derived, diagnostic values (failure text, the joined subscriber
+  list, a worker identity) are truncated with a marker instead, so a reader can
+  tell the value was cut.
 - Retention pruning in bounded batches, on independently configurable windows.
   In-flight rows and dead-letters are never pruned. Register it with
   `jasil.retention.schedule_retention_maintenance(scheduler)`, the counterpart of
@@ -173,6 +183,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   have emptied the keyspace — while the in-memory backend, which compares with
   `startswith`, matched only the literal. The two backends now agree.
 - The local storage backend rejects absolute and parent-traversal area and key
-  values before any filesystem access.
+  values before any filesystem access, and percent-encodes both into the URL it
+  returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
 [0.1.0]: https://github.com/endurain-project/jasil/releases/tag/v0.1.0

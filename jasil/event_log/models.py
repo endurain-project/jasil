@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
+from jasil._core.limits import MAX_HANDLER_NAME_LENGTH, MAX_WORKER_ID_LENGTH
 from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
 from jasil.orm import get_active_base
 
@@ -86,12 +87,12 @@ class EventLog(Base):
         comment="published | queued | processing | completed | failed | dead_letter",
     )
     handler_name: Mapped[str | None] = mapped_column(
-        String(500),
+        String(MAX_HANDLER_NAME_LENGTH),
         nullable=True,
         comment="Subscriber(s) that processed the event, comma-separated",
     )
     worker_id: Mapped[str | None] = mapped_column(
-        String(100),
+        String(MAX_WORKER_ID_LENGTH),
         nullable=True,
         comment="Process/consumer that handled the event",
     )

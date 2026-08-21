@@ -1,5 +1,16 @@
 """CRUD for ``processing_jobs`` — the durable, database-as-truth work queue.
 
+**Internal.** Not covered by the API-stability contract, and it reaches a model
+at import time, so it cannot be imported before ``jasil.orm.map_models`` has run.
+Hosts wanting the dashboard aggregates or dead-letter replay should use
+:mod:`jasil.admin`, which is importable from anywhere and opens its own session.
+
+**Every function here commits the session it is given** — except where a
+``commit`` flag says otherwise (``enqueue_job``, for the relay's single-
+transaction fan-out). The claim, the terminal state writes and the reaper all
+have to be durable before the caller moves on, so they are not optional. Pass a
+session JASIL owns, not one carrying a caller's uncommitted work.
+
 Every query is portable, so the same code runs on PostgreSQL, MySQL and SQLite.
 The claim takes ``SELECT ... FOR UPDATE SKIP LOCKED`` wherever the dialect
 supports it (see :func:`jasil._core.dialects.supports_skip_locked`) so concurrent
@@ -23,7 +34,7 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
 import jasil.pruning as jasil_pruning
 from jasil._core.dialects import supports_skip_locked
-from jasil._core.limits import MAX_STORED_ERROR_LENGTH
+from jasil._core.limits import MAX_STORED_ERROR_LENGTH, fit_length
 from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.events import Event
@@ -227,7 +238,7 @@ def mark_job_failed(
     job = db.get(ProcessingJob, job_id)
     if job is None:
         return ""
-    truncated = error_message[:MAX_STORED_ERROR_LENGTH]
+    truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
     if job.attempts >= job.max_attempts:
         db.execute(
             update(ProcessingJob)
