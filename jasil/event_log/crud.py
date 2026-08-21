@@ -23,8 +23,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
+import jasil._core.pruning as pruning
 import jasil.event_log.schema as event_log_schema
-import jasil.pruning as jasil_pruning
 from jasil._core.limits import (
     MAX_HANDLER_NAME_LENGTH,
     MAX_STORED_ERROR_LENGTH,
@@ -317,7 +317,7 @@ def _recent_failures(db: Session, limit: int) -> list[event_log_schema.EventLogF
     return [event_log_schema.EventLogFailure.model_validate(row) for row in rows]
 
 
-def delete_events_before(cutoff: datetime, *, db: Session, batch_size: int = jasil_pruning.PRUNE_BATCH_SIZE) -> int:
+def delete_events_before(cutoff: datetime, *, db: Session, batch_size: int = pruning.PRUNE_BATCH_SIZE) -> int:
     """
     Delete ``event_log`` rows older than ``cutoff``, in bounded batches.
 
@@ -333,4 +333,4 @@ def delete_events_before(cutoff: datetime, *, db: Session, batch_size: int = jas
     Returns:
         The total number of rows deleted.
     """
-    return jasil_pruning.bounded_delete(EventLog, EventLog.created_at < cutoff, db=db, batch_size=batch_size)
+    return pruning.bounded_delete(EventLog, EventLog.created_at < cutoff, db=db, batch_size=batch_size)

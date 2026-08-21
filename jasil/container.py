@@ -24,8 +24,8 @@ production mystery.
 import logging
 from dataclasses import dataclass
 
+import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
-import jasil.redis as platform_redis
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
@@ -99,7 +99,7 @@ class Platform:
             self.events.stop()
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
-        platform_redis.close_shared_clients()
+        redis_clients.close_shared_clients()
 
 
 def build_platform(settings: JasilSettings | None = None) -> Platform:

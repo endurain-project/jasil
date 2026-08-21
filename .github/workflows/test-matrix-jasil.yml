@@ -1,12 +1,23 @@
 name: Test matrix jasil
 
 # Portability matrix on top of the fast default `test-jasil` job:
-#   * every supported Python (3.12, 3.13, 3.14) on the default SQLite backend;
-#   * the suite against real Postgres and MySQL servers (proving the ORM models
-#     and queries stay database-agnostic); and
+#   * every supported Python (3.12, 3.13, 3.14) on the default SQLite backend,
+#     plus one run on Windows (the storage traversal guard is OS-sensitive);
+#   * the suite against real Postgres, MySQL and MariaDB servers (proving the ORM
+#     models and queries stay database-agnostic);
+#   * the suite against the lowest dependency versions pyproject actually allows,
+#     rather than the locked ones; and
 #   * a bare `import jasil` with only the base dependencies installed (no
 #     optional extras, no dev groups), proving every backend client really is
 #     imported lazily.
+#
+# The database jobs pin Python rather than letting uv choose: what they exist to
+# vary is the *dialect*, and an unpinned interpreter makes a failure depend on
+# whatever the runner happened to resolve. The floor is used because the version
+# matrix above already covers the newer ones.
+
+env:
+  DATABASE_JOB_PYTHON: "3.12"
 
 on:
   push:
@@ -38,6 +49,7 @@ jobs:
   test-python-matrix:
     name: jasil (py${{ matrix.python }} · sqlite)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +80,7 @@ jobs:
   test-postgres:
     name: jasil (postgres)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17
@@ -98,15 +111,16 @@ jobs:
           version-file: pyproject.toml
 
       - name: Sync dependencies (with database drivers)
-        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
+        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project --python "$DATABASE_JOB_PYTHON"
 
       - name: Run tests
-        run: uv run --no-sync pytest
+        run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
 
   # 3. The suite against a real MySQL server.
   test-mysql:
     name: jasil (mysql)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       mysql:
         image: mysql:8.4
@@ -138,16 +152,130 @@ jobs:
           version-file: pyproject.toml
 
       - name: Sync dependencies (with database drivers)
-        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project
+        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project --python "$DATABASE_JOB_PYTHON"
 
       - name: Run tests
-        run: uv run --no-sync pytest
+        run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
 
-  # 4. Bare import with only the base dependencies (no extras, no dev groups):
+  # 4. The suite against a real MariaDB server. Not redundant with MySQL:
+  #    MariaDB reports itself as the ``mysql`` dialect but diverges in what it
+  #    supports, so ``jasil._core.dialects`` has a MariaDB-specific branch that no
+  #    other job exercises. It is also the MySQL-compatible server most
+  #    self-hosted deployments actually run.
+  test-mariadb:
+    name: jasil (mariadb)
+    runs-on: ubuntu-latest
+    # Higher than the other two: MariaDB is markedly slower at the per-test
+    # DDL the suite does than either PostgreSQL or MySQL.
+    timeout-minutes: 30
+    services:
+      mariadb:
+        image: mariadb:11.4
+        env:
+          MARIADB_USER: jasil
+          MARIADB_PASSWORD: jasil
+          MARIADB_DATABASE: jasil
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      JASIL_TEST_DATABASE_URL: mysql+pymysql://jasil:jasil@localhost:3306/jasil
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
+
+      - name: Sync dependencies (with database drivers)
+        run: uv sync --frozen --no-dev --group test --group test-db --no-install-project --python "$DATABASE_JOB_PYTHON"
+
+      - name: Run tests
+        run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
+
+  # 5. The suite against the lowest dependency versions each declaration allows,
+  #    rather than the locked ones. Every ``>=`` in pyproject is a promise to
+  #    whoever installs this package, and the lockfile pins current versions — so
+  #    without this job the floors are never executed and are effectively
+  #    fiction. It found ``apscheduler>=3.10`` to be unusable (3.10.0 and 3.10.1
+  #    import ``pkg_resources``, which a Python 3.12+ environment need not have).
+  #    Deliberately unlocked: ``--resolution lowest-direct`` is the point, so
+  #    ``--frozen`` cannot be used here.
+  test-lowest-direct:
+    name: jasil (lowest direct dependencies)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
+
+      # The oldest Python as well as the oldest dependencies: the most
+      # conservative environment a user can assemble from what is declared.
+      - name: Sync the lowest version each declaration allows
+        run: uv sync --resolution lowest-direct --all-extras --group test --no-install-project --python "$DATABASE_JOB_PYTHON"
+
+      - name: Run tests
+        run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
+
+  # 6. Windows on SQLite. The package claims OS independence, and the part that
+  #    is genuinely OS-sensitive is the storage backend's traversal guard:
+  #    ``_core.storage_keys`` rejects Windows separators and ``LocalStorage``
+  #    resolves real paths and refuses symlinks that leave the area. That is
+  #    security code, and no other job would notice if it broke on Windows.
+  #    Steps use bash (present on the Windows runners) so the commands stay
+  #    identical to every other job rather than forking into PowerShell.
+  test-windows:
+    name: jasil (windows · sqlite)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
+          # and local development are held to the same floor and ceiling.
+          version-file: pyproject.toml
+
+      - name: Sync dependencies
+        run: uv sync --frozen --no-dev --group test --no-install-project --python "$DATABASE_JOB_PYTHON"
+
+      - name: Run tests
+        run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
+
+  # 7. Bare import with only the base dependencies (no extras, no dev groups):
   #    proves `import jasil` and platform assembly work with zero extras installed.
   import-base-deps:
     name: jasil (bare import, no extras)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

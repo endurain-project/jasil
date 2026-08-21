@@ -100,9 +100,9 @@ you depend on by setting them explicitly.
 
 ### Internal helpers
 
-Functions in `jasil.jobs.crud`, `jasil.event_log.crud`, `jasil.pruning` and
-similar. They are importable, but they exist to serve the layers above and their
-signatures follow those needs.
+Functions in `jasil.jobs.crud` and `jasil.event_log.crud`. They are importable,
+but they exist to serve the layers above and their signatures follow those needs.
+Use `jasil.admin` for the dashboard aggregates and dead-letter replay.
 
 ### The capability report
 

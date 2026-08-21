@@ -21,6 +21,13 @@ on:
 permissions:
   contents: read
 
+# Pinned rather than left to uv: this is the fast feedback job, and an
+# interpreter chosen by whatever the runner resolved makes a failure that does
+# not reproduce locally. The supported range is covered by `test-matrix-jasil`;
+# this one runs the floor.
+env:
+  JOB_PYTHON: "3.12"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -29,6 +36,7 @@ jobs:
   test-jasil:
     name: jasil (pytest)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,13 +51,13 @@ jobs:
           version-file: pyproject.toml
 
       - name: Sync dependencies
-        run: uv sync --frozen --no-dev --group test --group lint --no-install-project
+        run: uv sync --frozen --no-dev --group test --group lint --no-install-project --python "$JOB_PYTHON"
 
       - name: Check import boundaries
-        run: uv run --no-sync lint-imports
+        run: uv run --no-sync --python "$JOB_PYTHON" lint-imports
 
       - name: Run tests
-        run: uv run --no-sync pytest
+        run: uv run --no-sync --python "$JOB_PYTHON" pytest
 
       # ``fail_under`` is an average, and an average hides its worst case: this
       # package once reported 90% overall while the Redis event bus sat at 48%.

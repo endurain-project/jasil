@@ -11,8 +11,8 @@ import socket
 
 import pytest
 
+from jasil._core.identity import process_identity
 from jasil._core.limits import MAX_WORKER_ID_LENGTH
-from jasil.node import process_identity
 
 LONG_HOSTNAME = "worker-" + "n" * 200
 

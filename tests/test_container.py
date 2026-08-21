@@ -8,8 +8,8 @@ faked at the client boundary so no server is needed.
 import fakeredis
 import pytest
 
+import jasil._core.redis_clients as redis_clients
 import jasil.container as container
-import jasil.redis as platform_redis
 import jasil.settings as settings
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
@@ -27,13 +27,13 @@ from jasil.profile import DeploymentProfile
 def fake_redis(monkeypatch):
     """Serve every shared-client request from fakeredis."""
     monkeypatch.setattr(
-        platform_redis,
+        redis_clients,
         "get_shared_client",
         lambda uri, *, purpose, decode_responses=True: fakeredis.FakeStrictRedis(decode_responses=decode_responses),
     )
-    platform_redis.reset_shared_clients()
+    redis_clients.reset_shared_clients()
     yield
-    platform_redis.reset_shared_clients()
+    redis_clients.reset_shared_clients()
 
 
 def _settings(**kwargs) -> settings.JasilSettings:

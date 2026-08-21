@@ -47,7 +47,7 @@ MAX_HANDLER_NAME_LENGTH = 500
 
 #: Width of ``event_log.worker_id`` and ``processing_jobs.locked_by``, both of
 #: which hold a process identity. That value derives from the machine's hostname
-#: (see :func:`jasil.node.process_identity`), so a deployment cannot shorten it
+#: (see :func:`jasil._core.identity.process_identity`), so a deployment cannot shorten it
 #: and the library has to guarantee the fit itself.
 MAX_WORKER_ID_LENGTH = 100
 

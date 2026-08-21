@@ -22,9 +22,9 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import jasil._core.redis_clients as redis_clients
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
-import jasil.redis as platform_redis
 import jasil.runtime as platform_runtime
 import jasil.settings as jasil_settings
 from jasil.container import Platform, build_platform
@@ -128,4 +128,4 @@ def reset_all() -> None:
     correlation.reset()
     platform_runtime.reset()
     jobs_registry.registry.clear()
-    platform_redis.reset_shared_clients()
+    redis_clients.reset_shared_clients()

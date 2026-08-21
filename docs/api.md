@@ -76,8 +76,6 @@ Generated from the source docstrings.
 
 ::: jasil.retention
 
-::: jasil.pruning
-
 ## Admin and dashboards
 
 ::: jasil.admin

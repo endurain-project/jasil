@@ -1017,8 +1017,8 @@ typecheck = [
 requires-dist = [
     { name = "alembic", marker = "extra == 'all'", specifier = ">=1.13" },
     { name = "alembic", marker = "extra == 'migrations'", specifier = ">=1.13" },
-    { name = "apscheduler", marker = "extra == 'all'", specifier = ">=3.10" },
-    { name = "apscheduler", marker = "extra == 'jobs'", specifier = ">=3.10" },
+    { name = "apscheduler", marker = "extra == 'all'", specifier = ">=3.10.2" },
+    { name = "apscheduler", marker = "extra == 'jobs'", specifier = ">=3.10.2" },
     { name = "boto3", marker = "extra == 'all'", specifier = ">=1.34.0" },
     { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34.0" },
     { name = "fastapi", marker = "extra == 'all'", specifier = ">=0.136.0" },
@@ -1037,11 +1037,11 @@ provides-extras = ["redis", "s3", "postgres", "jobs", "fastapi", "geocoding", "m
 [package.metadata.requires-dev]
 dev = [
     { name = "alembic", specifier = ">=1.13" },
-    { name = "apscheduler", specifier = ">=3.10" },
+    { name = "apscheduler", specifier = ">=3.10.2" },
     { name = "boto3", specifier = ">=1.34.0" },
     { name = "boto3-stubs", extras = ["s3"] },
     { name = "faker", specifier = ">=40.15.0" },
-    { name = "fakeredis", extras = ["lua"], specifier = ">=2.21.0" },
+    { name = "fakeredis", extras = ["lua"], specifier = ">=2.30" },
     { name = "fastapi", specifier = ">=0.136.0" },
     { name = "hatch", specifier = ">=1.16.5" },
     { name = "hypothesis", specifier = ">=6.150.0" },
@@ -1066,10 +1066,10 @@ lint = [
 ]
 test = [
     { name = "alembic", specifier = ">=1.13" },
-    { name = "apscheduler", specifier = ">=3.10" },
+    { name = "apscheduler", specifier = ">=3.10.2" },
     { name = "boto3", specifier = ">=1.34.0" },
     { name = "faker", specifier = ">=40.15.0" },
-    { name = "fakeredis", extras = ["lua"], specifier = ">=2.21.0" },
+    { name = "fakeredis", extras = ["lua"], specifier = ">=2.30" },
     { name = "fastapi", specifier = ">=0.136.0" },
     { name = "hypothesis", specifier = ">=6.150.0" },
     { name = "pytest", specifier = ">=9.0.3" },

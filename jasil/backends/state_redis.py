@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from typing import Any, Concatenate
 
-import jasil.redis as platform_redis
+import jasil._core.redis_clients as redis_clients
 from jasil.providers import StateBackendUnavailableError, TieredFailureOutcome
 
 # Atomic tiered-lockout script (KEYS: gate, counter; ARGV: now, counter_ttl,
@@ -70,7 +70,7 @@ def _translate_state_errors[**P, R](
     def wrapper(self: "RedisState", *args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return method(self, *args, **kwargs)
-        except platform_redis.RedisError as err:
+        except redis_clients.RedisError as err:
             raise StateBackendUnavailableError("Redis state backend is unavailable") from err
 
     return wrapper
@@ -96,7 +96,7 @@ class RedisState:
         Uses a ``decode_responses=False`` client so ``get`` returns ``bytes``
         (not ``str``) per the ``StateProvider`` contract.
         """
-        client = platform_redis.get_shared_client(uri, purpose="platform state", decode_responses=False)
+        client = redis_clients.get_shared_client(uri, purpose="platform state", decode_responses=False)
         return cls(client)
 
     @_translate_state_errors
@@ -137,13 +137,13 @@ class RedisState:
     def delete_prefix(self, prefix: str) -> int:
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
         # in a caller's prefix would delete far beyond what it named.
-        return platform_redis.delete_matching_keys(self._client, f"{platform_redis.glob_escape(prefix)}*")
+        return redis_clients.delete_matching_keys(self._client, f"{redis_clients.glob_escape(prefix)}*")
 
     @_translate_state_errors
     def iter_keys(self, prefix: str) -> Iterator[str]:
         # Materialised eagerly so a mid-scan Redis failure is translated here
         # rather than leaking out of a half-consumed generator.
-        pattern = f"{platform_redis.glob_escape(prefix)}*"
+        pattern = f"{redis_clients.glob_escape(prefix)}*"
         keys = [key.decode() if isinstance(key, bytes) else key for key in self._client.scan_iter(match=pattern)]
         return iter(keys)
 

@@ -9,10 +9,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import jasil._core.pruning as pruning
 import jasil.event_log.crud as event_log_crud
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
-import jasil.pruning as pruning
 from jasil.event_log.models import EventLog
 from jasil.events import new_event
 from jasil.jobs.models import EventOutbox, ProcessingJob

@@ -30,8 +30,8 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
-import jasil.node as platform_node
-import jasil.redis as platform_redis
+import jasil._core.identity as identity
+import jasil._core.redis_clients as redis_clients
 from jasil._core.threads import signal_and_join
 from jasil.events import INITIAL_SCHEMA_VERSION, Event
 
@@ -99,7 +99,7 @@ class RedisStreamEventBus:
         self._client = client
         self._stream = stream
         self._group = group
-        self._consumer = consumer or platform_node.process_identity()
+        self._consumer = consumer or identity.process_identity()
         self._handlers: dict[str, list[Callable[[Event], None]]] = defaultdict(list)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -115,7 +115,7 @@ class RedisStreamEventBus:
         recorder: "EventRecorder | None" = None,
     ) -> "RedisStreamEventBus":
         """Build from a ``redis://…`` URI, verifying connectivity eagerly."""
-        client = platform_redis.get_shared_client(uri, purpose="event bus")
+        client = redis_clients.get_shared_client(uri, purpose="event bus")
         return cls(client, stream=stream, group=group, recorder=recorder)
 
     def publish(self, event: Event) -> None:
@@ -145,7 +145,7 @@ class RedisStreamEventBus:
     def _ensure_group(self) -> None:
         try:
             self._client.xgroup_create(self._stream, self._group, id="0", mkstream=True)
-        except platform_redis.ResponseError as error:
+        except redis_clients.ResponseError as error:
             if "BUSYGROUP" not in str(error):  # any error other than "group already exists" is real
                 raise
 
@@ -153,7 +153,7 @@ class RedisStreamEventBus:
         while not self._stop.is_set():
             try:
                 self._poll_once()
-            except platform_redis.RedisError as error:
+            except redis_clients.RedisError as error:
                 logger.error("Event bus consumer poll failed", exc_info=error)
                 self._stop.wait(timeout=1.0)
 

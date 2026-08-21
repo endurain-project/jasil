@@ -10,9 +10,9 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import jasil._core.redis_clients as redis_clients
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
-import jasil.redis as platform_redis
 import jasil.runtime as platform_runtime
 import jasil.settings as jasil_settings
 import jasil.testing as jasil_testing
@@ -145,12 +145,12 @@ class TestResetAll:
         assert jobs_registry.registry.subscribers_for("order.created") == ()
 
     def test_it_discards_the_memoized_redis_clients(self, monkeypatch):
-        monkeypatch.setattr(platform_redis, "create_redis_client", lambda *a, **kw: object())
-        platform_redis.get_shared_client("redis://c:6379/0", purpose="test")
+        monkeypatch.setattr(redis_clients, "create_redis_client", lambda *a, **kw: object())
+        redis_clients.get_shared_client("redis://c:6379/0", purpose="test")
 
         jasil_testing.reset_all()
 
-        assert platform_redis._shared_clients == {}
+        assert redis_clients._shared_clients == {}
 
     def test_it_leaves_the_orm_mapping_alone(self, mapped_base):
         """Models capture the base at import time; clearing it strands every one."""
@@ -184,14 +184,14 @@ class TestPlatformClose:
             def close(self):
                 closed.append(True)
 
-        monkeypatch.setattr(platform_redis, "create_redis_client", lambda *a, **kw: Client())
-        platform_redis.get_shared_client("redis://c:6379/0", purpose="test")
+        monkeypatch.setattr(redis_clients, "create_redis_client", lambda *a, **kw: Client())
+        redis_clients.get_shared_client("redis://c:6379/0", purpose="test")
         platform = jasil_testing.install_test_platform(tmp_path)
 
         platform.close()
 
         assert closed == [True]
-        assert platform_redis._shared_clients == {}
+        assert redis_clients._shared_clients == {}
 
     def test_a_bus_that_fails_to_stop_does_not_break_shutdown(self, tmp_path, monkeypatch, caplog):
         """Shutdown must not mask whatever prompted it."""
@@ -212,13 +212,13 @@ class TestPlatformClose:
             def close(self):
                 raise OSError("already gone")
 
-        monkeypatch.setattr(platform_redis, "create_redis_client", lambda *a, **kw: Client())
-        platform_redis.get_shared_client("redis://c:6379/0", purpose="test")
+        monkeypatch.setattr(redis_clients, "create_redis_client", lambda *a, **kw: Client())
+        redis_clients.get_shared_client("redis://c:6379/0", purpose="test")
 
         with caplog.at_level("WARNING"):
-            platform_redis.close_shared_clients()
+            redis_clients.close_shared_clients()
 
-        assert platform_redis._shared_clients == {}
+        assert redis_clients._shared_clients == {}
         assert "Failed to close the shared redis client" in caplog.text
 
     def test_closing_twice_is_safe(self, tmp_path):

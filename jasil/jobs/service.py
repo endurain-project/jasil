@@ -14,8 +14,8 @@ from typing import TYPE_CHECKING
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import jasil._core.identity as identity
 import jasil.jobs.registry as jobs_registry
-import jasil.node as platform_node
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil.settings import get_settings
@@ -44,7 +44,7 @@ _worker: "BackgroundWorker | None" = None
 
 def _worker_id() -> str:
     """Return a per-process worker identifier (host + pid)."""
-    return platform_node.process_identity()
+    return identity.process_identity()
 
 
 def build_runner() -> "JobRunner":

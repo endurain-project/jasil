@@ -16,7 +16,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-import jasil.pruning as jasil_pruning
+import jasil._core.pruning as pruning
 from jasil._core.dialects import supports_skip_locked
 from jasil._core.sessions import commit_or_flush
 from jasil.events import Event
@@ -107,7 +107,7 @@ def mark_relayed(outbox_id: str, *, now: datetime, db: Session, commit: bool = T
     commit_or_flush(db, commit)
 
 
-def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = jasil_pruning.PRUNE_BATCH_SIZE) -> int:
+def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = pruning.PRUNE_BATCH_SIZE) -> int:
     """
     Delete relayed outbox rows older than ``cutoff``, in bounded batches.
 
@@ -124,7 +124,7 @@ def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = ja
     Returns:
         The total number of rows deleted.
     """
-    return jasil_pruning.bounded_delete(
+    return pruning.bounded_delete(
         EventOutbox,
         EventOutbox.relayed_at.is_not(None),
         EventOutbox.relayed_at < cutoff,

@@ -30,9 +30,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
+import jasil._core.pruning as pruning
 import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
-import jasil.pruning as jasil_pruning
 from jasil._core.dialects import supports_skip_locked
 from jasil._core.limits import MAX_STORED_ERROR_LENGTH, fit_length
 from jasil._core.sessions import commit_or_flush
@@ -464,9 +464,7 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
     return True
 
 
-def delete_completed_jobs_before(
-    cutoff: datetime, *, db: Session, batch_size: int = jasil_pruning.PRUNE_BATCH_SIZE
-) -> int:
+def delete_completed_jobs_before(cutoff: datetime, *, db: Session, batch_size: int = pruning.PRUNE_BATCH_SIZE) -> int:
     """
     Delete ``completed`` jobs older than ``cutoff``, in bounded batches.
 
@@ -484,7 +482,7 @@ def delete_completed_jobs_before(
     Returns:
         The total number of rows deleted.
     """
-    return jasil_pruning.bounded_delete(
+    return pruning.bounded_delete(
         ProcessingJob,
         ProcessingJob.status == STATUS_COMPLETED,
         ProcessingJob.completed_at < cutoff,

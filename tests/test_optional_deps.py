@@ -29,10 +29,10 @@ PURE_MODULES = (
     "jasil.correlation",
     "jasil.events",
     "jasil.event_versioning",
-    "jasil.node",
+    "jasil._core.identity",
     "jasil.profile",
     "jasil.providers",
-    "jasil.pruning",
+    "jasil._core.pruning",
     "jasil.settings",
     "jasil._core.network",
     "jasil._core.registry",
@@ -98,14 +98,14 @@ def test_the_test_helpers_import_without_any_extra():
 
 
 def test_redis_module_does_not_import_redis_until_an_attribute_is_used():
-    """``jasil.redis`` is the sole owner of the redis client and loads it lazily.
+    """``jasil._core.redis_clients`` is the sole owner of the redis client and loads it lazily.
 
     A ``local`` deployment imports this module transitively (the state and event
     backends reference it at their top level) but must never load ``redis``.
     """
     result = _run("""
         import sys
-        import jasil.redis
+        import jasil._core.redis_clients
         print("redis" in sys.modules)
     """)
 
@@ -115,7 +115,7 @@ def test_redis_module_does_not_import_redis_until_an_attribute_is_used():
 
 def test_redis_module_rejects_an_unknown_attribute():
     """The lazy ``__getattr__`` must not turn a typo into an opaque import error."""
-    import jasil.redis as platform_redis
+    import jasil._core.redis_clients as redis_clients
 
     with pytest.raises(AttributeError, match="no attribute 'Nonsense'"):
-        _ = platform_redis.Nonsense
+        _ = redis_clients.Nonsense
