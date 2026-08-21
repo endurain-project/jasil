@@ -88,10 +88,14 @@ def test_a_producer_can_import_the_publish_seam_at_module_scope():
 def test_the_database_layer_says_what_to_do_about_it(module: str):
     """The error has to name the fix; an unmapped-base traceback explains nothing."""
     result = _run(f"import {module}")
+    # The module is identified by the file the traceback points at. Asserting on
+    # the dotted name instead would pass only on the Python versions that echo
+    # the ``-c`` source line (3.13+), which is not what is being tested.
+    offending_file = pathlib.Path(*module.split(".")).with_suffix(".py")
 
     assert result.returncode != 0
     assert "jasil.orm.map_models" in result.stderr
-    assert module in result.stderr
+    assert str(offending_file) in result.stderr
 
 
 @pytest.mark.parametrize("module", NEEDS_MAPPING_FIRST)

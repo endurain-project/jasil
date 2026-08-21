@@ -153,8 +153,9 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           # This job never checks the repository out, so there is no
-          # pyproject.toml to read `required-version` from; keep this in step
-          # with the floor declared there.
+          # pyproject.toml to read `required-version` from. Any version inside
+          # the range declared there will do; this one is pinned so a release
+          # build is reproducible.
           version: "0.12.5"
           enable-cache: false
 

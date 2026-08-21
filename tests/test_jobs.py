@@ -146,10 +146,28 @@ class TestClaim:
         claimed = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
 
         assert [job.locked_by for job in claimed] == ["w1"]
-        assert as_utc(claimed[0].locked_at) == T0
-        assert as_utc(claimed[0].lease_expires_at) == T0 + timedelta(seconds=60)
-        assert claimed[0].locked_by == "w1"
-        assert as_utc(claimed[0].lease_expires_at) == T0 + timedelta(seconds=60)
+        # The lease *duration*, not the instant it was stamped at: MySQL's
+        # DATETIME keeps whole seconds, so a persisted timestamp is not
+        # guaranteed to equal the one that was written.
+        assert as_utc(claimed[0].lease_expires_at) - as_utc(claimed[0].locked_at) == timedelta(seconds=60)
+
+    def test_a_lease_taken_at_a_sub_second_instant_still_returns_its_rows(self, db, event):
+        """Regression: the claim used to re-select on ``locked_at == now``.
+
+        MySQL stores a DATETIME to the nearest second, so that equality matched
+        nothing there — the worker marked a batch claimed, burned an attempt on
+        each row, and was handed an empty list, over and over, until every job
+        dead-lettered without ever having run. A real clock always carries
+        microseconds; only the whole-second instants in this suite hid it.
+        """
+        _enqueue(event, db)
+
+        claimed = jobs_crud.claim_jobs(
+            worker_id="w1", limit=10, lease_seconds=60, now=T0 + timedelta(seconds=1, microseconds=654321), db=db
+        )
+
+        assert len(claimed) == 1
+        assert claimed[0].status == jobs_crud.STATUS_CLAIMED
 
     def test_a_claimed_job_is_not_claimed_again(self, db, event):
         _enqueue(event, db)

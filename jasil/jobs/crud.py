@@ -170,10 +170,16 @@ def claim_jobs(
             .where(
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
-                # The lease we just stamped: rows a competing worker won carry its
-                # id, and returning them would run their subscriber twice.
+                # The lease we just took. ``job_ids`` were all ``pending`` at
+                # select time and the update was a compare-and-set on that, so
+                # these three together name exactly the rows *this* call
+                # transitioned: a row a competing worker won carries its id, and
+                # a row this worker claimed in an earlier round was never
+                # ``pending`` to be selected here. Deliberately not also matching
+                # ``locked_at == now`` — MySQL's DATETIME keeps whole seconds and
+                # rounds anything finer, so that equality silently matched
+                # nothing and the worker claimed batches it then never ran.
                 ProcessingJob.locked_by == worker_id,
-                ProcessingJob.locked_at == now,
             )
             .order_by(ProcessingJob.available_at)
         )

@@ -157,6 +157,21 @@ publishes an event, deep in your import graph and long before any startup hook
 runs. It defers its model imports so `from jasil.publisher import publish` at the
 top of a domain module always works.
 
+### Databases
+
+JASIL runs its whole suite against **SQLite**, **PostgreSQL** and **MySQL** on
+every change, so all three are supported rather than merely expected to work.
+JASIL never creates the engine — whichever you hand it through
+`configure_sessionmaker` is the one it uses.
+
+What differs between them is handled internally, but two consequences are worth
+knowing:
+
+| | Consequence |
+|---|---|
+| **`FOR UPDATE SKIP LOCKED`** | Available on PostgreSQL, MySQL 8.0.1+ and MariaDB 10.6+. Where it is missing, concurrent workers and relayers fall back to a compare-and-set claim plus the idempotent fan-out, which is correct but does more redundant work. |
+| **Timestamp precision** | MySQL's `DATETIME` stores whole seconds and *rounds*, so a persisted timestamp can differ from the one written by up to half a second, in either direction. Lease expiry, backoff and retention are all interval comparisons measured in seconds or days, so this does not affect them — but do not compare a timestamp JASIL persisted for equality with the value you passed in. |
+
 ### Logging
 
 There is nothing to configure. JASIL uses `logging.getLogger(__name__)`

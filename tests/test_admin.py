@@ -7,6 +7,7 @@ commits a session the caller handed it — because it is handed none.
 """
 
 import inspect
+from datetime import timedelta
 
 import pytest
 
@@ -35,11 +36,18 @@ def now(platform):
 
 
 def _dead_letter_job(db, now) -> str:
-    """Drive a job to ``dead_letter`` through the real state machine."""
+    """Drive a job to ``dead_letter`` through the real state machine.
+
+    The claim happens a second after the enqueue, as a polling worker's would.
+    Claiming at the *same* instant is not a case that occurs in practice, and it
+    is unreproducible on MySQL, whose DATETIME rounds to the nearest second and
+    so can place ``available_at`` fractionally in the future.
+    """
     event = new_event("order.created", {"order_id": 1}, source="api:create_order")
     job = jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=now, db=db)
-    jobs_crud.claim_jobs(worker_id="worker-1", limit=10, lease_seconds=60, now=now, db=db)
-    jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=1, now=now, db=db)
+    claimed_at = now + timedelta(seconds=1)
+    jobs_crud.claim_jobs(worker_id="worker-1", limit=10, lease_seconds=60, now=claimed_at, db=db)
+    jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=1, now=claimed_at, db=db)
     return job.id
 
 

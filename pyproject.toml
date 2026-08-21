@@ -130,7 +130,13 @@ docs = [
 # ``==`` match makes every uv patch release a hard build failure (locally and on
 # the CI runner) for no reproducibility gain — the lockfile is what pins the
 # dependency set.
-required-version = ">=0.12.5,<0.13"
+#
+# The floor is capped by **Dependabot**, not by anything this project needs:
+# Dependabot ships its own uv and refuses the whole update job with
+# ``tool_version_not_supported`` when ``required-version`` excludes it. Raising
+# this floor above the uv that Dependabot bundles silently stops all dependency
+# updates, security ones included. Check what it supports before raising it.
+required-version = ">=0.12.1,<0.13"
 # Supply-chain cooldown: refuse dependency versions published in the last 30
 # days, so a compromised release has time to be caught before it can enter a
 # build.
