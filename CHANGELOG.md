@@ -27,15 +27,13 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   plain key/value access it exposes the atomic primitives correctness actually
   depends on — `set_if_absent`, `get_and_delete`, and `record_tiered_failure`
   (an atomic tiered lockout, implemented under a lock in memory and as a Lua
-  script on Redis) — so a store behaves identically on either backend. Both
-  backends are held to one shared conformance test suite for exactly that reason.
+  script on Redis) — so a store behaves identically on either backend.
 - `StorageProvider` — opaque blob storage addressed by `(area, key)`, backed by
   the local filesystem (`local://`) or S3-compatible object storage (`s3://`).
   Both backends refuse the same addresses — empty, absolute, or containing a
   `..` component — before touching a disk or a client, so the contract a caller
   sees does not change with the deployment. `list_keys` is recursive on both, so
-  a nested key is listed wherever it is stored. Held to one shared conformance
-  suite for that reason.
+  a nested key is listed wherever it is stored.
 - `EventBusProvider` — synchronous in-process dispatch (`memory://`) or Redis
   Streams with a consumer group (`redis://`), giving competing-consumer
   semantics across replicas.
@@ -101,18 +99,17 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - `DurableSubscriberNet` declares the reconciliation net — a scheduled backfill,
   or a documented exemption — that every subscriber writing durable derived state
   owes, since delivery is at-least-once but not guaranteed. `assert_nets_complete`
-  holds the whole registry to it in one conformance test.
+  holds the whole registry to it, so a missing net fails your own test suite
+  rather than surfacing in production.
 
 **Observability**
 
 - An `event_log` table recording each event's lifecycle, written by the bus and
   the publish facade, with dashboard aggregates.
-- Every persisted width lives in one constant, imported by both the model that
-  declares the column and the code that bounds the value — so a check cannot
-  drift from the column it protects. Developer-authored identifiers are refused
-  when too long; derived, diagnostic values (failure text, the joined subscriber
-  list, a worker identity) are truncated with a marker instead, so a reader can
-  tell the value was cut.
+- Identifiers that are too long for the column they are persisted in are refused
+  at the producing call site; derived, diagnostic values (failure text, the
+  joined subscriber list, a worker identity) are truncated with a marker instead,
+  so a reader can tell the value was cut.
 - Retention pruning in bounded batches, on independently configurable windows.
   In-flight rows and dead-letters are never pruned. Register it with
   `jasil.retention.schedule_retention_maintenance(scheduler)`, the counterpart of
@@ -121,9 +118,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 
 **Host integration**
 
-- Option B ORM: the **host** owns the declarative base and the engine. JASIL maps
-  its tables into the host's registry via `map_models(Base)` and takes a session
-  factory via `configure_sessionmaker(...)`. JASIL never creates an engine.
+- The **host** owns the declarative base and the engine. JASIL maps its tables
+  into the host's registry via `map_models(Base)` and takes a session factory via
+  `configure_sessionmaker(...)`. JASIL never creates an engine.
   `map_models` must run before `jasil.jobs.crud` or `jasil.event_log.crud` is
   imported; every other public module — `jasil.publisher` above all, which every
   producer imports at module scope — defers its model imports and is safe to
@@ -161,12 +158,8 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - A core install requires only `sqlalchemy` and `pydantic`. Every backend client
   lives behind an extra (`redis`, `s3`, `postgres`, `jobs`, `fastapi`,
   `geocoding`, `migrations`, `all`) and is imported lazily, so a single-process
-  deployment loads none of them. This is enforced by a test, not just intended.
+  deployment loads none of them.
 - Ships `py.typed`.
-- Architectural import contracts (`lint-imports`) encode the invariants the
-  module docstrings describe: the pure providers never reach a backend, only the
-  composition root selects one, the substrate reaches the jobs layer only through
-  the publisher, and the vendored `_core` helpers stay leaf utilities.
 
 ### Security
 
@@ -184,10 +177,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   failures are logged by exception type and status code only: `requests` puts the
   request URL in an error message, and that URL carries the API key.
 - The Redis state backend escapes glob metacharacters before turning a caller's
-  key prefix into a `SCAN`/`MATCH` pattern. Unescaped, a prefix holding `*`, `?`
-  or `[...]` matched keys the caller never named — `delete_prefix("*")` would
-  have emptied the keyspace — while the in-memory backend, which compares with
-  `startswith`, matched only the literal. The two backends now agree.
+  key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or
+  `[...]` matches only itself and never widens onto keys the caller did not name.
+  A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key
   values before any filesystem access, and percent-encodes both into the URL it
   returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
