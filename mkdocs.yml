@@ -49,7 +49,7 @@ nav:
   - Durable jobs: durable-jobs.md
   - Observability: observability.md
   - Security:
-    - Threat Model: security/threat-model.md
-    - Integration Checklist: security/integration-checklist.md
+    - Threat model: security/threat-model.md
+    - Integration checklist: security/integration-checklist.md
   - API stability: api-stability.md
-  - API Reference: api.md
+  - API reference: api.md
