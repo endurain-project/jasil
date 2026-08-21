@@ -186,7 +186,7 @@ class HttpGeocoding:
             failed. Never raises — geocoding is best-effort enrichment and must
             not fail the import or backfill that triggered it.
         """
-        logger.debug(f"Reverse-geocoding ({latitude}, {longitude}) via {self._service}")
+        logger.debug("Reverse-geocoding (%s, %s) via %s", latitude, longitude, self._service)
         self._throttle()
         try:
             # Imported lazily: ``requests`` is the optional `geocoding` extra, and
@@ -206,7 +206,7 @@ class HttpGeocoding:
                 response.raise_for_status()
                 return self._parse(json.loads(self._read_capped(response)))
         except Exception as error:
-            logger.error(f"Reverse-geocoding via {self._service} failed - {_failure_detail(error)}")
+            logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
             return None
 
 
@@ -226,9 +226,11 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
     reason = network.host_rejection_reason(host, allowed_hosts=allowed_hosts, purpose="reverse_geocoding")
     if reason is not None:
         logger.warning(
-            f"Reverse-geocoding host {host!r} {reason}; reverse geocoding is disabled. "
+            "Reverse-geocoding host %r %s; reverse geocoding is disabled. "
             "A self-hosted instance on a private network must be allow-listed via "
-            "the SSRF allowlist."
+            "the SSRF allowlist.",
+            host,
+            reason,
         )
         return None
     scheme = "https" if use_https else "http"

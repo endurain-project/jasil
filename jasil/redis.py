@@ -200,7 +200,7 @@ def close_shared_clients() -> None:
                 client.close()
             except Exception as error:
                 scheme, _, _ = uri.partition("://")
-                logger.warning(f"Failed to close the shared {scheme or 'redis'} client: {error!r}")
+                logger.warning("Failed to close the shared %s client: %r", scheme or "redis", error)
         _shared_clients.clear()
 
 

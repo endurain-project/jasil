@@ -179,7 +179,7 @@ class RedisStreamEventBus:
                     for handler in handlers:
                         handler(event)
         except Exception as error:  # a poisoned entry or handler must not kill the consumer thread
-            logger.error(f"Event handler failed for stream entry {entry_id}; leaving it pending", exc_info=error)
+            logger.error("Event handler failed for stream entry %s; leaving it pending", entry_id, exc_info=error)
             return
         # Ack only after success so a failure stays pending (at-least-once) for
         # reprocessing; durable jobs provide the retry/dead-letter path.

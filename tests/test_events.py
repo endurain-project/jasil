@@ -181,13 +181,19 @@ class TestParsePayload:
         with pytest.raises(UnsupportedEventVersionError, match="no upgrader from payload version 1 to 2"):
             parse_payload(PayloadWithMissingUpgrader, event)
 
-    def test_an_upgrade_is_logged(self, caplog):
+    def test_an_upgrade_is_logged_at_debug(self, caplog):
+        """Debug, not info: an upgrade is the versioning system working, and it
+        fires once per event — at info, draining an outbox backlog after a deploy
+        would write one line per row into the host's log budget.
+        """
         event = _event_at(1, {"name": "n"})
 
-        with caplog.at_level("INFO"):
+        with caplog.at_level("DEBUG"):
             parse_payload(Payload, event)
 
-        assert "Upgrading an event payload" in caplog.text
+        upgrades = [record for record in caplog.records if "Upgrading an event payload" in record.getMessage()]
+
+        assert [record.levelname for record in upgrades] == ["DEBUG"]
 
     def test_a_payload_that_does_not_match_its_model_raises(self):
         event = _event_at(3, {"name": "n"})

@@ -100,7 +100,7 @@ def _publish_on_bus(
         platform = platform_runtime.get_active_platform()
         platform.events.publish(_mint(event_type, payload, source, metadata, schema_version))
     except Exception as err:
-        logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
 
 
 def publish(
@@ -136,12 +136,12 @@ def publish(
             _stage_in_outbox(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
             # Which route an event took is the first thing anyone asks when it
             # appears not to have been processed, and nothing else records it.
-            logger.debug(f"Staged {event_type} ({event.event_id}) in the outbox for durable delivery")
+            logger.debug("Staged %s (%s) in the outbox for durable delivery", event_type, event.event_id)
         else:
             platform.events.publish(event)
-            logger.debug(f"Dispatched {event_type} ({event.event_id}) on the event bus")
+            logger.debug("Dispatched %s (%s) on the event bus", event_type, event.event_id)
     except Exception as err:
-        logger.error(f"Failed to publish event {event_type}: {err}", exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
 
 
 def publish_committing(
@@ -246,7 +246,11 @@ def publish_many_committing(
                 _stage_in_outbox(platform.recorder, event, db=db, now=now, commit=False)
         except Exception as err:
             logger.error(
-                f"Failed to stage {len(payloads)} {event_type} event(s) in the domain transaction: {err}", exc_info=err
+                "Failed to stage %d %s event(s) in the domain transaction: %s",
+                len(payloads),
+                event_type,
+                err,
+                exc_info=err,
             )
             raise
         commit()

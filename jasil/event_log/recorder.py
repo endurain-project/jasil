@@ -112,4 +112,4 @@ class EventLogRecorder:
             with jasil_orm.get_sessionmaker()() as db:
                 write(db)
         except Exception as error:  # observability must never break event processing
-            logger.warning(f"event_log {operation} failed: {error!r}")
+            logger.warning("event_log %s failed: %r", operation, error)

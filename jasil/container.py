@@ -98,7 +98,7 @@ class Platform:
         try:
             self.events.stop()
         except Exception as error:
-            logger.warning(f"Failed to stop the event bus during shutdown: {error!r}")
+            logger.warning("Failed to stop the event bus during shutdown: %r", error)
         platform_redis.close_shared_clients()
 
 
@@ -151,7 +151,7 @@ def _check_deployment_consistency(settings: JasilSettings) -> None:
         return
     if not settings.enforce_deployment_consistency:
         for issue in issues:
-            logger.warning(f"Inconsistent deployment wiring: {issue}")
+            logger.warning("Inconsistent deployment wiring: %s", issue)
         return
     detail = "\n  - ".join(issues)
     raise ValueError(
@@ -248,8 +248,9 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
 
     if provider not in _GEOCODING_SERVICES:
         logger.warning(
-            f"geocoding.provider {provider!r} is not a supported service "
-            f"(expected one of: {', '.join(_GEOCODING_SERVICES)}); reverse geocoding is disabled"
+            "geocoding.provider %r is not a supported service (expected one of: %s); reverse geocoding is disabled",
+            provider,
+            ", ".join(_GEOCODING_SERVICES),
         )
         return NullGeocoding()
 
@@ -274,7 +275,7 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
         base_url = resolved
         api_key = None
 
-    logger.info(f"Reverse geocoding enabled via {provider} ({base_url}), rate limit {geo.rate_limit}/s")
+    logger.info("Reverse geocoding enabled via %s (%s), rate limit %s/s", provider, base_url, geo.rate_limit)
     return HttpGeocoding(
         provider,
         base_url,

@@ -104,7 +104,10 @@ def parse_payload[T: VersionedPayload](model: type[T], event: Event) -> T:
 
     payload = event.payload
     if version < target:
-        logger.info(
+        # Debug, not info: an upgrade is the versioning system working as designed,
+        # and this fires once per event — draining an outbox backlog after a deploy
+        # would otherwise write one info line per row into the host's log budget.
+        logger.debug(
             "Upgrading an event payload written by an older build",
             extra={
                 "event_type": event.event_type,

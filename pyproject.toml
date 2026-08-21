@@ -262,6 +262,13 @@ select = [
     "A",      # flake8-builtins
     "T20",    # flake8-print
     "SIM",    # flake8-simplify
+    # Logging call style. This matters more in a library than in an application:
+    # the host owns the log configuration, so an eagerly-formatted f-string costs
+    # the caller string building on every call at a level they have switched off,
+    # and it destroys the message template that structured handlers and error
+    # trackers group by. Lazy ``%``-style keeps both the cost and the template.
+    "G",      # flake8-logging-format
+    "LOG",    # flake8-logging
     "RUF",    # ruff-specific rules
 ]
 ignore = [

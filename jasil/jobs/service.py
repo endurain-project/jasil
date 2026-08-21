@@ -118,7 +118,7 @@ def relay_outbox_scheduled() -> None:
     if total:
         # Debug, not info: this runs every few seconds, and "an event was
         # published but never processed" is the question it exists to answer.
-        logger.debug(f"Relayed {total} outbox row(s) into durable jobs")
+        logger.debug("Relayed %d outbox row(s) into durable jobs", total)
 
 
 def reap_expired_jobs_scheduled() -> None:
@@ -136,7 +136,7 @@ def reap_expired_jobs_scheduled() -> None:
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or overran, so this is the symptom of something else going wrong.
-        logger.warning(f"Reaped {reclaimed} expired job lease(s); a worker died mid-job or overran its lease")
+        logger.warning("Reaped %d expired job lease(s); a worker died mid-job or overran its lease", reclaimed)
 
 
 def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:

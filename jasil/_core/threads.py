@@ -41,4 +41,4 @@ def signal_and_join(
         # Abandoning it is the right call — it is a daemon thread and shutdown
         # must not block — but doing so silently makes the next symptom
         # (work that appears to run after shutdown) impossible to explain.
-        logger.warning(f"Thread {thread.name!r} did not stop within {timeout}s; continuing shutdown without it")
+        logger.warning("Thread %r did not stop within %ss; continuing shutdown without it", thread.name, timeout)

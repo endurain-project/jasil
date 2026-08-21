@@ -107,7 +107,10 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
 
     if events or outbox or jobs:
         logger.info(
-            f"Retention prune: deleted {events} event_log, {outbox} relayed outbox, and {jobs} completed job row(s)"
+            "Retention prune: deleted %d event_log, %d relayed outbox, and %d completed job row(s)",
+            events,
+            outbox,
+            jobs,
         )
     else:
         logger.debug("Retention prune: nothing to delete")

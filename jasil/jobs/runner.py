@@ -94,7 +94,7 @@ class JobRunner:
             )
             snapshots = [self._snapshot(job) for job in claimed]
         if snapshots:
-            logger.debug(f"Claimed {len(snapshots)} durable job(s) as {self._worker_id}")
+            logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
         for snapshot in snapshots:
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.

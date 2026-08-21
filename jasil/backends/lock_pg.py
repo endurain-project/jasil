@@ -72,6 +72,6 @@ class PgAdvisoryLock:
                     # Never let an unlock failure mask a body exception; drop the
                     # still-locked connection so its backend session (and the
                     # lock) is discarded instead of returned to the pool.
-                    logger.error(f"Failed to release advisory lock {name!r}", exc_info=error)
+                    logger.error("Failed to release advisory lock %r", name, exc_info=error)
                     connection.invalidate()
             connection.close()
