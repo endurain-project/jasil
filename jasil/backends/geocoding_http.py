@@ -186,7 +186,10 @@ class HttpGeocoding:
             failed. Never raises — geocoding is best-effort enrichment and must
             not fail the import or backfill that triggered it.
         """
-        logger.debug("Reverse-geocoding (%s, %s) via %s", latitude, longitude, self._service)
+        # The coordinates are deliberately not logged: they are a location fix
+        # belonging to the host's user, and this is a library — it does not get to
+        # decide that someone's whereabouts are acceptable to write to their log.
+        logger.debug("Reverse-geocoding via %s", self._service)
         self._throttle()
         try:
             # Imported lazily: ``requests`` is the optional `geocoding` extra, and

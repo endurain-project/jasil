@@ -11,6 +11,23 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.1.1]
+
+### Security
+
+- The reverse-geocoding backend no longer logs the coordinates it was asked to
+  resolve. A latitude/longitude pair is a location fix belonging to the host's
+  user, and a library does not get to decide that belongs in someone's log. The
+  debug line still names the upstream service, which is what it was useful for.
+  Only the `geocoding` extra reached this, and only at `DEBUG`.
+
+### Changed
+
+- Development lockfile only: `cryptography` moved to `50.0.0` for
+  CVE-2026-69247. It is reached through the `hatch` toolchain and is not a
+  dependency of JASIL or any of its extras, so no installed copy of `0.1.0` ever
+  contained it.
+
 ## [0.1.0]
 
 First release. Extracted from [Endurain](https://github.com/endurain-project/endurain),
@@ -184,4 +201,5 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   values before any filesystem access, and percent-encodes both into the URL it
   returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.1.1]: https://github.com/endurain-project/jasil/releases/tag/v0.1.1
 [0.1.0]: https://github.com/endurain-project/jasil/releases/tag/v0.1.0

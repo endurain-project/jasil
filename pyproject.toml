@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.1.0"
+version = "0.1.1"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -133,7 +133,7 @@ docs = [
 [tool.uv]
 # A floor plus a minor-series ceiling rather than an exact pin: an exact
 # ``==`` match makes every uv patch release a hard build failure (locally and on
-# the CI runner) for no reproducibility gain — the lockfile is what pins the
+# the CI runner) for no reproducibility gain, the lockfile is what pins the
 # dependency set.
 #
 # The floor is capped by **Dependabot**, not by anything this project needs:
@@ -154,6 +154,11 @@ exclude-newer = "30 days"
 # the cooldown keeps protecting everything else. Remove an entry once its fix is
 # older than the window.
 [tool.uv.exclude-newer-package]
+# CVE-2026-69247 (Bleichenbacher oracle in PKCS#7 EnvelopedData decryption) is
+# fixed in 50.0.0. Reached only through hatch -> keyring -> secretstorage, so it
+# is a development dependency and never installed by a consumer of this package,
+# but the fix should not sit behind the cooldown regardless.
+cryptography = "0 days"
 
 [[tool.uv.index]]
 name = "pypi"
