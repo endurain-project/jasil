@@ -185,6 +185,10 @@ time, so clearing it would strand every model already imported.
   payload versioning.
 - [Durable jobs](durable-jobs.md) — retries, leases, and dead-letters.
 - [Observability](observability.md) — the event log and retention.
+- [Threat model](security/threat-model.md) — what JASIL guards, and what it
+  leaves to you.
+- [Integration checklist](security/integration-checklist.md) — the list to work
+  through before you run it in production.
 
 ## License
 

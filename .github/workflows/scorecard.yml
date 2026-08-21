@@ -1,0 +1,66 @@
+name: OpenSSF Scorecard
+
+# Scores this repository's *supply-chain posture* rather than its code: are
+# actions pinned to SHAs, are workflow permissions least-privilege, is branch
+# protection on, are releases signed. Those are the properties a host adopting
+# an infrastructure library cannot verify from the source alone.
+
+on:
+  branch_protection_rule:
+  push:
+    branches:
+      - main
+  schedule:
+    # Weekly, offset from the CodeQL run so the two do not contend.
+    - cron: '45 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # Upload the SARIF result to the Security tab.
+      security-events: write
+      # Publish the result to the OpenSSF REST API so the badge resolves.
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishing makes the score readable by anyone evaluating the
+          # package, which is the point of running it. Requires a public repo.
+          publish_results: true
+
+      # Retained separately from the Security tab so a score regression can be
+      # diffed against a specific run.
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 7
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          sarif_file: results.sarif

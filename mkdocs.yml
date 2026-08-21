@@ -48,5 +48,8 @@ nav:
   - Events & outbox: events-and-outbox.md
   - Durable jobs: durable-jobs.md
   - Observability: observability.md
+  - Security:
+    - Threat Model: security/threat-model.md
+    - Integration Checklist: security/integration-checklist.md
   - API stability: api-stability.md
   - API Reference: api.md
