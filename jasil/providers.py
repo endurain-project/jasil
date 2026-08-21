@@ -91,6 +91,15 @@ class StorageProvider(Protocol):
     prefix listing, such a subsystem would have to reach past the provider to the
     filesystem to clean up after a deleted record, which is exactly what this
     provider exists to prevent.
+
+    ``expires_in`` is **best-effort, and the one place the backends genuinely
+    differ**: ``s3://`` returns a presigned URL that stops working when it
+    elapses, while ``local://`` returns a plain path for the host's own web
+    server and cannot expire at all — JASIL does not run that server and holds no
+    key to sign with. Do not rely on the lifetime for authorization unless you
+    know the deployment uses object storage; on local disk, restricting the URL
+    prefix is the host's job. The local backend logs a warning the first time it
+    is handed a non-default value.
     """
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...

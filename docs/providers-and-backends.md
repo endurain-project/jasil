@@ -82,6 +82,19 @@ exactly what the provider exists to prevent.
     path or a `..` segment raises `ValueError`. Keys are expected to be
     server-generated, but a stray value must never escape the storage root.
 
+!!! danger "`expires_in` is honoured by S3 only"
+    This is the one place the two backends genuinely differ. `s3://` returns a
+    presigned URL that stops working when `expires_in` elapses. `local://`
+    returns a plain path for **your** web server to serve, and cannot expire at
+    all — JASIL does not run that server and holds no key to sign with, so the
+    argument is ignored and the link is permanent.
+
+    So `url(area, key, expires_in=60)` is a one-minute link on S3 and a forever
+    link on local disk. Do not use the lifetime as an authorization control
+    unless you know the deployment uses object storage; on local disk, restrict
+    the URL prefix in the web server instead. The local backend logs a warning
+    the first time it is given a non-default value.
+
 ## EventBusProvider
 
 | Backend | URI | Notes |

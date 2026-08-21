@@ -186,6 +186,6 @@ time, so clearing it would strand every model already imported.
 - [Durable jobs](durable-jobs.md) — retries, leases, and dead-letters.
 - [Observability](observability.md) — the event log and retention.
 
-## Licence
+## License
 
 MIT.

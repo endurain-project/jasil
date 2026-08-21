@@ -1,10 +1,16 @@
 # JASIL
 
+[![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/endurain-project/jasil/blob/main/LICENSE.md)
+[![Release](https://img.shields.io/github/v/release/endurain-project/jasil?label=release&color=blue)](https://github.com/endurain-project/jasil/releases)
+[![PyPI version](https://img.shields.io/pypi/v/jasil)](https://pypi.org/project/jasil/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/jasil)](https://pypi.org/project/jasil/)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://pypi.org/project/jasil/)
+[![Docs](https://img.shields.io/badge/docs-jasil.endurain.com-blue)](https://jasil.endurain.com/)
+[![Stars](https://img.shields.io/github/stars/endurain-project/jasil?label=stars&logo=github)](https://github.com/endurain-project/jasil)
+
 **J**ust **A**nother **S**ubstrate & **I**nfrastructure **L**ibrary — a
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 
 > **Status:** `0.1.0` — the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
@@ -32,7 +38,7 @@ deployment never loads `redis`, `boto3`, or `requests`.
 > call into JASIL from a worker thread (a `def` FastAPI route or dependency does
 > this for you). See [the docs](https://jasil.endurain.com/#one-thing-it-cannot-do-yet).
 
-## Install
+## Installation
 
 ```bash
 pip install jasil                    # core: memory / local disk / in-process
@@ -49,6 +55,20 @@ pip install "jasil[all]"             # every optional backend
 | `fastapi` | `Depends` helpers exposing the providers to routes |
 | `geocoding` | HTTP reverse geocoding |
 | `migrations` | Packaged Alembic revisions |
+
+### Verifying a release
+
+Releases are built and published by [this repository's release workflow](.github/workflows/publish-jasil.yml) through PyPI Trusted Publishing, with [PEP 740](https://peps.python.org/pep-0740/) attestations. You can confirm a downloaded artifact came from that workflow and was not substituted:
+
+```bash
+uvx pypi-attestations verify pypi \
+  --repository https://github.com/endurain-project/jasil \
+  pypi:jasil-<version>-py3-none-any.whl
+```
+
+A successful run prints `OK: <filename>`. `Provenance for file ... was not found` means the artifact predates attested publishing rather than that verification failed.
+
+Each release run also produces a CycloneDX SBOM and `SHA256SUMS`, generated from a clean install of the built wheel. These are retained as workflow artifacts on the release run rather than published to PyPI.
 
 ## Quick start
 
@@ -136,11 +156,15 @@ uv run lint-imports        # architectural import contracts
 
 ## Documentation
 
-<https://jasil.endurain.com/>
+Full documentation is available at the [JASIL docs site](https://jasil.endurain.com/).
 
-## Licence
+## License
 
-MIT — see [LICENSE.md](LICENSE.md).
+This project is licensed under the MIT License - see the [LICENSE](LICENSE.md) file for details.
+
+## Contributing
+
+Contributions welcome! See [Contributing Guidelines](CONTRIBUTING.md) for guidelines.
 
 <div align="center">
   <sub>Built with ❤️ from Portugal | Part of the <a href="https://github.com/endurain-project">Endurain</a> ecosystem</sub>

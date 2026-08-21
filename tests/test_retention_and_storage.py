@@ -256,6 +256,36 @@ class TestLocalStorage:
         """``save`` accepts a nested key, so ``/`` is structure rather than data."""
         assert storage.url("thumbnails", "2026/01/1.webp") == "/media/thumbnails/2026/01/1.webp"
 
+    def test_a_requested_expiry_is_reported_as_ignored(self, storage, caplog):
+        """The one place the two storage backends genuinely differ.
+
+        S3 returns a presigned URL that stops working; this backend returns a
+        path for the host's own web server and cannot expire it. A caller who
+        asked for a lifetime and is silently not getting one would otherwise be
+        relying on an authorization control that does not exist.
+        """
+        with caplog.at_level("WARNING"):
+            url = storage.url("thumbnails", "1.webp", expires_in=60)
+
+        assert url == "/media/thumbnails/1.webp"
+        assert "expires_in=60 was ignored" in caplog.text
+        assert "permanent" in caplog.text
+
+    def test_the_expiry_warning_is_logged_once_per_backend(self, storage, caplog):
+        """``url`` is called per serialized record; this must not flood the log."""
+        with caplog.at_level("WARNING"):
+            for index in range(5):
+                storage.url("thumbnails", f"{index}.webp", expires_in=60)
+
+        assert caplog.text.count("was ignored") == 1
+
+    def test_not_asking_for_an_expiry_is_quiet(self, storage, caplog):
+        """The default means "no opinion", so there is nothing to warn about."""
+        with caplog.at_level("WARNING"):
+            storage.url("thumbnails", "1.webp")
+
+        assert caplog.text == ""
+
     @pytest.mark.parametrize("bad", ["../escape", "/etc/passwd", "a/../../b"])
     @pytest.mark.parametrize("field", ["area", "key"])
     def test_path_traversal_is_refused(self, storage, bad, field):

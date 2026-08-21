@@ -1,9 +1,17 @@
 """Local-filesystem ``StorageProvider`` backend."""
 
+import logging
 from pathlib import Path
 from urllib.parse import quote
 
 from jasil._core.storage_keys import check_segment
+
+logger = logging.getLogger(__name__)
+
+#: Mirrors the ``StorageProvider.url`` protocol default. Used as a sentinel for
+#: "the caller did not ask for a particular lifetime", which is the only way to
+#: tell an indifferent caller from one that will not get what it asked for.
+_DEFAULT_URL_EXPIRY_SECONDS = 3600
 
 
 class LocalStorage:
@@ -14,6 +22,11 @@ class LocalStorage:
     both area and key are validated so a stray value can never escape the base
     directory.
 
+    **:meth:`url` cannot expire.** It returns a plain path for the host's own web
+    server to serve, and JASIL neither runs that server nor holds a key to sign
+    with — so access control here is the host's, and ``expires_in`` is ignored.
+    The S3 backend, which does hold credentials, honours it.
+
     Args:
         base_dir: Absolute storage root every area subdirectory lives under.
         url_prefix: URL path prefix returned by :meth:`url` (default: root).
@@ -22,6 +35,7 @@ class LocalStorage:
     def __init__(self, base_dir: str, url_prefix: str = "") -> None:
         self._base = Path(base_dir)
         self._url_prefix = url_prefix.rstrip("/")
+        self._warned_about_expiry = False
 
     def _resolve(self, area: str, key: str) -> Path:
         """Resolve ``(area, key)`` to an absolute path, rejecting traversal outside base."""
@@ -76,9 +90,19 @@ class LocalStorage:
                 keys.append(key)
         return sorted(keys)
 
-    def url(self, area: str, key: str, expires_in: int = 3600) -> str:
+    def url(self, area: str, key: str, expires_in: int = _DEFAULT_URL_EXPIRY_SECONDS) -> str:
         check_segment(area, "area")
         check_segment(key, "key")
+        if expires_in != _DEFAULT_URL_EXPIRY_SECONDS and not self._warned_about_expiry:
+            # Once per backend: ``url`` is called per serialized record, and a
+            # caller who has to be told this has to be told it exactly once.
+            self._warned_about_expiry = True
+            logger.warning(
+                "Local storage cannot expire a URL, so expires_in=%s was ignored and the link is permanent. "
+                "Restrict %r in the web server that serves it, or use the s3:// backend for signed URLs.",
+                expires_in,
+                self._url_prefix or "/",
+            )
         # Percent-encoded, because a key is only validated against traversal: one
         # holding ``?`` or ``#`` would otherwise end the path early, and ``%``
         # would change it. ``/`` stays safe — a key may be nested.
