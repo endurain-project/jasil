@@ -32,6 +32,7 @@ ALWAYS_IMPORTABLE = (
     "jasil.deps",
     "jasil.jobs.registry",
     "jasil.jobs.service",
+    "jasil.lifecycle",
     "jasil.publisher",
     "jasil.retention",
     "jasil.runtime",

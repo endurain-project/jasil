@@ -54,6 +54,10 @@ Generated from the source docstrings.
 
 ::: jasil.runtime
 
+## Shutdown
+
+::: jasil.lifecycle
+
 ## FastAPI dependencies
 
 ::: jasil.deps

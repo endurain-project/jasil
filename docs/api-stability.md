@@ -28,7 +28,8 @@ modules:
 | `jasil.correlation` | `configure_provider`, `get_correlation_id`, `set_correlation_id`. |
 | `jasil.container` | `Platform`, `build_platform`. |
 | `jasil.capabilities` | `check_deployment_consistency` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
-| `jasil.runtime` | `set_active_platform`, `get_active_platform`, `get_state`, `reset`. |
+| `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
+| `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
 | `jasil.testing` | `FixedClock`, `install_test_platform`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
 | `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |

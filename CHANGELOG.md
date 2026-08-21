@@ -151,6 +151,10 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   thread and the shared Redis clients — and never raises, so a shutdown failure
   cannot mask whatever prompted the shutdown. The durable-job worker and the
   host's engine are stopped separately, because the platform does not own them.
+- `jasil.lifecycle.shutdown()` composes the two halves of that in the order that
+  matters — the worker stops before the bus its subscribers publish through — so
+  a host does not have to know the ordering. Idempotent, safe before anything has
+  started, and never raises.
 
 **Packaging**
 
@@ -172,7 +176,9 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   DNS rebinding. An allowlist escape hatch exists for self-hosted services on
   private networks, and every use of it is logged for audit. Configured values
   must be a bare `host[:port]`, so one carrying a scheme or path cannot redirect
-  a request elsewhere.
+  a request elsewhere. An allowlist entry that is a *hostname* exempts every
+  address that name resolves to, so taking one is logged at `WARNING` naming the
+  address and recommending a CIDR; a CIDR exemption logs at `INFO`.
 - The geocoding backend refuses redirects, so a permitted host cannot 3xx-pivot
   onto an internal target. Its response body is read under a size cap, and its
   failures are logged by exception type and status code only: `requests` puts the

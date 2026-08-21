@@ -182,3 +182,35 @@ class TestAllowlist:
 
         assert "SSRF allowlist hit" in caplog.text
         assert "geocoding" in caplog.text
+
+    def test_a_hostname_entry_warns_that_it_is_the_broader_form(self, resolve, caplog):
+        """It exempts whatever the name resolves to — a rebind, or a metadata endpoint.
+
+        A CIDR entry cannot widen that way, so the two are not equivalent and the
+        operator who chose the broader one should be told.
+        """
+        resolve(PRIVATE_IP)
+
+        with caplog.at_level("INFO", logger=network.__name__):
+            network.host_rejection_reason("nominatim.lan", allowed_hosts=["nominatim.lan"])
+
+        assert [record.levelname for record in caplog.records] == ["WARNING"]
+        assert "Prefer a CIDR" in caplog.text
+
+    def test_a_cidr_entry_does_not_warn(self, resolve, caplog):
+        """The precise form is the one being recommended; it must not nag."""
+        resolve(PRIVATE_IP)
+
+        with caplog.at_level("INFO", logger=network.__name__):
+            network.host_rejection_reason("nominatim.lan", allowed_hosts=["10.0.0.0/8"])
+
+        assert [record.levelname for record in caplog.records] == ["INFO"]
+
+    def test_a_rejected_host_logs_nothing(self, resolve, caplog):
+        """No exemption was taken, so there is nothing to audit."""
+        resolve(PRIVATE_IP)
+
+        with caplog.at_level("INFO", logger=network.__name__):
+            assert network.host_rejection_reason("evil.lan", allowed_hosts=["safe.lan"]) == network._NON_PUBLIC
+
+        assert caplog.records == []

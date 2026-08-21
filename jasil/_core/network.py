@@ -80,23 +80,6 @@ def _split_allowlist(
     return frozenset(hosts), tuple(networks)
 
 
-def _is_allowlisted(
-    hostname: str,
-    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
-    allowed_hosts: Sequence[str],
-) -> bool:
-    """Return True if ``hostname`` or ``addr`` is allowlisted.
-
-    Only consulted when the resolved address would otherwise be rejected. Both
-    the hostname (exact, case-insensitive) and the resolved IP (CIDR membership)
-    are checked, so an operator can opt in by either dimension.
-    """
-    hosts, networks = _split_allowlist(allowed_hosts)
-    if hostname.lower() in hosts:
-        return True
-    return any(addr in network for network in networks)
-
-
 def _address_rejection_reason(
     hostname: str,
     *,
@@ -124,6 +107,7 @@ def _address_rejection_reason(
     except socket.gaierror:
         return _UNRESOLVABLE
 
+    exempt_hostnames, exempt_networks = _split_allowlist(allowed_hosts)
     for info in infos:
         ip_text = info[4][0]
         try:
@@ -131,17 +115,28 @@ def _address_rejection_reason(
         except ValueError:
             # Defensive: a resolver answer we cannot parse is treated as unsafe.
             return _UNPARSEABLE
-        if _is_private_or_reserved(addr):
-            if _is_allowlisted(hostname, addr, allowed_hosts):
-                # Audit trail: every allowlisted private destination is logged so
-                # operators can review what the exception is being used for.
-                logger.info(
-                    "SSRF allowlist hit: dialing private address %s for host %s (purpose=%s)",
-                    ip_text,
-                    hostname,
-                    purpose or "unspecified",
-                )
-                continue
+        if not _is_private_or_reserved(addr):
+            continue
+        # Audit trail: every allowlisted private destination is logged so
+        # operators can review what the exception is being used for. A hostname
+        # entry is the broader of the two, and says so.
+        if hostname.lower() in exempt_hostnames:
+            logger.warning(
+                "SSRF allowlist hit: dialing private address %s for host %s (purpose=%s). That entry is a "
+                "hostname, so every address the name resolves to is exempt \u2014 including any it starts "
+                "returning later. Prefer a CIDR entry, which cannot widen.",
+                ip_text,
+                hostname,
+                purpose or "unspecified",
+            )
+        elif any(addr in network for network in exempt_networks):
+            logger.info(
+                "SSRF allowlist hit: dialing private address %s for host %s (purpose=%s)",
+                ip_text,
+                hostname,
+                purpose or "unspecified",
+            )
+        else:
             return _NON_PUBLIC
     return None
 
@@ -181,7 +176,8 @@ def host_rejection_reason(
         allowed_hosts: Hostnames and CIDRs exempt from the address denylist, for
             reaching a self-hosted service on a private network. An entry that is
             a *hostname* exempts every address it resolves to — including a cloud
-            metadata endpoint — so prefer a CIDR where you can.
+            metadata endpoint — so prefer a CIDR where you can; a hostname
+            exemption is logged at ``WARNING`` each time it is taken.
         purpose: Optional short tag identifying the outbound call, used only for
             audit logging.
 

@@ -42,6 +42,15 @@ def get_active_platform() -> "Platform":
     return _active_platform
 
 
+def is_platform_active() -> bool:
+    """Return whether a platform has been published.
+
+    Returns:
+        True once :func:`set_active_platform` has run and before :func:`reset`.
+    """
+    return _active_platform is not None
+
+
 def get_state() -> "StateProvider":
     """Return the process-wide ephemeral-state provider.
 

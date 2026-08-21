@@ -110,9 +110,21 @@ with platform.lock.try_acquire("nightly-backfill") as acquired:
 Nothing above changes when you move to Redis and S3 — only the
 [configuration](configuration.md) does.
 
-On shutdown, `platform.close()` stops the event-bus consumer and closes the
-shared Redis clients. It never raises. The durable-job worker and your engine are
-yours to stop — the platform does not own either.
+On shutdown, call `jasil.lifecycle.shutdown()`:
+
+```python
+import jasil.lifecycle as jasil_lifecycle
+
+jasil_lifecycle.shutdown()
+```
+
+It stops the durable-job worker, then releases the platform — the event-bus
+consumer thread and the shared Redis clients — and unpublishes it. That order
+matters: the worker runs subscribers, and a subscriber that publishes needs the
+bus still up. It never raises, and it is safe to call when nothing was started.
+
+Your APScheduler instance and your database engine are yours to stop. JASIL never
+created either, so it does not close them.
 
 ## On FastAPI
 
