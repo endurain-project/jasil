@@ -75,14 +75,14 @@ class TestAsyncEngineAccess:
 
 class TestReset:
     def test_reset_clears_both_session_factory_slots(self, pristine_orm):
-        orm.configure_sessionmaker(sessionmaker(bind=create_engine("sqlite://")))
-        orm.configure_async_sessionmaker(async_sessionmaker(bind=create_async_engine("sqlite+aiosqlite://")))
+        pristine_orm.configure_sessionmaker(sessionmaker(bind=create_engine("sqlite://")))
+        pristine_orm.configure_async_sessionmaker(async_sessionmaker(bind=create_async_engine("sqlite+aiosqlite://")))
 
-        orm.reset()
+        pristine_orm.reset()
 
-        assert orm.is_sessionmaker_configured() is False
-        assert orm.is_async_sessionmaker_configured() is False
+        assert pristine_orm.is_sessionmaker_configured() is False
+        assert pristine_orm.is_async_sessionmaker_configured() is False
         with pytest.raises(RuntimeError, match=r"\*synchronous\* session factory"):
-            orm.get_sessionmaker()
+            pristine_orm.get_sessionmaker()
         with pytest.raises(RuntimeError, match=r"\*async\* session factory"):
-            orm.get_async_sessionmaker()
+            pristine_orm.get_async_sessionmaker()

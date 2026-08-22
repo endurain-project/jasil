@@ -232,6 +232,22 @@ class TestAsyncJobRunner:
         assert processed == 2
         assert len(seen) == 1
 
+    async def test_a_finalize_failure_is_logged_and_does_not_escape(
+        self, runner, registry, async_db, monkeypatch, caplog
+    ):
+        registry.register("activity.created", "s", _noop)
+        await _enqueue(async_db)
+
+        async def explode(*args, **kwargs) -> None:
+            raise RuntimeError("database went away")
+
+        monkeypatch.setattr(runner_async.jobs_crud, "mark_job_completed", explode)
+
+        with caplog.at_level("ERROR"):
+            assert await runner.run_once() == 1
+
+        assert "Durable job could not be finalized" in caplog.text
+
     async def test_the_batch_size_bounds_a_pass(self, registry, clock, async_session_factory, async_db):
         registry.register("activity.created", "s", _noop)
         for index in range(5):
