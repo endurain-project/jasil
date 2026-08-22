@@ -5,14 +5,24 @@ Every table :mod:`jasil.retention` prunes (``event_log``, relayed
 same way, and only the model and the filter differ. The batching is what
 keeps each delete transaction short, so a prune pass never holds locks on
 a hot table long enough to block the relay or the worker.
+
+The async twin runs the same batching against an ``AsyncSession``. Batch sizes,
+the safety cap and the ``SKIP LOCKED`` page-claiming are shared constants rather
+than duplicated literals, because a prune pass that behaves differently under
+asyncio would be a difference nobody would think to look for.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import ColumnExpressionArgument, delete, select
 from sqlalchemy.orm import Session
 
 from jasil._core.dialects import supports_skip_locked
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+__all__ = ["PRUNE_BATCH_SIZE", "PRUNE_MAX_BATCHES", "bounded_delete", "bounded_delete_async"]
 
 # Rows deleted per batch when pruning; bounded so each delete transaction
 # stays short.
@@ -52,6 +62,46 @@ def bounded_delete(
             break
         db.execute(delete(model).where(model.id.in_(ids)))
         db.commit()
+        total += len(ids)
+        if len(ids) < batch_size:
+            break
+    return total
+
+
+async def bounded_delete_async(
+    model: type[Any],
+    *conditions: ColumnExpressionArgument[bool],
+    db: "AsyncSession",
+    batch_size: int = PRUNE_BATCH_SIZE,
+) -> int:
+    """
+    Delete the rows matching ``conditions`` in bounded, committed batches.
+
+    The asynchronous counterpart of :func:`bounded_delete`. The batching policy
+    is identical: each batch is its own short transaction, so a prune pass never
+    holds locks on a hot table long enough to block the relay or the worker.
+
+    Args:
+        model: Mapped class to delete from; must expose an ``id`` column.
+        *conditions: Filters selecting the rows that are safe to prune.
+        db: Active async database session.
+        batch_size: Maximum rows deleted per batch.
+
+    Returns:
+        The total number of rows deleted.
+    """
+    total = 0
+    for _ in range(PRUNE_MAX_BATCHES):
+        id_stmt = select(model.id).where(*conditions).limit(batch_size)
+        if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+            # Concurrent prunes step over each other's claimed page rather
+            # than blocking on it.
+            id_stmt = id_stmt.with_for_update(skip_locked=True)
+        ids = list((await db.execute(id_stmt)).scalars().all())
+        if not ids:
+            break
+        await db.execute(delete(model).where(model.id.in_(ids)))
+        await db.commit()
         total += len(ids)
         if len(ids) < batch_size:
             break
