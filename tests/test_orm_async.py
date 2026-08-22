@@ -74,7 +74,7 @@ class TestAsyncEngineAccess:
 
 
 class TestReset:
-    def test_reset_clears_both_session_factory_slots(self):
+    def test_reset_clears_both_session_factory_slots(self, pristine_orm):
         orm.configure_sessionmaker(sessionmaker(bind=create_engine("sqlite://")))
         orm.configure_async_sessionmaker(async_sessionmaker(bind=create_async_engine("sqlite+aiosqlite://")))
 

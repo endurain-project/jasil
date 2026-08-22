@@ -397,8 +397,9 @@ class TestAsyncRedisBackend:
                 return None
 
             async def scan_iter(self, *args, **kwargs):
+                for key in ():
+                    yield key
                 raise RedisConnectionError("connection refused")
-                yield "unreachable"
 
         with pytest.raises(StateBackendUnavailableError):
             await _collect_keys(AsyncRedisState(_Broken()), "k")
@@ -1113,6 +1114,35 @@ class RecordingAsyncClient:
     """Stands in for ``redis.asyncio.Redis``, recording async construction and close."""
 
     created: ClassVar[list[dict]] = []
+    instances: ClassVar[list["RecordingAsyncClient"]] = []
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.closed = False
+        self.pinged = False
+        self.close_error: Exception | None = None
+
+    @classmethod
+    def from_url(cls, url, **kwargs):
+        client = cls(url=url, **kwargs)
+        cls.created.append(client.kwargs)
+        cls.instances.append(client)
+        return client
+
+    async def ping(self):
+        self.pinged = True
+        return True
+
+    async def aclose(self):
+        if self.close_error is not None:
+            raise self.close_error
+        self.closed = True
+
+
+class RecordingClient:
+    """Sync redis client double used to keep redis_clients module coverage representative."""
+
+    created: ClassVar[list[dict]] = []
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
@@ -1126,11 +1156,11 @@ class RecordingAsyncClient:
         cls.created.append(client.kwargs)
         return client
 
-    async def ping(self):
+    def ping(self):
         self.pinged = True
         return True
 
-    async def aclose(self):
+    def close(self):
         if self.close_error is not None:
             raise self.close_error
         self.closed = True
@@ -1138,9 +1168,13 @@ class RecordingAsyncClient:
 
 @pytest.fixture(autouse=True)
 def _no_leaked_async_clients():
+    redis_clients.reset_shared_clients()
     redis_clients.reset_shared_async_clients()
+    RecordingClient.created = []
     RecordingAsyncClient.created = []
+    RecordingAsyncClient.instances = []
     yield
+    redis_clients.reset_shared_clients()
     redis_clients.reset_shared_async_clients()
 
 
@@ -1148,6 +1182,67 @@ def _no_leaked_async_clients():
 def async_recording(monkeypatch):
     monkeypatch.setattr(redis.asyncio, "Redis", RecordingAsyncClient)
     return RecordingAsyncClient
+
+
+@pytest.fixture
+def recording(monkeypatch):
+    monkeypatch.setattr(redis, "Redis", RecordingClient)
+    return RecordingClient
+
+
+class TestSyncRedisClientCoverage:
+    async def test_sync_client_creation_and_shared_cache(self, recording):
+        first = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+        second = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+
+        assert first is second
+        assert first.pinged is True
+        assert recording.created == [
+            {
+                "url": "redis://cache:6379/0",
+                "decode_responses": True,
+                "socket_connect_timeout": 2.0,
+                "socket_timeout": 2.0,
+            }
+        ]
+
+    async def test_sync_client_failures_are_wrapped(self, monkeypatch):
+        class _Unreachable(RecordingClient):
+            def ping(self):
+                raise redis.RedisError("connection refused")
+
+        monkeypatch.setattr(redis, "Redis", _Unreachable)
+
+        with pytest.raises(RuntimeError, match="platform state"):
+            redis_clients.create_redis_client("redis://cache:6379/0", "platform state")
+
+    async def test_sync_client_close_failure_is_logged_and_dropped(self, recording, caplog):
+        client = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+        client.close_error = RuntimeError("socket already gone")
+
+        with caplog.at_level("WARNING"):
+            redis_clients.close_shared_clients()
+
+        assert "Failed to close the shared redis client" in caplog.text
+        assert redis_clients._shared_clients == {}
+
+    async def test_sync_reset_discards_without_closing(self, recording):
+        client = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+
+        redis_clients.reset_shared_clients()
+
+        assert client.closed is False
+        assert redis_clients._shared_clients == {}
+
+    async def test_matching_keys_are_deleted_in_batches(self):
+        client = fakeredis.FakeStrictRedis(decode_responses=True)
+        for index in range(25):
+            client.set(f"session:{index}", "1")
+        client.set("other", "1")
+
+        assert redis_clients.delete_matching_keys(client, "session:*", scan_count=10) == 25
+        assert client.keys("session:*") == []
+        assert client.exists("other") == 1
 
 
 class TestAsyncRedisClients:
@@ -1178,6 +1273,7 @@ class TestAsyncRedisClients:
             await redis_clients.create_async_redis_client("redis://cache:6379/0", "platform state")
 
         assert _Unreachable.created[0]["url"] == "redis://cache:6379/0"
+        assert _Unreachable.instances[0].closed is True
 
     async def test_a_malformed_url_is_reported_the_same_way(self, monkeypatch):
         class _Invalid(RecordingAsyncClient):

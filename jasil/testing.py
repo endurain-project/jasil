@@ -161,7 +161,7 @@ def reset_all() -> None:
     """Clear every process-wide slot JASIL installs, except the ORM mapping.
 
     Covers the settings, the correlation provider, the published platforms (sync
-    and async alike), the durable subscriber registry, and the memoized Redis
+    and async alike), both durable subscriber registries, and the memoized Redis
     clients of both flavours. Call it in fixture teardown; leaving any one of them
     set is how a passing test starts depending on the one before it.
 
@@ -179,7 +179,11 @@ def reset_all() -> None:
     correlation.reset()
     # Clears both platform slots.
     platform_runtime.reset()
+    # Both registries: a host wiring the async face registers its durable
+    # subscribers in the async one, and leaking those across tests is exactly the
+    # kind of cross-contamination this function exists to prevent.
     jobs_registry.registry.clear()
+    jobs_registry.async_registry.clear()
     redis_clients.reset_shared_clients()
     # Discarded rather than closed, for the same reason as the sync clients:
     # closing is meaningless for an injected fake and closing here would need an

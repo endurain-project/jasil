@@ -261,12 +261,15 @@ async def create_async_redis_client(
     from redis import RedisError
     from redis.asyncio import Redis as AsyncRedis
 
-    redis_client = AsyncRedis.from_url(
-        storage_uri,
-        decode_responses=decode_responses,
-        socket_connect_timeout=socket_timeout,
-        socket_timeout=socket_timeout,
-    )
+    try:
+        redis_client = AsyncRedis.from_url(
+            storage_uri,
+            decode_responses=decode_responses,
+            socket_connect_timeout=socket_timeout,
+            socket_timeout=socket_timeout,
+        )
+    except ValueError as redis_error:
+        raise RuntimeError(f"Unable to initialize Redis storage for {purpose}.") from redis_error
     try:
         await redis_client.ping()
     except (RedisError, ValueError, OSError) as redis_error:
