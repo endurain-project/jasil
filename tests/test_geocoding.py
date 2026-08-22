@@ -25,8 +25,8 @@ from jasil.backends.geocoding_http import (
     MAX_RESPONSE_BYTES,
     HttpGeocoding,
     NullGeocoding,
-    failure_detail,
     build_reverse_endpoint,
+    failure_detail,
 )
 from jasil.providers import GeocodedPlace, GeocodingProvider
 

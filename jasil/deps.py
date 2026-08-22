@@ -14,13 +14,27 @@ Two places are consulted, in order:
 
 So a host that followed the quick start needs no extra wiring here, and one that
 wants per-app isolation gets it by setting ``app.state.platform`` at startup.
+
+The ``async_``-prefixed dependencies do the same for the async platform, reading
+``request.app.state.async_platform`` and then the process-wide async slot. They
+are separate names, and read a separate app-state attribute, so a process running
+both faces cannot hand an async provider to a synchronous route or the reverse.
+None of them are coroutines: resolving a provider is a dictionary lookup, and it
+is the *provider's* methods that are awaitable.
 """
 
 from fastapi import Request
 
 import jasil.runtime as platform_runtime
 from jasil.container import Platform
+from jasil.container_async import AsyncPlatform
 from jasil.providers import ClockProvider, EventBusProvider, LockProvider, StateProvider, StorageProvider
+from jasil.providers_async import (
+    AsyncEventBusProvider,
+    AsyncLockProvider,
+    AsyncStateProvider,
+    AsyncStorageProvider,
+)
 
 
 def get_platform(request: Request) -> Platform:
@@ -65,3 +79,51 @@ def get_lock(request: Request) -> LockProvider:
 def get_clock(request: Request) -> ClockProvider:
     """Return the clock provider."""
     return get_platform(request).clock
+
+
+def get_async_platform(request: Request) -> AsyncPlatform:
+    """Return the ``AsyncPlatform`` for this request.
+
+    Args:
+        request: The incoming request, used to reach ``app.state``.
+
+    Returns:
+        The app-scoped async platform when the host attached one (as
+        ``app.state.async_platform``), else the process-wide async platform.
+
+    Raises:
+        RuntimeError: When neither has been published, i.e. startup never ran.
+    """
+    platform: AsyncPlatform | None = getattr(request.app.state, "async_platform", None)
+    if platform is not None:
+        return platform
+    return platform_runtime.get_active_async_platform()
+
+
+def get_async_state(request: Request) -> AsyncStateProvider:
+    """Return the async ephemeral-state provider."""
+    return get_async_platform(request).state
+
+
+def get_async_storage(request: Request) -> AsyncStorageProvider:
+    """Return the async blob-storage provider."""
+    return get_async_platform(request).storage
+
+
+def get_async_events(request: Request) -> AsyncEventBusProvider:
+    """Return the async event-bus provider."""
+    return get_async_platform(request).events
+
+
+def get_async_lock(request: Request) -> AsyncLockProvider:
+    """Return the async coordination-lock provider."""
+    return get_async_platform(request).lock
+
+
+def get_async_clock(request: Request) -> ClockProvider:
+    """Return the clock provider.
+
+    Shared with the sync platform unchanged: reading a clock does no I/O, so
+    there is no async variant to return.
+    """
+    return get_async_platform(request).clock

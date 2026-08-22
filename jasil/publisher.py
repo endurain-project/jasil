@@ -212,6 +212,20 @@ def _durable_delivery_enabled(event_type: str) -> bool:
     return get_settings().jobs.enabled and bool(jobs_registry.registry.subscribers_for(event_type))
 
 
+def _durable_delivery_enabled_async(event_type: str) -> bool:
+    """Whether an event type should be delivered durably on the *async* face.
+
+    The same rule as :func:`_durable_delivery_enabled`, read against the async
+    registry. It has to be a separate lookup rather than a shared one: the two
+    registries are independent, and an async host registers coroutine handlers in
+    only one of them. Consulting the sync registry here would silently route
+    every async durable event onto the best-effort bus — the subscriber would
+    still run, but without a retry budget, a lease, or a dead-letter queue, which
+    is the entire reason the caller asked for durable delivery.
+    """
+    return get_settings().jobs.enabled and bool(jobs_registry.async_registry.subscribers_for(event_type))
+
+
 def publish_many_committing(
     event_type: str,
     payloads: Sequence[dict],
@@ -344,7 +358,7 @@ async def apublish(
     try:
         platform = platform_runtime.get_active_async_platform()
         event = _mint(event_type, payload, source, metadata, schema_version)
-        if db is not None and _durable_delivery_enabled(event_type):
+        if db is not None and _durable_delivery_enabled_async(event_type):
             await _stage_in_outbox_async(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
             # Which route an event took is the first thing anyone asks when it
             # appears not to have been processed, and nothing else records it.
@@ -427,7 +441,7 @@ async def apublish_many_committing(
         None.
     """
     metadata_of = metadata_for if metadata_for is not None else (lambda _payload: None)
-    if db is not None and _durable_delivery_enabled(event_type):
+    if db is not None and _durable_delivery_enabled_async(event_type):
         # Atomic path: stage every outbox row inside the caller's transaction, so
         # a failure here leaves it uncommitted and the caller rolls back as a
         # whole — no partial domain change, no orphaned event.

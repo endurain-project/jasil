@@ -5,11 +5,16 @@ Public (pure) surface — safe to import anywhere; pulls in no backends:
     - ``Event`` / ``new_event`` — the event envelope.
     - ``StateProvider`` / ``StorageProvider`` / ``EventBusProvider`` /
       ``LockProvider`` / ``ClockProvider`` — the capability providers.
+    - ``AsyncStateProvider`` / ``AsyncStorageProvider`` / ``AsyncEventBusProvider``
+      / ``AsyncLockProvider`` — the async capability providers. ``ClockProvider``
+      has no async twin: reading a clock does no I/O.
 
-The composition root (``Platform`` / ``build_platform``) lives in
-``jasil.container`` and is imported explicitly where the platform is
-built (startup, ``deps``). Keeping it out of this ``__init__`` means importing
-the pure profile/capabilities modules never drags the concrete backends in.
+The composition roots (``Platform`` / ``build_platform`` in ``jasil.container``,
+``AsyncPlatform`` / ``build_async_platform`` in ``jasil.container_async``) are
+imported explicitly where the platform is built (startup, ``deps``). Keeping them
+out of this ``__init__`` means importing the pure profile/capabilities modules
+never drags the concrete backends in — and that has to remain true now that some
+of those backends would pull in ``redis.asyncio`` or ``httpx``.
 """
 
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
@@ -26,6 +31,13 @@ from jasil.providers import (
     StorageProvider,
     TieredFailureOutcome,
 )
+from jasil.providers_async import (
+    AsyncEventBusProvider,
+    AsyncGeocodingProvider,
+    AsyncLockProvider,
+    AsyncStateProvider,
+    AsyncStorageProvider,
+)
 
 try:
     __version__ = _version("jasil")
@@ -35,6 +47,11 @@ except _PackageNotFoundError:  # pragma: no cover - running from an unbuilt sour
 __all__ = [
     # Package metadata
     "__version__",
+    "AsyncEventBusProvider",
+    "AsyncGeocodingProvider",
+    "AsyncLockProvider",
+    "AsyncStateProvider",
+    "AsyncStorageProvider",
     "ClockProvider",
     "DeploymentProfile",
     "Event",

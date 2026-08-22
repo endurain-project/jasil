@@ -17,6 +17,13 @@ In-flight and human-actionable rows are never touched: unrelayed outbox rows
 ``dead_letter`` jobs (kept for operator review). It runs single-runner across
 replicas via the platform ``LockProvider`` and is inert when both windows are
 ``<= 0`` (retention disabled — keep every row forever).
+
+:func:`aprune_expired_records` is the same pass for a host running the async
+face, taking the async platform's lock and pruning through the async CRUD. The
+*policy* — which windows apply, which rows are safe to delete, the lock name, the
+interval — is read from the same settings and the same constants, so the two
+cannot prune different things. Note the lock name is shared deliberately: a
+process running both faces must not prune twice concurrently.
 """
 
 import logging
@@ -139,6 +146,109 @@ def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_star
     starts_now = {"next_run_time": datetime.now(UTC)} if run_at_startup else {}
     scheduler.add_job(
         prune_expired_records,
+        "interval",
+        hours=_PRUNE_INTERVAL_HOURS,
+        id=_PRUNE_JOB_ID,
+        replace_existing=True,
+        **starts_now,
+    )
+    logger.info("Scheduled JASIL retention pruning")
+
+
+async def aprune_expired_records() -> None:
+    """Prune substrate bookkeeping rows older than their retention windows.
+
+    The asynchronous counterpart of :func:`prune_expired_records`, with identical
+    policy. Register it with :func:`schedule_async_retention_maintenance`, or call
+    it yourself. No-ops when both windows are disabled (``<= 0``) or when another
+    replica already holds the prune lock.
+
+    Returns:
+        None.
+    """
+    settings = get_settings()
+    event_log_days = settings.event_log.retention_days
+    jobs_days = settings.jobs.retention_days
+    if event_log_days <= 0 and jobs_days <= 0:
+        return
+
+    platform = platform_runtime.get_active_async_platform()
+    async with platform.lock.try_acquire(_PRUNE_LOCK_NAME) as acquired:
+        if not acquired:
+            logger.debug("Retention prune: another replica holds the lock; skipping")
+            return
+        await _arun_prune(platform.clock.now(), event_log_days, jobs_days)
+
+
+async def _arun_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
+    """Delete prunable rows older than each table's window, asynchronously.
+
+    Each table is pruned on its own short-lived session so one table's failure
+    cannot roll back another's progress. A window of ``<= 0`` skips that group.
+
+    Args:
+        now: The current instant; each cutoff is ``now`` minus that table's window.
+        event_log_days: Retention window for the event_log trail (days).
+        jobs_days: Retention window for the durable-job tables (days).
+
+    Returns:
+        None.
+    """
+    # Imported here rather than at module scope: these bind to the host's
+    # declarative base, so a top-level import would make ``import jasil.retention``
+    # fail until ``jasil.orm.map_models`` had run.
+    import jasil.event_log.crud_async as event_log_crud_async
+    import jasil.jobs.crud_async as jobs_crud_async
+    import jasil.jobs.outbox_async as jobs_outbox_async
+
+    events = outbox = jobs = 0
+
+    if event_log_days > 0:
+        cutoff = now - timedelta(days=event_log_days)
+        async with jasil_orm.get_async_sessionmaker()() as db:
+            events = await event_log_crud_async.delete_events_before(cutoff, db=db)
+
+    if jobs_days > 0:
+        cutoff = now - timedelta(days=jobs_days)
+        async with jasil_orm.get_async_sessionmaker()() as db:
+            outbox = await jobs_outbox_async.delete_relayed_before(cutoff, db=db)
+        async with jasil_orm.get_async_sessionmaker()() as db:
+            jobs = await jobs_crud_async.delete_completed_jobs_before(cutoff, db=db)
+
+    if events or outbox or jobs:
+        logger.info(
+            "Retention prune: deleted %d event_log, %d relayed outbox, and %d completed job row(s)",
+            events,
+            outbox,
+            jobs,
+        )
+    else:
+        logger.debug("Retention prune: nothing to delete")
+
+
+def schedule_async_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_startup: bool = True) -> None:
+    """
+    Register the recurring async retention prune on the host's scheduler.
+
+    The asynchronous counterpart of :func:`schedule_retention_maintenance`. The
+    scheduler is already an ``AsyncIOScheduler``, so it awaits the coroutine
+    natively — the only difference is which callable is registered.
+
+    Register it on every replica. The prune takes the platform's coordination
+    lock, so only one of them does the work per pass.
+
+    Args:
+        scheduler: The application scheduler to register the job on.
+        run_at_startup: Run one pass as soon as the scheduler starts. On by
+            default because a daily interval otherwise means a process that is
+            redeployed daily never prunes at all.
+
+    Returns:
+        None.
+    """
+    starts_now = {"next_run_time": datetime.now(UTC)} if run_at_startup else {}
+    scheduler.add_job(
+        aprune_expired_records,
         "interval",
         hours=_PRUNE_INTERVAL_HOURS,
         id=_PRUNE_JOB_ID,
