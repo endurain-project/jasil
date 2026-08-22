@@ -42,22 +42,45 @@ Host applications:
        engine = create_engine(...)
        jasil_orm.configure_sessionmaker(sessionmaker(bind=engine))
 
+   An async host registers an ``async_sessionmaker`` instead — or as well::
+
+       from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+       engine = create_async_engine("postgresql+psycopg://...")
+       jasil_orm.configure_async_sessionmaker(async_sessionmaker(bind=engine))
+
+   The two slots are independent, and the same mapped models serve both: an
+   ``AsyncSession`` and a ``Session`` are two ways of driving one registry, which
+   is why the async face needed no second set of models. Configure whichever the
+   process actually uses — or both, when one process runs an async API beside a
+   synchronous worker.
+
 JASIL never creates the engine; the host owns the connection.
 """
 
 import importlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from jasil._core.registry import ConfigSlot
 
+# Only for the annotations. ``sqlalchemy.ext.asyncio`` needs greenlet, which
+# SQLAlchemy ships separately (the ``async`` extra), so a synchronous deployment
+# must be able to import this module without it.
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 __all__ = [
     "Base",
+    "configure_async_sessionmaker",
     "configure_sessionmaker",
     "get_active_base",
+    "get_async_engine",
+    "get_async_sessionmaker",
     "get_engine",
     "get_sessionmaker",
+    "is_async_sessionmaker_configured",
     "is_models_mapped",
     "is_sessionmaker_configured",
     "jasil_table_names",
@@ -161,17 +184,34 @@ def map_models(base: type[DeclarativeBase] | None = None) -> None:
 
 _session_factory: ConfigSlot[sessionmaker[Session]] = ConfigSlot(
     missing_message=(
-        "JASIL has no session factory. Call jasil.orm.configure_sessionmaker(sessionmaker(bind=engine)) at startup."
+        "JASIL has no *synchronous* session factory. Call "
+        "jasil.orm.configure_sessionmaker(sessionmaker(bind=engine)) at startup. "
+        "If this process is async, you are on a synchronous code path (the sync platform, recorder, "
+        "job runner or retention prune) — use its async counterpart, or configure both factories."
+    )
+)
+
+_async_session_factory: ConfigSlot["async_sessionmaker[AsyncSession]"] = ConfigSlot(
+    missing_message=(
+        "JASIL has no *async* session factory. Call "
+        "jasil.orm.configure_async_sessionmaker(async_sessionmaker(bind=engine)) at startup, with an "
+        "engine built by sqlalchemy.ext.asyncio.create_async_engine. "
+        "If this process is synchronous, you are on an async code path — use its synchronous "
+        "counterpart, or configure both factories."
     )
 )
 
 
 def configure_sessionmaker(factory: sessionmaker[Session]) -> None:
-    """Install the host's session factory.
+    """Install the host's synchronous session factory.
 
     Call once at startup with a ``sessionmaker`` bound to the application's
     engine. The event-log recorder, the job runner, the relay, and the retention
     sweeps all obtain their sessions from it.
+
+    Independent of :func:`configure_async_sessionmaker`: configure this one for a
+    synchronous deployment, the async one for an async deployment, or both when a
+    single process runs each.
 
     Args:
         factory: A configured ``sessionmaker``.
@@ -179,8 +219,27 @@ def configure_sessionmaker(factory: sessionmaker[Session]) -> None:
     _session_factory.configure(factory)
 
 
+def configure_async_sessionmaker(factory: "async_sessionmaker[AsyncSession]") -> None:
+    """Install the host's async session factory.
+
+    The counterpart of :func:`configure_sessionmaker` for a host built on
+    ``AsyncSession``. The async event-log recorder, the async job runner, the
+    async relay, and the async retention sweep obtain their sessions from it.
+
+    The factory must be bound to an engine from
+    :func:`sqlalchemy.ext.asyncio.create_async_engine`, using an async driver
+    (``postgresql+psycopg``, ``postgresql+asyncpg``, ``sqlite+aiosqlite``, …).
+    JASIL's models need no change to work through it: an ``AsyncSession`` drives
+    the same declarative registry :func:`map_models` populated.
+
+    Args:
+        factory: A configured ``async_sessionmaker``.
+    """
+    _async_session_factory.configure(factory)
+
+
 def get_sessionmaker() -> sessionmaker[Session]:
-    """Return the installed session factory.
+    """Return the installed synchronous session factory.
 
     Raises:
         RuntimeError: If :func:`configure_sessionmaker` has not been called.
@@ -188,13 +247,27 @@ def get_sessionmaker() -> sessionmaker[Session]:
     return _session_factory.get()
 
 
+def get_async_sessionmaker() -> "async_sessionmaker[AsyncSession]":
+    """Return the installed async session factory.
+
+    Raises:
+        RuntimeError: If :func:`configure_async_sessionmaker` has not been called.
+    """
+    return _async_session_factory.get()
+
+
 def is_sessionmaker_configured() -> bool:
     """Return whether :func:`configure_sessionmaker` has been called."""
     return _session_factory.is_configured()
 
 
+def is_async_sessionmaker_configured() -> bool:
+    """Return whether :func:`configure_async_sessionmaker` has been called."""
+    return _async_session_factory.is_configured()
+
+
 def get_engine() -> Any:
-    """Return the engine the session factory is bound to.
+    """Return the engine the synchronous session factory is bound to.
 
     Needed by the Postgres advisory-lock backend, which holds a dedicated
     connection for the lifetime of a lock and so cannot work through a session.
@@ -213,8 +286,30 @@ def get_engine() -> Any:
     return bind
 
 
+def get_async_engine() -> Any:
+    """Return the ``AsyncEngine`` the async session factory is bound to.
+
+    Needed by the async Postgres advisory-lock backend for the same reason as
+    :func:`get_engine`: a session-level advisory lock lives on one connection for
+    the lock's whole lifetime, which no session-scoped API can express. The async
+    backend calls ``AsyncEngine.connect()`` on what this returns.
+
+    Raises:
+        RuntimeError: If :func:`configure_async_sessionmaker` has not been called,
+            or its factory is not bound to an engine.
+    """
+    bind = get_async_sessionmaker().kw.get("bind")
+    if bind is None:
+        raise RuntimeError(
+            "JASIL's async session factory is not bound to an engine. Pass bind= to "
+            "async_sessionmaker(...) so capabilities needing a raw connection (the "
+            "postgres-advisory lock) can reach it."
+        )
+    return bind
+
+
 def reset() -> None:
-    """Clear the mapped base and the session factory.
+    """Clear the mapped base and both session factories.
 
     For tests that need a clean process-wide state between cases; production code
     configures once at startup and never resets.
@@ -222,3 +317,4 @@ def reset() -> None:
     global _active_base
     _active_base = None
     _session_factory.reset()
+    _async_session_factory.reset()

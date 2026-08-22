@@ -8,15 +8,17 @@ between the domain commit and the outbox write. ``list_unrelayed`` and
 ``mark_relayed`` are used by the relay; combined with the idempotent job fan-out
 (dedup on ``event_id + subscriber_id``) and ``SELECT ... FOR UPDATE SKIP LOCKED``,
 that makes concurrent relayers safe and re-relaying a row harmless.
+
+The statements themselves live in :mod:`jasil.jobs.statements`, shared with the
+async twin (:mod:`jasil.jobs.outbox_async`); what remains here is the execution.
 """
 
-import uuid
 from datetime import datetime
 
-from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 import jasil._core.pruning as pruning
+import jasil.jobs.statements as statements
 from jasil._core.dialects import supports_skip_locked
 from jasil._core.sessions import commit_or_flush
 from jasil.events import Event
@@ -45,21 +47,10 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
     Returns:
         The new outbox row id.
     """
-    outbox_id = str(uuid.uuid4())
-    db.add(
-        EventOutbox(
-            id=outbox_id,
-            event_id=event.event_id,
-            event_type=event.event_type,
-            source=event.source,
-            timestamp=event.timestamp,
-            payload=event.payload,
-            schema_version=event.schema_version,
-            event_metadata=event.metadata or None,
-            created_at=now,
-        )
-    )
+    row = statements.new_outbox_row(event, now=now)
+    db.add(row)
     commit_or_flush(db, commit)
+    outbox_id: str = row.id
     return outbox_id
 
 
@@ -82,9 +73,7 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
     Returns:
         Unrelayed outbox rows, oldest-first.
     """
-    stmt = select(EventOutbox).where(EventOutbox.relayed_at.is_(None)).order_by(EventOutbox.created_at).limit(limit)
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
-        stmt = stmt.with_for_update(skip_locked=True)
+    stmt = statements.unrelayed_stmt(limit=limit, skip_locked=supports_skip_locked(db.bind))
     return list(db.execute(stmt).scalars().all())
 
 
@@ -103,7 +92,7 @@ def mark_relayed(outbox_id: str, *, now: datetime, db: Session, commit: bool = T
     Returns:
         None.
     """
-    db.execute(update(EventOutbox).where(EventOutbox.id == outbox_id).values(relayed_at=now))
+    db.execute(statements.mark_relayed_stmt(outbox_id, now=now))
     commit_or_flush(db, commit)
 
 
@@ -126,8 +115,7 @@ def delete_relayed_before(cutoff: datetime, *, db: Session, batch_size: int = pr
     """
     return pruning.bounded_delete(
         EventOutbox,
-        EventOutbox.relayed_at.is_not(None),
-        EventOutbox.relayed_at < cutoff,
+        *statements.outbox_prune_condition(cutoff),
         db=db,
         batch_size=batch_size,
     )

@@ -11,41 +11,34 @@ transaction fan-out). The claim, the terminal state writes and the reaper all
 have to be durable before the caller moves on, so they are not optional. Pass a
 session JASIL owns, not one carrying a caller's uncommitted work.
 
-Every query is portable, so the same code runs on PostgreSQL, MySQL and SQLite.
-The claim takes ``SELECT ... FOR UPDATE SKIP LOCKED`` wherever the dialect
-supports it (see :func:`jasil._core.dialects.supports_skip_locked`) so concurrent
-workers never grab the same row; where it does not, the clause is omitted and a
-single worker is still correct. Callers pass an explicit ``now`` (from the
-``ClockProvider``) so lease, backoff, and reaping are deterministic under test.
+Nothing here builds a query. The claim's ``SELECT ... FOR UPDATE SKIP LOCKED``
+plus compare-and-set, the reaper's double-guarded requeue and the dialect
+insert-or-ignore all live in :mod:`jasil.jobs.statements`, so this module and its
+async twin (:mod:`jasil.jobs.crud_async`) execute the same SQL and cannot drift.
+Callers pass an explicit ``now`` (from the ``ClockProvider``) so lease, backoff,
+and reaping are deterministic under test.
 """
 
-import uuid
-from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, func, select, update
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import CursorResult
 from sqlalchemy.orm import Session
 
 import jasil._core.pruning as pruning
-import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
+import jasil.jobs.statements as statements
 from jasil._core.dialects import supports_skip_locked
-from jasil._core.limits import MAX_STORED_ERROR_LENGTH, fit_length
 from jasil._core.sessions import commit_or_flush
-from jasil._core.timestamps import age_seconds
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
 
-STATUS_PENDING = "pending"
-STATUS_CLAIMED = "claimed"
-STATUS_COMPLETED = "completed"
-STATUS_DEAD_LETTER = "dead_letter"
-
-_CONFLICT_KEYS = ["event_id", "subscriber_id"]
+# Re-exported so callers (the runner's dead-letter check, the admin surface) keep
+# importing their status constants from the CRUD module they already use.
+STATUS_PENDING = statements.STATUS_PENDING
+STATUS_CLAIMED = statements.STATUS_CLAIMED
+STATUS_COMPLETED = statements.STATUS_COMPLETED
+STATUS_DEAD_LETTER = statements.STATUS_DEAD_LETTER
 
 
 def enqueue_job(
@@ -81,28 +74,18 @@ def enqueue_job(
         The inserted job, or ``None`` when a job for this ``(event, subscriber)``
         already existed.
     """
-    job_id = str(uuid.uuid4())
-    values = {
-        "id": job_id,
-        "event_id": event.event_id,
-        "event_type": event.event_type,
-        "subscriber_id": subscriber_id,
-        "source": event.source,
-        "payload": event.payload,
-        "schema_version": event.schema_version,
-        "job_metadata": event.metadata or None,
-        "status": STATUS_PENDING,
-        "attempts": 0,
-        "max_attempts": max_attempts,
-        "available_at": available_at or now,
-        "created_at": now,
-        "updated_at": now,
-    }
-    db.execute(_insert_ignoring_duplicate(values, db))
+    values = statements.job_values(
+        event,
+        subscriber_id,
+        max_attempts=max_attempts,
+        now=now,
+        available_at=available_at,
+    )
+    db.execute(statements.insert_ignoring_duplicate(values, _dialect_name(db)))
     commit_or_flush(db, commit)
     # Returns the row only when this call inserted it: a skipped conflict leaves
     # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
-    return db.get(ProcessingJob, job_id)
+    return db.get(ProcessingJob, values["id"])
 
 
 def claim_jobs(
@@ -134,58 +117,14 @@ def claim_jobs(
     Returns:
         The jobs this call actually claimed, oldest-available first.
     """
-    id_stmt = (
-        select(ProcessingJob.id)
-        .where(ProcessingJob.status == STATUS_PENDING, ProcessingJob.available_at <= now)
-        .order_by(ProcessingJob.available_at)
-        .limit(limit)
-    )
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
-        id_stmt = id_stmt.with_for_update(skip_locked=True)
+    id_stmt = statements.due_job_ids_stmt(now=now, limit=limit, skip_locked=supports_skip_locked(db.bind))
     job_ids = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()  # end the transaction so FOR UPDATE locks are released
         return []
-    db.execute(
-        update(ProcessingJob)
-        .where(
-            ProcessingJob.id.in_(job_ids),
-            # Compare-and-set. Without SKIP LOCKED two workers can select the same
-            # ids, and only the one that still finds them pending may take them.
-            ProcessingJob.status == STATUS_PENDING,
-        )
-        .values(
-            status=STATUS_CLAIMED,
-            attempts=ProcessingJob.attempts + 1,
-            locked_by=worker_id,
-            locked_at=now,
-            lease_expires_at=now + timedelta(seconds=lease_seconds),
-            updated_at=now,
-        )
-    )
+    db.execute(statements.claim_update_stmt(job_ids, worker_id=worker_id, now=now, lease_seconds=lease_seconds))
     db.commit()
-    claimed = (
-        db.execute(
-            select(ProcessingJob)
-            .where(
-                ProcessingJob.id.in_(job_ids),
-                ProcessingJob.status == STATUS_CLAIMED,
-                # The lease we just took. ``job_ids`` were all ``pending`` at
-                # select time and the update was a compare-and-set on that, so
-                # these three together name exactly the rows *this* call
-                # transitioned: a row a competing worker won carries its id, and
-                # a row this worker claimed in an earlier round was never
-                # ``pending`` to be selected here. Deliberately not also matching
-                # ``locked_at == now`` — MySQL's DATETIME keeps whole seconds and
-                # rounds anything finer, so that equality silently matched
-                # nothing and the worker claimed batches it then never ran.
-                ProcessingJob.locked_by == worker_id,
-            )
-            .order_by(ProcessingJob.available_at)
-        )
-        .scalars()
-        .all()
-    )
+    claimed = db.execute(statements.claimed_jobs_stmt(job_ids, worker_id=worker_id)).scalars().all()
     return list(claimed)
 
 
@@ -201,18 +140,7 @@ def mark_job_completed(job_id: str, *, now: datetime, db: Session) -> None:
     Returns:
         None.
     """
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_COMPLETED,
-            completed_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            lease_expires_at=None,
-        )
-    )
+    db.execute(statements.mark_job_completed_stmt(job_id, now=now))
     db.commit()
 
 
@@ -244,34 +172,18 @@ def mark_job_failed(
     job = db.get(ProcessingJob, job_id)
     if job is None:
         return ""
-    truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
     if job.attempts >= job.max_attempts:
-        db.execute(
-            update(ProcessingJob)
-            .where(ProcessingJob.id == job_id)
-            .values(
-                status=STATUS_DEAD_LETTER,
-                last_error=truncated,
-                completed_at=now,
-                updated_at=now,
-                locked_by=None,
-                lease_expires_at=None,
-            )
-        )
+        db.execute(statements.mark_job_dead_letter_stmt(job_id, error_message, now=now))
         db.commit()
         return STATUS_DEAD_LETTER
-    delay = jobs_backoff.backoff_seconds(job.attempts, base_seconds=base_seconds, max_seconds=max_seconds)
     db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_PENDING,
-            last_error=truncated,
-            available_at=now + timedelta(seconds=delay),
-            updated_at=now,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
+        statements.reschedule_stmt(
+            job_id,
+            error_message,
+            attempts=job.attempts,
+            base_seconds=base_seconds,
+            max_seconds=max_seconds,
+            now=now,
         )
     )
     db.commit()
@@ -293,59 +205,13 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     Returns:
         The number of jobs this call reclaimed (requeued plus dead-lettered).
     """
-    id_stmt = (
-        select(ProcessingJob.id)
-        .where(ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.lease_expires_at < now)
-        .limit(limit)
-    )
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
-        id_stmt = id_stmt.with_for_update(skip_locked=True)
+    id_stmt = statements.expired_lease_ids_stmt(now=now, limit=limit, skip_locked=supports_skip_locked(db.bind))
     job_ids = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()
         return 0
-    # Both updates re-assert ``status = 'claimed'``: without SKIP LOCKED two
-    # reapers can select the same rows, and the loser must not overwrite the
-    # requeue the winner already performed.
-    dead_lettered = cast(
-        CursorResult[Any],
-        db.execute(
-            update(ProcessingJob)
-            .where(
-                ProcessingJob.id.in_(job_ids),
-                ProcessingJob.status == STATUS_CLAIMED,
-                ProcessingJob.attempts >= ProcessingJob.max_attempts,
-            )
-            .values(
-                status=STATUS_DEAD_LETTER,
-                last_error="lease expired; max attempts exhausted",
-                completed_at=now,
-                updated_at=now,
-                locked_by=None,
-                lease_expires_at=None,
-            )
-        ),
-    )
-    requeued = cast(
-        CursorResult[Any],
-        db.execute(
-            update(ProcessingJob)
-            .where(
-                ProcessingJob.id.in_(job_ids),
-                ProcessingJob.status == STATUS_CLAIMED,
-                ProcessingJob.attempts < ProcessingJob.max_attempts,
-            )
-            .values(
-                status=STATUS_PENDING,
-                last_error="lease expired; requeued",
-                available_at=now,
-                updated_at=now,
-                locked_by=None,
-                locked_at=None,
-                lease_expires_at=None,
-            )
-        ),
-    )
+    dead_lettered = cast(CursorResult[Any], db.execute(statements.reap_dead_letter_stmt(job_ids, now=now)))
+    requeued = cast(CursorResult[Any], db.execute(statements.reap_requeue_stmt(job_ids, now=now)))
     db.commit()
     return dead_lettered.rowcount + requeued.rowcount
 
@@ -379,51 +245,12 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
     """
     now = datetime.now(UTC)
     window_start = now - timedelta(hours=hours)
-    rows = db.execute(
-        select(ProcessingJob.subscriber_id, ProcessingJob.event_type, ProcessingJob.status, func.count())
-        .where(ProcessingJob.created_at >= window_start)
-        .group_by(ProcessingJob.subscriber_id, ProcessingJob.event_type, ProcessingJob.status)
-    ).all()
-    counts: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    totals: dict[str, int] = defaultdict(int)
-    for subscriber_id, event_type, status, count in rows:
-        counts[(subscriber_id, event_type)][status] += count
-        totals[status] += count
-    by_subscriber = [
-        jobs_schema.JobSubscriberStats(
-            subscriber_id=subscriber_id,
-            event_type=event_type,
-            total=sum(status_counts.values()),
-            pending=status_counts.get(STATUS_PENDING, 0),
-            claimed=status_counts.get(STATUS_CLAIMED, 0),
-            completed=status_counts.get(STATUS_COMPLETED, 0),
-            dead_letter=status_counts.get(STATUS_DEAD_LETTER, 0),
-        )
-        for (subscriber_id, event_type), status_counts in sorted(counts.items())
-    ]
-    oldest_pending = db.execute(
-        select(func.min(ProcessingJob.created_at)).where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))
-    ).scalar()
-    dead_letter_jobs = (
-        db.execute(
-            select(ProcessingJob)
-            .where(ProcessingJob.status == STATUS_DEAD_LETTER)
-            .order_by(ProcessingJob.updated_at.desc())
-            .limit(dead_letter_limit)
-        )
-        .scalars()
-        .all()
-    )
-    return jobs_schema.JobsSummary(
-        window_hours=hours,
-        total_jobs=sum(totals.values()),
-        pending=totals.get(STATUS_PENDING, 0),
-        claimed=totals.get(STATUS_CLAIMED, 0),
-        completed=totals.get(STATUS_COMPLETED, 0),
-        dead_letter=totals.get(STATUS_DEAD_LETTER, 0),
-        oldest_pending_seconds=age_seconds(oldest_pending, now),
-        by_subscriber=by_subscriber,
-        recent_dead_letter=[jobs_schema.DeadLetterJob.model_validate(job) for job in dead_letter_jobs],
+    return statements.build_jobs_summary(
+        hours=hours,
+        now=now,
+        count_rows=db.execute(statements.subscriber_counts_stmt(window_start)).all(),
+        oldest_pending=db.execute(statements.oldest_pending_stmt()).scalar(),
+        dead_letter_rows=db.execute(statements.dead_letter_list_stmt(dead_letter_limit)).scalars().all(),
     )
 
 
@@ -445,21 +272,7 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
     job = db.get(ProcessingJob, job_id)
     if job is None or job.status != STATUS_DEAD_LETTER:
         return False
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id, ProcessingJob.status == STATUS_DEAD_LETTER)
-        .values(
-            status=STATUS_PENDING,
-            attempts=0,
-            available_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-            completed_at=None,
-        )
-    )
+    db.execute(statements.replay_stmt(job_id, now=now))
     db.commit()
     return True
 
@@ -484,46 +297,13 @@ def delete_completed_jobs_before(cutoff: datetime, *, db: Session, batch_size: i
     """
     return pruning.bounded_delete(
         ProcessingJob,
-        ProcessingJob.status == STATUS_COMPLETED,
-        ProcessingJob.completed_at < cutoff,
+        *statements.jobs_prune_condition(cutoff),
         db=db,
         batch_size=batch_size,
     )
 
 
-def _insert_ignoring_duplicate(values: dict, db: Session):
-    """
-    Build a dialect-appropriate "insert, or do nothing if it exists" statement.
-
-    The ``(event_id, subscriber_id)`` unique constraint is what makes a durable
-    subscriber an idempotent consumer, so a duplicate enqueue must be a silent
-    no-op on **every** supported database — not an ``IntegrityError`` the relay
-    would have to catch.
-
-    Args:
-        values: Column values for the new row.
-        db: Active database session (used only for dialect detection).
-
-    Returns:
-        An executable insert statement that ignores a duplicate
-        ``(event_id, subscriber_id)``.
-
-    Raises:
-        RuntimeError: On a dialect with no supported conflict clause, rather
-            than emitting a plain INSERT that would raise on the second enqueue.
-    """
-    dialect = db.bind.dialect.name if db.bind is not None else ""
-    if dialect == "postgresql":  # pragma: no cover - exercised on Postgres, not in SQLite tests
-        return pg_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect == "sqlite":
-        return sqlite_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect == "mysql":  # pragma: no cover - exercised on MySQL, not in SQLite tests
-        # MySQL has no ON CONFLICT DO NOTHING. Assigning a column to *itself*
-        # is the standard no-op form; ``INSERT IGNORE`` would also swallow
-        # unrelated errors such as truncation.
-        statement = mysql_insert(ProcessingJob).values(**values)
-        return statement.on_duplicate_key_update(event_id=ProcessingJob.event_id)
-    raise RuntimeError(
-        f"JASIL's durable jobs need an insert-or-ignore clause, which dialect {dialect!r} does not provide. "
-        "Supported: postgresql, mysql, sqlite."
-    )
+def _dialect_name(db: Session) -> str:
+    """Return the session bind's dialect name, or the empty string when unbound."""
+    bind = db.bind
+    return bind.dialect.name if bind is not None else ""

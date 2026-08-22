@@ -70,6 +70,25 @@ geocoding = [
 migrations = [
     "alembic>=1.13",
 ]
+# The async face: async providers, an AsyncSession-backed event log and durable
+# jobs, and an async composition root. ``sqlalchemy[asyncio]`` is the greenlet
+# bridge SQLAlchemy's async API runs on; ``anyio`` is how the blocking-underneath
+# backends (local filesystem, boto3) reach a worker thread without blocking the
+# loop. ``redis`` already ships ``redis.asyncio``, so the Redis backends need
+# nothing beyond the ``redis`` extra above; an async database driver
+# (``postgresql+psycopg``, ``postgresql+asyncpg``, ``sqlite+aiosqlite``) is the
+# host's to choose, exactly as the synchronous driver already is.
+async = [
+    "sqlalchemy[asyncio]>=2.0.49",
+    "anyio>=4.4.0",
+]
+# HTTP reverse geocoding on the async face. ``requests`` has no async API, so the
+# async backend is a genuine httpx rewrite rather than the sync one in a thread —
+# which is also why it is its own extra: an async deployment that does not
+# geocode should not install an HTTP client it never calls.
+geocoding-async = [
+    "httpx>=0.28.1",
+]
 # Convenience: every optional backend at once.
 all = [
     "redis>=5.0.0",
@@ -79,6 +98,9 @@ all = [
     "fastapi>=0.136.0",
     "requests>=2.32.4",
     "alembic>=1.13",
+    "sqlalchemy[asyncio]>=2.0.49",
+    "anyio>=4.4.0",
+    "httpx>=0.28.1",
 ]
 
 [dependency-groups]
@@ -111,6 +133,14 @@ test = [
     "responses>=0.25.0",
     # The migrations suite drives the packaged Alembic revisions.
     "alembic>=1.13",
+    # The async suite. ``aiosqlite`` is the async driver behind the in-memory
+    # AsyncSession fixtures (as SQLite is for the synchronous ones), ``httpx``
+    # backs the async geocoding backend and its own egress-hardening tests, and
+    # ``anyio`` is what the thread-offloading storage backends run on. fakeredis
+    # already ships ``fakeredis.aioredis`` for the async Redis backends.
+    "aiosqlite>=0.21.0",
+    "httpx>=0.28.1",
+    "anyio>=4.4.0",
 ]
 # Real database drivers for the CI database matrix. The default test run uses
 # in-memory SQLite (built into Python) and needs neither; set
