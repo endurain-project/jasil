@@ -22,10 +22,10 @@ import responses
 
 import jasil._core.network as network
 from jasil.backends.geocoding_http import (
-    _MAX_RESPONSE_BYTES,
+    MAX_RESPONSE_BYTES,
     HttpGeocoding,
     NullGeocoding,
-    _failure_detail,
+    failure_detail,
     build_reverse_endpoint,
 )
 from jasil.providers import GeocodedPlace, GeocodingProvider
@@ -319,10 +319,10 @@ class TestTheFailureLogIsRedacted:
         assert "HTTP 429" in caplog.text
 
     def test_a_failure_carrying_no_response_is_named_by_its_type(self):
-        assert _failure_detail(TimeoutError("connect timed out")) == "TimeoutError"
+        assert failure_detail(TimeoutError("connect timed out")) == "TimeoutError"
 
     def test_a_failure_message_is_never_interpolated(self):
-        assert "connect timed out" not in _failure_detail(TimeoutError("connect timed out"))
+        assert "connect timed out" not in failure_detail(TimeoutError("connect timed out"))
 
 
 class TestTheResponseBodyIsCapped:
@@ -342,7 +342,7 @@ class TestTheResponseBodyIsCapped:
         responses.add(
             responses.GET,
             "https://geo.test/reverse",
-            body=b"x" * (_MAX_RESPONSE_BYTES + 1),
+            body=b"x" * (MAX_RESPONSE_BYTES + 1),
             status=200,
         )
 
@@ -353,7 +353,7 @@ class TestTheResponseBodyIsCapped:
 
     @responses.activate
     def test_a_large_but_permitted_body_is_still_parsed(self, backend):
-        padding = "P" * (_MAX_RESPONSE_BYTES // 2)
+        padding = "P" * (MAX_RESPONSE_BYTES // 2)
         responses.add(
             responses.GET,
             "https://geo.test/reverse",

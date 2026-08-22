@@ -28,10 +28,18 @@ sweeper that re-derives missed work). A future unit-of-work refactor can upgrade
 atomic outbox; until then, "durable" means *retryable once written*, not *never
 lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
+
+The ``a``-prefixed functions are the asynchronous face. They take the same
+arguments, make the same routing decision, and give the same guarantee; the only
+differences are that they resolve the async platform and that ``commit`` is a
+callable returning an awaitable. Crucially, the *decision* — outbox versus bus —
+comes from the same :func:`_durable_delivery_enabled`, and the envelope from the
+same :func:`_mint`, so an event cannot take a different route depending on which
+face published it.
 """
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -40,6 +48,7 @@ import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
 from jasil.providers import EventRecorder
+from jasil.providers_async import AsyncEventRecorder
 from jasil.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -261,3 +270,187 @@ def publish_many_committing(
         commit()
         for payload in payloads:
             _publish_on_bus(event_type, payload, source, metadata_of(payload), schema_version)
+
+
+async def _stage_in_outbox_async(
+    recorder: AsyncEventRecorder | None,
+    event: Event,
+    *,
+    db: Any,
+    now: datetime,
+    commit: bool,
+) -> None:
+    """Write one event to the async outbox, recording it ``queued`` in the event_log.
+
+    The event_log row is terminal for a durable event, exactly as in the sync
+    path: the bus records its own lifecycle, the outbox path does not go through
+    the bus, and per-subscriber execution is tracked in ``processing_jobs``.
+    """
+    # Imported here rather than at module scope, for the same reason as the sync
+    # path: the outbox model binds to the host's declarative base, so a top-level
+    # import would make ``import jasil.publisher`` fail until
+    # ``jasil.orm.map_models`` had run.
+    import jasil.jobs.outbox_async as jobs_outbox_async
+
+    if recorder is not None:
+        await recorder.record_queued(event)
+    await jobs_outbox_async.add_to_outbox(event, now=now, db=db, commit=commit)
+
+
+async def _publish_on_bus_async(
+    event_type: str,
+    payload: dict,
+    source: str,
+    metadata: dict | None,
+    schema_version: int,
+) -> None:
+    """Dispatch one event on the async bus, logging and swallowing any failure."""
+    try:
+        platform = platform_runtime.get_active_async_platform()
+        await platform.events.publish(_mint(event_type, payload, source, metadata, schema_version))
+    except Exception as err:
+        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+
+
+async def apublish(
+    event_type: str,
+    payload: dict,
+    *,
+    source: str,
+    metadata: dict | None = None,
+    db: Any = None,
+    schema_version: int = INITIAL_SCHEMA_VERSION,
+) -> None:
+    """Publish a domain event through the active async platform, best-effort.
+
+    The asynchronous counterpart of :func:`publish`, with identical routing and
+    identical semantics.
+
+    Args:
+        event_type: The domain-owned channel, e.g. ``order.created``.
+        payload: Domain data for the event (homogeneous per ``event_type``).
+        source: Origin label, e.g. ``api:create_order``.
+        metadata: Optional correlation context; merged with the ambient request
+            id when one is set on the current request.
+        db: The producer's SQLAlchemy ``AsyncSession``. When provided and durable
+            jobs are enabled for this event type, the event is written to the
+            outbox using this session (durable delivery); otherwise it is ignored.
+        schema_version: The payload schema version for this event type.
+
+    Returns:
+        None. Delivery failures are logged and swallowed so a publish never
+        breaks the producer.
+    """
+    try:
+        platform = platform_runtime.get_active_async_platform()
+        event = _mint(event_type, payload, source, metadata, schema_version)
+        if db is not None and _durable_delivery_enabled(event_type):
+            await _stage_in_outbox_async(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
+            # Which route an event took is the first thing anyone asks when it
+            # appears not to have been processed, and nothing else records it.
+            logger.debug("Staged %s (%s) in the outbox for durable delivery", event_type, event.event_id)
+        else:
+            await platform.events.publish(event)
+            logger.debug("Dispatched %s (%s) on the event bus", event_type, event.event_id)
+    except Exception as err:
+        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+
+
+async def apublish_committing(
+    event_type: str,
+    payload: dict,
+    *,
+    source: str,
+    metadata: dict | None = None,
+    db: Any,
+    commit: Callable[[], Awaitable[None]],
+    schema_version: int = INITIAL_SCHEMA_VERSION,
+) -> None:
+    """Publish a domain event atomically around the caller's async domain commit.
+
+    The asynchronous counterpart of :func:`publish_committing`. ``commit`` is a
+    zero-arg callable returning an awaitable that commits the caller's unit of
+    work.
+
+    Args:
+        event_type: The domain-owned channel, e.g. ``order.created``.
+        payload: Domain data for the event.
+        source: Origin label, e.g. ``api:create_order``.
+        metadata: Optional correlation context; merged with the ambient request id.
+        db: The producer's ``AsyncSession`` (holds the uncommitted domain change).
+        commit: Zero-arg callable returning an awaitable that commits the caller's
+            unit of work.
+        schema_version: The payload schema version for this event type.
+
+    Returns:
+        None.
+    """
+    await apublish_many_committing(
+        event_type,
+        [payload],
+        source=source,
+        metadata_for=lambda _payload: metadata,
+        db=db,
+        commit=commit,
+        schema_version=schema_version,
+    )
+
+
+async def apublish_many_committing(
+    event_type: str,
+    payloads: Sequence[dict],
+    *,
+    source: str,
+    metadata_for: Callable[[dict], dict | None] | None = None,
+    db: Any,
+    commit: Callable[[], Awaitable[None]],
+    schema_version: int = INITIAL_SCHEMA_VERSION,
+) -> None:
+    """Publish many same-type events atomically around one async domain commit.
+
+    The asynchronous counterpart of :func:`publish_many_committing`. All outbox
+    rows are staged on ``db`` uncommitted and land in the caller's transaction, so
+    the domain change and every event commit together or not at all.
+
+    Args:
+        event_type: The domain-owned channel shared by every event in the batch.
+        payloads: One payload per event. An empty sequence still runs ``commit``
+            so the caller's unit of work is committed exactly once either way.
+        source: Origin label, e.g. ``api:bulk_delete``.
+        metadata_for: Optional per-payload correlation metadata builder.
+        db: The producer's ``AsyncSession`` (holds the uncommitted change).
+        commit: Zero-arg callable returning an awaitable that commits the caller's
+            unit of work.
+        schema_version: The payload schema version for this event type.
+
+    Returns:
+        None.
+    """
+    metadata_of = metadata_for if metadata_for is not None else (lambda _payload: None)
+    if db is not None and _durable_delivery_enabled(event_type):
+        # Atomic path: stage every outbox row inside the caller's transaction, so
+        # a failure here leaves it uncommitted and the caller rolls back as a
+        # whole — no partial domain change, no orphaned event.
+        try:
+            platform = platform_runtime.get_active_async_platform()
+            now = platform.clock.now()
+            for payload in payloads:
+                event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+                await _stage_in_outbox_async(platform.recorder, event, db=db, now=now, commit=False)
+        except Exception as err:
+            logger.error(
+                "Failed to stage %d %s event(s) in the domain transaction: %s",
+                len(payloads),
+                event_type,
+                err,
+                exc_info=err,
+            )
+            raise
+        await commit()
+    else:
+        # Best-effort path: the domain change is the source of truth, so commit it
+        # first, then dispatch each event on the bus (swallowing failures — the
+        # subscriber's reconciliation net recovers anything dropped).
+        await commit()
+        for payload in payloads:
+            await _publish_on_bus_async(event_type, payload, source, metadata_of(payload), schema_version)

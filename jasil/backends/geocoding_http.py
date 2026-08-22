@@ -12,6 +12,14 @@ redirects are refused on every request so a permitted host cannot 3xx-pivot onto
 an internal target. The response body is read under a size cap, and failures are
 logged without their message, which would carry the request URL and with it the
 API key.
+
+The parts that are pure — building the request URL, shaping a response into a
+:class:`~jasil.providers.GeocodedPlace`, redacting a failure, and validating the
+operator-configured host — are module-level functions rather than methods, so the
+async backend in :mod:`jasil.backends.geocoding_http_async` calls exactly the
+same code. Only the transport differs between the two. That matters more here
+than elsewhere: a second copy of the parsing would be a maintenance nuisance, but
+a second copy of the egress rules would be a security bug waiting to happen.
 """
 
 import json
@@ -31,22 +39,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Egress timeout for a single reverse-geocode request (seconds).
-_TIMEOUT_SECONDS = 10
+TIMEOUT_SECONDS = 10
 
 # Cap on a reverse-geocode response body. A resolved place is a few kilobytes;
 # the limit is what stops an upstream that is hostile, compromised, or simply
 # broken from exhausting memory, because reading a response buffers whatever it
 # is sent and the timeout above bounds each read rather than the whole transfer.
-_MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 # Read granularity while enforcing that cap.
-_READ_CHUNK_BYTES = 8192
+READ_CHUNK_BYTES = 8192
 
 
-def _failure_detail(error: Exception) -> str:
+def failure_detail(error: Exception) -> str:
     """Describe a request failure without echoing its message.
 
-    ``requests`` puts the full request URL in an ``HTTPError`` message, and the
+    Both ``requests`` and ``httpx`` put the full request URL in an ``HTTPError``
+    message, and the
     geocode.maps.co URL carries ``api_key`` in its query string — so neither the
     message nor a traceback may reach the log. The type and status code are what
     an operator actually needs to tell a 401 from a 429 from a timeout.
@@ -59,6 +68,63 @@ def _failure_detail(error: Exception) -> str:
     """
     status = getattr(getattr(error, "response", None), "status_code", None)
     return f"{type(error).__name__} (HTTP {status})" if status is not None else type(error).__name__
+
+
+def build_request_url(
+    service: str,
+    base_url: str,
+    api_key: str | None,
+    latitude: float,
+    longitude: float,
+) -> str:
+    """Build the reverse-geocode URL for a service.
+
+    Args:
+        service: Which upstream to call — ``"nominatim"``, ``"photon"`` or ``"geocode"``.
+        base_url: Fully-qualified reverse endpoint.
+        api_key: API key, for the services that require one (geocode.maps.co).
+        latitude: WGS-84 latitude in decimal degrees.
+        longitude: WGS-84 longitude in decimal degrees.
+
+    Returns:
+        The fully-qualified request URL, query string included.
+    """
+    params: dict[str, str | float]
+    if service == "photon":
+        params = {"lat": latitude, "lon": longitude}
+    elif service == "geocode":
+        params = {"lat": latitude, "lon": longitude, "api_key": api_key or ""}
+    else:  # nominatim
+        params = {"format": "jsonv2", "lat": latitude, "lon": longitude}
+    return f"{base_url}?{urlencode(params)}"
+
+
+def parse_place(service: str, payload: dict) -> GeocodedPlace | None:
+    """Extract city/town/country from a service response, or None when empty.
+
+    Args:
+        service: Which upstream produced the payload.
+        payload: The decoded JSON response body.
+
+    Returns:
+        The resolved place, or ``None`` when the response named nowhere.
+    """
+    if service == "photon":
+        # Photon uses 'district' for city and 'city' for town.
+        features = payload.get("features", [])
+        data = features[0].get("properties", {}) if features else {}
+        city = data.get("district")
+        town = data.get("city")
+    else:
+        # Nominatim and geocode.maps.co share a shape; 'town' is the district.
+        data = payload.get("address", {})
+        city = data.get("city")
+        town = data.get("town")
+    country = data.get("country")
+
+    if not any((city, town, country)):
+        return None
+    return GeocodedPlace(city=city, town=town, country=country)
 
 
 class NullGeocoding:
@@ -113,33 +179,11 @@ class HttpGeocoding:
 
     def _build_url(self, latitude: float, longitude: float) -> str:
         """Build the reverse-geocode URL for the configured service."""
-        params: dict[str, str | float]
-        if self._service == "photon":
-            params = {"lat": latitude, "lon": longitude}
-        elif self._service == "geocode":
-            params = {"lat": latitude, "lon": longitude, "api_key": self._api_key or ""}
-        else:  # nominatim
-            params = {"format": "jsonv2", "lat": latitude, "lon": longitude}
-        return f"{self._base_url}?{urlencode(params)}"
+        return build_request_url(self._service, self._base_url, self._api_key, latitude, longitude)
 
     def _parse(self, payload: dict) -> GeocodedPlace | None:
         """Extract city/town/country from a service response, or None when empty."""
-        if self._service == "photon":
-            # Photon uses 'district' for city and 'city' for town.
-            features = payload.get("features", [])
-            data = features[0].get("properties", {}) if features else {}
-            city = data.get("district")
-            town = data.get("city")
-        else:
-            # Nominatim and geocode.maps.co share a shape; 'town' is the district.
-            data = payload.get("address", {})
-            city = data.get("city")
-            town = data.get("town")
-        country = data.get("country")
-
-        if not any((city, town, country)):
-            return None
-        return GeocodedPlace(city=city, town=town, country=country)
+        return parse_place(self._service, payload)
 
     def _throttle(self) -> None:
         """Sleep as needed to respect the configured request rate."""
@@ -153,7 +197,7 @@ class HttpGeocoding:
 
     @staticmethod
     def _read_capped(response: "requests.Response") -> bytes:
-        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES`.
+        """Read a response body, refusing one past :data:`MAX_RESPONSE_BYTES`.
 
         Streamed rather than taken from ``response.content`` so an oversized body
         is abandoned partway instead of being buffered in full first.
@@ -168,10 +212,10 @@ class HttpGeocoding:
             ValueError: When the body exceeds the cap.
         """
         body = bytearray()
-        for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
+        for chunk in response.iter_content(chunk_size=READ_CHUNK_BYTES):
             body.extend(chunk)
-            if len(body) > _MAX_RESPONSE_BYTES:
-                raise ValueError(f"response body exceeded the {_MAX_RESPONSE_BYTES}-byte limit")
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError(f"response body exceeded the {MAX_RESPONSE_BYTES}-byte limit")
         return bytes(body)
 
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None:
@@ -200,7 +244,7 @@ class HttpGeocoding:
             with requests.get(
                 self._build_url(latitude, longitude),
                 headers={"User-Agent": self._user_agent},
-                timeout=_TIMEOUT_SECONDS,
+                timeout=TIMEOUT_SECONDS,
                 # A permitted host must not 3xx-pivot the request onto an
                 # internal target (SSRF defense in depth, OWASP A10).
                 allow_redirects=False,
@@ -209,7 +253,7 @@ class HttpGeocoding:
                 response.raise_for_status()
                 return self._parse(json.loads(self._read_capped(response)))
         except Exception as error:
-            logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
+            logger.error("Reverse-geocoding via %s failed - %s", self._service, failure_detail(error))
             return None
 
 
