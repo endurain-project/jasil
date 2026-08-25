@@ -23,7 +23,9 @@ from jasil.providers import (
     LockProvider,
     StateBackendUnavailableError,
     StateProvider,
+    StorageBackendUnavailableError,
     StorageProvider,
+    StorageSizeLimitError,
     TieredFailureOutcome,
 )
 
@@ -42,7 +44,9 @@ __all__ = [
     "LockProvider",
     "StateBackendUnavailableError",
     "StateProvider",
+    "StorageBackendUnavailableError",
     "StorageProvider",
+    "StorageSizeLimitError",
     "TieredFailureOutcome",
     "new_event",
 ]

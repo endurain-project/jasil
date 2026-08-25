@@ -5,6 +5,7 @@ storage backend's contract is mostly about refusing to write outside its root.
 """
 
 import contextlib
+import io
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -19,6 +20,7 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.event_log.models import EventLog
 from jasil.events import new_event
 from jasil.jobs.models import EventOutbox
+from jasil.providers import StorageBackendUnavailableError
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 OLD = T0 - timedelta(days=90)
@@ -194,6 +196,14 @@ class TestLocalStorage:
     def test_saving_returns_the_key(self, storage):
         assert storage.save("thumbnails", "1.webp", b"x") == "1.webp"
 
+    def test_streaming_and_byte_writes_use_the_same_file_permissions(self, storage, tmp_path):
+        storage.save("thumbnails", "bytes.webp", b"x")
+        storage.save_stream("thumbnails", "stream.webp", io.BytesIO(b"x"))
+
+        byte_mode = (tmp_path / "thumbnails" / "bytes.webp").stat().st_mode & 0o777
+        stream_mode = (tmp_path / "thumbnails" / "stream.webp").stat().st_mode & 0o777
+        assert stream_mode == byte_mode
+
     def test_a_missing_blob_reads_as_none(self, storage):
         assert storage.get("thumbnails", "absent.webp") is None
 
@@ -285,6 +295,25 @@ class TestLocalStorage:
             storage.url("thumbnails", "1.webp")
 
         assert caplog.text == ""
+
+    def test_response_header_controls_are_reported_as_ignored(self, storage, caplog):
+        with caplog.at_level("WARNING"):
+            url = storage.url(
+                "thumbnails",
+                "1.webp",
+                download_as="photo.webp",
+                content_type="application/octet-stream",
+            )
+
+        assert url == "/media/thumbnails/1.webp"
+        assert "download_as, content_type were ignored" in caplog.text
+        assert "permanent" in caplog.text
+
+    def test_a_missing_storage_root_is_not_reported_writable(self, tmp_path):
+        storage = LocalStorage(str(tmp_path / "detached-volume"))
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.check_writable()
 
     @pytest.mark.parametrize("bad", ["../escape", "/etc/passwd", "a/../../b"])
     @pytest.mark.parametrize("field", ["area", "key"])

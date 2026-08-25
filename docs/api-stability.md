@@ -68,8 +68,9 @@ Removing a column is a major change. Adding a nullable one is not.
 
 ### Exception types
 
-`StateBackendUnavailableError` and `UnsupportedEventVersionError` — what raises
-them and what they inherit from.
+`StateBackendUnavailableError`, `StorageBackendUnavailableError`,
+`StorageSizeLimitError`, and `UnsupportedEventVersionError` — what raises them
+and what they inherit from.
 
 ## Not covered
 

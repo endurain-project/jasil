@@ -12,14 +12,18 @@ must not masquerade as one).
 """
 
 import io
+from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
 import boto3
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ReadTimeoutError
 from botocore.response import StreamingBody
-from botocore.stub import Stubber
+from botocore.stub import ANY, Stubber
 
+import jasil.backends.storage_s3 as storage_s3
 from jasil.backends.storage_s3 import S3Storage
+from jasil.providers import StorageBackendUnavailableError, StorageSizeLimitError
 
 BUCKET = "blobs"
 PREFIX = "jasil"
@@ -27,6 +31,7 @@ AREA = "avatars"
 KEY = "42.webp"
 # What ``_object_key`` must compose from the three parts above.
 OBJECT_KEY = f"{PREFIX}/{AREA}/{KEY}"
+MODIFIED = datetime(2026, 1, 2, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -54,6 +59,14 @@ def storage(client):
 
 def _body(data: bytes) -> StreamingBody:
     return StreamingBody(io.BytesIO(data), len(data))
+
+
+class _FailingBody:
+    def read(self, size=-1):
+        raise ReadTimeoutError(endpoint_url="https://s3.test")
+
+    def close(self):
+        pass
 
 
 class TestFromUri:
@@ -104,6 +117,104 @@ class TestSave:
         storage.save(AREA, KEY, b"bytes")
 
 
+class TestSaveStream:
+    def test_it_completes_a_multipart_upload(self, storage, stub):
+        stub.add_response(
+            "create_multipart_upload",
+            {"UploadId": "upload-1"},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"etag-1"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"streamed",
+            },
+        )
+        stub.add_response(
+            "complete_multipart_upload",
+            {},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "MultipartUpload": {"Parts": [{"ETag": '"etag-1"', "PartNumber": 1}]},
+            },
+        )
+
+        assert storage.save_stream(AREA, KEY, io.BytesIO(b"streamed")) == 8
+
+    def test_content_type_is_set_when_the_upload_is_created(self, storage, stub):
+        stub.add_response(
+            "create_multipart_upload",
+            {"UploadId": "upload-1"},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "ContentType": "application/zip"},
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"etag-1"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"x",
+            },
+        )
+        stub.add_response(
+            "complete_multipart_upload",
+            {},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "MultipartUpload": {"Parts": [{"ETag": '"etag-1"', "PartNumber": 1}]},
+            },
+        )
+
+        storage.save_stream(AREA, KEY, io.BytesIO(b"x"), content_type="application/zip")
+
+    def test_an_empty_stream_uses_a_zero_byte_object(self, storage, stub):
+        stub.add_response(
+            "put_object",
+            {},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "Body": b"", "ContentType": "application/zip"},
+        )
+
+        assert storage.save_stream(AREA, KEY, io.BytesIO(), content_type="application/zip") == 0
+
+    def test_a_mid_stream_limit_breach_aborts_the_upload(self, storage, stub, monkeypatch):
+        monkeypatch.setattr(storage_s3, "_MULTIPART_PART_BYTES", 4)
+        stub.add_response(
+            "create_multipart_upload",
+            {"UploadId": "upload-1"},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"etag-1"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"1234",
+            },
+        )
+        stub.add_response(
+            "abort_multipart_upload",
+            {},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream(AREA, KEY, io.BytesIO(b"12345"), max_bytes=4)
+
+
 class TestGet:
     def test_it_returns_the_stored_bytes(self, storage, stub):
         stub.add_response("get_object", {"Body": _body(b"bytes")}, {"Bucket": BUCKET, "Key": OBJECT_KEY})
@@ -117,12 +228,66 @@ class TestGet:
 
         assert storage.get(AREA, KEY) is None
 
-    def test_an_access_failure_is_not_a_missing_blob(self, storage, stub):
+    def test_an_access_failure_is_provider_neutral(self, storage, stub):
         """Swallowing this would silently serve empty data on a credentials mistake."""
         stub.add_client_error("get_object", service_error_code="AccessDenied", http_status_code=403)
 
-        with pytest.raises(ClientError):
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
             storage.get(AREA, KEY)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+
+class TestOpenStream:
+    def test_a_bounded_range_is_requested_from_s3(self, storage, stub):
+        stub.add_response(
+            "get_object",
+            {"Body": _body(b"2345")},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "Range": "bytes=2-5"},
+        )
+
+        with storage.open_stream(AREA, KEY, offset=2, length=4) as stream:
+            assert stream.read() == b"2345"
+
+    def test_an_unbounded_offset_is_requested_to_the_end(self, storage, stub):
+        stub.add_response(
+            "get_object",
+            {"Body": _body(b"23456789")},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "Range": "bytes=2-"},
+        )
+
+        with storage.open_stream(AREA, KEY, offset=2) as stream:
+            assert stream.read() == b"23456789"
+
+    def test_a_zero_length_range_checks_existence_without_fetching_a_body(self, storage, stub):
+        stub.add_response("head_object", {}, {"Bucket": BUCKET, "Key": OBJECT_KEY})
+
+        with storage.open_stream(AREA, KEY, length=0) as stream:
+            assert stream.read() == b""
+
+    def test_a_missing_object_raises_file_not_found(self, storage, stub):
+        stub.add_client_error("get_object", service_error_code="NoSuchKey", http_status_code=404)
+
+        with pytest.raises(FileNotFoundError):
+            storage.open_stream(AREA, KEY)
+
+    def test_an_offset_past_the_end_is_an_empty_stream(self, storage, stub):
+        stub.add_client_error("get_object", service_error_code="InvalidRange", http_status_code=416)
+
+        with storage.open_stream(AREA, KEY, offset=100) as stream:
+            assert stream.read() == b""
+
+    def test_a_body_read_failure_is_provider_neutral(self, storage, stub):
+        stub.add_response(
+            "get_object",
+            {"Body": _FailingBody()},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+
+        with storage.open_stream(AREA, KEY) as stream, pytest.raises(StorageBackendUnavailableError) as excinfo:
+            stream.read()
+
+        assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
 
 
 class TestExists:
@@ -136,11 +301,13 @@ class TestExists:
 
         assert storage.exists(AREA, KEY) is False
 
-    def test_a_throttling_failure_surfaces(self, storage, stub):
+    def test_a_throttling_failure_is_provider_neutral(self, storage, stub):
         stub.add_client_error("head_object", service_error_code="SlowDown", http_status_code=503)
 
-        with pytest.raises(ClientError):
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
             storage.exists(AREA, KEY)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
 
 
 class TestDelete:
@@ -149,14 +316,27 @@ class TestDelete:
 
         storage.delete(AREA, KEY)
 
+    def test_a_client_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("delete_object", service_error_code="AccessDenied", http_status_code=403)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.delete(AREA, KEY)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
 
 class TestListKeys:
     def test_it_strips_the_bucket_prefix_and_the_area(self, storage, stub):
         """Callers hold bare keys, so a listing has to hand back the same shape."""
         stub.add_response(
             "list_objects_v2",
-            {"Contents": [{"Key": f"{PREFIX}/{AREA}/b.webp"}, {"Key": f"{PREFIX}/{AREA}/a.webp"}]},
-            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}"},
+            {
+                "Contents": [
+                    {"Key": f"{PREFIX}/{AREA}/b.webp", "LastModified": MODIFIED},
+                    {"Key": f"{PREFIX}/{AREA}/a.webp", "LastModified": MODIFIED},
+                ]
+            },
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/"},
         )
 
         assert storage.list_keys(AREA) == ["a.webp", "b.webp"]
@@ -164,7 +344,7 @@ class TestListKeys:
     def test_a_key_prefix_narrows_the_listing(self, storage, stub):
         stub.add_response(
             "list_objects_v2",
-            {"Contents": [{"Key": f"{PREFIX}/{AREA}/user-1.webp"}]},
+            {"Contents": [{"Key": f"{PREFIX}/{AREA}/user-1.webp", "LastModified": MODIFIED}]},
             {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/user-"},
         )
 
@@ -174,19 +354,23 @@ class TestListKeys:
         """An area larger than one page must not be silently truncated."""
         stub.add_response(
             "list_objects_v2",
-            {"Contents": [{"Key": f"{PREFIX}/{AREA}/a.webp"}], "IsTruncated": True, "NextContinuationToken": "next"},
-            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}"},
+            {
+                "Contents": [{"Key": f"{PREFIX}/{AREA}/a.webp", "LastModified": MODIFIED}],
+                "IsTruncated": True,
+                "NextContinuationToken": "next",
+            },
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/"},
         )
         stub.add_response(
             "list_objects_v2",
-            {"Contents": [{"Key": f"{PREFIX}/{AREA}/b.webp"}], "IsTruncated": False},
-            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}", "ContinuationToken": "next"},
+            {"Contents": [{"Key": f"{PREFIX}/{AREA}/b.webp", "LastModified": MODIFIED}], "IsTruncated": False},
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/", "ContinuationToken": "next"},
         )
 
         assert storage.list_keys(AREA) == ["a.webp", "b.webp"]
 
     def test_an_empty_area_lists_nothing(self, storage, stub):
-        stub.add_response("list_objects_v2", {}, {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}"})
+        stub.add_response("list_objects_v2", {}, {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/"})
 
         assert storage.list_keys(AREA) == []
 
@@ -194,11 +378,52 @@ class TestListKeys:
         """A flat prefix scan sees every depth, and the local backend must match."""
         stub.add_response(
             "list_objects_v2",
-            {"Contents": [{"Key": f"{PREFIX}/{AREA}/2026/01/a.webp"}]},
-            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}"},
+            {"Contents": [{"Key": f"{PREFIX}/{AREA}/2026/01/a.webp", "LastModified": MODIFIED}]},
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/"},
         )
 
         assert storage.list_keys(AREA) == ["2026/01/a.webp"]
+
+    def test_the_lazy_variant_yields_the_last_modified_epoch(self, storage, stub):
+        stub.add_response(
+            "list_objects_v2",
+            {"Contents": [{"Key": OBJECT_KEY, "LastModified": MODIFIED}]},
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/{AREA}/"},
+        )
+
+        assert list(storage.iter_objects(AREA)) == [(KEY, MODIFIED.timestamp())]
+
+    def test_a_listing_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("list_objects_v2", service_error_code="SlowDown", http_status_code=503)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            list(storage.iter_objects(AREA))
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+
+class TestCheckWritable:
+    def test_it_writes_and_removes_a_unique_probe(self, storage, stub):
+        stub.add_response(
+            "put_object",
+            {},
+            {"Bucket": BUCKET, "Key": ANY, "Body": b""},
+        )
+        stub.add_response(
+            "delete_object",
+            {},
+            {"Bucket": BUCKET, "Key": ANY},
+        )
+
+        storage.check_writable()
+
+    def test_a_probe_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("put_object", service_error_code="SlowDown", http_status_code=503)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.check_writable()
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
 
 
 class TestUrl:
@@ -220,3 +445,28 @@ class TestUrl:
         long = storage.url(AREA, KEY, expires_in=86_400)
 
         assert short != long
+
+    def test_download_headers_are_pinned_in_the_signature(self, storage):
+        url = storage.url(
+            AREA,
+            KEY,
+            download_as="release 2026.zip",
+            content_type="application/octet-stream",
+        )
+
+        query = parse_qs(urlparse(url).query)
+        disposition = query["response-content-disposition"][0]
+        assert disposition.startswith('attachment; filename="release 2026.zip";')
+        assert "filename*=UTF-8''release%202026.zip" in disposition
+        assert query["response-content-type"] == ["application/octet-stream"]
+
+    @pytest.mark.parametrize(
+        ("arguments", "match"),
+        [
+            ({"download_as": "bad\r\nname.zip"}, "download_as"),
+            ({"content_type": "text/plain\r\nX-Test: bad"}, "content_type"),
+        ],
+    )
+    def test_response_headers_refuse_line_breaks(self, storage, arguments, match):
+        with pytest.raises(ValueError, match=match):
+            storage.url(AREA, KEY, **arguments)
