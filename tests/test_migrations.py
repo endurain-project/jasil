@@ -10,7 +10,7 @@ is the guard for that.
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from jasil import migrations
 from jasil.orm import jasil_table_names
@@ -77,6 +77,51 @@ class TestUpgrade:
 
         assert migrations.db_revision(engine) == migrations.head_revision()
 
+    def test_existing_jobs_become_default_queue_jobs(self, engine):
+        migrations.upgrade(engine, "rev0001")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO processing_jobs (
+                        id, event_id, event_type, subscriber_id, source, payload,
+                        max_attempts, available_at, created_at, updated_at
+                    ) VALUES (
+                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
+                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )"""
+                )
+            )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT queue FROM processing_jobs WHERE id = 'job-1'")).scalar_one()
+                == "default"
+            )
+
+    def test_old_writers_receive_the_database_default_queue(self, engine):
+        migrations.upgrade(engine)
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO processing_jobs (
+                        id, event_id, event_type, subscriber_id, source, payload,
+                        max_attempts, available_at, created_at, updated_at
+                    ) VALUES (
+                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
+                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )"""
+                )
+            )
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT queue FROM processing_jobs WHERE id = 'job-1'")).scalar_one()
+                == "default"
+            )
+
 
 class TestNoDrift:
     # The migration adds one index the ORM cannot declare: a PostgreSQL-only GIN
@@ -137,6 +182,28 @@ class TestDowngrade:
         migrations.downgrade(engine, "base")
 
         assert not set(inspect(engine).get_table_names()) & jasil_table_names()
+
+    def test_named_queues_can_downgrade_and_upgrade_again(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0001")
+
+        assert "queue" not in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
+
+        migrations.upgrade(engine)
+
+        assert "queue" in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
+
+    def test_worker_registry_can_downgrade_and_upgrade_again(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0002")
+
+        assert "job_workers" not in inspect(engine).get_table_names()
+
+        migrations.upgrade(engine)
+
+        assert "job_workers" in inspect(engine).get_table_names()
 
 
 class TestStamp:

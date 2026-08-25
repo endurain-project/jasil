@@ -1,8 +1,9 @@
 """Pydantic response schemas for the durable-jobs admin dashboard."""
 
 from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobSubscriberStats(BaseModel):
@@ -26,6 +27,18 @@ class JobSubscriberStats(BaseModel):
     claimed: int
     completed: int
     dead_letter: int
+
+
+class JobQueueStats(BaseModel):
+    """Job counts and backlog age for one named queue."""
+
+    queue: str
+    total: int
+    pending: int
+    claimed: int
+    completed: int
+    dead_letter: int
+    oldest_pending_seconds: float | None
 
 
 class DeadLetterJob(BaseModel):
@@ -74,6 +87,7 @@ class JobsSummary(BaseModel):
         dead_letter: Window count that exhausted retries.
         oldest_pending_seconds: Age of the oldest unfinished job, in seconds.
         by_subscriber: Per-subscriber breakdown within the window.
+        by_queue: Per-queue breakdown within the window.
         recent_dead_letter: The current dead-letter queue contents (most recent first).
     """
 
@@ -85,6 +99,7 @@ class JobsSummary(BaseModel):
     dead_letter: int
     oldest_pending_seconds: float | None
     by_subscriber: list[JobSubscriberStats]
+    by_queue: list[JobQueueStats] = Field(default_factory=list)
     recent_dead_letter: list[DeadLetterJob]
 
 
@@ -97,3 +112,32 @@ class JobReplayResult(BaseModel):
     """
 
     replayed: bool
+
+
+WorkerStatus = Literal["running", "stale", "stopped"]
+
+
+class WorkerInfo(BaseModel):
+    """Operator-facing state for one restart-unique worker instance."""
+
+    instance_id: str
+    started_at: datetime
+    last_heartbeat_at: datetime
+    stopped_at: datetime | None
+    queues: list[str] | None
+    role: str | None
+    label: str | None
+    metadata: dict[str, Any] | None
+    active_claimed_jobs: int
+    status: WorkerStatus
+
+
+class WorkersSummary(BaseModel):
+    """Current and retained durable-worker telemetry."""
+
+    stale_after_seconds: float
+    total_workers: int
+    running: int
+    stale: int
+    stopped: int
+    workers: list[WorkerInfo]

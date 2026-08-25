@@ -28,6 +28,9 @@ through.
       uses its own `jasil_alembic_version` table and never touches yours.
 - [ ] On MySQL, note that `DATETIME` stores whole seconds and rounds. Do not
       compare a timestamp JASIL persisted for equality with the value you passed.
+- [ ] Upgrade through JASIL's packaged revisions before rolling out queue-aware
+      code. The queue column is non-null and has a database-side `default`
+      default so previous-release writers remain valid during the rollout.
 
 ## Secrets and event payloads
 
@@ -72,6 +75,16 @@ through.
 - [ ] Alert on `dead_letter` job count, and on the `Reaped N expired job lease(s)`
       warning: a lease only expires because a worker died or overran.
 - [ ] Alert on the oldest pending job age from `jasil.admin.get_jobs_summary()`.
+- [ ] Assign queue names at subscriber registration. Keep them lowercase ASCII,
+      stable, and domain-neutral from JASIL's point of view; renaming a queue
+      while old rows remain requires workers for both names during the drain.
+- [ ] For SQLite, run exactly one API process and one in-process worker. For
+      PostgreSQL, do not start handlers in API replicas; run standalone workers
+      with explicit non-empty allowlists and size each queue's process group.
+- [ ] Remember that durable jobs do not require Redis. Do not introduce a second
+      queue as a source of truth beside `processing_jobs`.
+- [ ] Set `lease_seconds` above the longest handler duration. Heartbeats remain
+      live during a long handler, but they do not extend the job lease.
 
 ## The admin surface
 
@@ -80,6 +93,11 @@ through.
       JASIL has no notion of who is calling.
 - [ ] Do not reflect the summaries to end users. `recent_failures` carries error
       messages and `event_metadata`.
+- [ ] Expose worker and queue summaries through host-owned authenticated routes.
+      JASIL supplies typed reads, not FastAPI routes or UI.
+- [ ] Treat running/stale/stopped as operator telemetry. Decide alert and
+      container-health policy in the host rather than mapping status to health
+      automatically.
 
 ## Logging
 
@@ -96,6 +114,8 @@ through.
 
 - [ ] Call `jasil.lifecycle.shutdown()` on the way down. It stops the durable-job
       worker before releasing the bus its subscribers publish through.
+- [ ] Standalone workers must pass a stop event and set it from their signal
+      handler so JASIL can record a graceful stop.
 - [ ] Stop your own scheduler and dispose your own engine — JASIL created neither
       and does not touch them.
 

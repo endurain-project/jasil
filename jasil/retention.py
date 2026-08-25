@@ -10,7 +10,7 @@ disabled independently), deleting only what is safe to lose:
 
 * every ``event_log`` row (best-effort, safe-to-lose observability trail),
 * relayed ``event_outbox`` rows (already fanned out into jobs), and
-* ``completed`` ``processing_jobs`` rows.
+* ``completed`` ``processing_jobs`` rows, plus stopped/stale worker telemetry.
 
 In-flight and human-actionable rows are never touched: unrelayed outbox rows
 (pending relay), ``pending`` / ``claimed`` jobs (in-flight work), and
@@ -88,10 +88,11 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
     # declarative base, so a top-level import would make ``import jasil.retention``
     # fail until ``jasil.orm.map_models`` had run.
     import jasil.event_log.crud as event_log_crud
+    import jasil.jobs._worker_registry as worker_registry
     import jasil.jobs.crud as jobs_crud
     import jasil.jobs.outbox as jobs_outbox
 
-    events = outbox = jobs = 0
+    events = outbox = jobs = workers = 0
 
     if event_log_days > 0:
         cutoff = now - timedelta(days=event_log_days)
@@ -104,13 +105,16 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
             outbox = jobs_outbox.delete_relayed_before(cutoff, db=db)
         with jasil_orm.get_sessionmaker()() as db:
             jobs = jobs_crud.delete_completed_jobs_before(cutoff, db=db)
+        with jasil_orm.get_sessionmaker()() as db:
+            workers = worker_registry.prune_worker_records_before(cutoff, db=db)
 
-    if events or outbox or jobs:
+    if events or outbox or jobs or workers:
         logger.info(
-            "Retention prune: deleted %d event_log, %d relayed outbox, and %d completed job row(s)",
+            "Retention prune: deleted %d event_log, %d relayed outbox, %d completed job, and %d worker row(s)",
             events,
             outbox,
             jobs,
+            workers,
         )
     else:
         logger.debug("Retention prune: nothing to delete")

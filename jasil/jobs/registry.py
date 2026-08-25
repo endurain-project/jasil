@@ -7,8 +7,9 @@ worker uses the id mapping to resolve a claimed job back to its handler. The sam
 code therefore runs subscribers in-process or out-of-process in a worker.
 """
 
+import re
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from jasil._core.limits import check_length
 from jasil.events import MAX_EVENT_TYPE_LENGTH, Event
@@ -19,6 +20,51 @@ JobHandler = Callable[[Event], None]
 #: so the two cannot drift.
 MAX_SUBSCRIBER_ID_LENGTH = 200
 
+#: Queue assigned to registrations and jobs that do not select one explicitly.
+DEFAULT_QUEUE = "default"
+
+#: Width of ``processing_jobs.queue``. Queue names are configuration identifiers,
+#: so they are rejected rather than truncated before they can reach a database.
+MAX_QUEUE_NAME_LENGTH = 100
+
+_QUEUE_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+
+
+def validate_queue_name(queue: str) -> str:
+    """Validate and return one portable durable-job queue identifier.
+
+    Queue names are deliberately lowercase ASCII so equality and ordering have
+    the same meaning under SQLite, PostgreSQL, and MySQL collations.
+
+    Args:
+        queue: Queue identifier to validate.
+
+    Returns:
+        The unchanged queue name.
+
+    Raises:
+        ValueError: When the queue is empty, overlong, or contains unsupported
+            characters.
+    """
+    if not isinstance(queue, str):
+        raise ValueError("queue must be a string")
+    check_length(queue, field="queue", limit=MAX_QUEUE_NAME_LENGTH)
+    if _QUEUE_NAME_PATTERN.fullmatch(queue) is None:
+        raise ValueError(
+            "queue must start with a lowercase letter or digit and contain only a-z, 0-9, '.', '_', or '-'"
+        )
+    return queue
+
+
+def normalize_queue_selector(queues: Iterable[str] | None) -> tuple[str, ...] | None:
+    """Validate an optional non-empty queue allowlist and remove duplicates."""
+    if queues is None:
+        return None
+    values = (queues,) if isinstance(queues, str) else tuple(queues)
+    if not values:
+        raise ValueError("queues must be a non-empty allowlist when provided")
+    return tuple(dict.fromkeys(validate_queue_name(queue) for queue in values))
+
 
 class JobHandlerRegistry:
     """A process-local registry of durable subscribers."""
@@ -26,8 +72,16 @@ class JobHandlerRegistry:
     def __init__(self) -> None:
         self._handlers: dict[str, JobHandler] = {}
         self._by_event_type: dict[str, list[str]] = defaultdict(list)
+        self._queues: dict[str, str] = {}
 
-    def register(self, event_type: str, subscriber_id: str, handler: JobHandler) -> None:
+    def register(
+        self,
+        event_type: str,
+        subscriber_id: str,
+        handler: JobHandler,
+        *,
+        queue: str = DEFAULT_QUEUE,
+    ) -> None:
         """
         Register (or replace) a durable subscriber.
 
@@ -35,19 +89,22 @@ class JobHandlerRegistry:
             event_type: The domain-event channel the subscriber reacts to.
             subscriber_id: The stable durable-subscriber identifier.
             handler: The callable that processes an event for this subscriber.
+            queue: Durable-job queue assigned to this subscriber's fan-out.
 
         Returns:
             None.
 
         Raises:
-            ValueError: When ``event_type`` or ``subscriber_id`` is longer than
-                the ``processing_jobs`` column it is written to. Checked at
-                registration — startup — rather than when the relay first tries
-                to enqueue a job, where the failure would be far from its cause.
+            ValueError: When an identifier is invalid for the column it is
+                written to. Checked at registration — startup — rather than when
+                the relay first tries to enqueue a job, where the failure would
+                be far from its cause.
         """
         check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
         check_length(subscriber_id, field="subscriber_id", limit=MAX_SUBSCRIBER_ID_LENGTH)
+        validate_queue_name(queue)
         self._handlers[subscriber_id] = handler
+        self._queues[subscriber_id] = queue
         if subscriber_id not in self._by_event_type[event_type]:
             self._by_event_type[event_type].append(subscriber_id)
 
@@ -62,6 +119,20 @@ class JobHandlerRegistry:
             The registered handler, or ``None`` when none is registered.
         """
         return self._handlers.get(subscriber_id)
+
+    def queue_for(self, subscriber_id: str) -> str:
+        """Return the queue assigned to a registered subscriber.
+
+        Raises:
+            LookupError: When registry state has no queue for ``subscriber_id``.
+                Registration always stores the handler and queue together, so
+                this indicates inconsistent process-local state and must not be
+                hidden by routing the job to another queue.
+        """
+        try:
+            return self._queues[subscriber_id]
+        except KeyError as error:
+            raise LookupError(f"no queue registered for subscriber_id {subscriber_id!r}") from error
 
     def subscribers_for(self, event_type: str) -> tuple[str, ...]:
         """
@@ -88,6 +159,7 @@ class JobHandlerRegistry:
         """Remove every registration (used to reset state between tests)."""
         self._handlers.clear()
         self._by_event_type.clear()
+        self._queues.clear()
 
 
 # Process-wide default registry: durable subscribers register here at startup and

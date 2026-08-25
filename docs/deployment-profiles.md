@@ -29,6 +29,10 @@ install, nothing to run alongside.
 Valid for a single process. A multi-worker `local` deployment is a different
 matter — see below.
 
+With durable jobs enabled, the complete local shape is SQLite, one API process,
+and `start_job_worker()`. That one background consumer drains every named queue
+serially and fairly. It needs neither PostgreSQL nor Redis.
+
 ## distributed
 
 Many replicas on separate nodes. Every capability must point at something they
@@ -59,6 +63,14 @@ jasil_settings.configure(
     shared — a rate limiter that permits N times the configured rate, a lockout
     that never triggers, a session that exists on one replica and not another.
     None of that fails loudly. A refusal to start does.
+
+Durable jobs have a separate database topology from the capability URIs above.
+In a distributed deployment, use PostgreSQL for the outbox, jobs, and worker
+registry. API replicas schedule relay/reaping but do not call
+`start_job_worker()`; standalone processes call `run_job_worker(queues=...)`.
+Queue-specific process counts provide independent concurrency, while several
+processes selecting the same queue compete through `SKIP LOCKED`. Redis may
+back state or the event bus, but durable jobs themselves do not use it.
 
 ## custom
 
@@ -141,8 +153,10 @@ you want it somewhere other than the log.
 
 1. Stand up Redis, object storage, and Postgres.
 2. Set the four URIs and switch the profile.
-3. Run the [migrations](observability.md#migrations) if you enable the event log
-   or durable jobs.
+3. Run the [migrations](observability.md#migrations).
+4. Stop starting the in-process worker in the API; keep relay/reaper scheduling.
+5. Start standalone PostgreSQL workers with their queue allowlists and desired
+    process counts.
 
-No domain code changes. That is the point of depending on the providers rather
-than on the infrastructure.
+Subscriber registration keeps the queue assignment, so no domain code changes.
+That is the point of depending on the providers rather than on infrastructure.

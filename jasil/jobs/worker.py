@@ -9,14 +9,135 @@ loop.
 
 import logging
 import threading
+from collections.abc import Callable, Iterable
+from datetime import datetime
+from typing import Any
 
+from jasil._core.limits import MAX_WORKER_LABEL_LENGTH, MAX_WORKER_ROLE_LENGTH, check_length
 from jasil._core.threads import signal_and_join
+from jasil.jobs.registry import normalize_queue_selector
 from jasil.jobs.runner import JobRunner
+from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
 
 
-def run_worker(runner: JobRunner, *, poll_interval_seconds: float, stop: threading.Event) -> None:
+class WorkerTelemetry:
+    """Best-effort durable lifecycle telemetry for one worker instance."""
+
+    def __init__(
+        self,
+        *,
+        instance_id: str,
+        clock: ClockProvider,
+        session_factory: Callable,
+        heartbeat_interval_seconds: float,
+        queues: Iterable[str] | None,
+        role: str | None = None,
+        label: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if heartbeat_interval_seconds <= 0:
+            raise ValueError("heartbeat_interval_seconds must be greater than zero")
+        selected_queues = normalize_queue_selector(queues)
+        if role is not None:
+            check_length(role, field="role", limit=MAX_WORKER_ROLE_LENGTH)
+        if label is not None:
+            check_length(label, field="label", limit=MAX_WORKER_LABEL_LENGTH)
+        self._instance_id = instance_id
+        self._clock = clock
+        self._session_factory = session_factory
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._queues = selected_queues
+        self._role = role
+        self._label = label
+        self._metadata = dict(metadata) if metadata is not None else None
+        self._started_at: datetime | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Record startup and begin bounded periodic heartbeats."""
+        if self._thread is not None:
+            return
+        self._started_at = self._clock.now()
+        self._write_start()
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="durable-job-worker-heartbeat",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop periodic heartbeats and record a graceful shutdown."""
+        thread, self._thread = self._thread, None
+        signal_and_join(thread, self._stop)
+        self._write_stop()
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop.wait(self._heartbeat_interval_seconds):
+            self._write_heartbeat()
+
+    def _write_start(self) -> None:
+        import jasil.jobs._worker_registry as worker_registry
+
+        started_at = self._started_at
+        if started_at is None:
+            return
+        try:
+            with self._session_factory() as db:
+                worker_registry.record_worker_start(
+                    self._instance_id,
+                    started_at=started_at,
+                    queues=self._queues,
+                    role=self._role,
+                    label=self._label,
+                    metadata=self._metadata,
+                    db=db,
+                )
+        except Exception as error:
+            logger.warning("Durable worker start telemetry failed", exc_info=error)
+
+    def _write_heartbeat(self) -> None:
+        import jasil.jobs._worker_registry as worker_registry
+
+        started_at = self._started_at
+        if started_at is None:
+            return
+        try:
+            with self._session_factory() as db:
+                worker_registry.record_worker_heartbeat(
+                    self._instance_id,
+                    started_at=started_at,
+                    now=self._clock.now(),
+                    queues=self._queues,
+                    role=self._role,
+                    label=self._label,
+                    metadata=self._metadata,
+                    db=db,
+                )
+        except Exception as error:
+            logger.warning("Durable worker heartbeat failed", exc_info=error)
+
+    def _write_stop(self) -> None:
+        import jasil.jobs._worker_registry as worker_registry
+
+        try:
+            with self._session_factory() as db:
+                worker_registry.record_worker_stop(self._instance_id, now=self._clock.now(), db=db)
+        except Exception as error:
+            logger.warning("Durable worker stop telemetry failed", exc_info=error)
+
+
+def run_worker(
+    runner: JobRunner,
+    *,
+    poll_interval_seconds: float,
+    stop: threading.Event,
+    telemetry: WorkerTelemetry | None = None,
+) -> None:
     """
     Claim and process jobs until ``stop`` is set.
 
@@ -28,28 +149,42 @@ def run_worker(runner: JobRunner, *, poll_interval_seconds: float, stop: threadi
         runner: The job runner to drive.
         poll_interval_seconds: Idle wait between empty polls.
         stop: Event that ends the loop when set.
+        telemetry: Optional durable worker-lifecycle recorder.
 
     Returns:
         None.
     """
     logger.info("Durable job worker started")
-    while not stop.is_set():
-        try:
-            processed = runner.run_once()
-        except Exception as error:
-            logger.error("Durable job worker iteration failed", exc_info=error)
-            processed = 0
-        if processed == 0:
-            stop.wait(poll_interval_seconds)
-    logger.info("Durable job worker stopped")
+    if telemetry is not None:
+        telemetry.start()
+    try:
+        while not stop.is_set():
+            try:
+                processed = runner.run_once()
+            except Exception as error:
+                logger.error("Durable job worker iteration failed", exc_info=error)
+                processed = 0
+            if processed == 0:
+                stop.wait(poll_interval_seconds)
+    finally:
+        if telemetry is not None:
+            telemetry.stop()
+        logger.info("Durable job worker stopped")
 
 
 class BackgroundWorker:
     """Runs :func:`run_worker` on a daemon thread for in-process deployments."""
 
-    def __init__(self, runner: JobRunner, *, poll_interval_seconds: float) -> None:
+    def __init__(
+        self,
+        runner: JobRunner,
+        *,
+        poll_interval_seconds: float,
+        telemetry: WorkerTelemetry | None = None,
+    ) -> None:
         self._runner = runner
         self._poll_interval_seconds = poll_interval_seconds
+        self._telemetry = telemetry
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -69,7 +204,11 @@ class BackgroundWorker:
         self._thread = threading.Thread(
             target=run_worker,
             args=(self._runner,),
-            kwargs={"poll_interval_seconds": self._poll_interval_seconds, "stop": self._stop},
+            kwargs={
+                "poll_interval_seconds": self._poll_interval_seconds,
+                "stop": self._stop,
+                "telemetry": self._telemetry,
+            },
             name="durable-job-worker",
             daemon=True,
         )

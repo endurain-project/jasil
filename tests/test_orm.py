@@ -6,7 +6,7 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 import jasil.orm as orm
 
-JASIL_TABLES = {"event_log", "processing_jobs", "event_outbox"}
+JASIL_TABLES = {"event_log", "processing_jobs", "event_outbox", "job_workers"}
 
 
 @pytest.fixture

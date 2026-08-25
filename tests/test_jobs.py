@@ -46,9 +46,9 @@ def event():
     return new_event("activity.created", {"activity_id": 7}, source="test")
 
 
-def _enqueue(event, db, *, subscriber=SUBSCRIBER, max_attempts=3, now=T0, available_at=None):
+def _enqueue(event, db, *, subscriber=SUBSCRIBER, queue="default", max_attempts=3, now=T0, available_at=None):
     return jobs_crud.enqueue_job(
-        event, subscriber, max_attempts=max_attempts, now=now, db=db, available_at=available_at
+        event, subscriber, queue=queue, max_attempts=max_attempts, now=now, db=db, available_at=available_at
     )
 
 
@@ -58,6 +58,19 @@ class TestEnqueue:
 
         assert job.status == jobs_crud.STATUS_PENDING
         assert job.attempts == 0
+        assert job.queue == "default"
+
+    def test_a_named_queue_is_persisted(self, db, event):
+        job = _enqueue(event, db, queue="campaign")
+
+        assert job.queue == "campaign"
+
+    @pytest.mark.parametrize("queue", ["", "has spaces", "has/slash", "q" * 101])
+    def test_an_invalid_queue_fails_before_persistence(self, db, event, queue):
+        with pytest.raises(ValueError, match="queue"):
+            _enqueue(event, db, queue=queue)
+
+        assert db.query(ProcessingJob).count() == 0
 
     def test_the_envelope_is_carried_onto_the_job(self, db, event):
         job = _enqueue(event, db)
@@ -104,6 +117,29 @@ class TestEnqueue:
 
 
 class TestSubscriberRegistration:
+    def test_existing_registration_uses_the_default_queue(self):
+        registry = JobHandlerRegistry()
+
+        registry.register("a.b", "sub", lambda _e: None)
+
+        assert registry.queue_for("sub") == "default"
+
+    def test_a_subscriber_can_select_a_named_queue(self):
+        registry = JobHandlerRegistry()
+
+        registry.register("a.b", "sub", lambda _e: None, queue="maintenance")
+
+        assert registry.queue_for("sub") == "maintenance"
+
+    @pytest.mark.parametrize("queue", ["", "has spaces", "has/slash", "q" * 101])
+    def test_an_invalid_queue_is_refused_at_registration(self, queue):
+        registry = JobHandlerRegistry()
+
+        with pytest.raises(ValueError, match="queue"):
+            registry.register("a.b", "sub", lambda _e: None, queue=queue)
+
+        assert registry.get("sub") is None
+
     def test_an_over_long_subscriber_id_is_refused(self):
         """Caught at startup rather than when the relay first fans the event out."""
         with pytest.raises(ValueError, match="subscriber_id is 201 characters"):
@@ -202,6 +238,54 @@ class TestClaim:
 
     def test_claiming_an_empty_queue_returns_nothing(self, db):
         assert jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db) == []
+
+    def test_a_selective_claim_never_takes_another_queue(self, db):
+        _enqueue(new_event("activity.created", {"queue": "campaign"}, source="test"), db, queue="campaign")
+        _enqueue(new_event("activity.created", {"queue": "intake"}, source="test"), db, queue="intake")
+
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db, queues=("campaign",))
+
+        assert [job.queue for job in claimed] == ["campaign"]
+        assert db.query(ProcessingJob).filter_by(queue="intake", status=jobs_crud.STATUS_PENDING).count() == 1
+
+    def test_an_empty_queue_selector_is_refused(self, db):
+        with pytest.raises(ValueError, match="queues"):
+            jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db, queues=())
+
+    def test_the_queue_cursor_rotates_before_returning_to_a_backlog(self, db):
+        _enqueue(new_event("activity.created", {"i": 1}, source="test"), db, queue="campaign")
+        _enqueue(new_event("activity.created", {"i": 2}, source="test"), db, queue="campaign")
+        _enqueue(new_event("activity.created", {"i": 3}, source="test"), db, queue="intake")
+
+        first = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=T0, db=db)
+        second = jobs_crud.claim_jobs(
+            worker_id="w1",
+            limit=1,
+            lease_seconds=60,
+            now=T0,
+            db=db,
+            queue_cursor=first[-1].queue,
+        )
+
+        assert [first[0].queue, second[0].queue] == ["campaign", "intake"]
+
+    def test_a_large_backlog_cannot_starve_another_queue(self, db):
+        for index in range(50):
+            _enqueue(new_event("activity.created", {"i": index}, source="test"), db, queue="campaign")
+        intake = _enqueue(new_event("activity.created", {"i": 50}, source="test"), db, queue="intake")
+
+        first = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+        second = jobs_crud.claim_jobs(
+            worker_id="w1",
+            limit=10,
+            lease_seconds=60,
+            now=T0,
+            db=db,
+            queue_cursor=first[-1].queue,
+        )
+
+        assert {job.queue for job in first} == {"campaign"}
+        assert intake.id in {job.id for job in second}
 
 
 class TestCompletion:
@@ -389,6 +473,38 @@ class TestOutboxRelay:
 
         assert relayed == 1
         assert {job.subscriber_id for job in db.query(ProcessingJob).all()} == {"a", "b"}
+
+    def test_each_subscribers_queue_is_stamped_on_its_job(self, db, session_factory, event, clock, registry):
+        registry.register("activity.created", "a", lambda _e: None, queue="campaign")
+        registry.register("activity.created", "b", lambda _e: None, queue="maintenance")
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        jobs_relay.relay_outbox_once(
+            registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+        )
+
+        assert {(job.subscriber_id, job.queue) for job in db.query(ProcessingJob).all()} == {
+            ("a", "campaign"),
+            ("b", "maintenance"),
+        }
+
+    def test_inconsistent_queue_state_rolls_the_relay_back(self, db, session_factory, event, clock, registry):
+        registry.register("activity.created", "a", lambda _e: None, queue="campaign")
+        registry._queues.clear()
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        with pytest.raises(LookupError, match="no queue registered"):
+            jobs_relay.relay_outbox_once(
+                registry=registry,
+                clock=clock,
+                session_factory=session_factory,
+                max_attempts=3,
+                batch_size=10,
+            )
+
+        db.rollback()
+        assert db.query(EventOutbox).one().relayed_at is None
+        assert db.query(ProcessingJob).count() == 0
 
     def test_a_relayed_row_is_stamped_and_not_relayed_twice(self, db, session_factory, event, clock, registry):
         registry.register("activity.created", "a", lambda _e: None)

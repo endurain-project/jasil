@@ -40,10 +40,14 @@ from jasil.event_log.schema import (
 )
 from jasil.jobs.schema import (
     DeadLetterJob,
+    JobQueueStats,
     JobReplayResult,
     JobsSummary,
     JobSubscriberStats,
+    WorkerInfo,
+    WorkersSummary,
 )
+from jasil.settings import get_settings
 
 __all__ = [
     "DeadLetterJob",
@@ -51,11 +55,15 @@ __all__ = [
     "EventLogPending",
     "EventLogSummary",
     "EventTypeStats",
+    "JobQueueStats",
     "JobReplayResult",
     "JobSubscriberStats",
     "JobsSummary",
+    "WorkerInfo",
+    "WorkersSummary",
     "get_event_log_summary",
     "get_jobs_summary",
+    "get_workers_summary",
     "replay_dead_letter_job",
 ]
 
@@ -98,6 +106,34 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
 
     with jasil_orm.get_sessionmaker()() as db:
         return event_log_crud.get_event_log_summary(db, hours=hours, failure_limit=failure_limit)
+
+
+def get_workers_summary(*, stale_after_seconds: float | None = None) -> WorkersSummary:
+    """Return durable-worker telemetry with running/stale/stopped status.
+
+    Status is operator telemetry only: JASIL does not map it onto a host health
+    endpoint or choose an alert policy.
+
+    Args:
+        stale_after_seconds: Maximum heartbeat age still considered running.
+            Defaults to three configured heartbeat intervals.
+
+    Returns:
+        Worker counts and retained worker-instance details.
+    """
+    from datetime import UTC, datetime
+
+    import jasil.jobs._worker_registry as worker_registry
+
+    effective_stale_after = (
+        stale_after_seconds if stale_after_seconds is not None else get_settings().jobs.heartbeat_interval_seconds * 3
+    )
+    with jasil_orm.get_sessionmaker()() as db:
+        return worker_registry.get_workers_summary(
+            now=datetime.now(UTC),
+            stale_after_seconds=effective_stale_after,
+            db=db,
+        )
 
 
 def replay_dead_letter_job(job_id: str) -> JobReplayResult:

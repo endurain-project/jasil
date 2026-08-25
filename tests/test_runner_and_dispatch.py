@@ -68,9 +68,9 @@ class TestJobRunner:
             backoff_max_seconds=100,
         )
 
-    def _enqueue(self, db, subscriber="s", max_attempts=3):
-        event = new_event("activity.created", {"id": 1}, source="test")
-        return jobs_crud.enqueue_job(event, subscriber, max_attempts=max_attempts, now=T0, db=db)
+    def _enqueue(self, db, subscriber="s", queue="default", max_attempts=3, payload=None):
+        event = new_event("activity.created", payload or {"id": 1}, source="test")
+        return jobs_crud.enqueue_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db)
 
     def test_an_empty_queue_processes_nothing(self, runner):
         assert runner.run_once() == 0
@@ -168,6 +168,63 @@ class TestJobRunner:
         )
 
         assert runner.run_once() == 2
+
+    def test_one_runner_consumes_multiple_named_queues_fairly(self, registry, clock, session_factory, db):
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.payload["id"]))
+        self._enqueue(db, queue="campaign", payload={"id": 1})
+        self._enqueue(db, queue="campaign", payload={"id": 2})
+        self._enqueue(db, queue="intake", payload={"id": 3})
+        runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="w",
+            lease_seconds=60,
+            batch_size=1,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+        )
+
+        assert [runner.run_once(), runner.run_once(), runner.run_once()] == [1, 1, 1]
+        assert seen[1] == 3
+        assert {seen[0], seen[2]} == {1, 2}
+
+    def test_a_selective_runner_never_processes_another_queue(self, registry, clock, session_factory, db):
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.payload["id"]))
+        self._enqueue(db, queue="campaign", payload={"id": 1})
+        self._enqueue(db, queue="intake", payload={"id": 2})
+        runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="w",
+            lease_seconds=60,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=("campaign",),
+        )
+
+        assert runner.run_once() == 1
+        assert seen == [1]
+        db.rollback()
+        assert db.query(ProcessingJob).filter_by(queue="intake", status=jobs_crud.STATUS_PENDING).count() == 1
+
+    def test_an_empty_queue_allowlist_is_refused(self, registry, clock, session_factory):
+        with pytest.raises(ValueError, match="queues"):
+            JobRunner(
+                registry=registry,
+                clock=clock,
+                session_factory=session_factory,
+                worker_id="w",
+                lease_seconds=60,
+                batch_size=10,
+                backoff_base_seconds=1,
+                backoff_max_seconds=2,
+                queues=(),
+            )
 
     def test_reaping_requeues_an_expired_lease(self, runner, registry, clock, db):
         registry.register("activity.created", "s", lambda _e: None)

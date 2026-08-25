@@ -18,6 +18,7 @@ import jasil.jobs.crud as jobs_crud
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import new_event
+from jasil.jobs.models import JobWorker
 
 SUBSCRIBER = "invoice.render"
 
@@ -71,6 +72,79 @@ class TestJobsSummary:
 
     def test_an_empty_database_summarizes_to_zero(self, platform, db):
         assert jasil_admin.get_jobs_summary().total_jobs == 0
+
+    def test_it_reports_queue_counts(self, platform, db, now):
+        jobs_crud.enqueue_job(
+            new_event("order.created", {"order_id": 1}, source="api:create_order"),
+            SUBSCRIBER,
+            queue="campaign",
+            max_attempts=3,
+            now=now,
+            db=db,
+        )
+
+        queue = jasil_admin.get_jobs_summary().by_queue[0]
+
+        assert queue.queue == "campaign"
+        assert queue.pending == 1
+        assert queue.total == 1
+
+
+class TestWorkersSummary:
+    def test_it_derives_running_stale_and_stopped(self, platform, db, now):
+        db.add_all(
+            [
+                JobWorker(instance_id="running", started_at=now, last_heartbeat_at=now, active_claimed_jobs=2),
+                JobWorker(
+                    instance_id="stale",
+                    started_at=now - timedelta(hours=2),
+                    last_heartbeat_at=now - timedelta(hours=1),
+                    active_claimed_jobs=1,
+                ),
+                JobWorker(
+                    instance_id="stopped",
+                    started_at=now - timedelta(hours=2),
+                    last_heartbeat_at=now,
+                    stopped_at=now,
+                    queues=["maintenance"],
+                    role="maintenance",
+                    label="nightly",
+                    worker_metadata={"zone": "a"},
+                    active_claimed_jobs=0,
+                ),
+            ]
+        )
+        db.commit()
+
+        summary = jasil_admin.get_workers_summary(stale_after_seconds=60)
+
+        assert (summary.running, summary.stale, summary.stopped) == (1, 1, 1)
+        stopped = next(worker for worker in summary.workers if worker.instance_id == "stopped")
+        assert stopped.queues == ["maintenance"]
+        assert stopped.metadata == {"zone": "a"}
+
+    def test_an_empty_registry_summarizes_to_zero(self, platform, db):
+        assert jasil_admin.get_workers_summary().total_workers == 0
+
+    def test_the_default_stale_threshold_is_three_heartbeat_intervals(self, platform, db):
+        settings.configure(settings.JasilSettings(jobs=settings.JobSettings(heartbeat_interval_seconds=7)))
+
+        assert jasil_admin.get_workers_summary().stale_after_seconds == 21
+
+    def test_active_claims_are_derived_from_jobs_not_a_stale_heartbeat_snapshot(self, platform, db, now):
+        db.add(
+            JobWorker(
+                instance_id="worker-1",
+                started_at=now,
+                last_heartbeat_at=now,
+                active_claimed_jobs=7,
+            )
+        )
+        db.commit()
+
+        worker = jasil_admin.get_workers_summary().workers[0]
+
+        assert worker.active_claimed_jobs == 0
 
 
 class TestEventLogSummary:
@@ -127,6 +201,7 @@ class TestItOwnsItsSessions:
         [
             jasil_admin.get_jobs_summary,
             jasil_admin.get_event_log_summary,
+            jasil_admin.get_workers_summary,
             jasil_admin.replay_dead_letter_job,
         ],
     )
@@ -139,6 +214,7 @@ class TestItOwnsItsSessions:
 
         assert jasil_admin.get_jobs_summary().dead_letter == 1
         assert jasil_admin.get_event_log_summary() is not None
+        assert jasil_admin.get_workers_summary() is not None
         assert jasil_admin.replay_dead_letter_job(job_id).replayed is True
 
 
@@ -154,8 +230,11 @@ class TestSchemasAreReExported:
             "EventLogSummary",
             "EventTypeStats",
             "JobReplayResult",
+            "JobQueueStats",
             "JobSubscriberStats",
             "JobsSummary",
+            "WorkerInfo",
+            "WorkersSummary",
         ],
     )
     def test_every_response_schema_is_reachable(self, name):

@@ -43,6 +43,23 @@ queued work.
 
 The handler must **raise** on failure. That is what drives retry.
 
+Every registration has a named queue. Existing calls use `default`; select one
+when the subscriber is registered when independent worker capacity matters:
+
+```python
+jobs_registry.registry.register(
+    "order.created",
+    "invoice.render",
+    render_invoice,
+    queue="campaign",
+)
+```
+
+Queue ownership belongs to the subscriber rather than the event. One event can
+fan out to several subscribers on different queues, and the relay stamps each
+subscriber's queue on its own job. Names are 1–100 lowercase ASCII characters:
+letters, digits, `.`, `_`, and `-`; an invalid name raises before persistence.
+
 ## The job state machine
 
 ```
@@ -67,6 +84,14 @@ enqueue ──▶ pending ──claim──▶ claimed ──success──▶ co
 A worker claims a batch of due jobs, taking a time-bounded lease. On PostgreSQL
 the claim uses `FOR UPDATE SKIP LOCKED`, so concurrent workers take disjoint
 batches with no coordinating lock.
+
+A worker can select a non-empty queue allowlist. Omitting it consumes every
+queue, preserving the original behavior. A selective claim includes the queue
+predicate in the locked query, so it cannot lease work from another queue.
+Workers consuming several queues rotate their queue cursor between batches; a
+permanently busy queue cannot starve another one indefinitely.
+Rotation considers only the worker's allowlist. Queues outside it are never
+claimed by that worker and need another matching worker.
 
 !!! note "The attempt is counted at claim time"
     Not at completion. A worker that crashes mid-run still consumes an attempt,
@@ -140,6 +165,8 @@ when you want to report the gap rather than fail on it.
 
 ## Running the workers
 
+### Local: one process and SQLite
+
 ```python
 import jasil.jobs.service as jobs_service
 
@@ -147,8 +174,49 @@ jobs_service.start_job_worker()  # in-process worker thread
 jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
 ```
 
-The relay and the reaper run on **every** replica. Both use `SKIP LOCKED`, and
-the fan-out is idempotent, so no single-runner lock is needed.
+This worker consumes all named queues serially and fairly. SQLite supports
+exactly this topology: one API process and one in-process consumer. JASIL refuses
+an in-process SQLite worker when `web_workers != 1`, and refuses a standalone
+SQLite worker because it has enough information to know those shapes are unsafe.
+
+### Distributed: API plumbing and PostgreSQL workers
+
+The API process schedules the relay and reaper but does not start a domain-job
+consumer:
+
+```python
+jobs_service.schedule_job_maintenance(scheduler)
+```
+
+Standalone worker processes use the supported blocking entry point:
+
+```python
+import signal
+import threading
+
+import jasil.jobs.service as jobs_service
+
+stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+jobs_service.run_job_worker(
+    queues=("campaign", "intake"),
+    role="domain-worker",
+    label="campaign-intake-1",
+    metadata={"zone": "eu-1"},
+    stop=stop,
+)
+```
+
+Pass one queue per process group when each queue needs independent concurrency.
+Run several processes with the same queue to get competing consumers; PostgreSQL
+claims remain `FOR UPDATE SKIP LOCKED`, so each job is processed once per claim.
+Omit `queues` to consume all queues, and never pass an empty allowlist.
+
+The relay and reaper may run on every API replica. Their locking and the
+idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
+unnecessary. Durable jobs use the database only; Redis is not a job-queue
+dependency.
 
 ## Dead letters
 
@@ -163,8 +231,10 @@ jasil_admin.replay_dead_letter_job(job_id)
 
 which returns the job to `pending` with a fresh attempt budget.
 
-`jasil_admin.get_jobs_summary()` gives counts by status, recent throughput, and
-the dead-letter list, for an operations dashboard.
+`jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
+throughput, backlog age, and the dead-letter list for an operations dashboard.
+`jasil_admin.get_workers_summary()` reports running, stale, and gracefully
+stopped worker instances; see [Observability](observability.md#worker-registry).
 
 !!! note "Why `jasil.admin` and not `jasil.jobs.crud`"
     The CRUD layer is where these queries live, but it is the wrong thing to wire
@@ -182,6 +252,7 @@ the dead-letter list, for an operations dashboard.
 | `max_attempts` | Failures are usually transient | Failures are usually permanent |
 | `backoff_base_seconds` | The dependency needs time to recover | Retries should be prompt |
 | `poll_interval_seconds` | The queue is usually empty | Latency matters |
+| `heartbeat_interval_seconds` | Telemetry write volume matters | Faster stale detection matters |
 
 `lease_seconds` must exceed the slowest realistic job duration. If a lease
 expires while a job is still running, the reaper requeues it and it runs twice
