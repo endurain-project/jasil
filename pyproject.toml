@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.2.0"
+version = "0.3.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
