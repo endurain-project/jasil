@@ -3,8 +3,10 @@
 Public (pure) surface — safe to import anywhere; pulls in no backends:
     - ``DeploymentProfile`` — the deployment shape.
     - ``Event`` / ``new_event`` — the event envelope.
-    - ``StateProvider`` / ``StorageProvider`` / ``EventBusProvider`` /
-      ``LockProvider`` / ``ClockProvider`` — the capability providers.
+        - Narrow storage protocols plus ``StorageProvider`` as their complete
+            aggregate.
+        - ``StateProvider`` / ``EventBusProvider`` / ``LockProvider`` /
+            ``ClockProvider`` - the other capability providers.
 
 The composition root (``Platform`` / ``build_platform``) lives in
 ``jasil.container`` and is imported explicitly where the platform is
@@ -22,6 +24,8 @@ from jasil.providers import (
     EventBusProvider,
     LockProvider,
     ObjectStat,
+    PartRef,
+    ResumableUploads,
     ServeFile,
     ServePlan,
     ServeRedirect,
@@ -29,9 +33,15 @@ from jasil.providers import (
     StateBackendUnavailableError,
     StateProvider,
     StorageBackendUnavailableError,
+    StorageDelivery,
+    StorageManagement,
+    StorageObjects,
     StorageProvider,
     StorageSizeLimitError,
+    StorageStreams,
+    StorageUploadSessionError,
     TieredFailureOutcome,
+    UploadSession,
 )
 
 try:
@@ -48,6 +58,8 @@ __all__ = [
     "EventBusProvider",
     "LockProvider",
     "ObjectStat",
+    "PartRef",
+    "ResumableUploads",
     "ServeFile",
     "ServePlan",
     "ServeRedirect",
@@ -55,8 +67,14 @@ __all__ = [
     "StateBackendUnavailableError",
     "StateProvider",
     "StorageBackendUnavailableError",
+    "StorageDelivery",
+    "StorageManagement",
+    "StorageObjects",
     "StorageProvider",
     "StorageSizeLimitError",
+    "StorageStreams",
+    "StorageUploadSessionError",
     "TieredFailureOutcome",
+    "UploadSession",
     "new_event",
 ]

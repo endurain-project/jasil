@@ -11,6 +11,57 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.4.0]
+
+### Breaking
+
+- `StorageProvider` now requires `begin_upload`, `upload_part`,
+  `complete_upload`, `abort_upload`, and `cleanup_uploads`. This intentional
+  pre-1.0 protocol expansion requires third-party storage backends to implement
+  the resumable lifecycle before they satisfy the runtime-checkable protocol.
+- Storage areas, keys, and prefixes must now be canonical slash-delimited paths.
+  Dot components, repeated or trailing separators, and backslashes are rejected
+  before I/O so local path normalization cannot address or delete a different
+  object set than S3. Areas are single namespace components; hierarchy belongs
+  in keys, preserving the area/key boundary on every backend.
+- `UploadSession` exposes an opaque `session_id`; native backend upload IDs stay
+  private.
+- `PartRef` exposes an opaque `validator` instead of the S3-shaped `etag` name,
+  and `upload_part` accepts an exact-size, read-once `BinaryIO` instead of
+  buffering a whole part as `bytes`.
+- `.jasil-objects` and `.jasil-upload-sessions` are reserved area names used by
+  private backend state.
+
+### Added
+
+- Durable resumable upload sessions with provider-neutral `UploadSession` and
+  size-bearing `PartRef` values. Parts can arrive out of order, replacement is
+  atomic, completion validates every current reference in ascending order, and
+  the destination changes only when completion succeeds.
+- Portable multipart constraints and session-wide `max_bytes` enforcement on
+  both built-in backends. The 5 MiB minimum, 5 GiB maximum, and 10,000-part cap
+  are JASIL's built-in portability limits. Invalid, cleaned, completed, or
+  foreign sessions raise `StorageUploadSessionError` without leaking filesystem
+  or S3 exceptions.
+- Bounded-memory part uploads from non-seekable sources with required exact byte
+  sizes and retryable short/long-source failures.
+- Cross-process local sessions backed by private filesystem staging, and S3
+  sessions backed directly by native multipart upload operations.
+- Idempotent upload aborts and explicit age-based cleanup for abandoned local
+  and S3 sessions.
+- Composable `StorageObjects`, `StorageStreams`, `StorageDelivery`,
+  `StorageManagement`, and `ResumableUploads` protocols. `StorageProvider`
+  remains their complete aggregate on `Platform.storage`.
+
+### Changed
+
+- Local storage uses a private versioned leaf-file layout so an object can
+  coexist with descendant keys, matching S3. Objects written by JASIL 0.3 and
+  earlier remain readable and migrate when overwritten.
+- S3 resumable sessions persist private manifests that map opaque session IDs to
+  native multipart uploads. Cleanup follows only those manifests and no longer
+  risks aborting unrelated multipart work under the configured prefix.
+
 ## [0.3.0]
 
 ### Breaking

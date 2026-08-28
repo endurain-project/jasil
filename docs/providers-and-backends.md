@@ -58,9 +58,21 @@ Object storage addressed by a key within a named *area*. The whole-object API is
 kept for small blobs, while the streaming API handles packages and other objects
 that must not be materialized in memory.
 
+`StorageProvider` is the complete capability installed on `Platform.storage`,
+so every URI-selected backend implements the same behavior. Domain services and
+small test doubles can depend on only the slice they use:
+
+| Protocol | Responsibility |
+|---|---|
+| `StorageObjects` | Whole-object persistence, metadata, deletion, and enumeration. |
+| `StorageStreams` | Bounded-memory reads and writes. |
+| `StorageDelivery` | Framework-neutral serving plans and URLs. |
+| `StorageManagement` | Copying, subtree deletion, and readiness. |
+| `ResumableUploads` | Durable multipart upload sessions and cleanup. |
+
 | Backend | URI | Notes |
 |---|---|---|
-| `LocalStorage` | `local://`, `local://<path>` | Files under `{data_dir}/{area}/{key}`. |
+| `LocalStorage` | `local://`, `local://<path>` | Logical objects in a private versioned filesystem layout. |
 | `S3Storage` | `s3://<bucket>` | Key prefix per area. Requires the `s3` extra. |
 
 ```python
@@ -83,11 +95,40 @@ with source.open("rb") as stream:
 
 with platform.storage.open_stream("packages", "release.zip", offset=1024, length=4096) as stream:
     chunk = stream.read()
+
+session = platform.storage.begin_upload(
+    "packages",
+    "release.zip",
+    max_bytes=20 * 1024**3,
+    content_type="application/zip",
+)
+parts = [
+    platform.storage.upload_part(session, 1, first_stream, size=first_size),
+    platform.storage.upload_part(session, 2, final_stream, size=final_size),
+]
+stored = platform.storage.complete_upload(session, parts)
 ```
 
-An area is a domain-owned namespace. Store only the key in your database — `url`
-is computed at serialization time, so migrating local → S3 needs no data
-migration.
+An area is one domain-owned namespace component; hierarchy belongs in the key.
+This keeps `(area, key)` boundaries unambiguous on every backend. Store only the
+key in your database. `url` is computed at serialization time, so migrating
+local to S3 needs no data migration.
+
+The logical namespace permits both an object and its descendants, such as
+`release/1` and `release/1/archive.bin`. S3 supports that directly. Local
+storage maps each logical object to a leaf file under
+`.jasil-objects/v1` using a fixed-depth SHA-256 address plus verified area and
+key sidecars. This avoids file/directory, path-length, case-folding,
+Unicode-normalization, and private-marker collisions; a digest collision or
+tampered sidecar is rejected rather than aliased. The physical path is private
+and may change in a future major layout version; use `serve()` or `url()` rather
+than constructing it.
+
+Local objects created by JASIL 0.3 and earlier at `{data_dir}/{area}/{key}` are
+read, listed, served, and deleted transparently. Rewriting a legacy object moves
+that logical key into the versioned layout. Legacy files that are never touched
+remain valid and can be removed through normal `delete` or `delete_prefix`
+operations.
 
 ### Streaming contract
 
@@ -106,6 +147,74 @@ migration.
 S3 uses multipart upload rather than `upload_fileobj`. This is deliberate: the
 latter cannot provide the same mid-stream limit guarantee for an unknown-length,
 non-seekable source. There is no local/S3 divergence in `max_bytes` behavior.
+
+### Resumable upload contract
+
+`begin_upload` creates durable staging state and returns an `UploadSession` with
+an opaque `session_id`. Persist that value as trusted server-side state when an
+upload spans requests.
+Do not let an untrusted client construct or alter its target, total limit, or
+part constraints. A session can be resumed by another process configured with
+the same local root or S3 bucket and prefix. It is not portable across backend
+changes or different storage configurations.
+
+The returned session reports JASIL's built-in portability limits. They use the
+common denominator supported by local and S3-compatible storage so application
+code never branches by backend:
+
+- Part numbers are integers from 1 through 10,000. Parts may be uploaded out of
+    order or concurrently, and uploading the same number again atomically
+    replaces that part. Wait for every part call to finish before completion or
+    cleanup.
+- A part is at most 5 GiB. At completion, every part except the final one must
+    be at least 5 MiB. The final part may be smaller or empty.
+- `upload_part(session, part_number, source, size=...)` reads a non-seekable
+    binary source once without materializing the part. `size` is required and
+    must exactly match the source: a short or longer source raises `ValueError`
+    and leaves the session available for a replacement upload. The caller owns
+    and closes the source. A failed attempt may have consumed it, so retry with
+    a newly opened source and the same session and part number.
+- `PartRef` records the part number, actual byte size, and an opaque
+    `validator`. The validator may internally be a digest, an S3 ETag, or
+    another backend token; callers compare or persist it but never interpret
+    it. Pass the current reference for every uploaded part to
+    `complete_upload`, exactly once and in ascending part-number order. A
+    replaced part invalidates its old reference.
+- `max_bytes` is checked against the currently visible staged parts before each
+    part upload and authoritatively against the complete part set. Parallel calls
+    can temporarily stage more than the limit when they race on the same observed
+    set, but completion refuses the aggregate. A breach raises
+    `StorageSizeLimitError` without changing the destination object.
+
+An active upload is not an object: `exists`, `stat`, `list_keys`, and
+`iter_objects` do not expose it. `complete_upload` validates every reference,
+assembles the object atomically, returns its byte count, and consumes the
+session. The previous destination remains visible until that commit. Local
+storage uses durable manifests and atomic part files under the reserved
+`.jasil-upload-sessions` directory. S3 stores private session manifests under
+the same reserved namespace and maps their opaque IDs to native multipart upload
+IDs. Both backends reserve that area name so switching backends cannot expose
+session state as ordinary objects. `.jasil-objects` is also reserved for the
+local physical layout.
+
+`upload_part` and `complete_upload` raise `StorageUploadSessionError` for an
+unknown, cleaned, completed, mismatched, or foreign session and for a stale part
+reference. `abort_upload` is idempotent, including after completion or cleanup.
+`complete_upload` is terminal but not retry-idempotent: if its response is lost,
+inspect the destination with `stat` before deciding how the host should recover.
+
+Sessions do not expire automatically. Call
+`cleanup_uploads(older_than_epoch=cutoff)` from host-owned maintenance to abort
+uploads initiated before an epoch cutoff; it returns the number removed. The
+cutoff is based on initiation time, not the last uploaded part, so choose a
+window longer than any valid upload. Cleanup attempts every eligible session
+before reporting a provider-neutral backend failure; retry the pass after the
+backend recovers. S3 cleanup covers every multipart upload
+registered by a JASIL session manifest and leaves `save_stream`, managed copy,
+and independently initiated multipart work untouched. If the process dies in
+the narrow interval after S3 creates a native multipart upload but before its
+manifest is stored, only the bucket's incomplete-multipart lifecycle policy can
+remove that unregistered upload. Configure that policy as a final safety net.
 
 ### Serving plans and metadata
 
@@ -190,11 +299,14 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 
 !!! warning "Traversal and aliases are rejected"
     Area, key, source, destination, and deletion-prefix values are validated
-    before backend I/O; an absolute path or a `..` segment raises `ValueError`.
-    Keys are expected to be server-generated, but a stray value must never
-    escape the storage root. Local storage also rejects object addresses that
-    traverse symbolic links and omits symlink aliases from listings, preserving
-    area and subtree boundaries if the storage tree is modified outside JASIL.
+    before backend I/O. Addresses must be canonical slash-delimited paths: an
+    absolute path, a `.` or `..` component, a repeated or trailing separator,
+    or any backslash raises `ValueError`. Dots inside a component, such as
+    `.metadata.json`, remain valid. Keys are expected to be server-generated,
+    but a stray value must never escape or alias another address. Local storage
+    also rejects object addresses that traverse symbolic links and omits symlink
+    aliases from listings, preserving area and subtree boundaries if the storage
+    tree is modified outside JASIL.
 
 !!! danger "URL controls are honoured by S3 only"
     This is the one place the two backends genuinely differ. `s3://` returns a
@@ -311,14 +423,27 @@ capability exists.
 
 ## Writing your own backend
 
-A backend is any object satisfying the protocol — the provider protocols are
-`runtime_checkable`, and nothing inherits from anything:
+A backend is any object satisfying the protocol. The provider protocols are
+`runtime_checkable`; no concrete backend has to inherit from them. Depend on a
+narrow storage protocol when a service uses only one slice:
 
 ```python
-from collections.abc import Iterator
 from typing import BinaryIO
 
-from jasil.providers import ObjectStat, ServePlan
+from jasil.providers import StorageStreams
+
+
+def persist_export(storage: StorageStreams, source: BinaryIO) -> int:
+    return storage.save_stream("exports", "latest.bin", source)
+```
+
+The complete custom backend shape used by `Platform.storage` is:
+
+```python
+from collections.abc import Iterator, Sequence
+from typing import BinaryIO
+
+from jasil.providers import ObjectStat, PartRef, ServePlan, UploadSession
 
 
 class MyStorage:
@@ -332,6 +457,25 @@ class MyStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int: ...
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession: ...
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef: ...
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
+    def abort_upload(self, session: UploadSession) -> None: ...
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
     def get(self, area: str, key: str) -> bytes | None: ...
     def open_stream(
         self,
@@ -369,11 +513,12 @@ class MyStorage:
     ) -> str: ...
 ```
 
-Every member shown is required. Protocol expansions are intentional pre-1.0
-breaks: runtime checks against `StorageProvider` reject an older custom backend
-until it implements the complete contract. JASIL chooses one complete storage
-contract over optional feature checks that would make every caller branch by
-backend.
+Every member shown is required only for the complete `StorageProvider`
+aggregate. Each narrow protocol contains the corresponding subset. Protocol
+expansions are intentional pre-1.0 breaks: runtime checks against
+`StorageProvider` reject an older custom backend until it implements the complete
+contract. JASIL chooses one complete platform capability over optional feature
+checks that would make callers branch by backend.
 
 Construct the `Platform` yourself to use it, rather than going through
 `build_platform`:
