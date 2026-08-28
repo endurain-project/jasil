@@ -63,7 +63,9 @@ pair.
   silently stored under a nonsense key rather than refused.
 - The local backend additionally resolves the final path and requires it to stay
   under the base directory, and never follows a symlink out of an area when
-  listing.
+  listing. Resumable parts live under a reserved private staging directory;
+  session manifests and part files are validated before they are read, and
+  symbolic-link aliases are rejected.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
   alter the URL it lands in.
 
@@ -115,9 +117,19 @@ never interpolated from input.
 - Stored failure text is truncated; the joined subscriber list is clamped to its
   column width.
 - The geocoding response body is capped (above).
+- Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
+  Resumable sessions also cap parts at 5 GiB and part numbers at 10,000. Active
+  parts remain backend resources until completion, abort, or explicit
+  `cleanup_uploads` maintenance. Parallel part calls may temporarily stage more
+  than the session limit because completion is the authoritative aggregate
+  check.
 
 What is **not** bounded: event `payload` and `metadata` size. A producer can
-write an arbitrarily large payload into the outbox.
+write an arbitrarily large payload into the outbox. JASIL also does not limit
+the number of upload sessions a caller can begin; authenticate and rate-limit
+that host endpoint, bound its request concurrency, retain session handles as
+trusted server-side state, and run cleanup with a cutoff longer than a valid
+upload.
 
 ## Duplicate execution
 

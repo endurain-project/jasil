@@ -7,7 +7,7 @@ these providers without pulling in a backend. Concrete backends live in
 (``jasil.container.build_platform``).
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
@@ -32,6 +32,32 @@ class StorageBackendUnavailableError(RuntimeError):
 
 class StorageSizeLimitError(ValueError):
     """Raised when a streaming write exceeds its configured byte limit."""
+
+
+class StorageUploadSessionError(RuntimeError):
+    """Raised when a resumable upload session or part reference is not active."""
+
+
+@dataclass(frozen=True)
+class UploadSession:
+    """Durable handle and portable limits for one resumable upload."""
+
+    area: str
+    key: str
+    upload_id: str
+    max_bytes: int | None
+    min_part_size: int
+    max_part_size: int
+    max_parts: int
+
+
+@dataclass(frozen=True)
+class PartRef:
+    """Backend-validated reference to one uploaded part."""
+
+    part_number: int
+    size: int
+    etag: str
 
 
 @dataclass(frozen=True)
@@ -137,6 +163,11 @@ class StorageProvider(Protocol):
     and ``length`` select a byte range without requiring the returned stream to
     seek; a missing object raises :class:`FileNotFoundError`.
 
+    Resumable writes use ``begin_upload``, one or more ``upload_part`` calls,
+    then ``complete_upload`` or ``abort_upload``. Sessions are portable across
+    processes sharing the configured backend and report their part constraints.
+    ``cleanup_uploads`` aborts sessions initiated before a caller-owned cutoff.
+
     ``list_keys`` is the convenient materialized listing for small namespaces.
     ``iter_objects`` lazily yields ``(key, modified_epoch)`` for reconciliation
     jobs that may scan millions of objects and need an age guard.
@@ -174,6 +205,18 @@ class StorageProvider(Protocol):
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int: ...
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession: ...
+    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
+    def abort_upload(self, session: UploadSession) -> None: ...
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
     def get(self, area: str, key: str) -> bytes | None: ...
     def open_stream(
         self,

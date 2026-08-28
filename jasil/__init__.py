@@ -22,6 +22,7 @@ from jasil.providers import (
     EventBusProvider,
     LockProvider,
     ObjectStat,
+    PartRef,
     ServeFile,
     ServePlan,
     ServeRedirect,
@@ -31,7 +32,9 @@ from jasil.providers import (
     StorageBackendUnavailableError,
     StorageProvider,
     StorageSizeLimitError,
+    StorageUploadSessionError,
     TieredFailureOutcome,
+    UploadSession,
 )
 
 try:
@@ -48,6 +51,7 @@ __all__ = [
     "EventBusProvider",
     "LockProvider",
     "ObjectStat",
+    "PartRef",
     "ServeFile",
     "ServePlan",
     "ServeRedirect",
@@ -57,6 +61,8 @@ __all__ = [
     "StorageBackendUnavailableError",
     "StorageProvider",
     "StorageSizeLimitError",
+    "StorageUploadSessionError",
     "TieredFailureOutcome",
+    "UploadSession",
     "new_event",
 ]

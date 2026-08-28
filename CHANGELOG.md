@@ -11,6 +11,29 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.4.0]
+
+### Breaking
+
+- `StorageProvider` now requires `begin_upload`, `upload_part`,
+  `complete_upload`, `abort_upload`, and `cleanup_uploads`. This intentional
+  pre-1.0 protocol expansion requires third-party storage backends to implement
+  the resumable lifecycle before they satisfy the runtime-checkable protocol.
+
+### Added
+
+- Durable resumable upload sessions with provider-neutral `UploadSession` and
+  size-bearing `PartRef` values. Parts can arrive out of order, replacement is
+  atomic, completion validates every current reference in ascending order, and
+  the destination changes only when completion succeeds.
+- Portable multipart constraints and session-wide `max_bytes` enforcement on
+  both built-in backends. Invalid, cleaned, completed, or foreign sessions raise
+  `StorageUploadSessionError` without leaking filesystem or S3 exceptions.
+- Cross-process local sessions backed by private filesystem staging, and S3
+  sessions backed directly by native multipart upload operations.
+- Idempotent upload aborts and explicit age-based cleanup for abandoned local
+  and S3 sessions.
+
 ## [0.3.0]
 
 ### Breaking

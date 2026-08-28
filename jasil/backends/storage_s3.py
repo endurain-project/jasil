@@ -8,7 +8,8 @@ extra (``pip install jasil[s3]``).
 import functools
 import io
 import logging
-from collections.abc import Callable, Iterator
+import math
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any, BinaryIO, Concatenate
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
@@ -18,9 +19,17 @@ from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from jasil._core.storage_keys import check_segment
+from jasil._core.storage_keys import check_area, check_segment
 from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
-from jasil.providers import ObjectStat, ServeRedirect, StorageBackendUnavailableError, StorageSizeLimitError
+from jasil.providers import (
+    ObjectStat,
+    PartRef,
+    ServeRedirect,
+    StorageBackendUnavailableError,
+    StorageSizeLimitError,
+    StorageUploadSessionError,
+    UploadSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +39,11 @@ logger = logging.getLogger(__name__)
 # S3-compatible providers (MinIO, R2, Ceph).
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _INVALID_RANGE_CODES = frozenset({"416", "InvalidRange", "RequestedRangeNotSatisfiable"})
+_MISSING_UPLOAD_CODES = frozenset({"404", "NoSuchUpload", "NotFound"})
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
+_UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
+_UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
+_UPLOAD_MAX_PARTS = 10_000
 
 
 def _error_code(error: ClientError) -> str:
@@ -129,9 +142,85 @@ class S3Storage:
         # ``..`` is a literal in an S3 key rather than a traversal, so an unchecked
         # segment is stored under a nonsense key instead of being refused. The
         # local backend rejects it, and one contract has to hold on both.
-        check_segment(area, "area")
+        check_area(area)
         check_segment(key, "key")
         return "/".join(part for part in (self._prefix, area, key) if part)
+
+    def _validate_upload_session(self, session: UploadSession) -> str:
+        try:
+            object_key = self._object_key(session.area, session.key)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise StorageUploadSessionError("Upload session is not valid for S3 storage") from error
+        if (
+            not session.upload_id
+            or (session.max_bytes is not None and session.max_bytes < 0)
+            or session.min_part_size != _UPLOAD_MIN_PART_SIZE
+            or session.max_part_size != _UPLOAD_MAX_PART_SIZE
+            or session.max_parts != _UPLOAD_MAX_PARTS
+        ):
+            raise StorageUploadSessionError("Upload session is not valid for S3 storage")
+        return object_key
+
+    @staticmethod
+    def _validate_part_number(session: UploadSession, part_number: int) -> None:
+        if not 1 <= part_number <= session.max_parts:
+            raise ValueError(f"part_number must be between 1 and {session.max_parts}")
+
+    def _validate_completion_parts(
+        self,
+        session: UploadSession,
+        parts: Sequence[PartRef],
+    ) -> tuple[list[PartRef], int]:
+        ordered = list(parts)
+        if not ordered:
+            raise ValueError("At least one upload part is required")
+        if len(ordered) > session.max_parts:
+            raise ValueError(f"An upload may contain at most {session.max_parts} parts")
+        previous_part_number = 0
+        for part in ordered:
+            self._validate_part_number(session, part.part_number)
+            if part.part_number <= previous_part_number:
+                raise ValueError("Upload parts must be unique and ordered by part_number")
+            previous_part_number = part.part_number
+        total = 0
+        for index, part in enumerate(ordered):
+            if part.size < 0 or part.size > session.max_part_size:
+                raise ValueError(f"Upload part size must be between 0 and {session.max_part_size}")
+            if not part.etag:
+                raise ValueError("Upload part etag must not be empty")
+            if index < len(ordered) - 1 and part.size < session.min_part_size:
+                raise ValueError(f"Every upload part except the last must be at least {session.min_part_size} bytes")
+            total += part.size
+        if session.max_bytes is not None and total > session.max_bytes:
+            raise StorageSizeLimitError(f"Resumable upload exceeds max_bytes={session.max_bytes}")
+        return ordered, total
+
+    def _list_upload_parts(self, session: UploadSession) -> dict[int, tuple[int, str]]:
+        object_key = self._validate_upload_session(session)
+        uploaded: dict[int, tuple[int, str]] = {}
+        marker: int | None = None
+        while True:
+            request: dict[str, Any] = {
+                "Bucket": self._bucket,
+                "Key": object_key,
+                "UploadId": session.upload_id,
+            }
+            if marker is not None:
+                request["PartNumberMarker"] = marker
+            try:
+                response = self._client.list_parts(**request)
+            except ClientError as error:
+                if _error_code(error) in _MISSING_UPLOAD_CODES:
+                    raise StorageUploadSessionError("Upload session is not active") from error
+                raise
+            for part in response.get("Parts", []):
+                part_number = int(part["PartNumber"])
+                if part_number in uploaded:
+                    raise StorageUploadSessionError("Upload session contains duplicate part state")
+                uploaded[part_number] = (int(part["Size"]), str(part["ETag"]))
+            if not response.get("IsTruncated"):
+                return uploaded
+            marker = int(response["NextPartNumberMarker"])
 
     @_translate_s3_errors
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
@@ -206,6 +295,129 @@ class S3Storage:
                 except (BotoCoreError, ClientError):
                     logger.warning("Failed to abort an incomplete S3 multipart upload")
             raise
+
+    @_translate_s3_errors
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession:
+        object_key = self._object_key(area, key)
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("Resumable upload max_bytes must not be negative")
+        request = {"Bucket": self._bucket, "Key": object_key}
+        if content_type:
+            request["ContentType"] = content_type
+        response = self._client.create_multipart_upload(**request)
+        return UploadSession(
+            area=area,
+            key=key,
+            upload_id=response["UploadId"],
+            max_bytes=max_bytes,
+            min_part_size=_UPLOAD_MIN_PART_SIZE,
+            max_part_size=_UPLOAD_MAX_PART_SIZE,
+            max_parts=_UPLOAD_MAX_PARTS,
+        )
+
+    @_translate_s3_errors
+    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef:
+        object_key = self._validate_upload_session(session)
+        self._validate_part_number(session, part_number)
+        size = len(data)
+        if size > session.max_part_size:
+            raise StorageSizeLimitError(f"Upload part exceeds max_part_size={session.max_part_size}")
+        if session.max_bytes is not None:
+            uploaded = self._list_upload_parts(session)
+            staged_total = sum(part_size for number, (part_size, _) in uploaded.items() if number != part_number)
+            if staged_total + size > session.max_bytes:
+                raise StorageSizeLimitError(f"Resumable upload exceeds max_bytes={session.max_bytes}")
+        try:
+            response = self._client.upload_part(
+                Bucket=self._bucket,
+                Key=object_key,
+                UploadId=session.upload_id,
+                PartNumber=part_number,
+                Body=data,
+            )
+        except ClientError as error:
+            if _error_code(error) in _MISSING_UPLOAD_CODES:
+                raise StorageUploadSessionError("Upload session is not active") from error
+            raise
+        return PartRef(part_number=part_number, size=size, etag=response["ETag"])
+
+    @_translate_s3_errors
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
+        object_key = self._validate_upload_session(session)
+        ordered, total = self._validate_completion_parts(session, parts)
+        uploaded = self._list_upload_parts(session)
+        if set(uploaded) != {part.part_number for part in ordered}:
+            raise StorageUploadSessionError("Completion must reference every uploaded part exactly once")
+        for part in ordered:
+            if uploaded[part.part_number] != (part.size, part.etag):
+                raise StorageUploadSessionError(f"Upload part {part.part_number} does not match its reference")
+        try:
+            self._client.complete_multipart_upload(
+                Bucket=self._bucket,
+                Key=object_key,
+                UploadId=session.upload_id,
+                MultipartUpload={"Parts": [{"ETag": part.etag, "PartNumber": part.part_number} for part in ordered]},
+            )
+        except ClientError as error:
+            if _error_code(error) in _MISSING_UPLOAD_CODES:
+                raise StorageUploadSessionError("Upload session is not active") from error
+            raise
+        return total
+
+    @_translate_s3_errors
+    def abort_upload(self, session: UploadSession) -> None:
+        object_key = self._validate_upload_session(session)
+        try:
+            self._client.abort_multipart_upload(
+                Bucket=self._bucket,
+                Key=object_key,
+                UploadId=session.upload_id,
+            )
+        except ClientError as error:
+            if _error_code(error) in _MISSING_UPLOAD_CODES:
+                return
+            raise
+
+    @_translate_s3_errors
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int:
+        if not math.isfinite(older_than_epoch):
+            raise ValueError("older_than_epoch must be finite")
+        prefix = f"{self._prefix}/" if self._prefix else ""
+        key_marker: str | None = None
+        upload_id_marker: str | None = None
+        removed = 0
+        while True:
+            request = {"Bucket": self._bucket, "Prefix": prefix}
+            if key_marker is not None:
+                request["KeyMarker"] = key_marker
+            if upload_id_marker is not None:
+                request["UploadIdMarker"] = upload_id_marker
+            response = self._client.list_multipart_uploads(**request)
+            for upload in response.get("Uploads", []):
+                if upload["Initiated"].timestamp() >= older_than_epoch:
+                    continue
+                try:
+                    self._client.abort_multipart_upload(
+                        Bucket=self._bucket,
+                        Key=upload["Key"],
+                        UploadId=upload["UploadId"],
+                    )
+                except ClientError as error:
+                    if _error_code(error) in _MISSING_UPLOAD_CODES:
+                        continue
+                    raise
+                removed += 1
+            if not response.get("IsTruncated"):
+                return removed
+            key_marker = response["NextKeyMarker"]
+            upload_id_marker = response["NextUploadIdMarker"]
 
     def get(self, area: str, key: str) -> bytes | None:
         try:
@@ -365,7 +577,7 @@ class S3Storage:
         return sorted(key for key, _ in self.iter_objects(area, prefix))
 
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
-        check_segment(area, "area")
+        check_area(area)
         if prefix:
             check_segment(prefix, "prefix")
         area_root = "/".join(part for part in (self._prefix, area) if part)

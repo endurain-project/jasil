@@ -7,7 +7,9 @@ driven through an in-memory client here; ``test_storage_s3`` separately uses
 botocore's Stubber to validate the exact AWS request shapes.
 """
 
+import hashlib
 import io
+from dataclasses import replace
 from datetime import UTC, datetime
 from itertools import count
 from urllib.parse import urlparse
@@ -18,7 +20,14 @@ from botocore.response import StreamingBody
 
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
-from jasil.providers import ServeFile, ServeRedirect, ServeStream, StorageProvider, StorageSizeLimitError
+from jasil.providers import (
+    ServeFile,
+    ServeRedirect,
+    ServeStream,
+    StorageProvider,
+    StorageSizeLimitError,
+    StorageUploadSessionError,
+)
 
 # Values that must never address a blob, whichever backend is configured.
 UNSAFE_SEGMENTS = ["../escape", "/etc/passwd", "a/../../b", ".."]
@@ -121,24 +130,63 @@ class _MemoryS3Client:
             "key": request["Key"],
             "parts": {},
             "content_type": request.get("ContentType"),
+            "initiated": MODIFIED,
         }
         return {"UploadId": upload_id}
 
     def upload_part(self, **request):
         upload_id = request["UploadId"]
+        if upload_id not in self.uploads or self.uploads[upload_id]["key"] != request["Key"]:
+            raise _client_error("UploadPart", "NoSuchUpload", 404)
         part_number = request["PartNumber"]
-        self.uploads[upload_id]["parts"][part_number] = bytes(request["Body"])
-        return {"ETag": f'"part-{part_number}"'}
+        data = bytes(request["Body"])
+        self.uploads[upload_id]["parts"][part_number] = data
+        return {"ETag": f'"part-{hashlib.sha256(data).hexdigest()}"'}
+
+    def list_parts(self, **request):
+        upload_id = request["UploadId"]
+        if upload_id not in self.uploads or self.uploads[upload_id]["key"] != request["Key"]:
+            raise _client_error("ListParts", "NoSuchUpload", 404)
+        marker = request.get("PartNumberMarker", 0)
+        parts = [
+            {
+                "PartNumber": part_number,
+                "Size": len(data),
+                "ETag": f'"part-{hashlib.sha256(data).hexdigest()}"',
+            }
+            for part_number, data in sorted(self.uploads[upload_id]["parts"].items())
+            if part_number > marker
+        ]
+        return {"Parts": parts, "IsTruncated": False}
 
     def complete_multipart_upload(self, **request):
-        upload = self.uploads.pop(request["UploadId"])
+        upload_id = request["UploadId"]
+        if upload_id not in self.uploads or self.uploads[upload_id]["key"] != request["Key"]:
+            raise _client_error("CompleteMultipartUpload", "NoSuchUpload", 404)
+        upload = self.uploads.pop(upload_id)
         data = b"".join(upload["parts"][part["PartNumber"]] for part in request["MultipartUpload"]["Parts"])
         self.objects[request["Key"]] = (data, MODIFIED, upload["content_type"])
         return {}
 
     def abort_multipart_upload(self, **request):
-        self.uploads.pop(request["UploadId"], None)
+        upload_id = request["UploadId"]
+        if upload_id not in self.uploads or self.uploads[upload_id]["key"] != request["Key"]:
+            raise _client_error("AbortMultipartUpload", "NoSuchUpload", 404)
+        self.uploads.pop(upload_id)
         return {}
+
+    def list_multipart_uploads(self, **request):
+        prefix = request.get("Prefix", "")
+        uploads = [
+            {
+                "Key": upload["key"],
+                "UploadId": upload_id,
+                "Initiated": upload["initiated"],
+            }
+            for upload_id, upload in self.uploads.items()
+            if upload["key"].startswith(prefix)
+        ]
+        return {"Uploads": uploads, "IsTruncated": False}
 
     def get_paginator(self, operation):
         assert operation == "list_objects_v2"
@@ -237,6 +285,107 @@ class TestStreamingConformance:
 
         with pytest.raises(ValueError, match="must not be negative"):
             storage.open_stream(AREA, KEY, offset=offset, length=length)
+
+
+class TestResumableUploadConformance:
+    def test_parts_upload_out_of_order_and_commit_atomically(self, storage):
+        storage.save(AREA, KEY, b"previous")
+        session = storage.begin_upload(
+            AREA,
+            KEY,
+            max_bytes=5 * 1024 * 1024 + 4,
+            content_type="application/octet-stream",
+        )
+        tail = storage.upload_part(session, 2, b"tail")
+        first = storage.upload_part(session, 1, b"a" * session.min_part_size)
+
+        assert session.min_part_size == 5 * 1024 * 1024
+        assert session.max_part_size == 5 * 1024 * 1024 * 1024
+        assert session.max_parts == 10_000
+        assert storage.get(AREA, KEY) == b"previous"
+        assert storage.list_keys(AREA) == [KEY]
+
+        stored = storage.complete_upload(session, [first, tail])
+
+        assert stored == first.size + tail.size
+        assert storage.get(AREA, KEY) == b"a" * session.min_part_size + b"tail"
+
+    def test_an_active_upload_is_not_an_object(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        storage.upload_part(session, 1, b"partial")
+
+        assert storage.exists(AREA, KEY) is False
+        assert storage.list_keys(AREA) == []
+
+    def test_a_zero_byte_final_part_creates_a_zero_byte_object(self, storage):
+        session = storage.begin_upload(AREA, KEY, max_bytes=0)
+        part = storage.upload_part(session, 1, b"")
+
+        assert storage.complete_upload(session, [part]) == 0
+        assert storage.get(AREA, KEY) == b""
+
+    def test_reuploading_a_part_invalidates_the_old_reference(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        stale = storage.upload_part(session, 1, b"old")
+        current = storage.upload_part(session, 1, b"new")
+
+        with pytest.raises(StorageUploadSessionError, match="does not match"):
+            storage.complete_upload(session, [stale])
+
+        assert storage.complete_upload(session, [current]) == 3
+
+    def test_the_total_limit_is_enforced_before_a_part_is_replaced(self, storage):
+        session = storage.begin_upload(AREA, KEY, max_bytes=4)
+        storage.upload_part(session, 1, b"1234")
+
+        with pytest.raises(StorageSizeLimitError, match="max_bytes=4"):
+            storage.upload_part(session, 2, b"5")
+
+        replacement = storage.upload_part(session, 1, b"12")
+        assert storage.complete_upload(session, [replacement]) == 2
+
+    def test_completion_requires_every_part_in_strict_order(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        first = storage.upload_part(session, 1, b"a" * session.min_part_size)
+        second = storage.upload_part(session, 2, b"tail")
+
+        with pytest.raises(ValueError, match="ordered"):
+            storage.complete_upload(session, [second, first])
+        with pytest.raises(StorageUploadSessionError, match="every uploaded part"):
+            storage.complete_upload(session, [first])
+
+        assert storage.complete_upload(session, [first, second]) == first.size + second.size
+
+    def test_a_foreign_target_makes_the_session_invalid(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        foreign = replace(session, key="other.bin")
+
+        with pytest.raises(StorageUploadSessionError):
+            storage.upload_part(foreign, 1, b"data")
+
+    def test_abort_is_idempotent_and_terminal(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        part = storage.upload_part(session, 1, b"partial")
+
+        storage.abort_upload(session)
+        storage.abort_upload(session)
+
+        with pytest.raises(StorageUploadSessionError, match="not active"):
+            storage.complete_upload(session, [part])
+        assert storage.exists(AREA, KEY) is False
+
+    def test_cleanup_aborts_only_sessions_before_the_cutoff(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+
+        assert storage.cleanup_uploads(older_than_epoch=0.0) == 0
+        assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 1
+
+        with pytest.raises(StorageUploadSessionError, match="not active"):
+            storage.upload_part(session, 1, b"data")
+
+    def test_a_negative_session_limit_is_refused(self, storage):
+        with pytest.raises(ValueError, match="must not be negative"):
+            storage.begin_upload(AREA, KEY, max_bytes=-1)
 
 
 class TestServingConformance:
@@ -380,6 +529,18 @@ class TestWritableConformance:
 
 
 class TestSegmentValidationConformance:
+    @pytest.mark.parametrize(
+        "area",
+        [".jasil-upload-sessions", ".jasil-upload-sessions/session", ".jasil-upload-sessions\\session"],
+    )
+    def test_the_private_upload_staging_area_is_reserved(self, storage, area):
+        with pytest.raises(ValueError, match="reserved"):
+            storage.begin_upload(area, KEY)
+        with pytest.raises(ValueError, match="reserved"):
+            storage.save(area, KEY, b"data")
+        with pytest.raises(ValueError, match="reserved"):
+            storage.list_keys(area)
+
     @pytest.mark.parametrize("unsafe", UNSAFE_SEGMENTS)
     @pytest.mark.parametrize("field", ["area", "key"])
     @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "open_stream", "exists", "delete", "url"])

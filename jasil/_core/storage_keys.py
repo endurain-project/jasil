@@ -13,7 +13,16 @@ to share a rule they both enforce.
 
 from pathlib import PurePosixPath
 
-__all__ = ["check_segment"]
+UPLOAD_STAGING_AREA = ".jasil-upload-sessions"
+
+__all__ = ["UPLOAD_STAGING_AREA", "check_area", "check_segment"]
+
+
+def check_area(area: str) -> None:
+    """Validate an area and reject JASIL's private upload staging name."""
+    check_segment(area, "area")
+    if PurePosixPath(area.replace("\\", "/")).parts[0] == UPLOAD_STAGING_AREA:
+        raise ValueError(f"Storage area is reserved: {area!r}")
 
 
 def check_segment(value: str, label: str) -> None:

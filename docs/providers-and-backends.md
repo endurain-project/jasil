@@ -83,6 +83,18 @@ with source.open("rb") as stream:
 
 with platform.storage.open_stream("packages", "release.zip", offset=1024, length=4096) as stream:
     chunk = stream.read()
+
+session = platform.storage.begin_upload(
+    "packages",
+    "release.zip",
+    max_bytes=20 * 1024**3,
+    content_type="application/zip",
+)
+parts = [
+    platform.storage.upload_part(session, 1, first_chunk),
+    platform.storage.upload_part(session, 2, final_chunk),
+]
+stored = platform.storage.complete_upload(session, parts)
 ```
 
 An area is a domain-owned namespace. Store only the key in your database — `url`
@@ -106,6 +118,57 @@ migration.
 S3 uses multipart upload rather than `upload_fileobj`. This is deliberate: the
 latter cannot provide the same mid-stream limit guarantee for an unknown-length,
 non-seekable source. There is no local/S3 divergence in `max_bytes` behavior.
+
+### Resumable upload contract
+
+`begin_upload` creates durable staging state and returns an `UploadSession`.
+Persist that value as trusted server-side state when an upload spans requests.
+Do not let an untrusted client construct or alter its target, total limit, or
+part constraints. A session can be resumed by another process configured with
+the same local root or S3 bucket and prefix. It is not portable across backend
+changes or different storage configurations.
+
+The returned session reports the constraints both built-in backends enforce:
+
+- Part numbers are integers from 1 through 10,000. Parts may be uploaded out of
+    order or concurrently, and uploading the same number again atomically
+    replaces that part. Wait for every part call to finish before completion or
+    cleanup.
+- A part is at most 5 GiB. At completion, every part except the final one must
+    be at least 5 MiB. The final part may be smaller or empty.
+- `PartRef` records the part number, actual byte size, and an opaque ETag. Pass
+    the current reference for every uploaded part to `complete_upload`, exactly
+    once and in ascending part-number order. A replaced part invalidates its old
+    reference.
+- `max_bytes` is checked against the currently visible staged parts before each
+    part upload and authoritatively against the complete part set. Parallel calls
+    can temporarily stage more than the limit when they race on the same observed
+    set, but completion refuses the aggregate. A breach raises
+    `StorageSizeLimitError` without changing the destination object.
+
+An active upload is not an object: `exists`, `stat`, `list_keys`, and
+`iter_objects` do not expose it. `complete_upload` validates every reference,
+assembles the object atomically, returns its byte count, and consumes the
+session. The previous destination remains visible until that commit. Local
+storage uses durable manifests and atomic part files under the reserved
+`.jasil-upload-sessions` directory; S3 maps the lifecycle directly to native
+multipart operations. Both backends reserve that area name so switching
+backends cannot expose local staging as ordinary objects; nested areas below
+that name are reserved too.
+
+`upload_part` and `complete_upload` raise `StorageUploadSessionError` for an
+unknown, cleaned, completed, mismatched, or foreign session and for a stale part
+reference. `abort_upload` is idempotent, including after completion or cleanup.
+`complete_upload` is terminal but not retry-idempotent: if its response is lost,
+inspect the destination with `stat` before deciding how the host should recover.
+
+Sessions do not expire automatically. Call
+`cleanup_uploads(older_than_epoch=cutoff)` from host-owned maintenance to abort
+uploads initiated before an epoch cutoff; it returns the number removed. The
+cutoff is based on initiation time, not the last uploaded part, so choose a
+window longer than any valid upload. S3 cleanup covers every multipart upload
+under the configured prefix, which therefore must not be shared with an
+independent multipart-upload owner.
 
 ### Serving plans and metadata
 
@@ -315,10 +378,10 @@ A backend is any object satisfying the protocol — the provider protocols are
 `runtime_checkable`, and nothing inherits from anything:
 
 ```python
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import BinaryIO
 
-from jasil.providers import ObjectStat, ServePlan
+from jasil.providers import ObjectStat, PartRef, ServePlan, UploadSession
 
 
 class MyStorage:
@@ -332,6 +395,18 @@ class MyStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int: ...
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession: ...
+    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
+    def abort_upload(self, session: UploadSession) -> None: ...
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
     def get(self, area: str, key: str) -> bytes | None: ...
     def open_stream(
         self,

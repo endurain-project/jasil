@@ -12,6 +12,7 @@ must not masquerade as one).
 """
 
 import io
+from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 
@@ -23,7 +24,14 @@ from botocore.stub import ANY, Stubber
 
 import jasil.backends.storage_s3 as storage_s3
 from jasil.backends.storage_s3 import S3Storage
-from jasil.providers import ServeRedirect, StorageBackendUnavailableError, StorageSizeLimitError
+from jasil.providers import (
+    PartRef,
+    ServeRedirect,
+    StorageBackendUnavailableError,
+    StorageSizeLimitError,
+    StorageUploadSessionError,
+    UploadSession,
+)
 
 BUCKET = "blobs"
 PREFIX = "jasil"
@@ -59,6 +67,18 @@ def storage(client):
 
 def _body(data: bytes) -> StreamingBody:
     return StreamingBody(io.BytesIO(data), len(data))
+
+
+def _upload_session(*, max_bytes: int | None = None) -> UploadSession:
+    return UploadSession(
+        area=AREA,
+        key=KEY,
+        upload_id="upload-1",
+        max_bytes=max_bytes,
+        min_part_size=5 * 1024 * 1024,
+        max_part_size=5 * 1024 * 1024 * 1024,
+        max_parts=10_000,
+    )
 
 
 class _FailingBody:
@@ -224,6 +244,424 @@ class TestSaveStream:
 
         with pytest.raises(StorageSizeLimitError):
             storage.save_stream(AREA, KEY, io.BytesIO(b"12345"), max_bytes=4)
+
+    def test_a_failed_best_effort_abort_does_not_hide_the_original_limit_error(
+        self,
+        storage,
+        stub,
+        monkeypatch,
+        caplog,
+    ):
+        monkeypatch.setattr(storage_s3, "_MULTIPART_PART_BYTES", 4)
+        stub.add_response(
+            "create_multipart_upload",
+            {"UploadId": "upload-1"},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"etag-1"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"1234",
+            },
+        )
+        stub.add_client_error(
+            "abort_multipart_upload",
+            service_error_code="SlowDown",
+            http_status_code=503,
+            expected_params={"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with caplog.at_level("WARNING"), pytest.raises(StorageSizeLimitError):
+            storage.save_stream(AREA, KEY, io.BytesIO(b"12345"), max_bytes=4)
+
+        assert "Failed to abort" in caplog.text
+
+
+class TestResumableUpload:
+    def test_begin_creates_a_native_multipart_upload_with_portable_limits(self, storage, stub):
+        stub.add_response(
+            "create_multipart_upload",
+            {"UploadId": "upload-1"},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "ContentType": "application/octet-stream",
+            },
+        )
+
+        session = storage.begin_upload(
+            AREA,
+            KEY,
+            max_bytes=20 * 1024 * 1024,
+            content_type="application/octet-stream",
+        )
+
+        assert session == _upload_session(max_bytes=20 * 1024 * 1024)
+
+    def test_upload_and_completion_use_native_part_references(self, storage, stub):
+        session = _upload_session()
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"etag-1"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"part",
+            },
+        )
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 4, "ETag": '"etag-1"'}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+        stub.add_response(
+            "complete_multipart_upload",
+            {},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "MultipartUpload": {"Parts": [{"ETag": '"etag-1"', "PartNumber": 1}]},
+            },
+        )
+
+        part = storage.upload_part(session, 1, b"part")
+
+        assert part == PartRef(part_number=1, size=4, etag='"etag-1"')
+        assert storage.complete_upload(session, [part]) == 4
+
+    def test_a_total_limit_lists_existing_parts_before_uploading(self, storage, stub):
+        session = _upload_session(max_bytes=4)
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 4, "ETag": '"etag-1"'}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageSizeLimitError, match="max_bytes=4"):
+            storage.upload_part(session, 2, b"x")
+
+    def test_replacing_a_part_excludes_its_previous_size_from_the_limit(self, storage, stub):
+        session = _upload_session(max_bytes=4)
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 4, "ETag": '"old"'}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"new"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"new",
+            },
+        )
+
+        assert storage.upload_part(session, 1, b"new") == PartRef(1, 3, '"new"')
+
+    def test_a_stale_part_reference_is_rejected_before_completion(self, storage, stub):
+        session = _upload_session()
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 4, "ETag": '"current"'}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageUploadSessionError, match="does not match"):
+            storage.complete_upload(session, [PartRef(1, 4, '"stale"')])
+
+    @pytest.mark.parametrize("operation", ["upload", "complete"])
+    def test_no_such_upload_is_a_provider_neutral_session_error(self, storage, stub, operation):
+        session = _upload_session()
+        api_operation = "upload_part" if operation == "upload" else "list_parts"
+        stub.add_client_error(
+            api_operation,
+            service_error_code="NoSuchUpload",
+            http_status_code=404,
+            expected_params={
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                **({"PartNumber": 1, "Body": b"part"} if operation == "upload" else {}),
+            },
+        )
+
+        with pytest.raises(StorageUploadSessionError) as excinfo:
+            if operation == "upload":
+                storage.upload_part(session, 1, b"part")
+            else:
+                storage.complete_upload(session, [PartRef(1, 4, '"etag"')])
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+    def test_abort_is_idempotent_when_s3_no_longer_knows_the_upload(self, storage, stub):
+        session = _upload_session()
+        expected = {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"}
+        stub.add_response("abort_multipart_upload", {}, expected)
+        stub.add_client_error(
+            "abort_multipart_upload",
+            service_error_code="NoSuchUpload",
+            http_status_code=404,
+            expected_params=expected,
+        )
+
+        storage.abort_upload(session)
+        storage.abort_upload(session)
+
+    def test_cleanup_aborts_old_uploads_and_paginates_with_both_markers(self, storage, stub):
+        old = datetime(2026, 1, 1, tzinfo=UTC)
+        current = datetime(2026, 3, 1, tzinfo=UTC)
+        stub.add_response(
+            "list_multipart_uploads",
+            {
+                "Uploads": [{"Key": OBJECT_KEY, "UploadId": "old-upload", "Initiated": old}],
+                "IsTruncated": True,
+                "NextKeyMarker": OBJECT_KEY,
+                "NextUploadIdMarker": "old-upload",
+            },
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/"},
+        )
+        stub.add_response(
+            "abort_multipart_upload",
+            {},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "old-upload"},
+        )
+        stub.add_response(
+            "list_multipart_uploads",
+            {
+                "Uploads": [{"Key": OBJECT_KEY, "UploadId": "current-upload", "Initiated": current}],
+                "IsTruncated": False,
+            },
+            {
+                "Bucket": BUCKET,
+                "Prefix": f"{PREFIX}/",
+                "KeyMarker": OBJECT_KEY,
+                "UploadIdMarker": "old-upload",
+            },
+        )
+
+        assert storage.cleanup_uploads(older_than_epoch=datetime(2026, 2, 1, tzinfo=UTC).timestamp()) == 1
+
+    def test_malformed_and_wrong_constraint_sessions_are_rejected_before_s3_access(self, storage):
+        with pytest.raises(StorageUploadSessionError):
+            storage.upload_part(replace(_upload_session(), area="../escape"), 1, b"part")
+        with pytest.raises(StorageUploadSessionError):
+            storage.upload_part(replace(_upload_session(), upload_id=""), 1, b"part")
+
+    @pytest.mark.parametrize("part_number", [0, 10_001])
+    def test_part_numbers_outside_the_portable_range_are_rejected(self, storage, part_number):
+        with pytest.raises(ValueError, match="between 1 and 10000"):
+            storage.upload_part(_upload_session(), part_number, b"part")
+
+    @pytest.mark.parametrize(
+        ("session", "parts", "error", "match"),
+        [
+            (_upload_session(), [], ValueError, "At least one"),
+            (_upload_session(), [PartRef(1, 0, '"etag"')] * 10_001, ValueError, "at most"),
+            (_upload_session(), [PartRef(1, -1, '"etag"')], ValueError, "size"),
+            (_upload_session(), [PartRef(1, 0, "")], ValueError, "etag"),
+            (
+                _upload_session(),
+                [PartRef(1, 1, '"etag-1"'), PartRef(2, 1, '"etag-2"')],
+                ValueError,
+                "except the last",
+            ),
+            (_upload_session(max_bytes=1), [PartRef(1, 2, '"etag"')], StorageSizeLimitError, "max_bytes=1"),
+        ],
+    )
+    def test_completion_validates_the_portable_contract_before_s3_access(
+        self,
+        storage,
+        session,
+        parts,
+        error,
+        match,
+    ):
+        with pytest.raises(error, match=match):
+            storage.complete_upload(session, parts)
+
+    def test_part_listing_paginates_before_enforcing_the_total_limit(self, storage, stub):
+        session = _upload_session(max_bytes=10)
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 3, "ETag": '"one"'}],
+                "IsTruncated": True,
+                "NextPartNumberMarker": 1,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 2, "Size": 3, "ETag": '"two"'}],
+                "IsTruncated": False,
+            },
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumberMarker": 1,
+            },
+        )
+        stub.add_response(
+            "upload_part",
+            {"ETag": '"three"'},
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 3,
+                "Body": b"part",
+            },
+        )
+
+        assert storage.upload_part(session, 3, b"part") == PartRef(3, 4, '"three"')
+
+    def test_duplicate_part_state_from_s3_is_rejected(self, storage, stub):
+        session = _upload_session()
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [
+                    {"PartNumber": 1, "Size": 4, "ETag": '"one"'},
+                    {"PartNumber": 1, "Size": 4, "ETag": '"duplicate"'},
+                ],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageUploadSessionError, match="duplicate"):
+            storage.complete_upload(session, [PartRef(1, 4, '"one"')])
+
+    def test_a_part_listing_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error(
+            "list_parts",
+            service_error_code="SlowDown",
+            http_status_code=503,
+            expected_params={"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.complete_upload(_upload_session(), [PartRef(1, 4, '"etag"')])
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+    def test_an_oversized_part_is_rejected_before_s3_access(self, storage, monkeypatch):
+        monkeypatch.setattr(storage_s3, "_UPLOAD_MAX_PART_SIZE", 3)
+        session = replace(_upload_session(), max_part_size=3)
+
+        with pytest.raises(StorageSizeLimitError, match="max_part_size=3"):
+            storage.upload_part(session, 1, b"four")
+
+    def test_an_upload_part_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error(
+            "upload_part",
+            service_error_code="SlowDown",
+            http_status_code=503,
+            expected_params={
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "PartNumber": 1,
+                "Body": b"part",
+            },
+        )
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.upload_part(_upload_session(), 1, b"part")
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+    @pytest.mark.parametrize(
+        ("code", "error"), [("NoSuchUpload", StorageUploadSessionError), ("SlowDown", StorageBackendUnavailableError)]
+    )
+    def test_completion_failures_are_translated(self, storage, stub, code, error):
+        stub.add_response(
+            "list_parts",
+            {
+                "Parts": [{"PartNumber": 1, "Size": 4, "ETag": '"etag"'}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+        stub.add_client_error(
+            "complete_multipart_upload",
+            service_error_code=code,
+            http_status_code=404 if code == "NoSuchUpload" else 503,
+            expected_params={
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "upload-1",
+                "MultipartUpload": {"Parts": [{"ETag": '"etag"', "PartNumber": 1}]},
+            },
+        )
+
+        with pytest.raises(error):
+            storage.complete_upload(_upload_session(), [PartRef(1, 4, '"etag"')])
+
+    def test_an_abort_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error(
+            "abort_multipart_upload",
+            service_error_code="SlowDown",
+            http_status_code=503,
+            expected_params={"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "upload-1"},
+        )
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.abort_upload(_upload_session())
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+    def test_cleanup_requires_a_finite_cutoff(self, storage):
+        with pytest.raises(ValueError, match="finite"):
+            storage.cleanup_uploads(older_than_epoch=float("inf"))
+
+    @pytest.mark.parametrize(("code", "expected"), [("NoSuchUpload", 0), ("SlowDown", None)])
+    def test_cleanup_handles_abort_races_and_failures(self, storage, stub, code, expected):
+        stub.add_response(
+            "list_multipart_uploads",
+            {
+                "Uploads": [{"Key": OBJECT_KEY, "UploadId": "old-upload", "Initiated": MODIFIED}],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Prefix": f"{PREFIX}/"},
+        )
+        stub.add_client_error(
+            "abort_multipart_upload",
+            service_error_code=code,
+            http_status_code=404 if code == "NoSuchUpload" else 503,
+            expected_params={"Bucket": BUCKET, "Key": OBJECT_KEY, "UploadId": "old-upload"},
+        )
+
+        if expected is None:
+            with pytest.raises(StorageBackendUnavailableError):
+                storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+        else:
+            assert storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1) == expected
 
 
 class TestGet:

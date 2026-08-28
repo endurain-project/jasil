@@ -6,12 +6,17 @@ storage backend's contract is mostly about refusing to write outside its root.
 
 import contextlib
 import io
+import json
+import os
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import jasil.backends.storage_local as storage_local
 import jasil.jobs.outbox as jobs_outbox
 import jasil.retention as retention
 import jasil.runtime as runtime
@@ -21,7 +26,13 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.event_log.models import EventLog
 from jasil.events import new_event
 from jasil.jobs.models import EventOutbox
-from jasil.providers import ServeFile, StorageBackendUnavailableError
+from jasil.providers import (
+    PartRef,
+    ServeFile,
+    StorageBackendUnavailableError,
+    StorageSizeLimitError,
+    StorageUploadSessionError,
+)
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 OLD = T0 - timedelta(days=90)
@@ -204,6 +215,341 @@ class TestLocalStorage:
         byte_mode = (tmp_path / "thumbnails" / "bytes.webp").stat().st_mode & 0o777
         stream_mode = (tmp_path / "thumbnails" / "stream.webp").stat().st_mode & 0o777
         assert stream_mode == byte_mode
+
+    def test_a_resumable_upload_survives_backend_instances_and_commits_atomically(self, storage, tmp_path):
+        storage.save("packages", "release.bin", b"previous")
+        session = storage.begin_upload(
+            "packages",
+            "release.bin",
+            max_bytes=5 * 1024 * 1024 + 4,
+            content_type="application/octet-stream",
+        )
+        tail = storage.upload_part(session, 2, b"tail")
+        other_instance = LocalStorage(str(tmp_path), url_prefix="/media")
+        first = other_instance.upload_part(session, 1, b"a" * session.min_part_size)
+
+        assert storage.get("packages", "release.bin") == b"previous"
+        assert storage.list_keys("packages") == ["release.bin"]
+
+        stored = other_instance.complete_upload(session, [first, tail])
+
+        assert stored == session.min_part_size + 4
+        assert storage.get("packages", "release.bin") == b"a" * session.min_part_size + b"tail"
+
+    def test_reuploading_a_part_replaces_it_and_invalidates_the_old_reference(self, storage):
+        session = storage.begin_upload("packages", "release.bin")
+        stale = storage.upload_part(session, 1, b"old")
+        current = storage.upload_part(session, 1, b"new")
+
+        with pytest.raises(StorageUploadSessionError, match="does not match"):
+            storage.complete_upload(session, [stale])
+
+        assert storage.complete_upload(session, [current]) == 3
+        assert storage.get("packages", "release.bin") == b"new"
+
+    def test_a_session_size_limit_counts_every_current_part(self, storage):
+        session = storage.begin_upload("packages", "release.bin", max_bytes=4)
+        storage.upload_part(session, 1, b"1234")
+
+        with pytest.raises(StorageSizeLimitError, match="max_bytes=4"):
+            storage.upload_part(session, 2, b"5")
+
+        replacement = storage.upload_part(session, 1, b"12")
+        assert storage.complete_upload(session, [replacement]) == 2
+
+    def test_completion_requires_every_part_in_strict_order(self, storage):
+        session = storage.begin_upload("packages", "release.bin")
+        first = storage.upload_part(session, 1, b"a" * session.min_part_size)
+        second = storage.upload_part(session, 2, b"tail")
+
+        with pytest.raises(ValueError, match="ordered"):
+            storage.complete_upload(session, [second, first])
+        with pytest.raises(StorageUploadSessionError, match="every uploaded part"):
+            storage.complete_upload(session, [first])
+
+        assert storage.complete_upload(session, [first, second]) == first.size + second.size
+
+    def test_every_non_final_part_must_meet_the_portable_minimum(self, storage):
+        session = storage.begin_upload("packages", "release.bin")
+        first = storage.upload_part(session, 1, b"small")
+        second = storage.upload_part(session, 2, b"tail")
+
+        with pytest.raises(ValueError, match="except the last"):
+            storage.complete_upload(session, [first, second])
+
+    def test_abort_is_idempotent_and_makes_the_session_terminal(self, storage):
+        session = storage.begin_upload("packages", "release.bin")
+        part = storage.upload_part(session, 1, b"partial")
+
+        storage.abort_upload(session)
+        storage.abort_upload(session)
+
+        with pytest.raises(StorageUploadSessionError, match="not active"):
+            storage.complete_upload(session, [part])
+        assert storage.exists("packages", "release.bin") is False
+
+    def test_cleanup_removes_only_sessions_older_than_the_cutoff(self, storage, monkeypatch):
+        monkeypatch.setattr(storage_local.time, "time", lambda: 10.0)
+        old_session = storage.begin_upload("packages", "old.bin")
+        monkeypatch.setattr(storage_local.time, "time", lambda: 20.0)
+        current_session = storage.begin_upload("packages", "current.bin")
+
+        assert storage.cleanup_uploads(older_than_epoch=15.0) == 1
+
+        with pytest.raises(StorageUploadSessionError, match="not active"):
+            storage.upload_part(old_session, 1, b"old")
+        current = storage.upload_part(current_session, 1, b"current")
+        assert storage.complete_upload(current_session, [current]) == 7
+
+    def test_a_symlinked_staged_part_is_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        outside = tmp_path / "outside"
+        outside.write_bytes(b"outside")
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        (parts / "00001.part").symlink_to(outside)
+
+        with pytest.raises(StorageUploadSessionError, match="unsafe"):
+            storage.upload_part(session, 2, b"data")
+
+    def test_a_symlinked_parts_directory_is_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id
+        parts = session_directory / storage_local._UPLOAD_PARTS_DIRECTORY
+        parts.rmdir()
+        outside = tmp_path / "outside-parts"
+        outside.mkdir()
+        parts.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(StorageUploadSessionError, match="unsafe"):
+            storage.upload_part(session, 1, b"data")
+
+    def test_the_private_staging_area_is_reserved(self, storage):
+        with pytest.raises(ValueError, match="reserved"):
+            storage.begin_upload(storage_local._UPLOADS_DIRECTORY, "release.bin")
+
+    def test_malformed_and_mismatched_sessions_are_rejected(self, storage):
+        session = storage.begin_upload("packages", "release.bin")
+
+        with pytest.raises(StorageUploadSessionError, match="not valid"):
+            storage.upload_part(replace(session, upload_id="not-a-uuid"), 1, b"data")
+        with pytest.raises(StorageUploadSessionError, match="durable state"):
+            storage.upload_part(replace(session, key="other.bin"), 1, b"data")
+
+    def test_a_symlinked_upload_root_is_rejected(self, tmp_path):
+        base = tmp_path / "storage"
+        base.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (base / storage_local._UPLOADS_DIRECTORY).symlink_to(outside, target_is_directory=True)
+        storage = LocalStorage(str(base))
+
+        with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
+            storage.begin_upload("packages", "release.bin")
+
+    def test_an_upload_root_resolution_failure_is_provider_neutral(self, storage):
+        unavailable_base = Mock()
+        unavailable_base.resolve.side_effect = OSError("storage unavailable")
+        storage._base = unavailable_base
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage._upload_root()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_a_symlinked_session_manifest_is_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest.unlink()
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}")
+        manifest.symlink_to(outside)
+
+        with pytest.raises(StorageUploadSessionError, match="unsafe"):
+            storage.upload_part(session, 1, b"data")
+
+    def test_a_corrupt_session_manifest_is_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest.write_text("{")
+
+        with pytest.raises(StorageUploadSessionError, match="manifest is invalid"):
+            storage.upload_part(session, 1, b"data")
+
+    def test_a_manifest_read_failure_is_provider_neutral(self, storage, monkeypatch):
+        session = storage.begin_upload("packages", "release.bin")
+        monkeypatch.setattr(Path, "read_text", Mock(side_effect=OSError("storage unavailable")))
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.upload_part(session, 1, b"data")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    @pytest.mark.parametrize("staged_name", ["bad.part", "00001.part"])
+    def test_invalid_staged_part_state_is_rejected(self, storage, tmp_path, staged_name):
+        session = storage.begin_upload("packages", "release.bin")
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        staged = parts / staged_name
+        if staged_name == "00001.part":
+            staged.mkdir()
+            match = "not a file"
+        else:
+            staged.write_bytes(b"data")
+            match = "name is invalid"
+
+        with pytest.raises(StorageUploadSessionError, match=match):
+            storage.upload_part(session, 2, b"data")
+
+    def test_duplicate_staged_part_names_are_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        (parts / "00001.part").write_bytes(b"first")
+        (parts / "1.part").write_bytes(b"duplicate")
+
+        with pytest.raises(StorageUploadSessionError, match="duplicate"):
+            storage.upload_part(session, 2, b"data")
+
+    @pytest.mark.parametrize("part_number", [0, 10_001])
+    def test_part_numbers_outside_the_portable_range_are_rejected(self, storage, part_number):
+        session = storage.begin_upload("packages", "release.bin")
+
+        with pytest.raises(ValueError, match="between 1 and 10000"):
+            storage.upload_part(session, part_number, b"data")
+
+    @pytest.mark.parametrize(
+        ("parts", "error", "match"),
+        [
+            ([], ValueError, "At least one"),
+            ([PartRef(1, 0, '"etag"')] * 10_001, ValueError, "at most"),
+            ([PartRef(1, -1, '"etag"')], ValueError, "size"),
+            ([PartRef(1, 0, "")], ValueError, "etag"),
+        ],
+    )
+    def test_completion_validates_part_references_before_reading_staging(self, storage, parts, error, match):
+        session = storage.begin_upload("packages", "release.bin")
+
+        with pytest.raises(error, match=match):
+            storage.complete_upload(session, parts)
+
+    def test_completion_rechecks_the_total_limit(self, storage):
+        session = storage.begin_upload("packages", "release.bin", max_bytes=1)
+        part = storage.upload_part(session, 1, b"x")
+
+        with pytest.raises(StorageSizeLimitError, match="max_bytes=1"):
+            storage.complete_upload(session, [replace(part, size=2)])
+
+    def test_an_oversized_part_is_rejected_before_writing(self, storage, monkeypatch):
+        monkeypatch.setattr(storage_local, "_UPLOAD_MAX_PART_SIZE", 3)
+        session = storage.begin_upload("packages", "release.bin")
+
+        with pytest.raises(StorageSizeLimitError, match="max_part_size=3"):
+            storage.upload_part(session, 1, b"four")
+
+    def test_a_part_write_failure_is_provider_neutral(self, storage, monkeypatch):
+        session = storage.begin_upload("packages", "release.bin")
+        monkeypatch.setattr(Path, "write_bytes", Mock(side_effect=OSError("storage unavailable")))
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.upload_part(session, 1, b"data")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_a_part_size_change_is_rejected_before_assembly(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        part = storage.upload_part(session, 1, b"data")
+        part_path = (
+            tmp_path
+            / storage_local._UPLOADS_DIRECTORY
+            / session.upload_id
+            / storage_local._UPLOAD_PARTS_DIRECTORY
+            / "00001.part"
+        )
+        part_path.write_bytes(b"changed")
+
+        with pytest.raises(StorageUploadSessionError, match="size does not match"):
+            storage.complete_upload(session, [part])
+
+    @pytest.mark.parametrize(
+        ("failure", "error"),
+        [(FileNotFoundError(), StorageUploadSessionError), (OSError(), StorageBackendUnavailableError)],
+    )
+    def test_part_open_failures_are_translated_during_assembly(self, storage, monkeypatch, failure, error):
+        session = storage.begin_upload("packages", "release.bin")
+        part = storage.upload_part(session, 1, b"data")
+        original_open = Path.open
+
+        def fail_part_open(path, *args, **kwargs):
+            if path.name == "00001.part":
+                raise failure
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_part_open)
+
+        with pytest.raises(error):
+            storage.complete_upload(session, [part])
+
+    def test_a_completed_object_survives_staging_cleanup_failure(self, storage, monkeypatch, caplog):
+        session = storage.begin_upload("packages", "release.bin")
+        part = storage.upload_part(session, 1, b"data")
+        monkeypatch.setattr(storage_local.shutil, "rmtree", Mock(side_effect=OSError("storage unavailable")))
+
+        with caplog.at_level("WARNING"):
+            assert storage.complete_upload(session, [part]) == 4
+
+        assert storage.get("packages", "release.bin") == b"data"
+        assert "Failed to remove" in caplog.text
+
+    def test_an_abort_failure_is_provider_neutral(self, storage, monkeypatch):
+        session = storage.begin_upload("packages", "release.bin")
+        monkeypatch.setattr(storage_local.shutil, "rmtree", Mock(side_effect=OSError("storage unavailable")))
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.abort_upload(session)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_cleanup_requires_a_finite_cutoff(self, storage):
+        with pytest.raises(ValueError, match="finite"):
+            storage.cleanup_uploads(older_than_epoch=float("nan"))
+
+    def test_cleanup_of_an_uninitialized_backend_is_empty(self, storage):
+        assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 0
+
+    def test_cleanup_ignores_non_session_entries(self, storage, tmp_path):
+        upload_root = tmp_path / storage_local._UPLOADS_DIRECTORY
+        upload_root.mkdir()
+        (upload_root / "not-a-session").write_bytes(b"data")
+
+        assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 0
+
+    def test_cleanup_uses_directory_time_for_a_corrupt_manifest(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id
+        (session_directory / storage_local._UPLOAD_MANIFEST).write_text("{")
+        os.utime(session_directory, (10.0, 10.0))
+
+        assert storage.cleanup_uploads(older_than_epoch=20.0) == 1
+
+    def test_manifest_timestamp_tampering_cannot_postpone_cleanup(self, storage, tmp_path, monkeypatch):
+        monkeypatch.setattr(storage_local.time, "time", lambda: 10.0)
+        session = storage.begin_upload("packages", "release.bin")
+        manifest_path = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest = json.loads(manifest_path.read_text())
+        manifest["created_epoch"] = 1_000_000_000_000.0
+        manifest_path.write_text(json.dumps(manifest))
+
+        assert storage.cleanup_uploads(older_than_epoch=20.0) == 1
+
+    @pytest.mark.parametrize("failure", [FileNotFoundError(), OSError("storage unavailable")])
+    def test_cleanup_handles_removal_races_and_failures(self, storage, monkeypatch, failure):
+        storage.begin_upload("packages", "release.bin")
+        monkeypatch.setattr(storage_local.shutil, "rmtree", Mock(side_effect=failure))
+
+        if isinstance(failure, FileNotFoundError):
+            assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 0
+        else:
+            with pytest.raises(StorageBackendUnavailableError) as excinfo:
+                storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0)
+            assert isinstance(excinfo.value.__cause__, OSError)
 
     def test_a_missing_blob_reads_as_none(self, storage):
         assert storage.get("thumbnails", "absent.webp") is None
