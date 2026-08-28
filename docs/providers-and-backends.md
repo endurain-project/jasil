@@ -253,11 +253,14 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 
 !!! warning "Traversal and aliases are rejected"
     Area, key, source, destination, and deletion-prefix values are validated
-    before backend I/O; an absolute path or a `..` segment raises `ValueError`.
-    Keys are expected to be server-generated, but a stray value must never
-    escape the storage root. Local storage also rejects object addresses that
-    traverse symbolic links and omits symlink aliases from listings, preserving
-    area and subtree boundaries if the storage tree is modified outside JASIL.
+    before backend I/O. Addresses must be canonical slash-delimited paths: an
+    absolute path, a `.` or `..` component, a repeated or trailing separator,
+    or any backslash raises `ValueError`. Dots inside a component, such as
+    `.metadata.json`, remain valid. Keys are expected to be server-generated,
+    but a stray value must never escape or alias another address. Local storage
+    also rejects object addresses that traverse symbolic links and omits symlink
+    aliases from listings, preserving area and subtree boundaries if the storage
+    tree is modified outside JASIL.
 
 !!! danger "URL controls are honoured by S3 only"
     This is the one place the two backends genuinely differ. `s3://` returns a

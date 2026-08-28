@@ -19,7 +19,7 @@ from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from jasil._core.storage_keys import check_area, check_segment
+from jasil._core.storage_keys import check_area, check_listing_prefix, check_segment
 from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
@@ -579,7 +579,7 @@ class S3Storage:
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
         check_area(area)
         if prefix:
-            check_segment(prefix, "prefix")
+            check_listing_prefix(prefix)
         area_root = "/".join(part for part in (self._prefix, area) if part)
         object_prefix = f"{area_root}/{prefix}"
         strip_from = len(area_root) + 1

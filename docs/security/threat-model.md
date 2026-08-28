@@ -57,10 +57,11 @@ pair.
 **Mitigations.**
 
 - Both segments are validated before any filesystem or client access: empty,
-  absolute (`/` or `\`), and `..`-bearing values raise `ValueError`. The check is
-  pure and shared, so **both** backends enforce it — the S3 backend needs it
-  because `..` is a literal character in an object key, so an unchecked value is
-  silently stored under a nonsense key rather than refused.
+  absolute, dot-component, parent-traversing, repeated-separator,
+  trailing-separator, and backslash-bearing values raise `ValueError`. The check
+  is pure and shared, so **both** backends enforce one canonical slash-delimited
+  grammar. Without it, local paths normalize aliases such as `.` and `a//b`
+  while S3 preserves them as distinct literal keys.
 - The local backend additionally resolves the final path and requires it to stay
   under the base directory, and never follows a symlink out of an area when
   listing. Resumable parts live under a reserved private staging directory;

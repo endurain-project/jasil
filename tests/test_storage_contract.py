@@ -31,6 +31,7 @@ from jasil.providers import (
 
 # Values that must never address a blob, whichever backend is configured.
 UNSAFE_SEGMENTS = ["../escape", "/etc/passwd", "a/../../b", ".."]
+NON_CANONICAL_SEGMENTS = [".", "./pkg", "pkg/./1", "pkg//1", "pkg/1/", "pkg\\1"]
 AREA = "packages"
 KEY = "release.bin"
 MODIFIED = datetime(2026, 8, 25, tzinfo=UTC)
@@ -495,6 +496,16 @@ class TestDeletePrefixConformance:
         with pytest.raises(ValueError, match="must not be empty"):
             storage.delete_prefix(AREA, "")
 
+    @pytest.mark.parametrize("prefix", NON_CANONICAL_SEGMENTS)
+    def test_a_non_canonical_prefix_is_refused_without_deleting_objects(self, storage, prefix):
+        storage.save(AREA, "keep/a.bin", b"a")
+        storage.save(AREA, "keep/b.bin", b"b")
+
+        with pytest.raises(ValueError, match="canonical slash-delimited path"):
+            storage.delete_prefix(AREA, prefix)
+
+        assert storage.list_keys(AREA) == ["keep/a.bin", "keep/b.bin"]
+
 
 class TestListingConformance:
     def test_objects_are_yielded_lazily_with_modified_epochs(self, storage):
@@ -514,6 +525,12 @@ class TestListingConformance:
 
         assert [key for key, _ in storage.iter_objects(AREA, "release-")] == ["release-1.bin"]
 
+    def test_a_trailing_slash_filters_one_key_subtree(self, storage):
+        storage.save(AREA, "release/one.bin", b"1")
+        storage.save(AREA, "release-old/two.bin", b"2")
+
+        assert storage.list_keys(AREA, "release/") == ["release/one.bin"]
+
     def test_a_similarly_named_area_is_not_included(self, storage):
         storage.save(AREA, KEY, b"package")
         storage.save(f"{AREA}-old", KEY, b"old")
@@ -531,7 +548,7 @@ class TestWritableConformance:
 class TestSegmentValidationConformance:
     @pytest.mark.parametrize(
         "area",
-        [".jasil-upload-sessions", ".jasil-upload-sessions/session", ".jasil-upload-sessions\\session"],
+        [".jasil-upload-sessions", ".jasil-upload-sessions/session"],
     )
     def test_the_private_upload_staging_area_is_reserved(self, storage, area):
         with pytest.raises(ValueError, match="reserved"):
@@ -540,6 +557,51 @@ class TestSegmentValidationConformance:
             storage.save(area, KEY, b"data")
         with pytest.raises(ValueError, match="reserved"):
             storage.list_keys(area)
+
+    @pytest.mark.parametrize("field", ["area", "key"])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "save",
+            "save_stream",
+            "begin_upload",
+            "get",
+            "open_stream",
+            "stat",
+            "serve",
+            "exists",
+            "delete",
+            "delete_prefix",
+            "url",
+        ],
+    )
+    def test_every_object_entry_point_refuses_a_dot_alias(self, storage, field, operation):
+        arguments = {"area": AREA, "key": KEY, field: "."}
+        call = getattr(storage, operation)
+        extra = (b"x",) if operation == "save" else (_ReadOnceSource(b"x"),) if operation == "save_stream" else ()
+
+        with pytest.raises(ValueError, match="canonical slash-delimited path"):
+            call(arguments["area"], arguments["key"], *extra)
+
+    @pytest.mark.parametrize("field", ["src_area", "src_key", "dst_area", "dst_key"])
+    def test_copy_refuses_a_dot_alias_in_every_address_component(self, storage, field):
+        arguments = {"src_area": AREA, "src_key": KEY, "dst_area": "copies", "dst_key": KEY, field: "."}
+
+        with pytest.raises(ValueError, match="canonical slash-delimited path"):
+            storage.copy(**arguments)
+
+    @pytest.mark.parametrize("operation", ["list_keys", "iter_objects"])
+    @pytest.mark.parametrize("field", ["area", "prefix"])
+    def test_listing_refuses_a_dot_alias(self, storage, operation, field):
+        arguments = {"area": AREA, "prefix": "", field: "."}
+
+        with pytest.raises(ValueError, match="canonical slash-delimited path"):
+            list(getattr(storage, operation)(arguments["area"], arguments["prefix"]))
+
+    def test_a_dotted_filename_remains_valid(self, storage):
+        storage.save(AREA, ".metadata.json", b"data")
+
+        assert storage.get(AREA, ".metadata.json") == b"data"
 
     @pytest.mark.parametrize("unsafe", UNSAFE_SEGMENTS)
     @pytest.mark.parametrize("field", ["area", "key"])

@@ -16,7 +16,7 @@ from typing import BinaryIO
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_segment
+from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_listing_prefix, check_segment
 from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
@@ -579,7 +579,7 @@ class LocalStorage:
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
         check_area(area)
         if prefix:
-            check_segment(prefix, "prefix")
+            check_listing_prefix(prefix)
         try:
             base = self._base.resolve()
             requested_area = base / area

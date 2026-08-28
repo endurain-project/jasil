@@ -19,6 +19,10 @@ under `jasil._core`, log message text, and the wording of error messages are not
   `complete_upload`, `abort_upload`, and `cleanup_uploads`. This intentional
   pre-1.0 protocol expansion requires third-party storage backends to implement
   the resumable lifecycle before they satisfy the runtime-checkable protocol.
+- Storage areas, keys, and prefixes must now be canonical slash-delimited paths.
+  Dot components, repeated or trailing separators, and backslashes are rejected
+  before I/O so local path normalization cannot address or delete a different
+  object set than S3.
 
 ### Added
 
