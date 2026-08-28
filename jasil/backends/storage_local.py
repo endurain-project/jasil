@@ -23,7 +23,7 @@ from jasil._core.storage_keys import (
     check_listing_prefix,
     check_segment,
 )
-from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
+from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
     PartRef,
@@ -54,10 +54,6 @@ _UPLOAD_PARTS_DIRECTORY = "parts"
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
 _UPLOAD_MAX_PARTS = 10_000
-
-
-def _part_etag(data: bytes) -> str:
-    return f'"sha256-{hashlib.sha256(data).hexdigest()}"'
 
 
 def _path_digest(value: str) -> str:
@@ -347,8 +343,8 @@ class LocalStorage:
         for index, part in enumerate(ordered):
             if part.size < 0 or part.size > session.max_part_size:
                 raise ValueError(f"Upload part size must be between 0 and {session.max_part_size}")
-            if not part.etag:
-                raise ValueError("Upload part etag must not be empty")
+            if not part.validator:
+                raise ValueError("Upload part validator must not be empty")
             if index < len(ordered) - 1 and part.size < session.min_part_size:
                 raise ValueError(f"Every upload part except the last must be at least {session.min_part_size} bytes")
             total += part.size
@@ -464,12 +460,20 @@ class LocalStorage:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         return session
 
-    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef:
-        session_directory = self._load_upload_session(session)
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef:
+        self._validate_upload_session(session)
         self._validate_part_number(session, part_number)
-        size = len(data)
+        reader = ExactSizeReader(source, size)
         if size > session.max_part_size:
             raise StorageSizeLimitError(f"Upload part exceeds max_part_size={session.max_part_size}")
+        session_directory = self._load_upload_session(session)
         uploaded = self._uploaded_parts(session_directory)
         staged_total = sum(part_size for number, (_, part_size) in uploaded.items() if number != part_number)
         if session.max_bytes is not None and staged_total + size > session.max_bytes:
@@ -479,13 +483,35 @@ class LocalStorage:
         part_path = parts_directory / f"{part_number:05d}.part"
         temporary_path = parts_directory / f".{part_path.name}.{uuid4().hex}.tmp"
         try:
-            temporary_path.write_bytes(data)
-            os.replace(temporary_path, part_path)
+            destination = temporary_path.open("xb")
         except OSError as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        digest = hashlib.sha256()
+        try:
+            while chunk := reader.read(_STREAM_CHUNK_BYTES):
+                try:
+                    destination.write(chunk)
+                except OSError as error:
+                    raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+                digest.update(chunk)
+            reader.verify_complete()
+            try:
+                destination.close()
+                os.replace(temporary_path, part_path)
+            except OSError as error:
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        except BaseException:
+            if not destination.closed:
+                with suppress(OSError):
+                    destination.close()
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-        return PartRef(part_number=part_number, size=size, etag=_part_etag(data))
+            raise
+        return PartRef(
+            part_number=part_number,
+            size=size,
+            validator=f'"sha256-{digest.hexdigest()}"',
+        )
 
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
         session_directory = self._load_upload_session(session)
@@ -517,7 +543,7 @@ class LocalStorage:
                             destination.write(chunk)
                             digest.update(chunk)
                             copied += len(chunk)
-                    if copied != part.size or f'"sha256-{digest.hexdigest()}"' != part.etag:
+                    if copied != part.size or f'"sha256-{digest.hexdigest()}"' != part.validator:
                         raise StorageUploadSessionError(f"Upload part {part.part_number} does not match its reference")
             os.replace(temporary_path, destination_path)
         except OSError as error:

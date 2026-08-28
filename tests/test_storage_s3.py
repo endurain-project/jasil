@@ -68,7 +68,20 @@ def stub(client):
 
 
 @pytest.fixture
-def storage(client):
+def storage(client, monkeypatch):
+    upload_part = client.upload_part
+
+    def consume_streaming_body(**request):
+        body = request.get("Body")
+        if "ContentLength" in request:
+            assert hasattr(body, "read")
+            assert not isinstance(body, bytes)
+        if hasattr(body, "read"):
+            while body.read(1024 * 1024):
+                pass
+        return upload_part(**request)
+
+    monkeypatch.setattr(client, "upload_part", consume_streaming_body)
     return S3Storage(client, BUCKET, PREFIX)
 
 
@@ -86,6 +99,11 @@ def _upload_session(*, max_bytes: int | None = None) -> UploadSession:
         max_part_size=5 * 1024 * 1024 * 1024,
         max_parts=10_000,
     )
+
+
+def _upload_part(storage, session, part_number, data, *, size=None):
+    declared_size = len(data) if size is None else size
+    return storage.upload_part(session, part_number, io.BytesIO(data), size=declared_size)
 
 
 def _upload_state(
@@ -437,7 +455,7 @@ class TestResumableUpload:
         )
 
         with pytest.raises(StorageUploadSessionError, match="manifest is invalid"):
-            storage.upload_part(_upload_session(), 1, b"part")
+            _upload_part(storage, _upload_session(), 1, b"part")
 
     def test_a_manifest_with_a_non_canonical_target_is_rejected(self, storage, stub):
         state = replace(_upload_state(), key="../escape")
@@ -448,7 +466,7 @@ class TestResumableUpload:
         )
 
         with pytest.raises(StorageUploadSessionError, match="manifest is invalid"):
-            storage.upload_part(_upload_session(), 1, b"part")
+            _upload_part(storage, _upload_session(), 1, b"part")
 
     @pytest.mark.parametrize(
         "body",
@@ -473,7 +491,7 @@ class TestResumableUpload:
         )
 
         with pytest.raises(StorageBackendUnavailableError) as excinfo:
-            storage.upload_part(_upload_session(), 1, b"part")
+            _upload_part(storage, _upload_session(), 1, b"part")
 
         assert isinstance(excinfo.value.__cause__, ClientError)
 
@@ -499,7 +517,8 @@ class TestResumableUpload:
                 "Key": OBJECT_KEY,
                 "UploadId": UPLOAD_ID,
                 "PartNumber": 1,
-                "Body": b"part",
+                "Body": ANY,
+                "ContentLength": 4,
             },
         )
         _stub_manifest(stub)
@@ -523,9 +542,9 @@ class TestResumableUpload:
         )
         stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": MANIFEST_KEY})
 
-        part = storage.upload_part(session, 1, b"part")
+        part = _upload_part(storage, session, 1, b"part")
 
-        assert part == PartRef(part_number=1, size=4, etag='"etag-1"')
+        assert part == PartRef(part_number=1, size=4, validator='"etag-1"')
         assert storage.complete_upload(session, [part]) == 4
 
     def test_completion_succeeds_when_manifest_cleanup_is_temporarily_unavailable(self, storage, stub, caplog):
@@ -573,7 +592,7 @@ class TestResumableUpload:
         )
 
         with pytest.raises(StorageSizeLimitError, match="max_bytes=4"):
-            storage.upload_part(session, 2, b"x")
+            _upload_part(storage, session, 2, b"x")
 
     def test_replacing_a_part_excludes_its_previous_size_from_the_limit(self, storage, stub):
         session = _upload_session(max_bytes=4)
@@ -594,11 +613,12 @@ class TestResumableUpload:
                 "Key": OBJECT_KEY,
                 "UploadId": UPLOAD_ID,
                 "PartNumber": 1,
-                "Body": b"new",
+                "Body": ANY,
+                "ContentLength": 3,
             },
         )
 
-        assert storage.upload_part(session, 1, b"new") == PartRef(1, 3, '"new"')
+        assert _upload_part(storage, session, 1, b"new") == PartRef(1, 3, '"new"')
 
     def test_a_stale_part_reference_is_rejected_before_completion(self, storage, stub):
         session = _upload_session()
@@ -628,13 +648,13 @@ class TestResumableUpload:
                 "Bucket": BUCKET,
                 "Key": OBJECT_KEY,
                 "UploadId": UPLOAD_ID,
-                **({"PartNumber": 1, "Body": b"part"} if operation == "upload" else {}),
+                **({"PartNumber": 1, "Body": ANY, "ContentLength": 4} if operation == "upload" else {}),
             },
         )
 
         with pytest.raises(StorageUploadSessionError) as excinfo:
             if operation == "upload":
-                storage.upload_part(session, 1, b"part")
+                _upload_part(storage, session, 1, b"part")
             else:
                 storage.complete_upload(session, [PartRef(1, 4, '"etag"')])
 
@@ -693,16 +713,16 @@ class TestResumableUpload:
 
     def test_malformed_and_wrong_constraint_sessions_are_rejected_before_s3_access(self, storage):
         with pytest.raises(StorageUploadSessionError):
-            storage.upload_part(replace(_upload_session(), area="../escape"), 1, b"part")
+            _upload_part(storage, replace(_upload_session(), area="../escape"), 1, b"part")
         with pytest.raises(StorageUploadSessionError):
-            storage.upload_part(replace(_upload_session(), session_id=""), 1, b"part")
+            _upload_part(storage, replace(_upload_session(), session_id=""), 1, b"part")
         with pytest.raises(StorageUploadSessionError):
-            storage.upload_part(replace(_upload_session(), max_parts=9_999), 1, b"part")
+            _upload_part(storage, replace(_upload_session(), max_parts=9_999), 1, b"part")
 
     @pytest.mark.parametrize("part_number", [0, 10_001])
     def test_part_numbers_outside_the_portable_range_are_rejected(self, storage, part_number):
         with pytest.raises(ValueError, match="between 1 and 10000"):
-            storage.upload_part(_upload_session(), part_number, b"part")
+            _upload_part(storage, _upload_session(), part_number, b"part")
 
     @pytest.mark.parametrize(
         ("session", "parts", "error", "match"),
@@ -710,7 +730,7 @@ class TestResumableUpload:
             (_upload_session(), [], ValueError, "At least one"),
             (_upload_session(), [PartRef(1, 0, '"etag"')] * 10_001, ValueError, "at most"),
             (_upload_session(), [PartRef(1, -1, '"etag"')], ValueError, "size"),
-            (_upload_session(), [PartRef(1, 0, "")], ValueError, "etag"),
+            (_upload_session(), [PartRef(1, 0, "")], ValueError, "validator"),
             (
                 _upload_session(),
                 [PartRef(1, 1, '"etag-1"'), PartRef(2, 1, '"etag-2"')],
@@ -764,11 +784,12 @@ class TestResumableUpload:
                 "Key": OBJECT_KEY,
                 "UploadId": UPLOAD_ID,
                 "PartNumber": 3,
-                "Body": b"part",
+                "Body": ANY,
+                "ContentLength": 4,
             },
         )
 
-        assert storage.upload_part(session, 3, b"part") == PartRef(3, 4, '"three"')
+        assert _upload_part(storage, session, 3, b"part") == PartRef(3, 4, '"three"')
 
     def test_duplicate_part_state_from_s3_is_rejected(self, storage, stub):
         session = _upload_session()
@@ -807,7 +828,7 @@ class TestResumableUpload:
         session = replace(_upload_session(), max_part_size=3)
 
         with pytest.raises(StorageSizeLimitError, match="max_part_size=3"):
-            storage.upload_part(session, 1, b"four")
+            _upload_part(storage, session, 1, b"four")
 
     def test_an_upload_part_failure_is_provider_neutral(self, storage, stub):
         _stub_manifest(stub)
@@ -820,12 +841,13 @@ class TestResumableUpload:
                 "Key": OBJECT_KEY,
                 "UploadId": UPLOAD_ID,
                 "PartNumber": 1,
-                "Body": b"part",
+                "Body": ANY,
+                "ContentLength": 4,
             },
         )
 
         with pytest.raises(StorageBackendUnavailableError) as excinfo:
-            storage.upload_part(_upload_session(), 1, b"part")
+            _upload_part(storage, _upload_session(), 1, b"part")
 
         assert isinstance(excinfo.value.__cause__, ClientError)
 

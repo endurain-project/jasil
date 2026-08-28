@@ -124,14 +124,15 @@ never interpolated from input.
   column width.
 - The geocoding response body is capped (above).
 - Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
-  Resumable sessions also cap parts at 5 GiB and part numbers at 10,000. Active
-  parts remain backend resources until completion, abort, or explicit
-  `cleanup_uploads` maintenance. Parallel part calls may temporarily stage more
-  than the session limit because completion is the authoritative aggregate
-  check. S3 cleanup follows JASIL-owned manifests and cannot abort unrelated
-  multipart operations. Configure an S3 incomplete-multipart lifecycle rule as
-  a final safety net for a process death between native upload creation and
-  manifest persistence.
+  Resumable parts stream under an exact declared size rather than being buffered
+  in memory. JASIL's built-in portability limits cap parts at 5 GiB and part
+  numbers at 10,000. Active parts remain backend resources until completion,
+  abort, or explicit `cleanup_uploads` maintenance. Parallel part calls may
+  temporarily stage more than the session limit because completion is the
+  authoritative aggregate check. S3 cleanup follows JASIL-owned manifests and
+  cannot abort unrelated multipart operations. Configure an S3
+  incomplete-multipart lifecycle rule as a final safety net for a process death
+  between native upload creation and manifest persistence.
 
 What is **not** bounded: event `payload` and `metadata` size. A producer can
 write an arbitrarily large payload into the outbox. JASIL also does not limit

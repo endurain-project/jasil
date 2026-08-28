@@ -53,11 +53,15 @@ class UploadSession:
 
 @dataclass(frozen=True)
 class PartRef:
-    """Backend-validated reference to one uploaded part."""
+    """Backend-validated reference to one uploaded part.
+
+    ``validator`` is an opaque equality token. It may be a digest, an object
+    storage ETag, or another backend value; callers must not interpret it.
+    """
 
     part_number: int
     size: int
-    etag: str
+    validator: str
 
 
 @dataclass(frozen=True)
@@ -216,7 +220,16 @@ class StorageManagement(Protocol):
 
 @runtime_checkable
 class ResumableUploads(Protocol):
-    """Durable multipart upload lifecycle and abandoned-session cleanup."""
+    """Durable multipart upload lifecycle and abandoned-session cleanup.
+
+    ``upload_part`` reads ``source`` once without seeking or closing it. The
+    required ``size`` must exactly match the source; short and long sources raise
+    :class:`ValueError` without committing that part. A failed attempt may have
+    consumed the source, so retry with a newly opened source and the same session
+    and part number. Limits reported by :class:`UploadSession` are JASIL's
+    built-in portability limits, shared by every built-in backend so callers
+    never branch on the selected backend.
+    """
 
     def begin_upload(
         self,
@@ -226,7 +239,14 @@ class ResumableUploads(Protocol):
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> UploadSession: ...
-    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef: ...
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
     def abort_upload(self, session: UploadSession) -> None: ...
     def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...

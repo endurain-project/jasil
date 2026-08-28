@@ -23,7 +23,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_listing_prefix, check_segment
-from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
+from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
     PartRef,
@@ -324,8 +324,8 @@ class S3Storage:
         for index, part in enumerate(ordered):
             if part.size < 0 or part.size > session.max_part_size:
                 raise ValueError(f"Upload part size must be between 0 and {session.max_part_size}")
-            if not part.etag:
-                raise ValueError("Upload part etag must not be empty")
+            if not part.validator:
+                raise ValueError("Upload part validator must not be empty")
             if index < len(ordered) - 1 and part.size < session.min_part_size:
                 raise ValueError(f"Every upload part except the last must be at least {session.min_part_size} bytes")
             total += part.size
@@ -490,12 +490,21 @@ class S3Storage:
         return session
 
     @_translate_s3_errors
-    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef:
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef:
         self._validate_upload_session(session)
         self._validate_part_number(session, part_number)
-        size = len(data)
+        reader = ExactSizeReader(source, size)
         if size > session.max_part_size:
             raise StorageSizeLimitError(f"Upload part exceeds max_part_size={session.max_part_size}")
+        if size == 0:
+            reader.verify_complete()
         state = self._load_upload_state(session)
         if state is None:  # pragma: no cover - missing_ok is false above
             raise AssertionError("Non-optional upload state was not loaded")
@@ -511,13 +520,15 @@ class S3Storage:
                 Key=object_key,
                 UploadId=state.upload_id,
                 PartNumber=part_number,
-                Body=data,
+                Body=reader,
+                ContentLength=size,
             )
         except ClientError as error:
             if _error_code(error) in _MISSING_UPLOAD_CODES:
                 raise StorageUploadSessionError("Upload session is not active") from error
             raise
-        return PartRef(part_number=part_number, size=size, etag=response["ETag"])
+        reader.verify_complete()
+        return PartRef(part_number=part_number, size=size, validator=response["ETag"])
 
     @_translate_s3_errors
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
@@ -531,14 +542,16 @@ class S3Storage:
         if set(uploaded) != {part.part_number for part in ordered}:
             raise StorageUploadSessionError("Completion must reference every uploaded part exactly once")
         for part in ordered:
-            if uploaded[part.part_number] != (part.size, part.etag):
+            if uploaded[part.part_number] != (part.size, part.validator):
                 raise StorageUploadSessionError(f"Upload part {part.part_number} does not match its reference")
         try:
             self._client.complete_multipart_upload(
                 Bucket=self._bucket,
                 Key=object_key,
                 UploadId=state.upload_id,
-                MultipartUpload={"Parts": [{"ETag": part.etag, "PartNumber": part.part_number} for part in ordered]},
+                MultipartUpload={
+                    "Parts": [{"ETag": part.validator, "PartNumber": part.part_number} for part in ordered]
+                },
             )
         except ClientError as error:
             if _error_code(error) in _MISSING_UPLOAD_CODES:

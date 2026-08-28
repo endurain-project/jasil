@@ -103,8 +103,8 @@ session = platform.storage.begin_upload(
     content_type="application/zip",
 )
 parts = [
-    platform.storage.upload_part(session, 1, first_chunk),
-    platform.storage.upload_part(session, 2, final_chunk),
+    platform.storage.upload_part(session, 1, first_stream, size=first_size),
+    platform.storage.upload_part(session, 2, final_stream, size=final_size),
 ]
 stored = platform.storage.complete_upload(session, parts)
 ```
@@ -158,7 +158,9 @@ part constraints. A session can be resumed by another process configured with
 the same local root or S3 bucket and prefix. It is not portable across backend
 changes or different storage configurations.
 
-The returned session reports the constraints both built-in backends enforce:
+The returned session reports JASIL's built-in portability limits. They use the
+common denominator supported by local and S3-compatible storage so application
+code never branches by backend:
 
 - Part numbers are integers from 1 through 10,000. Parts may be uploaded out of
     order or concurrently, and uploading the same number again atomically
@@ -166,10 +168,18 @@ The returned session reports the constraints both built-in backends enforce:
     cleanup.
 - A part is at most 5 GiB. At completion, every part except the final one must
     be at least 5 MiB. The final part may be smaller or empty.
-- `PartRef` records the part number, actual byte size, and an opaque ETag. Pass
-    the current reference for every uploaded part to `complete_upload`, exactly
-    once and in ascending part-number order. A replaced part invalidates its old
-    reference.
+- `upload_part(session, part_number, source, size=...)` reads a non-seekable
+    binary source once without materializing the part. `size` is required and
+    must exactly match the source: a short or longer source raises `ValueError`
+    and leaves the session available for a replacement upload. The caller owns
+    and closes the source. A failed attempt may have consumed it, so retry with
+    a newly opened source and the same session and part number.
+- `PartRef` records the part number, actual byte size, and an opaque
+    `validator`. The validator may internally be a digest, an S3 ETag, or
+    another backend token; callers compare or persist it but never interpret
+    it. Pass the current reference for every uploaded part to
+    `complete_upload`, exactly once and in ascending part-number order. A
+    replaced part invalidates its old reference.
 - `max_bytes` is checked against the currently visible staged parts before each
     part upload and authoritatively against the complete part set. Parallel calls
     can temporarily stage more than the limit when they race on the same observed
@@ -455,7 +465,14 @@ class MyStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> UploadSession: ...
-    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef: ...
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
     def abort_upload(self, session: UploadSession) -> None: ...
     def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...

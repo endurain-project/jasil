@@ -18,6 +18,7 @@ import pytest
 from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 
+from jasil._core.storage_streams import ExactSizeReader
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
@@ -145,7 +146,15 @@ class _MemoryS3Client:
         if upload_id not in self.uploads or self.uploads[upload_id]["key"] != request["Key"]:
             raise _client_error("UploadPart", "NoSuchUpload", 404)
         part_number = request["PartNumber"]
-        data = bytes(request["Body"])
+        body = request["Body"]
+        if hasattr(body, "read"):
+            chunks = []
+            while chunk := body.read(1024 * 1024):
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        else:
+            data = bytes(body)
+        assert request.get("ContentLength", len(data)) == len(data)
         self.uploads[upload_id]["parts"][part_number] = data
         return {"ETag": f'"part-{hashlib.sha256(data).hexdigest()}"'}
 
@@ -208,6 +217,39 @@ class _ReadOnceSource(io.BytesIO):
 
     def seekable(self):
         return False
+
+
+class _OverReadingSource:
+    def read(self, size=-1):
+        return b"x" * (size + 1)
+
+
+def _upload_part(storage, session, part_number, data, *, size=None):
+    declared_size = len(data) if size is None else size
+    return storage.upload_part(session, part_number, _ReadOnceSource(data), size=declared_size)
+
+
+class TestExactSizeReader:
+    def test_it_exposes_non_seekable_file_like_progress(self):
+        reader = ExactSizeReader(_ReadOnceSource(b"data"), 4)
+
+        assert len(reader) == 4
+        assert reader.readable() is True
+        assert reader.seekable() is False
+        assert reader.tell() == 0
+        assert reader.read(0) == b""
+        assert reader.read(2) == b"da"
+        assert reader.tell() == 2
+        with pytest.raises(ValueError, match="not consumed"):
+            reader.verify_complete()
+        assert reader.read() == b"ta"
+        reader.verify_complete()
+
+    def test_a_source_must_not_return_more_than_requested(self):
+        reader = ExactSizeReader(_OverReadingSource(), 4)
+
+        with pytest.raises(ValueError, match="more than requested"):
+            reader.read(2)
 
 
 @pytest.fixture(params=["local", "s3"])
@@ -309,8 +351,8 @@ class TestResumableUploadConformance:
             max_bytes=5 * 1024 * 1024 + 4,
             content_type="application/octet-stream",
         )
-        tail = storage.upload_part(session, 2, b"tail")
-        first = storage.upload_part(session, 1, b"a" * session.min_part_size)
+        tail = _upload_part(storage, session, 2, b"tail")
+        first = _upload_part(storage, session, 1, b"a" * session.min_part_size)
 
         assert session.min_part_size == 5 * 1024 * 1024
         assert session.max_part_size == 5 * 1024 * 1024 * 1024
@@ -325,22 +367,32 @@ class TestResumableUploadConformance:
 
     def test_an_active_upload_is_not_an_object(self, storage):
         session = storage.begin_upload(AREA, KEY)
-        storage.upload_part(session, 1, b"partial")
+        _upload_part(storage, session, 1, b"partial")
 
         assert storage.exists(AREA, KEY) is False
         assert storage.list_keys(AREA) == []
 
     def test_a_zero_byte_final_part_creates_a_zero_byte_object(self, storage):
         session = storage.begin_upload(AREA, KEY, max_bytes=0)
-        part = storage.upload_part(session, 1, b"")
+        part = _upload_part(storage, session, 1, b"")
 
         assert storage.complete_upload(session, [part]) == 0
         assert storage.get(AREA, KEY) == b""
 
+    def test_the_caller_retains_ownership_of_the_part_source(self, storage):
+        session = storage.begin_upload(AREA, KEY)
+        source = _ReadOnceSource(b"part")
+
+        part = storage.upload_part(session, 1, source, size=4)
+
+        assert source.closed is False
+        assert storage.complete_upload(session, [part]) == 4
+        source.close()
+
     def test_reuploading_a_part_invalidates_the_old_reference(self, storage):
         session = storage.begin_upload(AREA, KEY)
-        stale = storage.upload_part(session, 1, b"old")
-        current = storage.upload_part(session, 1, b"new")
+        stale = _upload_part(storage, session, 1, b"old")
+        current = _upload_part(storage, session, 1, b"new")
 
         with pytest.raises(StorageUploadSessionError, match="does not match"):
             storage.complete_upload(session, [stale])
@@ -349,18 +401,18 @@ class TestResumableUploadConformance:
 
     def test_the_total_limit_is_enforced_before_a_part_is_replaced(self, storage):
         session = storage.begin_upload(AREA, KEY, max_bytes=4)
-        storage.upload_part(session, 1, b"1234")
+        _upload_part(storage, session, 1, b"1234")
 
         with pytest.raises(StorageSizeLimitError, match="max_bytes=4"):
-            storage.upload_part(session, 2, b"5")
+            _upload_part(storage, session, 2, b"5")
 
-        replacement = storage.upload_part(session, 1, b"12")
+        replacement = _upload_part(storage, session, 1, b"12")
         assert storage.complete_upload(session, [replacement]) == 2
 
     def test_completion_requires_every_part_in_strict_order(self, storage):
         session = storage.begin_upload(AREA, KEY)
-        first = storage.upload_part(session, 1, b"a" * session.min_part_size)
-        second = storage.upload_part(session, 2, b"tail")
+        first = _upload_part(storage, session, 1, b"a" * session.min_part_size)
+        second = _upload_part(storage, session, 2, b"tail")
 
         with pytest.raises(ValueError, match="ordered"):
             storage.complete_upload(session, [second, first])
@@ -374,11 +426,11 @@ class TestResumableUploadConformance:
         foreign = replace(session, key="other.bin")
 
         with pytest.raises(StorageUploadSessionError):
-            storage.upload_part(foreign, 1, b"data")
+            _upload_part(storage, foreign, 1, b"data")
 
     def test_abort_is_idempotent_and_terminal(self, storage):
         session = storage.begin_upload(AREA, KEY)
-        part = storage.upload_part(session, 1, b"partial")
+        part = _upload_part(storage, session, 1, b"partial")
 
         storage.abort_upload(session)
         storage.abort_upload(session)
@@ -394,7 +446,28 @@ class TestResumableUploadConformance:
         assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 1
 
         with pytest.raises(StorageUploadSessionError, match="not active"):
-            storage.upload_part(session, 1, b"data")
+            _upload_part(storage, session, 1, b"data")
+
+    @pytest.mark.parametrize(
+        ("data", "size", "match"),
+        [(b"short", 6, "ended before"), (b"long", 3, "exceeds declared")],
+    )
+    def test_a_part_source_must_match_its_declared_size(self, storage, data, size, match):
+        session = storage.begin_upload(AREA, KEY)
+
+        with pytest.raises(ValueError, match=match):
+            _upload_part(storage, session, 1, data, size=size)
+
+        current = _upload_part(storage, session, 2, b"retry")
+        assert storage.complete_upload(session, [current]) == 5
+        assert storage.get(AREA, KEY) == b"retry"
+
+    @pytest.mark.parametrize("size", [-1, True])
+    def test_a_part_size_must_be_a_non_negative_integer(self, storage, size):
+        session = storage.begin_upload(AREA, KEY)
+
+        with pytest.raises(ValueError, match="non-negative integer"):
+            storage.upload_part(session, 1, _ReadOnceSource(b"data"), size=size)
 
     def test_a_negative_session_limit_is_refused(self, storage):
         with pytest.raises(ValueError, match="must not be negative"):

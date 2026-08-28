@@ -26,6 +26,11 @@ under `jasil._core`, log message text, and the wording of error messages are not
   in keys, preserving the area/key boundary on every backend.
 - `UploadSession` exposes an opaque `session_id`; native backend upload IDs stay
   private.
+- `PartRef` exposes an opaque `validator` instead of the S3-shaped `etag` name,
+  and `upload_part` accepts an exact-size, read-once `BinaryIO` instead of
+  buffering a whole part as `bytes`.
+- `.jasil-objects` and `.jasil-upload-sessions` are reserved area names used by
+  private backend state.
 
 ### Added
 
@@ -34,8 +39,12 @@ under `jasil._core`, log message text, and the wording of error messages are not
   atomic, completion validates every current reference in ascending order, and
   the destination changes only when completion succeeds.
 - Portable multipart constraints and session-wide `max_bytes` enforcement on
-  both built-in backends. Invalid, cleaned, completed, or foreign sessions raise
-  `StorageUploadSessionError` without leaking filesystem or S3 exceptions.
+  both built-in backends. The 5 MiB minimum, 5 GiB maximum, and 10,000-part cap
+  are JASIL's built-in portability limits. Invalid, cleaned, completed, or
+  foreign sessions raise `StorageUploadSessionError` without leaking filesystem
+  or S3 exceptions.
+- Bounded-memory part uploads from non-seekable sources with required exact byte
+  sizes and retryable short/long-source failures.
 - Cross-process local sessions backed by private filesystem staging, and S3
   sessions backed directly by native multipart upload operations.
 - Idempotent upload aborts and explicit age-based cleanup for abandoned local
