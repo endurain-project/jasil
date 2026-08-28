@@ -10,6 +10,7 @@ botocore's Stubber to validate the exact AWS request shapes.
 import io
 from datetime import UTC, datetime
 from itertools import count
+from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
@@ -17,7 +18,7 @@ from botocore.response import StreamingBody
 
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
-from jasil.providers import StorageProvider, StorageSizeLimitError
+from jasil.providers import ServeFile, ServeRedirect, ServeStream, StorageProvider, StorageSizeLimitError
 
 # Values that must never address a blob, whichever backend is configured.
 UNSAFE_SEGMENTS = ["../escape", "/etc/passwd", "a/../../b", ".."]
@@ -80,11 +81,39 @@ class _MemoryS3Client:
         key = request["Key"]
         if key not in self.objects:
             raise _client_error("HeadObject", "404", 404)
-        return {"LastModified": self.objects[key][1]}
+        data, modified, content_type = self.objects[key]
+        return {
+            "ContentLength": len(data),
+            "LastModified": modified,
+            "ContentType": content_type,
+            "ETag": f'"memory-{len(data)}"',
+        }
 
     def delete_object(self, **request):
         self.objects.pop(request["Key"], None)
         return {}
+
+    def delete_objects(self, **request):
+        for entry in request["Delete"]["Objects"]:
+            self.objects.pop(entry["Key"], None)
+        return {}
+
+    def list_objects_v2(self, **request):
+        prefix = request["Prefix"]
+        limit = request.get("MaxKeys", 1000)
+        contents = [
+            {"Key": key, "LastModified": metadata[1]}
+            for key, metadata in sorted(self.objects.items())
+            if key.startswith(prefix)
+        ][:limit]
+        return {"Contents": contents} if contents else {}
+
+    def copy(self, copy_source, bucket, key):
+        source_key = copy_source["Key"]
+        if source_key not in self.objects:
+            raise _client_error("CopyObject", "NoSuchKey", 404)
+        data, _, content_type = self.objects[source_key]
+        self.objects[key] = (data, MODIFIED, content_type)
 
     def create_multipart_upload(self, **request):
         upload_id = str(next(self._upload_ids))
@@ -210,6 +239,114 @@ class TestStreamingConformance:
             storage.open_stream(AREA, KEY, offset=offset, length=length)
 
 
+class TestServingConformance:
+    def test_a_serve_plan_reads_the_stored_object(self, storage):
+        storage.save(AREA, KEY, b"package bytes", content_type="application/octet-stream")
+
+        plan = storage.serve(
+            AREA,
+            KEY,
+            download_as="release.bin",
+            content_type="application/octet-stream",
+            expires_in=60,
+        )
+
+        if isinstance(plan, ServeFile):
+            assert plan.path.is_absolute()
+            assert plan.path.is_file()
+            assert plan.path.read_bytes() == b"package bytes"
+        elif isinstance(plan, ServeRedirect):
+            object_key = urlparse(plan.url).path.lstrip("/")
+            assert storage._client.objects[object_key][0] == b"package bytes"
+        elif isinstance(plan, ServeStream):
+            with plan.stream:
+                assert plan.stream.read() == b"package bytes"
+        else:
+            raise AssertionError(f"Unknown serve plan: {plan!r}")
+
+    def test_serving_a_missing_object_raises(self, storage):
+        with pytest.raises(FileNotFoundError):
+            storage.serve(AREA, "missing.bin")
+
+
+class TestObjectStatConformance:
+    def test_stat_agrees_with_stream_size_and_listing_epoch(self, storage):
+        stored = storage.save_stream(
+            AREA,
+            KEY,
+            _ReadOnceSource(b"package bytes"),
+            content_type="application/octet-stream",
+        )
+
+        metadata = storage.stat(AREA, KEY)
+        listed = dict(storage.iter_objects(AREA))
+
+        assert metadata is not None
+        assert metadata.size == stored
+        assert metadata.modified_epoch == listed[KEY]
+
+    def test_a_missing_object_has_no_stat(self, storage):
+        assert storage.stat(AREA, "missing.bin") is None
+
+
+class TestCopyConformance:
+    def test_copy_preserves_the_source_and_overwrites_the_destination(self, storage):
+        storage.save(AREA, "source.bin", b"source")
+        storage.save("copies", "destination.bin", b"old")
+
+        storage.copy(AREA, "source.bin", "copies", "destination.bin")
+
+        assert storage.get(AREA, "source.bin") == b"source"
+        assert storage.get("copies", "destination.bin") == b"source"
+
+    def test_copying_a_missing_source_raises_without_changing_the_destination(self, storage):
+        storage.save(AREA, "destination.bin", b"original")
+
+        with pytest.raises(FileNotFoundError):
+            storage.copy(AREA, "missing.bin", AREA, "destination.bin")
+
+        assert storage.get(AREA, "destination.bin") == b"original"
+
+    def test_copying_an_object_onto_itself_is_a_no_op(self, storage):
+        storage.save(AREA, KEY, b"package")
+        metadata_before = storage.stat(AREA, KEY)
+
+        storage.copy(AREA, KEY, AREA, KEY)
+
+        assert storage.get(AREA, KEY) == b"package"
+        assert storage.stat(AREA, KEY) == metadata_before
+
+    def test_copying_a_missing_object_onto_itself_raises(self, storage):
+        with pytest.raises(FileNotFoundError):
+            storage.copy(AREA, "missing.bin", AREA, "missing.bin")
+
+
+class TestDeletePrefixConformance:
+    def test_only_the_exact_key_root_and_its_descendants_are_deleted(self, storage):
+        storage.save(AREA, "pkg/1/a.bin", b"a")
+        storage.save(AREA, "pkg/1/nested/b.bin", b"b")
+        storage.save(AREA, "pkg/10/c.bin", b"c")
+        storage.save(AREA, "pkg/1-other.bin", b"other")
+
+        deleted = storage.delete_prefix(AREA, "pkg/1")
+
+        assert deleted == 2
+        assert storage.list_keys(AREA) == ["pkg/1-other.bin", "pkg/10/c.bin"]
+
+    def test_an_exact_object_is_deleted(self, storage):
+        storage.save(AREA, KEY, b"package")
+
+        assert storage.delete_prefix(AREA, KEY) == 1
+        assert storage.exists(AREA, KEY) is False
+
+    def test_an_unknown_prefix_deletes_nothing(self, storage):
+        assert storage.delete_prefix(AREA, "unknown") == 0
+
+    def test_an_empty_prefix_is_refused(self, storage):
+        with pytest.raises(ValueError, match="must not be empty"):
+            storage.delete_prefix(AREA, "")
+
+
 class TestListingConformance:
     def test_objects_are_yielded_lazily_with_modified_epochs(self, storage):
         storage.save(AREA, "b.bin", b"b")
@@ -264,6 +401,23 @@ class TestSegmentValidationConformance:
 
         with pytest.raises(ValueError, match="must not be empty"):
             call(arguments["area"], arguments["key"], *extra)
+
+    @pytest.mark.parametrize("operation", ["stat", "serve", "delete_prefix"])
+    @pytest.mark.parametrize("unsafe", [*UNSAFE_SEGMENTS, ""])
+    @pytest.mark.parametrize("field", ["area", "key"])
+    def test_new_entry_points_refuse_traversing_segments(self, storage, operation, unsafe, field):
+        arguments = {"area": AREA, "key": KEY, field: unsafe}
+
+        with pytest.raises(ValueError, match=r"escapes base directory|must not be empty"):
+            getattr(storage, operation)(arguments["area"], arguments["key"])
+
+    @pytest.mark.parametrize("unsafe", [*UNSAFE_SEGMENTS, ""])
+    @pytest.mark.parametrize("field", ["src_area", "src_key", "dst_area", "dst_key"])
+    def test_copy_refuses_every_traversing_segment(self, storage, unsafe, field):
+        arguments = {"src_area": AREA, "src_key": KEY, "dst_area": "copies", "dst_key": KEY, field: unsafe}
+
+        with pytest.raises(ValueError, match=r"escapes base directory|must not be empty"):
+            storage.copy(**arguments)
 
     @pytest.mark.parametrize("operation", ["list_keys", "iter_objects"])
     @pytest.mark.parametrize("unsafe", UNSAFE_SEGMENTS)

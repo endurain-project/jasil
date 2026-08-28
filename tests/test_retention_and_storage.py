@@ -7,6 +7,7 @@ storage backend's contract is mostly about refusing to write outside its root.
 import contextlib
 import io
 from datetime import UTC, datetime, timedelta
+from unittest.mock import Mock
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -20,7 +21,7 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.event_log.models import EventLog
 from jasil.events import new_event
 from jasil.jobs.models import EventOutbox
-from jasil.providers import StorageBackendUnavailableError
+from jasil.providers import ServeFile, StorageBackendUnavailableError
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 OLD = T0 - timedelta(days=90)
@@ -221,6 +222,14 @@ class TestLocalStorage:
 
         assert storage.exists("thumbnails", "1.webp") is False
 
+    def test_deleting_prunes_empty_directories_but_not_the_storage_root(self, storage, tmp_path):
+        storage.save("thumbnails", "nested/1.webp", b"x")
+
+        storage.delete("thumbnails", "nested/1.webp")
+
+        assert (tmp_path / "thumbnails").exists() is False
+        assert tmp_path.is_dir()
+
     def test_deleting_a_missing_blob_is_a_no_op(self, storage):
         storage.delete("thumbnails", "absent.webp")
 
@@ -245,6 +254,43 @@ class TestLocalStorage:
 
     def test_listing_an_unknown_area_is_empty(self, storage):
         assert storage.list_keys("nothing") == []
+
+    def test_stat_reports_portable_filesystem_metadata(self, storage):
+        storage.save("thumbnails", "1.webp", b"bytes", content_type="image/webp")
+
+        metadata = storage.stat("thumbnails", "1.webp")
+
+        assert metadata is not None
+        assert metadata.size == 5
+        assert metadata.modified_epoch > 0
+        assert metadata.content_type is None
+        assert metadata.etag is None
+
+    def test_a_directory_has_no_object_metadata(self, storage, tmp_path):
+        (tmp_path / "thumbnails" / "directory").mkdir(parents=True)
+
+        assert storage.stat("thumbnails", "directory") is None
+
+    @pytest.mark.parametrize("operation", ["stat", "serve", "delete_prefix"])
+    def test_object_inspection_failures_are_provider_neutral(self, storage, monkeypatch, operation):
+        unavailable_path = Mock()
+        unavailable_path.stat.side_effect = OSError("storage unavailable")
+        unavailable_path.open.side_effect = OSError("storage unavailable")
+        monkeypatch.setattr(storage, "_resolve", lambda _area, _key: unavailable_path)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            getattr(storage, operation)("thumbnails", "1.webp")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_serve_returns_a_readable_absolute_file(self, storage):
+        storage.save("thumbnails", "1.webp", b"bytes")
+
+        plan = storage.serve("thumbnails", "1.webp")
+
+        assert isinstance(plan, ServeFile)
+        assert plan.path.is_absolute()
+        assert plan.path.read_bytes() == b"bytes"
 
     def test_a_url_is_built_from_the_prefix(self, storage):
         assert storage.url("thumbnails", "1.webp") == "/media/thumbnails/1.webp"
@@ -308,6 +354,50 @@ class TestLocalStorage:
         assert url == "/media/thumbnails/1.webp"
         assert "download_as, content_type were ignored" in caplog.text
         assert "permanent" in caplog.text
+
+    def test_serve_and_url_share_one_ignored_control_warning(self, storage, caplog):
+        storage.save("thumbnails", "1.webp", b"bytes")
+
+        with caplog.at_level("WARNING"):
+            storage.serve("thumbnails", "1.webp", download_as="photo.webp")
+            storage.url("thumbnails", "1.webp", download_as="photo.webp")
+
+        assert caplog.text.count("was ignored") == 1
+
+    def test_delete_prefix_prunes_its_empty_parent_directories(self, storage, tmp_path):
+        storage.save("thumbnails", "packages/1/a.webp", b"a")
+
+        assert storage.delete_prefix("thumbnails", "packages/1") == 1
+        assert (tmp_path / "thumbnails").exists() is False
+        assert tmp_path.is_dir()
+
+    def test_delete_prefix_refuses_a_symlink_into_another_area(self, storage, tmp_path):
+        storage.save("archive", "keep.webp", b"keep")
+        source_area = tmp_path / "thumbnails"
+        source_area.mkdir()
+        (source_area / "linked").symlink_to(tmp_path / "archive", target_is_directory=True)
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            storage.delete_prefix("thumbnails", "linked")
+
+        assert storage.get("archive", "keep.webp") == b"keep"
+
+    def test_delete_prefix_ignores_a_non_file_non_directory(self, storage, monkeypatch):
+        special_path = Mock()
+        special_path.stat.return_value.st_mode = 0
+        monkeypatch.setattr(storage, "_resolve", lambda _area, _key: special_path)
+
+        assert storage.delete_prefix("thumbnails", "special") == 0
+
+    def test_copy_failures_are_provider_neutral(self, storage, monkeypatch):
+        unavailable_path = Mock()
+        unavailable_path.open.side_effect = OSError("storage unavailable")
+        monkeypatch.setattr(storage, "_resolve", lambda _area, _key: unavailable_path)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.copy("thumbnails", "source.webp", "archive", "destination.webp")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
 
     def test_a_missing_storage_root_is_not_reported_writable(self, tmp_path):
         storage = LocalStorage(str(tmp_path / "detached-volume"))
@@ -380,6 +470,13 @@ class TestLocalStorage:
         (area / "link.webp").symlink_to(outside)
 
         assert storage.list_keys("thumbnails") == []
+
+    def test_an_in_area_symlink_alias_is_not_listed(self, storage, tmp_path):
+        storage.save("thumbnails", "original.webp", b"original")
+        area = tmp_path / "thumbnails"
+        (area / "alias.webp").symlink_to(area / "original.webp")
+
+        assert storage.list_keys("thumbnails") == ["original.webp"]
 
 
 class TestRuntimeHandle:

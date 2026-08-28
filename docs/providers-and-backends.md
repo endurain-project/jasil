@@ -68,6 +68,9 @@ platform.storage.save("avatars", "42.webp", data)
 platform.storage.get("avatars", "42.webp")  # bytes | None
 platform.storage.url("avatars", "42.webp")
 platform.storage.list_keys("avatars", prefix="42-")
+platform.storage.stat("avatars", "42.webp")
+platform.storage.copy("avatars", "42.webp", "archive", "42.webp")
+platform.storage.delete_prefix("packages", "release/42")
 
 with source.open("rb") as stream:
     stored = platform.storage.save_stream(
@@ -104,6 +107,61 @@ S3 uses multipart upload rather than `upload_fileobj`. This is deliberate: the
 latter cannot provide the same mid-stream limit guarantee for an unknown-length,
 non-seekable source. There is no local/S3 divergence in `max_bytes` behavior.
 
+### Serving plans and metadata
+
+`serve(area, key, ...)` tells a host how the selected backend can serve an
+object efficiently without importing Starlette, FastAPI, or another web
+framework:
+
+- `ServeFile(path)` is returned by local storage. The absolute path can be
+    passed to a framework file response, used with `sendfile`, or mapped to an
+    internal `X-Accel-Redirect` or `X-Sendfile` target. It remains the object's
+    local address while that object exists, but it is not a snapshot: deleting or
+    replacing the object after plan creation changes what a later open sees. Do
+    not expose the raw filesystem path as a public URL.
+- `ServeRedirect(url)` is returned by S3. The URL is presigned with the requested
+    expiry, download disposition, and response content type, so object bytes do
+    not pass through the application process.
+- `ServeStream(stream)` is the complete-contract fallback for a custom backend
+    that can do neither. The host owns and must close the read-once stream.
+
+Both built-in backends verify existence before returning a plan, so a missing
+object raises `FileNotFoundError`. S3 performs a `HeadObject` before signing its
+redirect. As with any path or URL handed to another component, deletion can
+still race with the eventual response.
+
+!!! danger "`ServeFile` controls belong to the host"
+        Local storage cannot enforce `expires_in`, `download_as`, or `content_type`.
+        Apply the filename and media type when constructing the framework response,
+        and enforce authorization before serving the path. `serve()` and `url()`
+        share the same one-warning-per-backend behavior when a caller requests a
+        control that local storage cannot honour.
+
+`stat(area, key)` returns `ObjectStat(size, modified_epoch, content_type, etag)`
+without reading object content, or `None` when the object is absent. Size and
+modification time are available on both backends and agree with `save_stream`
+and `iter_objects`. S3 also returns its stored content type and ETag. Portable
+local filesystems expose neither, so both fields are `None` locally even when
+`save` received a content type. JASIL does not create hidden metadata sidecars
+or depend on non-portable filesystem extended attributes. Treat an ETag as an
+opaque backend validator, not necessarily a content digest.
+
+### Object management
+
+`copy(src_area, src_key, dst_area, dst_key)` overwrites the destination while
+leaving the source intact. Local storage copies through the same atomic
+temporary-file path as `save_stream`. S3 uses boto3's managed server-side copy,
+which automatically switches to multipart copy for large objects; bytes never
+round-trip through the application process.
+
+`delete_prefix(area, prefix)` requires a non-empty key root and returns the
+number of objects removed. Its matching is deliberately hierarchical rather
+than lexical: it removes the exact key and slash-delimited descendants, so
+`delete_prefix("packages", "pkg/1")` never removes `pkg/10` or `pkg/1-old`.
+S3 deletes in batches of at most 1,000 objects. Local storage removes the
+matching subtree, and both `delete` and `delete_prefix` prune directories they
+leave empty without removing the configured storage root.
+
 ### Reconciliation and readiness
 
 `list_keys` remains the convenient materialized, sorted listing for small
@@ -130,10 +188,13 @@ S3 client failures and local filesystem failures surface as
 `StorageBackendUnavailableError`, never as botocore or backend-specific
 exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 
-!!! warning "Traversal is rejected"
-    Area and key values are validated before any filesystem access; an absolute
-    path or a `..` segment raises `ValueError`. Keys are expected to be
-    server-generated, but a stray value must never escape the storage root.
+!!! warning "Traversal and aliases are rejected"
+    Area, key, source, destination, and deletion-prefix values are validated
+    before backend I/O; an absolute path or a `..` segment raises `ValueError`.
+    Keys are expected to be server-generated, but a stray value must never
+    escape the storage root. Local storage also rejects object addresses that
+    traverse symbolic links and omits symlink aliases from listings, preserving
+    area and subtree boundaries if the storage tree is modified outside JASIL.
 
 !!! danger "URL controls are honoured by S3 only"
     This is the one place the two backends genuinely differ. `s3://` returns a
@@ -257,6 +318,8 @@ A backend is any object satisfying the protocol — the provider protocols are
 from collections.abc import Iterator
 from typing import BinaryIO
 
+from jasil.providers import ObjectStat, ServePlan
+
 
 class MyStorage:
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
@@ -278,8 +341,20 @@ class MyStorage:
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO: ...
+    def stat(self, area: str, key: str) -> ObjectStat | None: ...
+    def serve(
+        self,
+        area: str,
+        key: str,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> ServePlan: ...
     def exists(self, area: str, key: str) -> bool: ...
     def delete(self, area: str, key: str) -> None: ...
+    def delete_prefix(self, area: str, prefix: str) -> int: ...
+    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None: ...
     def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
     def check_writable(self) -> None: ...
@@ -294,10 +369,11 @@ class MyStorage:
     ) -> str: ...
 ```
 
-These members are required. Their addition is an intentional pre-1.0 protocol
-break: runtime checks against `StorageProvider` now reject an older custom
-backend until it implements them. JASIL chose one complete storage contract over
-optional feature checks that would make every caller branch by backend.
+Every member shown is required. Protocol expansions are intentional pre-1.0
+breaks: runtime checks against `StorageProvider` reject an older custom backend
+until it implements the complete contract. JASIL chooses one complete storage
+contract over optional feature checks that would make every caller branch by
+backend.
 
 Construct the `Platform` yourself to use it, rather than going through
 `build_platform`:

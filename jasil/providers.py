@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
 from jasil.events import Event
@@ -31,6 +32,45 @@ class StorageBackendUnavailableError(RuntimeError):
 
 class StorageSizeLimitError(ValueError):
     """Raised when a streaming write exceeds its configured byte limit."""
+
+
+@dataclass(frozen=True)
+class ObjectStat:
+    """Metadata available without reading an object's content.
+
+    ``content_type`` and ``etag`` are optional because portable local
+    filesystems expose neither. An ETag is an opaque backend validator, not
+    necessarily a digest of the object bytes.
+    """
+
+    size: int
+    modified_epoch: float
+    content_type: str | None = None
+    etag: str | None = None
+
+
+@dataclass(frozen=True)
+class ServeFile:
+    """Serve a local file directly, using sendfile or a reverse-proxy mapping."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class ServeRedirect:
+    """Redirect the client to a backend-generated object URL."""
+
+    url: str
+
+
+@dataclass(frozen=True)
+class ServeStream:
+    """Proxy an object through the host using a read-once binary stream."""
+
+    stream: BinaryIO
+
+
+type ServePlan = ServeFile | ServeRedirect | ServeStream
 
 
 @dataclass(frozen=True)
@@ -101,6 +141,16 @@ class StorageProvider(Protocol):
     ``iter_objects`` lazily yields ``(key, modified_epoch)`` for reconciliation
     jobs that may scan millions of objects and need an age guard.
 
+    ``serve`` selects the backend's efficient delivery primitive without
+    importing a web framework: local storage returns :class:`ServeFile`, S3
+    returns :class:`ServeRedirect`, and a backend with neither capability may
+    return :class:`ServeStream`. It verifies that the object exists first.
+
+    ``stat`` returns size and modification time plus backend metadata when
+    available. ``copy`` keeps object bytes inside the backend. ``delete_prefix``
+    deletes one non-empty key root and its slash-delimited descendants, not
+    adjacent lexical prefixes (``"pkg/1"`` never selects ``"pkg/10"``).
+
     ``check_writable`` performs a write-and-delete readiness probe and raises
     :class:`StorageBackendUnavailableError` when the configured store cannot
     persist objects.
@@ -133,8 +183,20 @@ class StorageProvider(Protocol):
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO: ...
+    def stat(self, area: str, key: str) -> ObjectStat | None: ...
+    def serve(
+        self,
+        area: str,
+        key: str,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> ServePlan: ...
     def exists(self, area: str, key: str) -> bool: ...
     def delete(self, area: str, key: str) -> None: ...
+    def delete_prefix(self, area: str, prefix: str) -> int: ...
+    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None: ...
     def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
     def check_writable(self) -> None: ...

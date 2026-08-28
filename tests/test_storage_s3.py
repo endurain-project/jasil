@@ -23,7 +23,7 @@ from botocore.stub import ANY, Stubber
 
 import jasil.backends.storage_s3 as storage_s3
 from jasil.backends.storage_s3 import S3Storage
-from jasil.providers import StorageBackendUnavailableError, StorageSizeLimitError
+from jasil.providers import ServeRedirect, StorageBackendUnavailableError, StorageSizeLimitError
 
 BUCKET = "blobs"
 PREFIX = "jasil"
@@ -92,6 +92,17 @@ class TestFromUri:
 
     def test_the_region_is_honoured(self):
         assert S3Storage.from_uri("s3://my-bucket?region=eu-west-1")._client.meta.region_name == "eu-west-1"
+
+    def test_a_client_creation_failure_is_provider_neutral(self, monkeypatch):
+        def fail_to_create_client(*_args, **_kwargs):
+            raise ReadTimeoutError(endpoint_url="https://s3.test")
+
+        monkeypatch.setattr(storage_s3.boto3, "client", fail_to_create_client)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            S3Storage.from_uri("s3://my-bucket")
+
+        assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
 
 
 class TestSave:
@@ -265,6 +276,14 @@ class TestOpenStream:
         with storage.open_stream(AREA, KEY, length=0) as stream:
             assert stream.read() == b""
 
+    def test_a_zero_length_access_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="AccessDenied", http_status_code=403)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.open_stream(AREA, KEY, length=0)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
     def test_a_missing_object_raises_file_not_found(self, storage, stub):
         stub.add_client_error("get_object", service_error_code="NoSuchKey", http_status_code=404)
 
@@ -288,6 +307,69 @@ class TestOpenStream:
             stream.read()
 
         assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
+
+
+class TestStat:
+    def test_it_returns_head_object_metadata(self, storage, stub):
+        stub.add_response(
+            "head_object",
+            {
+                "ContentLength": 5,
+                "LastModified": MODIFIED,
+                "ContentType": "image/webp",
+                "ETag": '"etag"',
+            },
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+
+        metadata = storage.stat(AREA, KEY)
+
+        assert metadata is not None
+        assert metadata.size == 5
+        assert metadata.modified_epoch == MODIFIED.timestamp()
+        assert metadata.content_type == "image/webp"
+        assert metadata.etag == '"etag"'
+
+    def test_a_missing_object_has_no_stat(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="404", http_status_code=404)
+
+        assert storage.stat(AREA, KEY) is None
+
+    def test_an_access_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="AccessDenied", http_status_code=403)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.stat(AREA, KEY)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+
+class TestServe:
+    def test_it_returns_a_presigned_redirect_with_response_controls(self, storage, stub):
+        stub.add_response(
+            "head_object",
+            {"ContentLength": 5, "LastModified": MODIFIED},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+
+        plan = storage.serve(
+            AREA,
+            KEY,
+            download_as="photo.webp",
+            content_type="application/octet-stream",
+            expires_in=60,
+        )
+
+        assert isinstance(plan, ServeRedirect)
+        query = parse_qs(urlparse(plan.url).query)
+        assert query["response-content-disposition"][0].startswith('attachment; filename="photo.webp";')
+        assert query["response-content-type"] == ["application/octet-stream"]
+
+    def test_a_missing_object_raises_before_signing(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="NoSuchKey", http_status_code=404)
+
+        with pytest.raises(FileNotFoundError):
+            storage.serve(AREA, KEY)
 
 
 class TestExists:
@@ -321,6 +403,129 @@ class TestDelete:
 
         with pytest.raises(StorageBackendUnavailableError) as excinfo:
             storage.delete(AREA, KEY)
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+
+class TestDeletePrefix:
+    def test_it_deletes_the_exact_key_and_strict_descendants(self, storage, stub):
+        root = f"{PREFIX}/{AREA}/pkg/1"
+        descendants = [f"{root}/a.webp", f"{root}/nested/b.webp"]
+        stub.add_response("head_object", {}, {"Bucket": BUCKET, "Key": root})
+        stub.add_response(
+            "delete_objects",
+            {},
+            {"Bucket": BUCKET, "Delete": {"Objects": [{"Key": root}], "Quiet": True}},
+        )
+        stub.add_response(
+            "list_objects_v2",
+            {"Contents": [{"Key": key} for key in descendants]},
+            {"Bucket": BUCKET, "Prefix": f"{root}/", "MaxKeys": 1000},
+        )
+        stub.add_response(
+            "delete_objects",
+            {},
+            {"Bucket": BUCKET, "Delete": {"Objects": [{"Key": key} for key in descendants], "Quiet": True}},
+        )
+        stub.add_response(
+            "list_objects_v2",
+            {},
+            {"Bucket": BUCKET, "Prefix": f"{root}/", "MaxKeys": 1000},
+        )
+
+        assert storage.delete_prefix(AREA, "pkg/1") == 3
+
+    def test_it_batches_more_than_one_thousand_descendants(self, storage, stub):
+        root = f"{PREFIX}/{AREA}/pkg/1"
+        first_batch = [f"{root}/{index:04}.webp" for index in range(1000)]
+        second_batch = [f"{root}/1000.webp"]
+        stub.add_client_error("head_object", service_error_code="404", http_status_code=404)
+        for keys in (first_batch, second_batch):
+            stub.add_response(
+                "list_objects_v2",
+                {
+                    "Contents": [{"Key": key} for key in keys],
+                    "IsTruncated": len(keys) == 1000,
+                    **({"NextContinuationToken": "ignored-after-delete"} if len(keys) == 1000 else {}),
+                },
+                {"Bucket": BUCKET, "Prefix": f"{root}/", "MaxKeys": 1000},
+            )
+            stub.add_response(
+                "delete_objects",
+                {},
+                {"Bucket": BUCKET, "Delete": {"Objects": [{"Key": key} for key in keys], "Quiet": True}},
+            )
+        stub.add_response(
+            "list_objects_v2",
+            {},
+            {"Bucket": BUCKET, "Prefix": f"{root}/", "MaxKeys": 1000},
+        )
+
+        assert storage.delete_prefix(AREA, "pkg/1") == 1001
+
+    def test_a_delete_error_is_provider_neutral(self, storage, stub):
+        root = f"{PREFIX}/{AREA}/pkg/1"
+        stub.add_response("head_object", {}, {"Bucket": BUCKET, "Key": root})
+        stub.add_response(
+            "delete_objects",
+            {"Errors": [{"Key": root, "Code": "AccessDenied", "Message": "denied"}]},
+            {"Bucket": BUCKET, "Delete": {"Objects": [{"Key": root}], "Quiet": True}},
+        )
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.delete_prefix(AREA, "pkg/1")
+
+    def test_an_access_failure_is_provider_neutral(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="AccessDenied", http_status_code=403)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.delete_prefix(AREA, "pkg/1")
+
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+
+class TestCopy:
+    def test_it_uses_boto3_managed_copy(self, storage, stub):
+        destination_key = f"{PREFIX}/copies/{KEY}"
+        stub.add_response(
+            "head_object",
+            {"ContentLength": 5},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+        stub.add_response(
+            "copy_object",
+            {},
+            {"Bucket": BUCKET, "Key": destination_key, "CopySource": {"Bucket": BUCKET, "Key": OBJECT_KEY}},
+        )
+
+        storage.copy(AREA, KEY, "copies", KEY)
+
+    def test_a_missing_source_raises_file_not_found(self, storage, stub):
+        stub.add_client_error("head_object", service_error_code="NoSuchKey", http_status_code=404)
+
+        with pytest.raises(FileNotFoundError):
+            storage.copy(AREA, KEY, "copies", KEY)
+
+    def test_an_access_failure_is_provider_neutral(self, storage, stub):
+        destination_key = f"{PREFIX}/copies/{KEY}"
+        stub.add_response(
+            "head_object",
+            {"ContentLength": 5},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY},
+        )
+        stub.add_client_error(
+            "copy_object",
+            service_error_code="AccessDenied",
+            http_status_code=403,
+            expected_params={
+                "Bucket": BUCKET,
+                "Key": destination_key,
+                "CopySource": {"Bucket": BUCKET, "Key": OBJECT_KEY},
+            },
+        )
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.copy(AREA, KEY, "copies", KEY)
 
         assert isinstance(excinfo.value.__cause__, ClientError)
 
