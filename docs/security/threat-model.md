@@ -57,13 +57,21 @@ pair.
 **Mitigations.**
 
 - Both segments are validated before any filesystem or client access: empty,
-  absolute (`/` or `\`), and `..`-bearing values raise `ValueError`. The check is
-  pure and shared, so **both** backends enforce it — the S3 backend needs it
-  because `..` is a literal character in an object key, so an unchecked value is
-  silently stored under a nonsense key rather than refused.
+  absolute, dot-component, parent-traversing, repeated-separator,
+  trailing-separator, and backslash-bearing values raise `ValueError`. The check
+  is pure and shared, so **both** backends enforce one canonical slash-delimited
+  grammar. Without it, local paths normalize aliases such as `.` and `a//b`
+  while S3 preserves them as distinct literal keys. An area is exactly one
+  component, so `(area="a/b", key="c")` cannot collapse onto
+  `(area="a", key="b/c")` in an object-store key.
 - The local backend additionally resolves the final path and requires it to stay
   under the base directory, and never follows a symlink out of an area when
-  listing.
+  listing. Logical objects use a reserved fixed-depth digest layout with
+  verified identity sidecars, avoiding path-length and file/directory collisions
+  between a key and its descendants without trusting the digest alone.
+  Resumable parts live under a separate reserved private staging directory;
+  session manifests and part files are validated before they are read, and
+  symbolic-link aliases are rejected.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
   alter the URL it lands in.
 
@@ -115,9 +123,23 @@ never interpolated from input.
 - Stored failure text is truncated; the joined subscriber list is clamped to its
   column width.
 - The geocoding response body is capped (above).
+- Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
+  Resumable parts stream under an exact declared size rather than being buffered
+  in memory. JASIL's built-in portability limits cap parts at 5 GiB and part
+  numbers at 10,000. Active parts remain backend resources until completion,
+  abort, or explicit `cleanup_uploads` maintenance. Parallel part calls may
+  temporarily stage more than the session limit because completion is the
+  authoritative aggregate check. S3 cleanup follows JASIL-owned manifests and
+  cannot abort unrelated multipart operations. Configure an S3
+  incomplete-multipart lifecycle rule as a final safety net for a process death
+  between native upload creation and manifest persistence.
 
 What is **not** bounded: event `payload` and `metadata` size. A producer can
-write an arbitrarily large payload into the outbox.
+write an arbitrarily large payload into the outbox. JASIL also does not limit
+the number of upload sessions a caller can begin; authenticate and rate-limit
+that host endpoint, bound its request concurrency, retain session handles as
+trusted server-side state, and run cleanup with a cutoff longer than a valid
+upload.
 
 ## Duplicate execution
 
@@ -141,7 +163,7 @@ These are real risks that JASIL deliberately does not address, because it cannot
 | Risk | Why it is yours |
 |---|---|
 | Authentication and authorization on `jasil.admin` | It exposes operational data and a state-changing replay. JASIL has no notion of who is calling. |
-| Serving and restricting local storage URLs | They cannot expire — JASIL neither runs that web server nor holds a key to sign with. See [providers & backends](../providers-and-backends.md#storageprovider). |
+| Serving and restricting local storage paths and URLs | They cannot expire or enforce response headers; JASIL neither runs that web server nor holds a key to sign with. Authorize every request, apply headers in the host response, and never expose a `ServeFile` filesystem path as a public URL. See [providers & backends](../providers-and-backends.md#storageprovider). |
 | Namespacing keys and areas per tenant | The substrate sees opaque strings; only you know the tenancy boundary. |
 | Securing the database and Redis themselves | Network policy, TLS, and credentials belong to the deployment. JASIL never creates the engine. |
 | Rate limiting inbound requests | JASIL serves no requests. It provides the atomic primitives (`incr`, `set_if_absent`, `record_tiered_failure`) a limiter needs. |

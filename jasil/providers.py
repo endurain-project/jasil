@@ -1,4 +1,4 @@
-"""Platform providers — the tiny interfaces domain code depends on.
+"""Composable provider interfaces and complete platform capabilities.
 
 Pure module: only stdlib typing and the event envelope. No infrastructure
 (redis / boto3 / sqlalchemy) and no domain imports, so any module can depend on
@@ -7,11 +7,12 @@ these providers without pulling in a backend. Concrete backends live in
 (``jasil.container.build_platform``).
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from pathlib import Path
+from typing import BinaryIO, Protocol, runtime_checkable
 
 from jasil.events import Event
 
@@ -23,6 +24,83 @@ class StateBackendUnavailableError(RuntimeError):
     swallow a best-effort cleanup) without knowing or importing anything about
     the concrete backend (Redis). The in-memory backend never raises it.
     """
+
+
+class StorageBackendUnavailableError(RuntimeError):
+    """Raised when a storage backend cannot complete an operation."""
+
+
+class StorageSizeLimitError(ValueError):
+    """Raised when a streaming write exceeds its configured byte limit."""
+
+
+class StorageUploadSessionError(RuntimeError):
+    """Raised when a resumable upload session or part reference is not active."""
+
+
+@dataclass(frozen=True)
+class UploadSession:
+    """Durable handle and portable limits for one resumable upload."""
+
+    area: str
+    key: str
+    session_id: str
+    max_bytes: int | None
+    min_part_size: int
+    max_part_size: int
+    max_parts: int
+
+
+@dataclass(frozen=True)
+class PartRef:
+    """Backend-validated reference to one uploaded part.
+
+    ``validator`` is an opaque equality token. It may be a digest, an object
+    storage ETag, or another backend value; callers must not interpret it.
+    """
+
+    part_number: int
+    size: int
+    validator: str
+
+
+@dataclass(frozen=True)
+class ObjectStat:
+    """Metadata available without reading an object's content.
+
+    ``content_type`` and ``etag`` are optional because portable local
+    filesystems expose neither. An ETag is an opaque backend validator, not
+    necessarily a digest of the object bytes.
+    """
+
+    size: int
+    modified_epoch: float
+    content_type: str | None = None
+    etag: str | None = None
+
+
+@dataclass(frozen=True)
+class ServeFile:
+    """Serve a local file directly, using sendfile or a reverse-proxy mapping."""
+
+    path: Path
+
+
+@dataclass(frozen=True)
+class ServeRedirect:
+    """Redirect the client to a backend-generated object URL."""
+
+    url: str
+
+
+@dataclass(frozen=True)
+class ServeStream:
+    """Proxy an object through the host using a read-once binary stream."""
+
+    stream: BinaryIO
+
+
+type ServePlan = ServeFile | ServeRedirect | ServeStream
 
 
 @dataclass(frozen=True)
@@ -72,42 +150,163 @@ class StateProvider(Protocol):
 
 
 @runtime_checkable
-class StorageProvider(Protocol):
-    """Opaque byte-blob storage addressed by a key within a named *area*.
-
-    An area is a domain-owned namespace (e.g. ``"avatars"``, ``"exports"``) so
-    one backend serves every subsystem: locally it maps to a subdirectory, on S3
-    to a key prefix. The database stores only the key (the area is a fixed
-    constant of the calling domain); ``url`` is computed at serialization time so
-    migrating local -> S3 needs no data migration.
-
-    Most subsystems only ever write a blob and later serve it via ``url``, but
-    some need the bytes back in-process (e.g. bundling stored files into an
-    export); ``get`` is that read path, returning ``None`` when the blob is
-    absent.
-
-    ``list_keys`` exists for the subsystems whose keys are *not* derivable from a
-    domain id — for instance when a key carries a random component. Without a
-    prefix listing, such a subsystem would have to reach past the provider to the
-    filesystem to clean up after a deleted record, which is exactly what this
-    provider exists to prevent.
-
-    ``expires_in`` is **best-effort, and the one place the backends genuinely
-    differ**: ``s3://`` returns a presigned URL that stops working when it
-    elapses, while ``local://`` returns a plain path for the host's own web
-    server and cannot expire at all — JASIL does not run that server and holds no
-    key to sign with. Do not rely on the lifetime for authorization unless you
-    know the deployment uses object storage; on local disk, restricting the URL
-    prefix is the host's job. The local backend logs a warning the first time it
-    is handed a non-default value.
-    """
+class StorageObjects(Protocol):
+    """Whole-object persistence, metadata, deletion, and enumeration."""
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
     def get(self, area: str, key: str) -> bytes | None: ...
+    def stat(self, area: str, key: str) -> ObjectStat | None: ...
     def exists(self, area: str, key: str) -> bool: ...
     def delete(self, area: str, key: str) -> None: ...
     def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
-    def url(self, area: str, key: str, expires_in: int = 3600) -> str: ...
+    def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
+
+
+@runtime_checkable
+class StorageStreams(Protocol):
+    """Bounded-memory object reads and writes."""
+
+    def save_stream(
+        self,
+        area: str,
+        key: str,
+        source: BinaryIO,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> int: ...
+    def open_stream(
+        self,
+        area: str,
+        key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> BinaryIO: ...
+
+
+@runtime_checkable
+class StorageDelivery(Protocol):
+    """Backend-efficient delivery without coupling to a web framework."""
+
+    def serve(
+        self,
+        area: str,
+        key: str,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> ServePlan: ...
+    def url(
+        self,
+        area: str,
+        key: str,
+        expires_in: int = 3600,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+    ) -> str: ...
+
+
+@runtime_checkable
+class StorageManagement(Protocol):
+    """Object-set mutation and backend readiness operations."""
+
+    def delete_prefix(self, area: str, prefix: str) -> int: ...
+    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None: ...
+    def check_writable(self) -> None: ...
+
+
+@runtime_checkable
+class ResumableUploads(Protocol):
+    """Durable multipart upload lifecycle and abandoned-session cleanup.
+
+    ``upload_part`` reads ``source`` once without seeking or closing it. The
+    required ``size`` must exactly match the source; short and long sources raise
+    :class:`ValueError` without committing that part. A failed attempt may have
+    consumed the source, so retry with a newly opened source and the same session
+    and part number. Limits reported by :class:`UploadSession` are JASIL's
+    built-in portability limits, shared by every built-in backend so callers
+    never branch on the selected backend.
+    """
+
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession: ...
+    def upload_part(
+        self,
+        session: UploadSession,
+        part_number: int,
+        source: BinaryIO,
+        *,
+        size: int,
+    ) -> PartRef: ...
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
+    def abort_upload(self, session: UploadSession) -> None: ...
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
+
+
+@runtime_checkable
+class StorageProvider(
+    StorageObjects,
+    StorageStreams,
+    StorageDelivery,
+    StorageManagement,
+    ResumableUploads,
+    Protocol,
+):
+    """Complete object-storage capability assembled by :class:`Platform`.
+
+    An area is a domain-owned namespace (e.g. ``"avatars"``, ``"exports"``) so
+    one backend serves every subsystem. The database stores only the key (the
+    area is a fixed constant of the calling domain); ``url`` is computed at
+    serialization time so migrating local -> S3 needs no data migration.
+
+    ``save`` and ``get`` are the simple whole-object path for small blobs.
+    ``save_stream`` and ``open_stream`` are the bounded-memory path for large
+    objects. Streaming writes are atomic: exceeding ``max_bytes`` raises
+    :class:`StorageSizeLimitError` and never exposes a partial new object.
+    Streaming reads are read-once and non-seekable on every backend. ``offset``
+    and ``length`` select a byte range without requiring the returned stream to
+    seek; a missing object raises :class:`FileNotFoundError`.
+
+    Resumable writes use ``begin_upload``, one or more ``upload_part`` calls,
+    then ``complete_upload`` or ``abort_upload``. Sessions are portable across
+    processes sharing the configured backend and report their part constraints.
+    ``cleanup_uploads`` aborts sessions initiated before a caller-owned cutoff.
+
+    ``list_keys`` is the convenient materialized listing for small namespaces.
+    ``iter_objects`` lazily yields ``(key, modified_epoch)`` for reconciliation
+    jobs that may scan millions of objects and need an age guard.
+
+    ``serve`` selects the backend's efficient delivery primitive without
+    importing a web framework: local storage returns :class:`ServeFile`, S3
+    returns :class:`ServeRedirect`, and a backend with neither capability may
+    return :class:`ServeStream`. It verifies that the object exists first.
+
+    ``stat`` returns size and modification time plus backend metadata when
+    available. ``copy`` keeps object bytes inside the backend. ``delete_prefix``
+    deletes one non-empty key root and its slash-delimited descendants, not
+    adjacent lexical prefixes (``"pkg/1"`` never selects ``"pkg/10"``).
+
+    ``check_writable`` performs a write-and-delete readiness probe and raises
+    :class:`StorageBackendUnavailableError` when the configured store cannot
+    persist objects.
+
+    ``expires_in`` is **best-effort, and the one place the backends genuinely
+    differ**: ``s3://`` returns a presigned URL that honours expiry and response
+    header overrides, while ``local://`` returns a plain path for the host's own
+    web server and cannot enforce any of them. Do not rely on these controls
+    unless you know the deployment uses object storage; on local disk they are
+    host policy. The local backend logs a warning the first time it is handed a
+    control it cannot honour.
+    """
 
 
 @runtime_checkable
