@@ -14,12 +14,13 @@ from urllib.parse import parse_qs, quote, urlparse
 from uuid import uuid4
 
 import boto3
+from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from jasil._core.storage_keys import check_segment
 from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
-from jasil.providers import StorageBackendUnavailableError, StorageSizeLimitError
+from jasil.providers import ObjectStat, ServeRedirect, StorageBackendUnavailableError, StorageSizeLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ def _error_code(error: ClientError) -> str:
 
 
 def _translate_s3_stream_error(error: Exception) -> None:
-    if isinstance(error, (BotoCoreError, ClientError)):
+    if isinstance(error, (Boto3Error, BotoCoreError, ClientError)):
         raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
 
 
@@ -48,7 +49,7 @@ def _translate_s3_errors[**P, R](
     def wrapper(self: "S3Storage", *args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return method(self, *args, **kwargs)
-        except (BotoCoreError, ClientError) as error:
+        except (Boto3Error, BotoCoreError, ClientError) as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
 
     return wrapper
@@ -251,6 +252,42 @@ class S3Storage:
         return non_seekable_reader(response["Body"], length=length, translate_error=_translate_s3_stream_error)
 
     @_translate_s3_errors
+    def stat(self, area: str, key: str) -> ObjectStat | None:
+        try:
+            response = self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
+        except ClientError as error:
+            if _error_code(error) in _MISSING_OBJECT_CODES:
+                return None
+            raise
+        return ObjectStat(
+            size=int(response["ContentLength"]),
+            modified_epoch=response["LastModified"].timestamp(),
+            content_type=response.get("ContentType"),
+            etag=response.get("ETag"),
+        )
+
+    def serve(
+        self,
+        area: str,
+        key: str,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> ServeRedirect:
+        if self.stat(area, key) is None:
+            raise FileNotFoundError(f"Storage object not found: {area}/{key}")
+        return ServeRedirect(
+            self.url(
+                area,
+                key,
+                expires_in=expires_in,
+                download_as=download_as,
+                content_type=content_type,
+            )
+        )
+
+    @_translate_s3_errors
     def exists(self, area: str, key: str) -> bool:
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
@@ -263,6 +300,66 @@ class S3Storage:
     @_translate_s3_errors
     def delete(self, area: str, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=self._object_key(area, key))
+
+    @_translate_s3_errors
+    def delete_prefix(self, area: str, prefix: str) -> int:
+        root = self._object_key(area, prefix)
+        count = 0
+        try:
+            self._client.head_object(Bucket=self._bucket, Key=root)
+        except ClientError as error:
+            if _error_code(error) not in _MISSING_OBJECT_CODES:
+                raise
+        else:
+            self._delete_objects([root])
+            count += 1
+
+        descendant_prefix = f"{root}/"
+        # Delete each first page before listing again. Carrying a continuation
+        # token across a listing being mutated can skip keys; S3 makes a
+        # successful deletion visible to the next LIST request.
+        while True:
+            page = self._client.list_objects_v2(
+                Bucket=self._bucket,
+                Prefix=descendant_prefix,
+                MaxKeys=1000,
+            )
+            keys = [entry["Key"] for entry in page.get("Contents", [])]
+            if not keys:
+                return count
+            self._delete_objects(keys)
+            count += len(keys)
+
+    def _delete_objects(self, keys: list[str]) -> None:
+        response = self._client.delete_objects(
+            Bucket=self._bucket,
+            Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
+        )
+        if errors := response.get("Errors"):
+            raise StorageBackendUnavailableError(f"S3 failed to delete {len(errors)} storage objects")
+
+    @_translate_s3_errors
+    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
+        check_segment(src_area, "source area")
+        check_segment(src_key, "source key")
+        check_segment(dst_area, "destination area")
+        check_segment(dst_key, "destination key")
+        source_key = self._object_key(src_area, src_key)
+        destination_key = self._object_key(dst_area, dst_key)
+        if source_key == destination_key:
+            if self.stat(src_area, src_key) is None:
+                raise FileNotFoundError(f"Storage object not found: {src_area}/{src_key}")
+            return
+        try:
+            self._client.copy(
+                {"Bucket": self._bucket, "Key": source_key},
+                self._bucket,
+                destination_key,
+            )
+        except ClientError as error:
+            if _error_code(error) in _MISSING_OBJECT_CODES:
+                raise FileNotFoundError(f"Storage object not found: {src_area}/{src_key}") from error
+            raise
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
         return sorted(key for key, _ in self.iter_objects(area, prefix))

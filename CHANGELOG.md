@@ -11,6 +11,38 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.3.0]
+
+### Breaking
+
+- `StorageProvider` now requires `serve`, `stat`, `copy`, and `delete_prefix`.
+  This is another intentional pre-1.0 protocol expansion: existing calls remain
+  source-compatible, but third-party storage backends must implement the new
+  members before they satisfy the runtime-checkable protocol.
+
+### Added
+
+- Framework-neutral serving plans. Local storage returns `ServeFile` for
+  zero-copy file responses and reverse-proxy handoff, S3 returns a presigned
+  `ServeRedirect`, and custom backends may return `ServeStream`. Both built-in
+  backends verify object existence before creating a plan.
+- `ObjectStat` metadata with size and modification time on both backends, plus
+  content type and ETag where the backend exposes them. Portable local
+  filesystems return `None` for the latter two fields.
+- Backend-native object copying. Local copies remain atomic, while S3 uses
+  boto3's managed copy so large objects switch to multipart copy without passing
+  bytes through the application process.
+- Boundary-safe subtree deletion with `delete_prefix`, returning the number of
+  objects removed and batching S3 deletions at 1,000 keys per request.
+
+### Changed
+
+- Local `delete` and `delete_prefix` now prune empty directories while retaining
+  the configured storage root.
+- Local object operations reject filesystem paths that traverse symbolic links,
+  and listings omit symlink aliases, preserving area and subtree boundaries if
+  the storage tree is modified outside JASIL.
+
 ## [0.2.0]
 
 ### Breaking
@@ -235,6 +267,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   values before any filesystem access, and percent-encodes both into the URL it
   returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.3.0]: https://github.com/endurain-project/jasil/releases/tag/v0.3.0
 [0.2.0]: https://github.com/endurain-project/jasil/releases/tag/v0.2.0
 [0.1.1]: https://github.com/endurain-project/jasil/releases/tag/v0.1.1
 [0.1.0]: https://github.com/endurain-project/jasil/releases/tag/v0.1.0
