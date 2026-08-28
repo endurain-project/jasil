@@ -11,7 +11,7 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
-## [Unreleased]
+## [0.2.0]
 
 ### Breaking
 
@@ -235,5 +235,6 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
   values before any filesystem access, and percent-encodes both into the URL it
   returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.2.0]: https://github.com/endurain-project/jasil/releases/tag/v0.2.0
 [0.1.1]: https://github.com/endurain-project/jasil/releases/tag/v0.1.1
 [0.1.0]: https://github.com/endurain-project/jasil/releases/tag/v0.1.0

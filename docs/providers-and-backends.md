@@ -78,9 +78,7 @@ with source.open("rb") as stream:
         content_type="application/zip",
     )
 
-with platform.storage.open_stream(
-    "packages", "release.zip", offset=1024, length=4096
-) as stream:
+with platform.storage.open_stream("packages", "release.zip", offset=1024, length=4096) as stream:
     chunk = stream.read()
 ```
 
