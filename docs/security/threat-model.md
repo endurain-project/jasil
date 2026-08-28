@@ -141,7 +141,7 @@ These are real risks that JASIL deliberately does not address, because it cannot
 | Risk | Why it is yours |
 |---|---|
 | Authentication and authorization on `jasil.admin` | It exposes operational data and a state-changing replay. JASIL has no notion of who is calling. |
-| Serving and restricting local storage URLs | They cannot expire — JASIL neither runs that web server nor holds a key to sign with. See [providers & backends](../providers-and-backends.md#storageprovider). |
+| Serving and restricting local storage URLs | They cannot expire or enforce response headers — JASIL neither runs that web server nor holds a key to sign with. See [providers & backends](../providers-and-backends.md#storageprovider). |
 | Namespacing keys and areas per tenant | The substrate sees opaque strings; only you know the tenancy boundary. |
 | Securing the database and Redis themselves | Network policy, TLS, and credentials belong to the deployment. JASIL never creates the engine. |
 | Rate limiting inbound requests | JASIL serves no requests. It provides the atomic primitives (`incr`, `set_if_absent`, `record_tiered_failure`) a limiter needs. |

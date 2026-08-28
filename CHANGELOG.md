@@ -11,6 +11,40 @@ capability provider protocols, the event envelope, the capability URI schemes,
 and the database schema of JASIL's own tables are covered by SemVer; anything
 under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [Unreleased]
+
+### Breaking
+
+- `StorageProvider` now requires `save_stream`, range-aware `open_stream`,
+  `iter_objects`, and `check_writable`, and widens `url` with optional response
+  controls. This is intentionally slated for the next minor release: provider
+  protocols are runtime-checkable and custom backends are supported, so adding
+  required members breaks those backends even though existing callers of
+  `save`, `get`, and `url` remain source-compatible. The new members are not
+  optional capability checks; third-party storage backends must implement the
+  complete contract.
+
+### Added
+
+- Bounded-memory storage I/O. `save_stream` consumes non-seekable sources and
+  enforces `max_bytes` mid-stream; local disk writes through a temporary file,
+  while S3 uses multipart upload and aborts it on failure. `open_stream` returns
+  the same read-once, non-seekable stream contract on both backends and supports
+  `offset`/`length` range selection. Missing objects raise `FileNotFoundError`.
+- Lazy reconciliation via `iter_objects`, yielding each key with its modification
+  epoch, and a storage-specific `check_writable` readiness probe.
+- `StorageBackendUnavailableError` hides local filesystem and botocore failures,
+  and `StorageSizeLimitError` identifies a streaming size-limit breach.
+- S3 presigned URLs accept `download_as` and `content_type`, allowing a host to
+  force attachment download and pin the response media type for untrusted blobs.
+
+### Changed
+
+- The local backend warns once when URL expiry or response-header controls are
+  requested, because those controls belong to the host web server for
+  `local://`. Existing whole-object `save`/`get` behavior remains available for
+  small blobs.
+
 ## [0.1.1]
 
 ### Security

@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import BinaryIO, Protocol, runtime_checkable
 
 from jasil.events import Event
 
@@ -23,6 +23,14 @@ class StateBackendUnavailableError(RuntimeError):
     swallow a best-effort cleanup) without knowing or importing anything about
     the concrete backend (Redis). The in-memory backend never raises it.
     """
+
+
+class StorageBackendUnavailableError(RuntimeError):
+    """Raised when a storage backend cannot complete an operation."""
+
+
+class StorageSizeLimitError(ValueError):
+    """Raised when a streaming write exceeds its configured byte limit."""
 
 
 @dataclass(frozen=True)
@@ -73,7 +81,7 @@ class StateProvider(Protocol):
 
 @runtime_checkable
 class StorageProvider(Protocol):
-    """Opaque byte-blob storage addressed by a key within a named *area*.
+    """Object storage addressed by a key within a named *area*.
 
     An area is a domain-owned namespace (e.g. ``"avatars"``, ``"exports"``) so
     one backend serves every subsystem: locally it maps to a subdirectory, on S3
@@ -81,33 +89,64 @@ class StorageProvider(Protocol):
     constant of the calling domain); ``url`` is computed at serialization time so
     migrating local -> S3 needs no data migration.
 
-    Most subsystems only ever write a blob and later serve it via ``url``, but
-    some need the bytes back in-process (e.g. bundling stored files into an
-    export); ``get`` is that read path, returning ``None`` when the blob is
-    absent.
+    ``save`` and ``get`` are the simple whole-object path for small blobs.
+    ``save_stream`` and ``open_stream`` are the bounded-memory path for large
+    objects. Streaming writes are atomic: exceeding ``max_bytes`` raises
+    :class:`StorageSizeLimitError` and never exposes a partial new object.
+    Streaming reads are read-once and non-seekable on every backend. ``offset``
+    and ``length`` select a byte range without requiring the returned stream to
+    seek; a missing object raises :class:`FileNotFoundError`.
 
-    ``list_keys`` exists for the subsystems whose keys are *not* derivable from a
-    domain id — for instance when a key carries a random component. Without a
-    prefix listing, such a subsystem would have to reach past the provider to the
-    filesystem to clean up after a deleted record, which is exactly what this
-    provider exists to prevent.
+    ``list_keys`` is the convenient materialized listing for small namespaces.
+    ``iter_objects`` lazily yields ``(key, modified_epoch)`` for reconciliation
+    jobs that may scan millions of objects and need an age guard.
+
+    ``check_writable`` performs a write-and-delete readiness probe and raises
+    :class:`StorageBackendUnavailableError` when the configured store cannot
+    persist objects.
 
     ``expires_in`` is **best-effort, and the one place the backends genuinely
-    differ**: ``s3://`` returns a presigned URL that stops working when it
-    elapses, while ``local://`` returns a plain path for the host's own web
-    server and cannot expire at all — JASIL does not run that server and holds no
-    key to sign with. Do not rely on the lifetime for authorization unless you
-    know the deployment uses object storage; on local disk, restricting the URL
-    prefix is the host's job. The local backend logs a warning the first time it
-    is handed a non-default value.
+    differ**: ``s3://`` returns a presigned URL that honours expiry and response
+    header overrides, while ``local://`` returns a plain path for the host's own
+    web server and cannot enforce any of them. Do not rely on these controls
+    unless you know the deployment uses object storage; on local disk they are
+    host policy. The local backend logs a warning the first time it is handed a
+    control it cannot honour.
     """
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
+    def save_stream(
+        self,
+        area: str,
+        key: str,
+        source: BinaryIO,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> int: ...
     def get(self, area: str, key: str) -> bytes | None: ...
+    def open_stream(
+        self,
+        area: str,
+        key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> BinaryIO: ...
     def exists(self, area: str, key: str) -> bool: ...
     def delete(self, area: str, key: str) -> None: ...
     def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
-    def url(self, area: str, key: str, expires_in: int = 3600) -> str: ...
+    def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
+    def check_writable(self) -> None: ...
+    def url(
+        self,
+        area: str,
+        key: str,
+        expires_in: int = 3600,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+    ) -> str: ...
 
 
 @runtime_checkable

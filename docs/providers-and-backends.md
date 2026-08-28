@@ -54,7 +54,9 @@ memory backend never raises it.
 
 ## StorageProvider
 
-Opaque byte blobs addressed by a key within a named *area*.
+Object storage addressed by a key within a named *area*. The whole-object API is
+kept for small blobs, while the streaming API handles packages and other objects
+that must not be materialized in memory.
 
 | Backend | URI | Notes |
 |---|---|---|
@@ -66,34 +68,88 @@ platform.storage.save("avatars", "42.webp", data)
 platform.storage.get("avatars", "42.webp")  # bytes | None
 platform.storage.url("avatars", "42.webp")
 platform.storage.list_keys("avatars", prefix="42-")
+
+with source.open("rb") as stream:
+    stored = platform.storage.save_stream(
+        "packages",
+        "release.zip",
+        stream,
+        max_bytes=20 * 1024**3,
+        content_type="application/zip",
+    )
+
+with platform.storage.open_stream(
+    "packages", "release.zip", offset=1024, length=4096
+) as stream:
+    chunk = stream.read()
 ```
 
 An area is a domain-owned namespace. Store only the key in your database — `url`
 is computed at serialization time, so migrating local → S3 needs no data
 migration.
 
-`list_keys` exists for subsystems whose keys are not derivable from a domain id
-(for example when a key carries a random component). Without it, such a subsystem
-would have to reach past the provider to the filesystem to clean up, which is
-exactly what the provider exists to prevent.
+### Streaming contract
+
+- `save_stream` reads `source` once and never seeks it. Both backends enforce
+    `max_bytes` while reading. On a breach they raise `StorageSizeLimitError`, and
+    no partial new object is visible: local disk removes its temporary file and S3
+    calls `AbortMultipartUpload`. The previous object, if any, stays in place.
+- `open_stream` returns a read-once, non-seekable binary stream on **both**
+    backends. Always close it, normally with `with`. A missing object raises
+    `FileNotFoundError`; it never becomes an empty stream.
+- `offset` and `length` select a range before the stream is returned. This is the
+    primitive a host uses for HTTP range responses without assuming the stream can
+    seek. A zero `length`, or an offset beyond the end, yields an empty stream for
+    an object that exists. Negative values raise `ValueError`.
+
+S3 uses multipart upload rather than `upload_fileobj`. This is deliberate: the
+latter cannot provide the same mid-stream limit guarantee for an unknown-length,
+non-seekable source. There is no local/S3 divergence in `max_bytes` behavior.
+
+### Reconciliation and readiness
+
+`list_keys` remains the convenient materialized, sorted listing for small
+namespaces. `iter_objects(area, prefix)` is the reconciliation path: it lazily
+yields `(key, modified_epoch)` without collecting the namespace first. The epoch
+comes from `st_mtime` locally and S3 `LastModified`; use it as an age guard before
+deleting an object that has no database row.
+
+`check_writable()` performs a write-and-delete probe. S3 uses a unique private
+probe key. Local storage requires the configured root to exist, then creates a
+temporary file inside it; it deliberately does not recreate a missing root, so a
+missing volume path is not reported ready. Failures raise
+`StorageBackendUnavailableError`.
+
+This probe lives on `StorageProvider`, not on `Platform.health()`. The operation
+being promised is specifically "this object store can persist and remove a
+blob". A platform-wide readiness result would need host policy about which
+capabilities are required and whether degraded events or state should fail the
+process. Adding speculative methods to every provider would define none of that.
+A host can aggregate `check_writable()` with future capability-specific probes
+without changing this contract.
+
+S3 client failures and local filesystem failures surface as
+`StorageBackendUnavailableError`, never as botocore or backend-specific
+exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 
 !!! warning "Traversal is rejected"
     Area and key values are validated before any filesystem access; an absolute
     path or a `..` segment raises `ValueError`. Keys are expected to be
     server-generated, but a stray value must never escape the storage root.
 
-!!! danger "`expires_in` is honoured by S3 only"
+!!! danger "URL controls are honoured by S3 only"
     This is the one place the two backends genuinely differ. `s3://` returns a
-    presigned URL that stops working when `expires_in` elapses. `local://`
-    returns a plain path for **your** web server to serve, and cannot expire at
-    all — JASIL does not run that server and holds no key to sign with, so the
-    argument is ignored and the link is permanent.
+    presigned URL that honours `expires_in`, `download_as`, and `content_type`.
+    `download_as` pins an `attachment` content disposition, so an untrusted
+    object is downloaded rather than rendered inline. `local://` returns a plain
+    path for **your** web server to serve and cannot enforce any of those controls
+    — JASIL does not run that server and holds no key to sign with.
 
     So `url(area, key, expires_in=60)` is a one-minute link on S3 and a forever
-    link on local disk. Do not use the lifetime as an authorization control
-    unless you know the deployment uses object storage; on local disk, restrict
-    the URL prefix in the web server instead. The local backend logs a warning
-    the first time it is given a non-default value.
+    link on local disk; `download_as` and `content_type` are likewise host policy
+    on local disk. Do not rely on these controls unless you know the deployment
+    uses object storage. The local backend logs one warning per instance the
+    first time it is given a control it cannot honour.
 
 ## EventBusProvider
 
@@ -200,14 +256,50 @@ A backend is any object satisfying the protocol — the provider protocols are
 `runtime_checkable`, and nothing inherits from anything:
 
 ```python
+from collections.abc import Iterator
+from typing import BinaryIO
+
+
 class MyStorage:
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
+    def save_stream(
+        self,
+        area: str,
+        key: str,
+        source: BinaryIO,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> int: ...
     def get(self, area: str, key: str) -> bytes | None: ...
+    def open_stream(
+        self,
+        area: str,
+        key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> BinaryIO: ...
     def exists(self, area: str, key: str) -> bool: ...
     def delete(self, area: str, key: str) -> None: ...
     def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
-    def url(self, area: str, key: str, expires_in: int = 3600) -> str: ...
+    def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
+    def check_writable(self) -> None: ...
+    def url(
+        self,
+        area: str,
+        key: str,
+        expires_in: int = 3600,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+    ) -> str: ...
 ```
+
+These members are required. Their addition is an intentional pre-1.0 protocol
+break: runtime checks against `StorageProvider` now reject an older custom
+backend until it implements them. JASIL chose one complete storage contract over
+optional feature checks that would make every caller branch by backend.
 
 Construct the `Platform` yourself to use it, rather than going through
 `build_platform`:
