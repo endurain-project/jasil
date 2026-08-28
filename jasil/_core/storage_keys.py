@@ -10,15 +10,19 @@ Kept here rather than on either backend: neither should have to import the other
 to share a rule they both enforce.
 """
 
+OBJECT_STORAGE_AREA = ".jasil-objects"
 UPLOAD_STAGING_AREA = ".jasil-upload-sessions"
+_INTERNAL_AREAS = frozenset({OBJECT_STORAGE_AREA, UPLOAD_STAGING_AREA})
 
-__all__ = ["UPLOAD_STAGING_AREA", "check_area", "check_listing_prefix", "check_segment"]
+__all__ = ["OBJECT_STORAGE_AREA", "UPLOAD_STAGING_AREA", "check_area", "check_listing_prefix", "check_segment"]
 
 
 def check_area(area: str) -> None:
-    """Validate an area and reject JASIL's private upload staging name."""
+    """Validate an area and reject JASIL's private storage roots."""
     check_segment(area, "area")
-    if area.split("/", 1)[0] == UPLOAD_STAGING_AREA:
+    if "/" in area:
+        raise ValueError(f"Storage area must be a single path component: {area!r}")
+    if area in _INTERNAL_AREAS:
         raise ValueError(f"Storage area is reserved: {area!r}")
 
 

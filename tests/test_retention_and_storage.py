@@ -88,6 +88,11 @@ def _old_event_log_row(db) -> None:
     db.commit()
 
 
+def _local_object_url(storage: LocalStorage, area: str, key: str) -> str:
+    relative_path = storage._resolve(area, key).relative_to(storage._base.resolve()).as_posix()
+    return f"/media/{relative_path}"
+
+
 class TestRetention:
     def test_it_is_inert_when_both_windows_are_disabled(self, platform, session_factory, db):
         """Retention off means keep every row forever."""
@@ -212,9 +217,194 @@ class TestLocalStorage:
         storage.save("thumbnails", "bytes.webp", b"x")
         storage.save_stream("thumbnails", "stream.webp", io.BytesIO(b"x"))
 
-        byte_mode = (tmp_path / "thumbnails" / "bytes.webp").stat().st_mode & 0o777
-        stream_mode = (tmp_path / "thumbnails" / "stream.webp").stat().st_mode & 0o777
+        byte_mode = storage._resolve("thumbnails", "bytes.webp").stat().st_mode & 0o777
+        stream_mode = storage._resolve("thumbnails", "stream.webp").stat().st_mode & 0o777
         assert stream_mode == byte_mode
+
+    def test_a_negative_stream_limit_creates_no_private_object_state(self, storage, tmp_path):
+        with pytest.raises(ValueError, match="must not be negative"):
+            storage.save_stream("thumbnails", "stream.webp", io.BytesIO(b"x"), max_bytes=-1)
+
+        assert (tmp_path / storage_local._OBJECTS_DIRECTORY).exists() is False
+
+    def test_a_symlinked_key_identity_is_not_followed_or_listed(self, storage, tmp_path):
+        storage.save("thumbnails", "original.webp", b"original")
+        payload = storage._resolve("thumbnails", "original.webp")
+        key_file = payload.parent / storage_local._OBJECT_KEY_FILE
+        key_file.unlink()
+        outside = tmp_path / "outside-key"
+        outside.write_text("original.webp")
+        key_file.symlink_to(outside)
+
+        with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
+            storage.get("thumbnails", "original.webp")
+        assert storage.list_keys("thumbnails") == []
+
+    def test_a_symlinked_area_identity_blocks_new_writes(self, storage, tmp_path):
+        storage.save("thumbnails", "original.webp", b"original")
+        area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
+        area_file.unlink()
+        outside = tmp_path / "outside-area"
+        outside.write_text("thumbnails")
+        area_file.symlink_to(outside)
+
+        with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
+            storage.save("thumbnails", "other.webp", b"other")
+
+    def test_a_tampered_key_identity_blocks_reads_and_overwrites(self, storage):
+        storage.save("thumbnails", "original.webp", b"original")
+        payload = storage._resolve("thumbnails", "original.webp")
+        (payload.parent / storage_local._OBJECT_KEY_FILE).write_text("different.webp")
+
+        with pytest.raises(StorageBackendUnavailableError, match="does not match"):
+            storage.get("thumbnails", "original.webp")
+        with pytest.raises(StorageBackendUnavailableError, match="does not match"):
+            storage.save("thumbnails", "original.webp", b"replacement")
+
+    @pytest.mark.parametrize("component", ["foreign", "c-not-base32!", "c-MZXW6"])
+    def test_invalid_private_layout_components_are_not_listed(self, storage, component):
+        invalid_object = storage._resolve_area("thumbnails") / component / storage_local._OBJECT_PAYLOAD_FILE
+        invalid_object.parent.mkdir(parents=True)
+        invalid_object.write_bytes(b"private")
+        storage.save("thumbnails", "valid.webp", b"valid")
+
+        assert storage.list_keys("thumbnails") == ["valid.webp"]
+
+    def test_local_stream_errors_are_provider_neutral(self):
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage_local._translate_local_stream_error(OSError("storage unavailable"))
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert storage_local._translate_local_stream_error(ValueError("not an I/O failure")) is None
+
+    @pytest.mark.parametrize(
+        ("failure", "error"),
+        [(RuntimeError("loop"), ValueError), (OSError("storage unavailable"), StorageBackendUnavailableError)],
+    )
+    def test_object_root_resolution_failures_are_translated(self, storage, monkeypatch, failure, error):
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            if path == storage._base:
+                raise failure
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+
+        with pytest.raises(error):
+            storage.get("thumbnails", "1.webp")
+
+    def test_a_resolved_path_outside_the_root_is_rejected(self, storage, monkeypatch, tmp_path):
+        original_resolve = Path.resolve
+        calls = 0
+
+        def resolve(path, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                return tmp_path.parent / "outside"
+            return original_resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve)
+
+        with pytest.raises(ValueError, match="escapes base directory"):
+            storage.get("thumbnails", "1.webp")
+
+    def test_regular_file_metadata_failures_are_provider_neutral(self, storage):
+        unavailable_path = Mock()
+        unavailable_path.stat.side_effect = OSError("storage unavailable")
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage._is_regular_file(unavailable_path)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_a_legacy_object_remains_readable_and_visible(self, storage, tmp_path):
+        legacy_path = tmp_path / "thumbnails" / "legacy.webp"
+        legacy_path.parent.mkdir()
+        legacy_path.write_bytes(b"legacy")
+
+        metadata = storage.stat("thumbnails", "legacy.webp")
+        plan = storage.serve("thumbnails", "legacy.webp")
+
+        assert storage.get("thumbnails", "legacy.webp") == b"legacy"
+        assert storage.exists("thumbnails", "legacy.webp") is True
+        assert metadata is not None
+        assert metadata.size == 6
+        assert plan == ServeFile(legacy_path)
+        assert storage.url("thumbnails", "legacy.webp") == "/media/thumbnails/legacy.webp"
+        assert storage.list_keys("thumbnails") == ["legacy.webp"]
+
+    def test_overwriting_a_legacy_object_migrates_it_to_the_versioned_layout(self, storage, tmp_path):
+        legacy_path = tmp_path / "thumbnails" / "legacy.webp"
+        legacy_path.parent.mkdir()
+        legacy_path.write_bytes(b"legacy")
+
+        storage.save("thumbnails", "legacy.webp", b"current")
+
+        assert legacy_path.exists() is False
+        assert storage._resolve("thumbnails", "legacy.webp").read_bytes() == b"current"
+        assert storage.get("thumbnails", "legacy.webp") == b"current"
+
+    def test_a_legacy_cleanup_failure_does_not_hide_the_committed_replacement(
+        self,
+        storage,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        legacy_path = tmp_path / "thumbnails" / "legacy.webp"
+        legacy_path.parent.mkdir()
+        legacy_path.write_bytes(b"legacy")
+        original_unlink = Path.unlink
+
+        def fail_legacy_unlink(path, *args, **kwargs):
+            if path == legacy_path:
+                raise OSError("storage unavailable")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_legacy_unlink)
+
+        with caplog.at_level("WARNING"):
+            storage.save("thumbnails", "legacy.webp", b"current")
+
+        assert storage.get("thumbnails", "legacy.webp") == b"current"
+        assert legacy_path.read_bytes() == b"legacy"
+        assert "Failed to remove" in caplog.text
+
+    def test_pruning_tolerates_an_unresolvable_storage_root(self, storage):
+        unavailable_base = Mock()
+        unavailable_base.resolve.side_effect = OSError("storage unavailable")
+        storage._base = unavailable_base
+
+        storage._prune_empty_directories(Path("unused"))
+
+    def test_prefix_deletion_counts_duplicate_legacy_and_current_objects_once(self, storage, tmp_path):
+        storage.save("thumbnails", "release/a.webp", b"current")
+        legacy_path = tmp_path / "thumbnails" / "release" / "a.webp"
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"legacy")
+        (legacy_path.parent / "b.webp").write_bytes(b"legacy-only")
+
+        assert storage.delete_prefix("thumbnails", "release") == 2
+        assert storage.list_keys("thumbnails") == []
+
+    @pytest.mark.parametrize("legacy_parent", [True, False])
+    def test_legacy_and_current_objects_can_form_one_logical_tree(self, storage, tmp_path, legacy_parent, caplog):
+        legacy_key = "release/1" if legacy_parent else "release/1/archive.bin"
+        current_key = "release/1/archive.bin" if legacy_parent else "release/1"
+        legacy_path = tmp_path / "packages" / legacy_key
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_bytes(b"legacy")
+
+        with caplog.at_level("WARNING"):
+            storage.save("packages", current_key, b"current")
+
+        assert storage.get("packages", legacy_key) == b"legacy"
+        assert storage.get("packages", current_key) == b"current"
+        assert storage.list_keys("packages", "release/1") == ["release/1", "release/1/archive.bin"]
+        assert caplog.text == ""
+        assert storage.delete_prefix("packages", "release/1") == 2
 
     def test_a_resumable_upload_survives_backend_instances_and_commits_atomically(self, storage, tmp_path):
         storage.save("packages", "release.bin", b"previous")
@@ -305,7 +495,7 @@ class TestLocalStorage:
         session = storage.begin_upload("packages", "release.bin")
         outside = tmp_path / "outside"
         outside.write_bytes(b"outside")
-        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_PARTS_DIRECTORY
         (parts / "00001.part").symlink_to(outside)
 
         with pytest.raises(StorageUploadSessionError, match="unsafe"):
@@ -313,7 +503,7 @@ class TestLocalStorage:
 
     def test_a_symlinked_parts_directory_is_rejected(self, storage, tmp_path):
         session = storage.begin_upload("packages", "release.bin")
-        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id
+        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id
         parts = session_directory / storage_local._UPLOAD_PARTS_DIRECTORY
         parts.rmdir()
         outside = tmp_path / "outside-parts"
@@ -331,9 +521,11 @@ class TestLocalStorage:
         session = storage.begin_upload("packages", "release.bin")
 
         with pytest.raises(StorageUploadSessionError, match="not valid"):
-            storage.upload_part(replace(session, upload_id="not-a-uuid"), 1, b"data")
+            storage.upload_part(replace(session, session_id="not-a-uuid"), 1, b"data")
         with pytest.raises(StorageUploadSessionError, match="durable state"):
             storage.upload_part(replace(session, key="other.bin"), 1, b"data")
+        with pytest.raises(StorageUploadSessionError, match="not valid"):
+            storage.upload_part(replace(session, max_parts=session.max_parts - 1), 1, b"data")
 
     def test_a_symlinked_upload_root_is_rejected(self, tmp_path):
         base = tmp_path / "storage"
@@ -358,7 +550,7 @@ class TestLocalStorage:
 
     def test_a_symlinked_session_manifest_is_rejected(self, storage, tmp_path):
         session = storage.begin_upload("packages", "release.bin")
-        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_MANIFEST
         manifest.unlink()
         outside = tmp_path / "outside.json"
         outside.write_text("{}")
@@ -369,10 +561,22 @@ class TestLocalStorage:
 
     def test_a_corrupt_session_manifest_is_rejected(self, storage, tmp_path):
         session = storage.begin_upload("packages", "release.bin")
-        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_MANIFEST
         manifest.write_text("{")
 
         with pytest.raises(StorageUploadSessionError, match="manifest is invalid"):
+            storage.upload_part(session, 1, b"data")
+
+    def test_a_non_finite_session_timestamp_is_rejected(self, storage, tmp_path):
+        session = storage.begin_upload("packages", "release.bin")
+        manifest_path = (
+            tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_MANIFEST
+        )
+        manifest = json.loads(manifest_path.read_text())
+        manifest["created_epoch"] = float("inf")
+        manifest_path.write_text(json.dumps(manifest))
+
+        with pytest.raises(StorageUploadSessionError, match="durable state"):
             storage.upload_part(session, 1, b"data")
 
     def test_a_manifest_read_failure_is_provider_neutral(self, storage, monkeypatch):
@@ -387,7 +591,7 @@ class TestLocalStorage:
     @pytest.mark.parametrize("staged_name", ["bad.part", "00001.part"])
     def test_invalid_staged_part_state_is_rejected(self, storage, tmp_path, staged_name):
         session = storage.begin_upload("packages", "release.bin")
-        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_PARTS_DIRECTORY
         staged = parts / staged_name
         if staged_name == "00001.part":
             staged.mkdir()
@@ -401,7 +605,7 @@ class TestLocalStorage:
 
     def test_duplicate_staged_part_names_are_rejected(self, storage, tmp_path):
         session = storage.begin_upload("packages", "release.bin")
-        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_PARTS_DIRECTORY
+        parts = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_PARTS_DIRECTORY
         (parts / "00001.part").write_bytes(b"first")
         (parts / "1.part").write_bytes(b"duplicate")
 
@@ -459,7 +663,7 @@ class TestLocalStorage:
         part_path = (
             tmp_path
             / storage_local._UPLOADS_DIRECTORY
-            / session.upload_id
+            / session.session_id
             / storage_local._UPLOAD_PARTS_DIRECTORY
             / "00001.part"
         )
@@ -514,6 +718,16 @@ class TestLocalStorage:
     def test_cleanup_of_an_uninitialized_backend_is_empty(self, storage):
         assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 0
 
+    def test_cleanup_listing_failures_are_provider_neutral(self, storage, monkeypatch):
+        upload_root = Mock()
+        upload_root.iterdir.side_effect = OSError("storage unavailable")
+        monkeypatch.setattr(storage, "_upload_root", lambda: upload_root)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
     def test_cleanup_ignores_non_session_entries(self, storage, tmp_path):
         upload_root = tmp_path / storage_local._UPLOADS_DIRECTORY
         upload_root.mkdir()
@@ -523,7 +737,7 @@ class TestLocalStorage:
 
     def test_cleanup_uses_directory_time_for_a_corrupt_manifest(self, storage, tmp_path):
         session = storage.begin_upload("packages", "release.bin")
-        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id
+        session_directory = tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id
         (session_directory / storage_local._UPLOAD_MANIFEST).write_text("{")
         os.utime(session_directory, (10.0, 10.0))
 
@@ -532,7 +746,9 @@ class TestLocalStorage:
     def test_manifest_timestamp_tampering_cannot_postpone_cleanup(self, storage, tmp_path, monkeypatch):
         monkeypatch.setattr(storage_local.time, "time", lambda: 10.0)
         session = storage.begin_upload("packages", "release.bin")
-        manifest_path = tmp_path / storage_local._UPLOADS_DIRECTORY / session.upload_id / storage_local._UPLOAD_MANIFEST
+        manifest_path = (
+            tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_MANIFEST
+        )
         manifest = json.loads(manifest_path.read_text())
         manifest["created_epoch"] = 1_000_000_000_000.0
         manifest_path.write_text(json.dumps(manifest))
@@ -550,6 +766,26 @@ class TestLocalStorage:
             with pytest.raises(StorageBackendUnavailableError) as excinfo:
                 storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0)
             assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_cleanup_attempts_later_sessions_before_reporting_a_failure(self, storage, monkeypatch):
+        first = storage.begin_upload("packages", "first.bin")
+        second = storage.begin_upload("packages", "second.bin")
+        first_path = storage._upload_root() / first.session_id
+        second_path = storage._upload_root() / second.session_id
+        original_rmtree = storage_local.shutil.rmtree
+
+        def remove(path, *args, **kwargs):
+            if path == first_path:
+                raise OSError("storage unavailable")
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(storage_local.shutil, "rmtree", remove)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0)
+
+        assert first_path.exists() is True
+        assert second_path.exists() is False
 
     def test_a_missing_blob_reads_as_none(self, storage):
         assert storage.get("thumbnails", "absent.webp") is None
@@ -622,7 +858,15 @@ class TestLocalStorage:
         unavailable_path = Mock()
         unavailable_path.stat.side_effect = OSError("storage unavailable")
         unavailable_path.open.side_effect = OSError("storage unavailable")
-        monkeypatch.setattr(storage, "_resolve", lambda _area, _key: unavailable_path)
+        if operation == "delete_prefix":
+
+            def fail_to_resolve_legacy(_area, _key):
+                error = OSError("storage unavailable")
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+
+            monkeypatch.setattr(storage, "_resolve_legacy", fail_to_resolve_legacy)
+        else:
+            monkeypatch.setattr(storage, "_resolve", lambda _area, _key: unavailable_path)
 
         with pytest.raises(StorageBackendUnavailableError) as excinfo:
             getattr(storage, operation)("thumbnails", "1.webp")
@@ -639,24 +883,29 @@ class TestLocalStorage:
         assert plan.path.read_bytes() == b"bytes"
 
     def test_a_url_is_built_from_the_prefix(self, storage):
-        assert storage.url("thumbnails", "1.webp") == "/media/thumbnails/1.webp"
+        assert storage.url("thumbnails", "1.webp") == _local_object_url(storage, "thumbnails", "1.webp")
 
     @pytest.mark.parametrize(
-        ("key", "expected"),
+        "key",
         [
-            ("a b.webp", "/media/thumbnails/a%20b.webp"),
-            ("a?b.webp", "/media/thumbnails/a%3Fb.webp"),
-            ("a#b.webp", "/media/thumbnails/a%23b.webp"),
-            ("100%.webp", "/media/thumbnails/100%25.webp"),
+            "a b.webp",
+            "a?b.webp",
+            "a#b.webp",
+            "100%.webp",
         ],
     )
-    def test_a_key_is_percent_encoded(self, storage, key, expected):
-        """``?`` would end the path early and ``%`` would change it; only traversal is validated."""
-        assert storage.url("thumbnails", key) == expected
+    def test_a_key_with_url_metacharacters_maps_to_a_safe_physical_url(self, storage, key):
+        url = storage.url("thumbnails", key)
 
-    def test_a_nested_key_keeps_its_separators(self, storage):
-        """``save`` accepts a nested key, so ``/`` is structure rather than data."""
-        assert storage.url("thumbnails", "2026/01/1.webp") == "/media/thumbnails/2026/01/1.webp"
+        assert url == _local_object_url(storage, "thumbnails", key)
+        assert not any(character in url for character in (" ", "?", "#", "%"))
+
+    def test_a_nested_key_maps_to_its_physical_url(self, storage):
+        assert storage.url("thumbnails", "2026/01/1.webp") == _local_object_url(
+            storage,
+            "thumbnails",
+            "2026/01/1.webp",
+        )
 
     def test_a_requested_expiry_is_reported_as_ignored(self, storage, caplog):
         """The one place the two storage backends genuinely differ.
@@ -669,7 +918,7 @@ class TestLocalStorage:
         with caplog.at_level("WARNING"):
             url = storage.url("thumbnails", "1.webp", expires_in=60)
 
-        assert url == "/media/thumbnails/1.webp"
+        assert url == _local_object_url(storage, "thumbnails", "1.webp")
         assert "expires_in=60 was ignored" in caplog.text
         assert "permanent" in caplog.text
 
@@ -697,7 +946,7 @@ class TestLocalStorage:
                 content_type="application/octet-stream",
             )
 
-        assert url == "/media/thumbnails/1.webp"
+        assert url == _local_object_url(storage, "thumbnails", "1.webp")
         assert "download_as, content_type were ignored" in caplog.text
         assert "permanent" in caplog.text
 
@@ -728,16 +977,9 @@ class TestLocalStorage:
 
         assert storage.get("archive", "keep.webp") == b"keep"
 
-    def test_delete_prefix_ignores_a_non_file_non_directory(self, storage, monkeypatch):
-        special_path = Mock()
-        special_path.stat.return_value.st_mode = 0
-        monkeypatch.setattr(storage, "_resolve", lambda _area, _key: special_path)
-
-        assert storage.delete_prefix("thumbnails", "special") == 0
-
     def test_copy_failures_are_provider_neutral(self, storage, monkeypatch):
         unavailable_path = Mock()
-        unavailable_path.open.side_effect = OSError("storage unavailable")
+        unavailable_path.stat.side_effect = OSError("storage unavailable")
         monkeypatch.setattr(storage, "_resolve", lambda _area, _key: unavailable_path)
 
         with pytest.raises(StorageBackendUnavailableError) as excinfo:
@@ -819,8 +1061,10 @@ class TestLocalStorage:
 
     def test_an_in_area_symlink_alias_is_not_listed(self, storage, tmp_path):
         storage.save("thumbnails", "original.webp", b"original")
-        area = tmp_path / "thumbnails"
-        (area / "alias.webp").symlink_to(area / "original.webp")
+        original = storage._resolve("thumbnails", "original.webp")
+        alias = storage._resolve("thumbnails", "alias.webp")
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(original)
 
         assert storage.list_keys("thumbnails") == ["original.webp"]
 

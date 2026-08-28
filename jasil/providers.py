@@ -1,4 +1,4 @@
-"""Platform providers — the tiny interfaces domain code depends on.
+"""Composable provider interfaces and complete platform capabilities.
 
 Pure module: only stdlib typing and the event envelope. No infrastructure
 (redis / boto3 / sqlalchemy) and no domain imports, so any module can depend on
@@ -44,7 +44,7 @@ class UploadSession:
 
     area: str
     key: str
-    upload_id: str
+    session_id: str
     max_bytes: int | None
     min_part_size: int
     max_part_size: int
@@ -146,14 +146,107 @@ class StateProvider(Protocol):
 
 
 @runtime_checkable
-class StorageProvider(Protocol):
-    """Object storage addressed by a key within a named *area*.
+class StorageObjects(Protocol):
+    """Whole-object persistence, metadata, deletion, and enumeration."""
+
+    def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
+    def get(self, area: str, key: str) -> bytes | None: ...
+    def stat(self, area: str, key: str) -> ObjectStat | None: ...
+    def exists(self, area: str, key: str) -> bool: ...
+    def delete(self, area: str, key: str) -> None: ...
+    def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
+    def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
+
+
+@runtime_checkable
+class StorageStreams(Protocol):
+    """Bounded-memory object reads and writes."""
+
+    def save_stream(
+        self,
+        area: str,
+        key: str,
+        source: BinaryIO,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> int: ...
+    def open_stream(
+        self,
+        area: str,
+        key: str,
+        *,
+        offset: int = 0,
+        length: int | None = None,
+    ) -> BinaryIO: ...
+
+
+@runtime_checkable
+class StorageDelivery(Protocol):
+    """Backend-efficient delivery without coupling to a web framework."""
+
+    def serve(
+        self,
+        area: str,
+        key: str,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+        expires_in: int = 3600,
+    ) -> ServePlan: ...
+    def url(
+        self,
+        area: str,
+        key: str,
+        expires_in: int = 3600,
+        *,
+        download_as: str | None = None,
+        content_type: str | None = None,
+    ) -> str: ...
+
+
+@runtime_checkable
+class StorageManagement(Protocol):
+    """Object-set mutation and backend readiness operations."""
+
+    def delete_prefix(self, area: str, prefix: str) -> int: ...
+    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None: ...
+    def check_writable(self) -> None: ...
+
+
+@runtime_checkable
+class ResumableUploads(Protocol):
+    """Durable multipart upload lifecycle and abandoned-session cleanup."""
+
+    def begin_upload(
+        self,
+        area: str,
+        key: str,
+        *,
+        max_bytes: int | None = None,
+        content_type: str | None = None,
+    ) -> UploadSession: ...
+    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
+    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
+    def abort_upload(self, session: UploadSession) -> None: ...
+    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
+
+
+@runtime_checkable
+class StorageProvider(
+    StorageObjects,
+    StorageStreams,
+    StorageDelivery,
+    StorageManagement,
+    ResumableUploads,
+    Protocol,
+):
+    """Complete object-storage capability assembled by :class:`Platform`.
 
     An area is a domain-owned namespace (e.g. ``"avatars"``, ``"exports"``) so
-    one backend serves every subsystem: locally it maps to a subdirectory, on S3
-    to a key prefix. The database stores only the key (the area is a fixed
-    constant of the calling domain); ``url`` is computed at serialization time so
-    migrating local -> S3 needs no data migration.
+    one backend serves every subsystem. The database stores only the key (the
+    area is a fixed constant of the calling domain); ``url`` is computed at
+    serialization time so migrating local -> S3 needs no data migration.
 
     ``save`` and ``get`` are the simple whole-object path for small blobs.
     ``save_stream`` and ``open_stream`` are the bounded-memory path for large
@@ -194,64 +287,6 @@ class StorageProvider(Protocol):
     host policy. The local backend logs a warning the first time it is handed a
     control it cannot honour.
     """
-
-    def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str: ...
-    def save_stream(
-        self,
-        area: str,
-        key: str,
-        source: BinaryIO,
-        *,
-        max_bytes: int | None = None,
-        content_type: str | None = None,
-    ) -> int: ...
-    def begin_upload(
-        self,
-        area: str,
-        key: str,
-        *,
-        max_bytes: int | None = None,
-        content_type: str | None = None,
-    ) -> UploadSession: ...
-    def upload_part(self, session: UploadSession, part_number: int, data: bytes) -> PartRef: ...
-    def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int: ...
-    def abort_upload(self, session: UploadSession) -> None: ...
-    def cleanup_uploads(self, *, older_than_epoch: float) -> int: ...
-    def get(self, area: str, key: str) -> bytes | None: ...
-    def open_stream(
-        self,
-        area: str,
-        key: str,
-        *,
-        offset: int = 0,
-        length: int | None = None,
-    ) -> BinaryIO: ...
-    def stat(self, area: str, key: str) -> ObjectStat | None: ...
-    def serve(
-        self,
-        area: str,
-        key: str,
-        *,
-        download_as: str | None = None,
-        content_type: str | None = None,
-        expires_in: int = 3600,
-    ) -> ServePlan: ...
-    def exists(self, area: str, key: str) -> bool: ...
-    def delete(self, area: str, key: str) -> None: ...
-    def delete_prefix(self, area: str, prefix: str) -> int: ...
-    def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None: ...
-    def list_keys(self, area: str, prefix: str = "") -> list[str]: ...
-    def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]: ...
-    def check_writable(self) -> None: ...
-    def url(
-        self,
-        area: str,
-        key: str,
-        expires_in: int = 3600,
-        *,
-        download_as: str | None = None,
-        content_type: str | None = None,
-    ) -> str: ...
 
 
 @runtime_checkable

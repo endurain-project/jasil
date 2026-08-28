@@ -46,6 +46,11 @@ modules:
 Adding a method to a protocol is **breaking** — every host-supplied backend would
 have to implement it. Adding an optional keyword argument with a default is not.
 
+`StorageObjects`, `StorageStreams`, `StorageDelivery`, `StorageManagement`, and
+`ResumableUploads` are composable slices. `StorageProvider` is their complete
+aggregate and remains the type of `Platform.storage`; URI-selected built-in
+backends implement every slice.
+
 ### Capability URI schemes
 
 An existing scheme continuing to resolve to the same backend. Adding a new scheme

@@ -19,7 +19,7 @@ import jasil.testing as jasil_testing
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.storage_local import LocalStorage
 from jasil.profile import DeploymentProfile
-from jasil.providers import ClockProvider
+from jasil.providers import ClockProvider, ServeFile
 
 
 @pytest.fixture(autouse=True)
@@ -87,7 +87,10 @@ class TestInstallTestPlatform:
 
         platform.storage.save("avatars", "1.bin", b"x")
 
-        assert (tmp_path / "avatars" / "1.bin").read_bytes() == b"x"
+        plan = platform.storage.serve("avatars", "1.bin")
+        assert isinstance(plan, ServeFile)
+        assert plan.path.is_relative_to(tmp_path)
+        assert plan.path.read_bytes() == b"x"
 
     def test_the_clock_is_controllable(self, tmp_path):
         clock = jasil_testing.FixedClock()

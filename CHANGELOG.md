@@ -22,7 +22,10 @@ under `jasil._core`, log message text, and the wording of error messages are not
 - Storage areas, keys, and prefixes must now be canonical slash-delimited paths.
   Dot components, repeated or trailing separators, and backslashes are rejected
   before I/O so local path normalization cannot address or delete a different
-  object set than S3.
+  object set than S3. Areas are single namespace components; hierarchy belongs
+  in keys, preserving the area/key boundary on every backend.
+- `UploadSession` exposes an opaque `session_id`; native backend upload IDs stay
+  private.
 
 ### Added
 
@@ -37,6 +40,18 @@ under `jasil._core`, log message text, and the wording of error messages are not
   sessions backed directly by native multipart upload operations.
 - Idempotent upload aborts and explicit age-based cleanup for abandoned local
   and S3 sessions.
+- Composable `StorageObjects`, `StorageStreams`, `StorageDelivery`,
+  `StorageManagement`, and `ResumableUploads` protocols. `StorageProvider`
+  remains their complete aggregate on `Platform.storage`.
+
+### Changed
+
+- Local storage uses a private versioned leaf-file layout so an object can
+  coexist with descendant keys, matching S3. Objects written by JASIL 0.3 and
+  earlier remain readable and migrate when overwritten.
+- S3 resumable sessions persist private manifests that map opaque session IDs to
+  native multipart uploads. Cleanup follows only those manifests and no longer
+  risks aborting unrelated multipart work under the configured prefix.
 
 ## [0.3.0]
 

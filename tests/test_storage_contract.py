@@ -21,11 +21,16 @@ from botocore.response import StreamingBody
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
+    ResumableUploads,
     ServeFile,
     ServeRedirect,
     ServeStream,
+    StorageDelivery,
+    StorageManagement,
+    StorageObjects,
     StorageProvider,
     StorageSizeLimitError,
+    StorageStreams,
     StorageUploadSessionError,
 )
 
@@ -216,6 +221,13 @@ class TestStorageProtocolConformance:
     def test_the_backend_satisfies_the_runtime_protocol(self, storage):
         assert isinstance(storage, StorageProvider)
 
+    @pytest.mark.parametrize(
+        "protocol",
+        [StorageObjects, StorageStreams, StorageDelivery, StorageManagement, ResumableUploads],
+    )
+    def test_the_backend_satisfies_each_composable_protocol(self, storage, protocol):
+        assert isinstance(storage, protocol)
+
 
 class TestStreamingConformance:
     def test_a_non_seekable_source_round_trips(self, storage):
@@ -389,6 +401,16 @@ class TestResumableUploadConformance:
             storage.begin_upload(AREA, KEY, max_bytes=-1)
 
 
+class TestS3UploadSessionOwnership:
+    def test_cleanup_does_not_abort_an_unregistered_multipart_upload(self):
+        client = _MemoryS3Client()
+        storage = S3Storage(client, "blobs", "jasil")
+        response = client.create_multipart_upload(Key="jasil/packages/external.bin")
+
+        assert storage.cleanup_uploads(older_than_epoch=1_000_000_000_000.0) == 0
+        assert response["UploadId"] in client.uploads
+
+
 class TestServingConformance:
     def test_a_serve_plan_reads_the_stored_object(self, storage):
         storage.save(AREA, KEY, b"package bytes", content_type="application/octet-stream")
@@ -437,6 +459,74 @@ class TestObjectStatConformance:
 
     def test_a_missing_object_has_no_stat(self, storage):
         assert storage.stat(AREA, "missing.bin") is None
+
+
+class TestKeyTopologyConformance:
+    @pytest.mark.parametrize("write_parent_first", [True, False])
+    def test_an_object_can_coexist_with_its_descendants(self, storage, write_parent_first):
+        objects = [
+            ("releases/1", b"manifest"),
+            ("releases/1/archive.bin", b"archive"),
+            ("releases/1/checksums/sha256.txt", b"checksum"),
+        ]
+        if not write_parent_first:
+            objects.reverse()
+
+        for key, data in objects:
+            storage.save(AREA, key, data)
+
+        assert storage.get(AREA, "releases/1") == b"manifest"
+        assert storage.get(AREA, "releases/1/archive.bin") == b"archive"
+        assert storage.get(AREA, "releases/1/checksums/sha256.txt") == b"checksum"
+        assert storage.list_keys(AREA, "releases/1") == [
+            "releases/1",
+            "releases/1/archive.bin",
+            "releases/1/checksums/sha256.txt",
+        ]
+
+    @pytest.mark.parametrize("write_parent_first", [True, False])
+    def test_logical_names_cannot_collide_with_private_layout_markers(self, storage, write_parent_first):
+        objects = [
+            ("tree/node", b"node"),
+            ("tree/node.jasil-blob/child", b"child"),
+        ]
+        if not write_parent_first:
+            objects.reverse()
+
+        for key, data in objects:
+            storage.save(AREA, key, data)
+
+        assert storage.get(AREA, "tree/node") == b"node"
+        assert storage.get(AREA, "tree/node.jasil-blob/child") == b"child"
+
+    def test_case_and_unicode_normalization_remain_distinct(self, storage):
+        objects = {
+            "tree/Node": b"upper",
+            "tree/node": b"lower",
+            "tree/caf\N{LATIN SMALL LETTER E WITH ACUTE}": b"composed",
+            "tree/cafe\N{COMBINING ACUTE ACCENT}": b"decomposed",
+        }
+
+        for key, data in objects.items():
+            storage.save(AREA, key, data)
+
+        assert {key: storage.get(AREA, key) for key in objects} == objects
+
+    def test_a_long_component_round_trips_without_exceeding_filesystem_name_limits(self, storage):
+        key = f"tree/{'x' * 200}.bin"
+
+        storage.save(AREA, key, b"long")
+
+        assert storage.get(AREA, key) == b"long"
+        assert storage.list_keys(AREA, "tree/") == [key]
+
+    def test_a_deep_key_round_trips_without_exceeding_filesystem_path_limits(self, storage):
+        key = "/".join("x" for _ in range(400))
+
+        storage.save(AREA, key, b"deep")
+
+        assert storage.get(AREA, key) == b"deep"
+        assert storage.list_keys(AREA, "x/") == [key]
 
 
 class TestCopyConformance:
@@ -546,10 +636,7 @@ class TestWritableConformance:
 
 
 class TestSegmentValidationConformance:
-    @pytest.mark.parametrize(
-        "area",
-        [".jasil-upload-sessions", ".jasil-upload-sessions/session"],
-    )
+    @pytest.mark.parametrize("area", [".jasil-objects", ".jasil-upload-sessions"])
     def test_the_private_upload_staging_area_is_reserved(self, storage, area):
         with pytest.raises(ValueError, match="reserved"):
             storage.begin_upload(area, KEY)
@@ -557,6 +644,14 @@ class TestSegmentValidationConformance:
             storage.save(area, KEY, b"data")
         with pytest.raises(ValueError, match="reserved"):
             storage.list_keys(area)
+
+    @pytest.mark.parametrize("operation", ["save", "begin_upload", "list_keys"])
+    def test_an_area_is_one_namespace_component(self, storage, operation):
+        call = getattr(storage, operation)
+        extra = (b"data",) if operation == "save" else ()
+
+        with pytest.raises(ValueError, match="single path component"):
+            call("tenant/avatars", KEY, *extra) if operation != "list_keys" else call("tenant/avatars")
 
     @pytest.mark.parametrize("field", ["area", "key"])
     @pytest.mark.parametrize(

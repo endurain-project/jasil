@@ -3,12 +3,12 @@
 **J**ust **A**nother **S**ubstrate & **I**nfrastructure **L**ibrary — a
 framework-agnostic infrastructure substrate for Python services.
 
-Your domain code depends on small capability protocols — state, storage, events,
-locks, a clock — instead of on Redis, S3, or Postgres directly. Which
-implementation backs each one is a URI in your configuration, so the same code
-runs single-process on a laptop and multi-replica in production.
+Your domain code depends on small composable capability protocols - state,
+storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
+Complete aggregate protocols keep URI-selected backends interchangeable, so the
+same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.1.0"
+!!! warning "Status: 0.4.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -16,7 +16,7 @@ runs single-process on a laptop and multi-replica in production.
 
 | Layer | What it does |
 |---|---|
-| **Providers** | Protocols your domain code depends on: `StateProvider`, `StorageProvider`, `EventBusProvider`, `LockProvider`, `ClockProvider`, `GeocodingProvider`. |
+| **Providers** | Narrow protocols domain services can depend on, plus complete aggregates such as `StorageProvider` for the assembled platform. |
 | **Backends** | A working implementation of each, selected by URI. |
 | **Deployment profiles** | `local` needs no infrastructure at all. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload versioning that survives a rolling deploy. |

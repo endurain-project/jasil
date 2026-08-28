@@ -61,10 +61,15 @@ pair.
   trailing-separator, and backslash-bearing values raise `ValueError`. The check
   is pure and shared, so **both** backends enforce one canonical slash-delimited
   grammar. Without it, local paths normalize aliases such as `.` and `a//b`
-  while S3 preserves them as distinct literal keys.
+  while S3 preserves them as distinct literal keys. An area is exactly one
+  component, so `(area="a/b", key="c")` cannot collapse onto
+  `(area="a", key="b/c")` in an object-store key.
 - The local backend additionally resolves the final path and requires it to stay
   under the base directory, and never follows a symlink out of an area when
-  listing. Resumable parts live under a reserved private staging directory;
+  listing. Logical objects use a reserved fixed-depth digest layout with
+  verified identity sidecars, avoiding path-length and file/directory collisions
+  between a key and its descendants without trusting the digest alone.
+  Resumable parts live under a separate reserved private staging directory;
   session manifests and part files are validated before they are read, and
   symbolic-link aliases are rejected.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
@@ -123,7 +128,10 @@ never interpolated from input.
   parts remain backend resources until completion, abort, or explicit
   `cleanup_uploads` maintenance. Parallel part calls may temporarily stage more
   than the session limit because completion is the authoritative aggregate
-  check.
+  check. S3 cleanup follows JASIL-owned manifests and cannot abort unrelated
+  multipart operations. Configure an S3 incomplete-multipart lifecycle rule as
+  a final safety net for a process death between native upload creation and
+  manifest persistence.
 
 What is **not** bounded: event `payload` and `metadata` size. A producer can
 write an arbitrarily large payload into the outbox. JASIL also does not limit

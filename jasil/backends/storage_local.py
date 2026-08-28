@@ -16,7 +16,13 @@ from typing import BinaryIO
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
-from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_listing_prefix, check_segment
+from jasil._core.storage_keys import (
+    OBJECT_STORAGE_AREA,
+    UPLOAD_STAGING_AREA,
+    check_area,
+    check_listing_prefix,
+    check_segment,
+)
 from jasil._core.storage_streams import non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
@@ -35,6 +41,13 @@ logger = logging.getLogger(__name__)
 #: tell an indifferent caller from one that will not get what it asked for.
 _DEFAULT_URL_EXPIRY_SECONDS = 3600
 _STREAM_CHUNK_BYTES = 1024 * 1024
+_OBJECTS_DIRECTORY = OBJECT_STORAGE_AREA
+_OBJECTS_LAYOUT_VERSION = "v1"
+_OBJECT_AREAS_DIRECTORY = "areas"
+_OBJECT_KEYS_DIRECTORY = "objects"
+_OBJECT_PAYLOAD_FILE = "object"
+_OBJECT_AREA_FILE = "area"
+_OBJECT_KEY_FILE = "key"
 _UPLOADS_DIRECTORY = UPLOAD_STAGING_AREA
 _UPLOAD_MANIFEST = "session.json"
 _UPLOAD_PARTS_DIRECTORY = "parts"
@@ -47,16 +60,23 @@ def _part_etag(data: bytes) -> str:
     return f'"sha256-{hashlib.sha256(data).hexdigest()}"'
 
 
+def _path_digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def _translate_local_stream_error(error: Exception) -> None:
     if isinstance(error, OSError):
         raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
 
 class LocalStorage:
-    """``StorageProvider`` storing blobs as files under a per-area subdirectory.
+    """``StorageProvider`` storing blobs in a versioned filesystem layout.
 
-    A blob for ``(area, key)`` lives at ``{base_dir}/{area}/{key}`` and is served
-    at ``{url_prefix}/{area}/{key}``. Keys are server-generated (e.g. ``42.webp``);
+    A logical ``(area, key)`` maps to a leaf file under
+    ``{base_dir}/.jasil-objects/v1``. The private encoding lets one key coexist
+    with its descendants, matching object storage. Objects written by JASIL
+    0.3 and earlier at ``{base_dir}/{area}/{key}`` remain readable and are
+    migrated when overwritten. Keys are server-generated (e.g. ``42.webp``);
     both area and key are validated so a stray value can never escape the base
     directory.
 
@@ -75,23 +95,131 @@ class LocalStorage:
         self._url_prefix = url_prefix.rstrip("/")
         self._warned_about_delivery_controls = False
 
-    def _resolve(self, area: str, key: str) -> Path:
-        """Resolve ``(area, key)`` to an absolute path, rejecting traversal outside base."""
+    def _resolve_storage_path(
+        self,
+        area: str,
+        key: str | None = None,
+        *,
+        legacy: bool = False,
+        object_file: bool = False,
+    ) -> Path:
         check_area(area)
-        check_segment(key, "key")
+        if key is not None:
+            check_segment(key, "key")
         try:
             base = self._base.resolve()
-            requested = base / area / key
+            requested = base
+            if not legacy:
+                requested = requested / _OBJECTS_DIRECTORY / _OBJECTS_LAYOUT_VERSION / _OBJECT_AREAS_DIRECTORY
+                area_digest = _path_digest(area)
+                requested = requested / area_digest[:2] / area_digest[2:]
+                requested /= _OBJECT_KEYS_DIRECTORY
+                if key is not None:
+                    key_digest = _path_digest(key)
+                    requested = requested / key_digest[:2] / key_digest[2:]
+                    if object_file:
+                        requested /= _OBJECT_PAYLOAD_FILE
+            else:
+                requested /= area
+                if key is not None:
+                    requested /= key
             candidate = requested.resolve()
         except RuntimeError as error:
-            raise ValueError(f"Storage path contains a symbolic link loop: {area}/{key!r}") from error
+            raise ValueError(f"Storage path contains a symbolic link loop: {area}/{key or ''!r}") from error
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         if not candidate.is_relative_to(base):
-            raise ValueError(f"Storage key escapes base directory: {area}/{key!r}")
+            raise ValueError(f"Storage key escapes base directory: {area}/{key or ''!r}")
         if candidate != requested:
-            raise ValueError(f"Storage path resolves through a symbolic link: {area}/{key!r}")
+            raise ValueError(f"Storage path resolves through a symbolic link: {area}/{key or ''!r}")
         return candidate
+
+    def _resolve(self, area: str, key: str) -> Path:
+        """Resolve a logical object address into the versioned local layout."""
+        return self._resolve_storage_path(area, key, object_file=True)
+
+    def _resolve_area(self, area: str, *, legacy: bool = False) -> Path:
+        return self._resolve_storage_path(area, legacy=legacy)
+
+    def _resolve_legacy(self, area: str, key: str) -> Path:
+        return self._resolve_storage_path(area, key, legacy=True)
+
+    def _write_identity(self, path: Path, value: str) -> None:
+        try:
+            if path.is_symlink():
+                raise StorageBackendUnavailableError("Local storage object identity path is unsafe")
+            existing = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path.write_text(value, encoding="utf-8")
+                os.replace(temporary_path, path)
+            except OSError as error:
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+            return
+        except OSError as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        if existing != value:
+            raise StorageBackendUnavailableError("Local storage object identity does not match its address")
+
+    def _prepare_object(self, area: str, key: str) -> Path:
+        path = self._resolve(area, key)
+        area_file = self._resolve_area(area).parent / _OBJECT_AREA_FILE
+        self._write_identity(area_file, area)
+        self._write_identity(path.parent / _OBJECT_KEY_FILE, key)
+        return path
+
+    def _verify_object_identity(self, area: str, key: str, path: Path) -> None:
+        area_file = self._resolve_area(area).parent / _OBJECT_AREA_FILE
+        key_file = path.parent / _OBJECT_KEY_FILE
+        try:
+            if area_file.is_symlink() or key_file.is_symlink():
+                raise StorageBackendUnavailableError("Local storage object identity path is unsafe")
+            stored_area = area_file.read_text(encoding="utf-8")
+            stored_key = key_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise StorageBackendUnavailableError("Local storage object identity is unavailable") from error
+        if stored_area != area or stored_key != key:
+            raise StorageBackendUnavailableError("Local storage object identity does not match its address")
+
+    @staticmethod
+    def _is_regular_file(path: Path) -> bool:
+        try:
+            return stat.S_ISREG(path.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+
+    def _current_object_path(self, area: str, key: str) -> Path | None:
+        path = self._resolve(area, key)
+        if self._is_regular_file(path):
+            self._verify_object_identity(area, key, path)
+            return path
+        return None
+
+    def _existing_object_path(self, area: str, key: str) -> Path | None:
+        path = self._current_object_path(area, key)
+        if path is not None:
+            return path
+        legacy_path = self._resolve_legacy(area, key)
+        if self._is_regular_file(legacy_path):
+            return legacy_path
+        return None
+
+    def _remove_legacy_object(self, area: str, key: str) -> None:
+        path = self._resolve_legacy(area, key)
+        try:
+            if stat.S_ISREG(path.stat().st_mode):
+                path.unlink()
+                self._prune_empty_directories(path.parent)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except OSError:
+            logger.warning("Failed to remove a migrated legacy local storage object")
 
     def _prune_empty_directories(self, directory: Path) -> None:
         try:
@@ -120,18 +248,18 @@ class LocalStorage:
         try:
             check_area(session.area)
             check_segment(session.key, "key")
-            normalized_upload_id = UUID(session.upload_id).hex
+            normalized_session_id = UUID(session.session_id).hex
         except (AttributeError, TypeError, ValueError) as error:
             raise StorageUploadSessionError("Upload session is not valid for local storage") from error
         if (
-            normalized_upload_id != session.upload_id
+            normalized_session_id != session.session_id
             or (session.max_bytes is not None and session.max_bytes < 0)
             or session.min_part_size != _UPLOAD_MIN_PART_SIZE
             or session.max_part_size != _UPLOAD_MAX_PART_SIZE
             or session.max_parts != _UPLOAD_MAX_PARTS
         ):
             raise StorageUploadSessionError("Upload session is not valid for local storage")
-        return self._upload_root() / session.upload_id
+        return self._upload_root() / session.session_id
 
     def _load_upload_session(self, session: UploadSession) -> Path:
         session_directory = self._validate_upload_session(session)
@@ -150,13 +278,20 @@ class LocalStorage:
             "version": 1,
             "area": session.area,
             "key": session.key,
-            "upload_id": session.upload_id,
+            "session_id": session.session_id,
             "max_bytes": session.max_bytes,
             "min_part_size": session.min_part_size,
             "max_part_size": session.max_part_size,
             "max_parts": session.max_parts,
         }
-        if not isinstance(manifest, dict) or any(manifest.get(field) != value for field, value in expected.items()):
+        created_epoch = manifest.get("created_epoch") if isinstance(manifest, dict) else None
+        if (
+            not isinstance(manifest, dict)
+            or any(manifest.get(field) != value for field, value in expected.items())
+            or isinstance(created_epoch, bool)
+            or not isinstance(created_epoch, int | float)
+            or not math.isfinite(created_epoch)
+        ):
             raise StorageUploadSessionError("Upload session does not match its durable state")
         return session_directory
 
@@ -222,12 +357,13 @@ class LocalStorage:
         return ordered, total
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
-        path = self._resolve(area, key)
+        path = self._prepare_object(area, key)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        self._remove_legacy_object(area, key)
         return key
 
     def save_stream(
@@ -239,9 +375,9 @@ class LocalStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int:
-        path = self._resolve(area, key)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Storage stream max_bytes must not be negative")
+        path = self._prepare_object(area, key)
         temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,6 +413,7 @@ class LocalStorage:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
             raise
+        self._remove_legacy_object(area, key)
         return total
 
     def begin_upload(
@@ -293,7 +430,7 @@ class LocalStorage:
         session = UploadSession(
             area=area,
             key=key,
-            upload_id=uuid4().hex,
+            session_id=uuid4().hex,
             max_bytes=max_bytes,
             min_part_size=_UPLOAD_MIN_PART_SIZE,
             max_part_size=_UPLOAD_MAX_PART_SIZE,
@@ -305,7 +442,7 @@ class LocalStorage:
             "version": 1,
             "area": area,
             "key": key,
-            "upload_id": session.upload_id,
+            "session_id": session.session_id,
             "max_bytes": max_bytes,
             "min_part_size": session.min_part_size,
             "max_part_size": session.max_part_size,
@@ -360,7 +497,7 @@ class LocalStorage:
             if uploaded[part.part_number][1] != part.size:
                 raise StorageUploadSessionError(f"Upload part {part.part_number} size does not match")
 
-        destination_path = self._resolve(session.area, session.key)
+        destination_path = self._prepare_object(session.area, session.key)
         temporary_path = destination_path.with_name(f".{destination_path.name}.{uuid4().hex}")
         try:
             destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,6 +528,7 @@ class LocalStorage:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
             raise
+        self._remove_legacy_object(session.area, session.key)
         try:
             shutil.rmtree(session_directory)
         except OSError:
@@ -412,26 +550,35 @@ class LocalStorage:
             raise ValueError("older_than_epoch must be finite")
         upload_root = self._upload_root()
         try:
-            candidates = list(upload_root.iterdir())
+            candidates = upload_root.iterdir()
         except FileNotFoundError:
             return 0
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
         removed = 0
-        for candidate in candidates:
-            try:
-                if candidate.is_symlink() or not candidate.is_dir():
+        first_error: OSError | None = None
+        try:
+            for candidate in candidates:
+                try:
+                    if candidate.is_symlink() or not candidate.is_dir():
+                        continue
+                    created_epoch = candidate.stat().st_mtime
+                    if created_epoch >= older_than_epoch:
+                        continue
+                    shutil.rmtree(candidate)
+                    removed += 1
+                except FileNotFoundError:
                     continue
-                created_epoch = candidate.stat().st_mtime
-                if created_epoch >= older_than_epoch:
-                    continue
-                shutil.rmtree(candidate)
-                removed += 1
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+                except OSError as error:
+                    if first_error is None:
+                        first_error = error
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        if first_error is not None:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from first_error
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
@@ -450,14 +597,23 @@ class LocalStorage:
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO:
-        path = self._resolve(area, key)
+        path = self._current_object_path(area, key)
         validate_stream_range(offset, length)
-        try:
-            source = path.open("rb")
-        except FileNotFoundError:
-            raise
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        if path is None:
+            path = self._resolve_legacy(area, key)
+            try:
+                source = path.open("rb")
+            except (FileNotFoundError, NotADirectoryError) as error:
+                raise FileNotFoundError(f"Storage object not found: {area}/{key}") from error
+            except OSError as error:
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        else:
+            try:
+                source = path.open("rb")
+            except FileNotFoundError as error:
+                raise FileNotFoundError(f"Storage object not found: {area}/{key}") from error
+            except OSError as error:
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         try:
             source.seek(offset)
         except OSError as error:
@@ -466,10 +622,12 @@ class LocalStorage:
         return non_seekable_reader(source, length=length, translate_error=_translate_local_stream_error)
 
     def stat(self, area: str, key: str) -> ObjectStat | None:
-        path = self._resolve(area, key)
+        path = self._current_object_path(area, key)
+        if path is None:
+            path = self._resolve_legacy(area, key)
         try:
             metadata = path.stat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             return None
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
@@ -486,7 +644,9 @@ class LocalStorage:
         content_type: str | None = None,
         expires_in: int = _DEFAULT_URL_EXPIRY_SECONDS,
     ) -> ServeFile:
-        path = self._resolve(area, key)
+        path = self._existing_object_path(area, key)
+        if path is None:
+            raise FileNotFoundError(f"Storage object not found: {area}/{key}")
         try:
             with path.open("rb"):
                 pass
@@ -502,21 +662,23 @@ class LocalStorage:
         return ServeFile(path)
 
     def exists(self, area: str, key: str) -> bool:
-        path = self._resolve(area, key)
-        try:
-            return stat.S_ISREG(path.stat().st_mode)
-        except FileNotFoundError:
-            return False
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        return self._existing_object_path(area, key) is not None
 
     def delete(self, area: str, key: str) -> None:
-        path = self._resolve(area, key)
+        current_path = self._current_object_path(area, key)
+        if current_path is not None:
+            try:
+                current_path.unlink()
+                (current_path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
+                self._prune_empty_directories(current_path.parent)
+            except OSError as error:
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        legacy_path = self._resolve_legacy(area, key)
         try:
-            if stat.S_ISREG(path.stat().st_mode):
-                path.unlink()
-                self._prune_empty_directories(path.parent)
-        except FileNotFoundError:
+            if stat.S_ISREG(legacy_path.stat().st_mode):
+                legacy_path.unlink()
+                self._prune_empty_directories(legacy_path.parent)
+        except (FileNotFoundError, NotADirectoryError):
             return
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
@@ -524,53 +686,29 @@ class LocalStorage:
     def delete_prefix(self, area: str, prefix: str) -> int:
         check_area(area)
         check_segment(prefix, "prefix")
-        root = self._resolve(area, prefix)
-        try:
-            mode = root.stat().st_mode
-        except FileNotFoundError:
-            return 0
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-
-        if stat.S_ISREG(mode):
-            try:
-                root.unlink()
-            except OSError as error:
-                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-            self._prune_empty_directories(root.parent)
-            return 1
-        if not stat.S_ISDIR(mode):
-            return 0
-
-        count = 0
-        try:
-            for candidate in root.rglob("*"):
-                if candidate.is_symlink():
-                    continue
-                if stat.S_ISREG(candidate.stat().st_mode):
-                    count += 1
-            shutil.rmtree(root)
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-        self._prune_empty_directories(root.parent)
-        return count
+        self._resolve_legacy(area, prefix)
+        descendant_prefix = f"{prefix}/"
+        keys = [key for key, _ in self.iter_objects(area, prefix) if key == prefix or key.startswith(descendant_prefix)]
+        for key in keys:
+            self.delete(area, key)
+        return len(keys)
 
     def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
         check_area(src_area)
         check_segment(src_key, "source key")
         check_area(dst_area)
         check_segment(dst_key, "destination key")
-        source_path = self._resolve(src_area, src_key)
-        destination_path = self._resolve(dst_area, dst_key)
+        if src_area == dst_area and src_key == dst_key:
+            if not self.exists(src_area, src_key):
+                raise FileNotFoundError(f"Storage object not found: {src_area}/{src_key}")
+            return
         try:
-            source = source_path.open("rb")
+            source = self.open_stream(src_area, src_key)
         except FileNotFoundError:
             raise
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         with source:
-            if source_path == destination_path:
-                return
             self.save_stream(dst_area, dst_key, source)
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
@@ -580,31 +718,55 @@ class LocalStorage:
         check_area(area)
         if prefix:
             check_listing_prefix(prefix)
-        try:
-            base = self._base.resolve()
-            requested_area = base / area
-            area_dir = requested_area.resolve()
-        except RuntimeError as error:
-            raise ValueError(f"Storage path contains a symbolic link loop: {area!r}") from error
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-        if not area_dir.is_relative_to(base):
-            return iter(())
-        if area_dir != requested_area:
-            raise ValueError(f"Storage path resolves through a symbolic link: {area!r}")
-        try:
-            if not stat.S_ISDIR(area_dir.stat().st_mode):
-                return iter(())
-        except FileNotFoundError:
-            return iter(())
-        except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        area_dir = self._resolve_area(area)
+        legacy_area = self._resolve_area(area, legacy=True)
 
         def objects() -> Iterator[tuple[str, float]]:
             try:
-                for candidate in area_dir.rglob("*"):
+                if stat.S_ISDIR(area_dir.stat().st_mode):
+                    area_file = area_dir.parent / _OBJECT_AREA_FILE
+                    if area_file.is_symlink():
+                        raise StorageBackendUnavailableError("Local storage area identity path is unsafe")
+                    area_identity = area_file.read_text(encoding="utf-8")
+                    if area_identity != area:
+                        raise StorageBackendUnavailableError("Local storage area identity does not match its address")
+                    for candidate in area_dir.rglob("*"):
+                        resolved = candidate.resolve()
+                        if (
+                            resolved != candidate
+                            or not resolved.is_relative_to(area_dir)
+                            or candidate.name != _OBJECT_PAYLOAD_FILE
+                        ):
+                            continue
+                        try:
+                            metadata = resolved.stat()
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(metadata.st_mode):
+                            continue
+                        try:
+                            key_file = candidate.parent / _OBJECT_KEY_FILE
+                            if key_file.is_symlink():
+                                continue
+                            key = key_file.read_text(encoding="utf-8")
+                            check_segment(key, "key")
+                        except (FileNotFoundError, UnicodeError, ValueError):
+                            continue
+                        if candidate != self._resolve(area, key):
+                            continue
+                        if key.startswith(prefix):
+                            yield key, metadata.st_mtime
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+
+            try:
+                if not stat.S_ISDIR(legacy_area.stat().st_mode):
+                    return
+                for candidate in legacy_area.rglob("*"):
                     resolved = candidate.resolve()
-                    if resolved != candidate or not resolved.is_relative_to(area_dir):
+                    if resolved != candidate or not resolved.is_relative_to(legacy_area):
                         continue
                     try:
                         metadata = resolved.stat()
@@ -612,9 +774,17 @@ class LocalStorage:
                         continue
                     if not stat.S_ISREG(metadata.st_mode):
                         continue
-                    key = candidate.relative_to(area_dir).as_posix()
-                    if key.startswith(prefix):
-                        yield key, metadata.st_mtime
+                    key = candidate.relative_to(legacy_area).as_posix()
+                    if not key.startswith(prefix):
+                        continue
+                    try:
+                        if self._current_object_path(area, key) is not None:
+                            continue
+                    except ValueError:
+                        continue
+                    yield key, metadata.st_mtime
+            except FileNotFoundError:
+                return
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
@@ -673,4 +843,9 @@ class LocalStorage:
             download_as=download_as,
             content_type=content_type,
         )
-        return f"{self._url_prefix}/{quote(area, safe='/')}/{quote(key, safe='/')}"
+        path = self._existing_object_path(area, key) or self._resolve(area, key)
+        try:
+            relative_path = path.relative_to(self._base.resolve()).as_posix()
+        except (OSError, ValueError) as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        return f"{self._url_prefix}/{quote(relative_path, safe='/')}"
