@@ -8,7 +8,6 @@ is asserted is the wiring, since the behaviour underneath is covered by
 :mod:`tests.test_jobs`.
 """
 
-import asyncio
 import threading
 import uuid
 
@@ -141,32 +140,6 @@ class TestWorkerLifecycle:
         jobs_service.stop_job_worker()
 
         assert jobs_service._worker is worker
-
-    @pytest.mark.asyncio
-    async def test_async_stop_does_not_block_the_event_loop(self, monkeypatch):
-        started = threading.Event()
-        release = threading.Event()
-
-        class BlockingStopWorker:
-            thread_name: str | None = None
-
-            def stop(self):
-                self.thread_name = threading.current_thread().name
-                started.set()
-                assert release.wait(timeout=WAIT_TIMEOUT)
-                return True
-
-        worker = BlockingStopWorker()
-        monkeypatch.setattr(jobs_service, "_worker", worker)
-        task = asyncio.create_task(jobs_service.stop_job_worker_async())
-        while not started.is_set():
-            await asyncio.sleep(0)
-
-        assert task.done() is False
-        assert worker.thread_name != threading.current_thread().name
-        release.set()
-        await task
-        assert jobs_service._worker is None
 
     def test_the_poll_interval_comes_from_settings(self):
         settings.configure(settings.JasilSettings(jobs=settings.JobSettings(poll_interval_seconds=0.25)))

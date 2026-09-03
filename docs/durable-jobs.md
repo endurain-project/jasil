@@ -245,8 +245,7 @@ which returns the job to `pending` with a fresh attempt budget.
 throughput, backlog age, and the dead-letter list for an operations dashboard.
 `jasil_admin.get_workers_summary()` reports running, stale, and gracefully
 stopped worker instances one bounded page at a time; pass its `next_cursor` into
-the next call. Async routes use the matching `_async` admin functions so database
-work runs outside the event loop. See [Observability](observability.md#worker-registry).
+the next call. See [Observability](observability.md#worker-registry).
 
 !!! note "Why `jasil.admin` and not `jasil.jobs.crud`"
     The CRUD layer is where these queries live, but it is the wrong thing to wire

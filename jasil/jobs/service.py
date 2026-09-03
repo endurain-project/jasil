@@ -9,7 +9,6 @@ single-runner lock — duplicate work is skipped or deduplicated rather than
 serialized. All of this is inert unless durable jobs are enabled.
 """
 
-import asyncio
 import logging
 import threading
 import uuid
@@ -173,11 +172,6 @@ def stop_job_worker() -> None:
     worker = _worker
     if worker.stop() and _worker is worker:
         _worker = None
-
-
-async def stop_job_worker_async() -> None:
-    """Stop the in-process worker without blocking the caller's event loop."""
-    await asyncio.to_thread(stop_job_worker)
 
 
 def _ensure_in_process_topology() -> None:

@@ -192,11 +192,11 @@ lint = "ruff check . --fix"
 format = "ruff format ."
 lint-check = "ruff check ."
 format-check = "ruff format --check ."
-imports-check = "lint-imports"
+lint-imports = "lint-imports"
 test = "pytest"
 typecheck = "mypy"
 validate = ["lint", "format", "test", "typecheck"]
-check = ["lint-check", "format-check", "imports-check", "test", "typecheck"]
+check = ["lint-check", "format-check", "lint-imports", "test", "typecheck"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

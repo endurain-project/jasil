@@ -102,8 +102,6 @@ through.
       messages and `event_metadata`.
 - [ ] Expose worker and queue summaries through host-owned authenticated routes.
       JASIL supplies typed reads, not FastAPI routes or UI.
-- [ ] In async routes and lifespans, await the `_async` admin and shutdown APIs.
-      The synchronous variants use database sessions and bounded thread joins.
 - [ ] Treat running/stale/stopped as operator telemetry. Decide alert and
       container-health policy in the host rather than mapping status to health
       automatically.
@@ -121,9 +119,8 @@ through.
 
 ## Shutdown
 
-- [ ] Call `jasil.lifecycle.shutdown()` from synchronous shutdown code, or await
-      `shutdown_async()` from an async lifespan. Both stop the durable-job worker
-      before releasing the bus its subscribers publish through.
+- [ ] Call `jasil.lifecycle.shutdown()` on the way down. It stops the durable-job
+      worker before releasing the bus its subscribers publish through.
 - [ ] Standalone workers must pass a stop event and set it from their signal
       handler so JASIL can record a graceful stop.
 - [ ] Stop your own scheduler and dispose your own engine — JASIL created neither

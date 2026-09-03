@@ -9,7 +9,6 @@ commits a session the caller handed it — because it is handed none.
 import base64
 import inspect
 import json
-import threading
 from datetime import timedelta
 
 import pytest
@@ -263,10 +262,6 @@ class TestItOwnsItsSessions:
             jasil_admin.get_event_log_summary,
             jasil_admin.get_workers_summary,
             jasil_admin.replay_dead_letter_job,
-            jasil_admin.get_jobs_summary_async,
-            jasil_admin.get_event_log_summary_async,
-            jasil_admin.get_workers_summary_async,
-            jasil_admin.replay_dead_letter_job_async,
         ],
     )
     def test_no_entry_point_accepts_a_session(self, function):
@@ -280,35 +275,6 @@ class TestItOwnsItsSessions:
         assert jasil_admin.get_event_log_summary() is not None
         assert jasil_admin.get_workers_summary() is not None
         assert jasil_admin.replay_dead_letter_job(job_id).replayed is True
-
-
-class TestAsyncEntryPoints:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("async_name", "sync_name", "args", "kwargs"),
-        [
-            ("get_jobs_summary_async", "get_jobs_summary", (), {"hours": 6}),
-            ("get_event_log_summary_async", "get_event_log_summary", (), {"hours": 6}),
-            ("get_workers_summary_async", "get_workers_summary", (), {"limit": 10}),
-            ("replay_dead_letter_job_async", "replay_dead_letter_job", ("job-1",), {}),
-        ],
-    )
-    async def test_sync_database_work_is_offloaded(self, monkeypatch, async_name, sync_name, args, kwargs):
-        calling_thread = threading.current_thread()
-        result = object()
-        worker_thread = None
-
-        def sync_call(*call_args, **call_kwargs):
-            nonlocal worker_thread
-            worker_thread = threading.current_thread()
-            assert call_args == args
-            assert all(call_kwargs[key] == value for key, value in kwargs.items())
-            return result
-
-        monkeypatch.setattr(jasil_admin, sync_name, sync_call)
-
-        assert await getattr(jasil_admin, async_name)(*args, **kwargs) is result
-        assert worker_thread is not calling_thread
 
 
 class TestSchemasAreReExported:

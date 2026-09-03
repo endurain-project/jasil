@@ -86,11 +86,10 @@ Status is derived when read:
 The default stale threshold is three configured heartbeat intervals; an
 operator can pass `stale_after_seconds=` explicitly. Status totals cover every
 retained worker, while `workers` is a cursor-paginated page of 100 by default and
-500 at most. In an async route, await `get_workers_summary_async()` instead of
-running the synchronous database query on the event loop. This is telemetry,
-not a health policy. The host owns HTTP routes, authentication, authorization,
-UI, alerts, and whether any worker state affects a container health endpoint.
-JASIL ships no route or UI and never changes host health automatically.
+500 at most. This is telemetry, not a health policy. The host owns HTTP routes,
+authentication, authorization, UI, alerts, and whether any worker state affects
+a container health endpoint. JASIL ships no route or UI and never changes host
+health automatically.
 
 ## Migrations
 
