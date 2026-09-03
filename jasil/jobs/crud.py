@@ -579,7 +579,7 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
                 lease_expires_at=None,
                 completed_at=None,
             )
-        )
+        ),
     )
     db.commit()
     return replayed.rowcount == 1

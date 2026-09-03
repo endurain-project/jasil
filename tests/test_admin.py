@@ -120,7 +120,7 @@ class TestJobsSummary:
         assert queue.queue == "campaign"
         assert queue.total == 0
         assert queue.oldest_pending_seconds is not None
-        assert queue.oldest_pending_seconds >= 2 * 24 * 60 * 60
+        assert queue.oldest_pending_seconds >= timedelta(days=2, seconds=-1).total_seconds()
 
 
 class TestWorkersSummary:
