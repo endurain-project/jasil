@@ -563,26 +563,26 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
     Returns:
         True when a dead-letter job was requeued; False when none matched.
     """
-    job = db.get(ProcessingJob, job_id)
-    if job is None or job.status != STATUS_DEAD_LETTER:
-        return False
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id, ProcessingJob.status == STATUS_DEAD_LETTER)
-        .values(
-            status=STATUS_PENDING,
-            attempts=0,
-            available_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-            completed_at=None,
+    replayed = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(ProcessingJob.id == job_id, ProcessingJob.status == STATUS_DEAD_LETTER)
+            .values(
+                status=STATUS_PENDING,
+                attempts=0,
+                available_at=now,
+                updated_at=now,
+                last_error=None,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+                completed_at=None,
+            )
         )
     )
     db.commit()
-    return True
+    return replayed.rowcount == 1
 
 
 def delete_completed_jobs_before(cutoff: datetime, *, db: Session, batch_size: int = pruning.PRUNE_BATCH_SIZE) -> int:

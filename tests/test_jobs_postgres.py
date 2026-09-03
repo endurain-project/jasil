@@ -34,6 +34,14 @@ def _postgres_only(db_engine):
         pytest.skip("requires the real PostgreSQL test service")
 
 
+@pytest.fixture
+def platform(tmp_path, monkeypatch):
+    """Publish a platform for public facades that resolve the process clock."""
+    built = container.build_platform(settings.JasilSettings(data_dir=str(tmp_path)))
+    monkeypatch.setattr(platform_runtime, "_active_platform", built)
+    return built
+
+
 class FixedClock:
     def __init__(self, moment: datetime = T0) -> None:
         self._moment = moment
@@ -240,7 +248,7 @@ def test_public_standalone_worker_selects_queues_and_records_its_lifecycle(
     assert workers.workers[0].queues == ["campaign"]
 
 
-def test_heartbeat_rows_distinguish_running_stale_and_graceful_stop(db):
+def test_heartbeat_rows_distinguish_running_stale_and_graceful_stop(db, platform):
     now = datetime.now(UTC)
     worker_registry.record_worker_start(
         "00000000-0000-4000-8000-000000000011",
@@ -295,7 +303,7 @@ def test_heartbeat_rows_distinguish_running_stale_and_graceful_stop(db):
     }
 
 
-def test_queue_and_worker_admin_summaries_match_concurrent_claims(db, session_factory):
+def test_queue_and_worker_admin_summaries_match_concurrent_claims(db, session_factory, platform):
     now = datetime.now(UTC)
     worker_ids = (
         "00000000-0000-4000-8000-000000000021",
