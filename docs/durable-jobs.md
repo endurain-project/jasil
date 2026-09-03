@@ -174,8 +174,9 @@ jobs_service.start_job_worker()  # in-process worker thread
 jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
 ```
 
-This worker consumes all named queues serially and fairly. SQLite supports
-exactly this topology: one API process and one in-process consumer. JASIL refuses
+This worker consumes all named queues serially and rotates the starting queue
+between batches for process-lifetime fairness. SQLite supports exactly this
+topology: one API process and one in-process consumer. JASIL refuses
 an in-process SQLite worker when `web_workers != 1`, and refuses a standalone
 SQLite worker because it has enough information to know those shapes are unsafe.
 
@@ -188,7 +189,8 @@ consumer:
 jobs_service.schedule_job_maintenance(scheduler)
 ```
 
-Standalone worker processes use the supported blocking entry point:
+Standalone worker processes use the supported blocking entry point. It must run
+in a dedicated worker process, never on an API request or event-loop thread:
 
 ```python
 import signal
@@ -213,6 +215,14 @@ Run several processes with the same queue to get competing consumers; PostgreSQL
 claims remain `FOR UPDATE SKIP LOCKED`, so each job is processed once per claim.
 Omit `queues` to consume all queues, and never pass an empty allowlist.
 
+During a rolling upgrade, an old relay can still write the database-side
+`default` queue. A selective new worker also adopts those legacy rows when the
+subscriber is now registered to one of its selected queues. It does not adopt
+rows belonging to a subscriber that is genuinely registered to `default`, so
+queue isolation remains intact while old writers drain. Conversely, a selective
+`default` worker excludes legacy rows for subscribers now assigned to a named
+queue; the two workers cannot race for the same compatibility row.
+
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
 unnecessary. Durable jobs use the database only; Redis is not a job-queue
@@ -234,7 +244,9 @@ which returns the job to `pending` with a fresh attempt budget.
 `jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
 throughput, backlog age, and the dead-letter list for an operations dashboard.
 `jasil_admin.get_workers_summary()` reports running, stale, and gracefully
-stopped worker instances; see [Observability](observability.md#worker-registry).
+stopped worker instances one bounded page at a time; pass its `next_cursor` into
+the next call. Async routes use the matching `_async` admin functions so database
+work runs outside the event loop. See [Observability](observability.md#worker-registry).
 
 !!! note "Why `jasil.admin` and not `jasil.jobs.crud`"
     The CRUD layer is where these queries live, but it is the wrong thing to wire
@@ -256,4 +268,11 @@ stopped worker instances; see [Observability](observability.md#worker-registry).
 
 `lease_seconds` must exceed the slowest realistic job duration. If a lease
 expires while a job is still running, the reaper requeues it and it runs twice
-concurrently — which your handler must tolerate anyway, but is wasteful.
+concurrently — which your handler must tolerate anyway, but is wasteful. A late
+worker finalizes with its worker id and attempt generation, so it cannot overwrite
+the replacement worker's newer claim.
+
+Queue rotation is intentionally in-memory and resets when a worker process
+restarts. It prevents starvation across batches in a healthy process; it is not
+a global scheduling guarantee across repeated crashes or deployments. Use
+queue-specific process groups when queues require independent capacity.

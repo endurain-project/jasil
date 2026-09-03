@@ -24,11 +24,20 @@ middle of::
     def replay(job_id: str) -> jasil_admin.JobReplayResult:
         return jasil_admin.replay_dead_letter_job(job_id)
 
+An async route must use the matching wrapper so its synchronous session work
+runs on a worker thread::
+
+    @router.get("/admin/workers")
+    async def workers_dashboard() -> jasil_admin.WorkersSummary:
+        return await jasil_admin.get_workers_summary_async()
+
 The response schemas are re-exported here so a host can type its routes without
 importing from an internal module. Authentication and authorization are the
 host's: these functions expose operational data and one state-changing action,
 and JASIL has no notion of who is calling.
 """
+
+import asyncio
 
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
@@ -62,9 +71,13 @@ __all__ = [
     "WorkerInfo",
     "WorkersSummary",
     "get_event_log_summary",
+    "get_event_log_summary_async",
     "get_jobs_summary",
+    "get_jobs_summary_async",
     "get_workers_summary",
+    "get_workers_summary_async",
     "replay_dead_letter_job",
+    "replay_dead_letter_job_async",
 ]
 
 
@@ -88,6 +101,11 @@ def get_jobs_summary(*, hours: int = 24, dead_letter_limit: int = 50) -> JobsSum
         return jobs_crud.get_jobs_summary(db, hours=hours, dead_letter_limit=dead_letter_limit)
 
 
+async def get_jobs_summary_async(*, hours: int = 24, dead_letter_limit: int = 50) -> JobsSummary:
+    """Return the jobs summary without blocking the caller's event loop."""
+    return await asyncio.to_thread(get_jobs_summary, hours=hours, dead_letter_limit=dead_letter_limit)
+
+
 def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventLogSummary:
     """Aggregate ``event_log`` into the observability dashboard payload.
 
@@ -108,8 +126,18 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
         return event_log_crud.get_event_log_summary(db, hours=hours, failure_limit=failure_limit)
 
 
-def get_workers_summary(*, stale_after_seconds: float | None = None) -> WorkersSummary:
-    """Return durable-worker telemetry with running/stale/stopped status.
+async def get_event_log_summary_async(*, hours: int = 24, failure_limit: int = 20) -> EventLogSummary:
+    """Return the event-log summary without blocking the caller's event loop."""
+    return await asyncio.to_thread(get_event_log_summary, hours=hours, failure_limit=failure_limit)
+
+
+def get_workers_summary(
+    *,
+    stale_after_seconds: float | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> WorkersSummary:
+    """Return global worker totals and one bounded telemetry page.
 
     Status is operator telemetry only: JASIL does not map it onto a host health
     endpoint or choose an alert policy.
@@ -117,6 +145,8 @@ def get_workers_summary(*, stale_after_seconds: float | None = None) -> WorkersS
     Args:
         stale_after_seconds: Maximum heartbeat age still considered running.
             Defaults to three configured heartbeat intervals.
+        limit: Page size from 1 through 500.
+        cursor: Opaque cursor returned as ``next_cursor`` by the previous page.
 
     Returns:
         Worker counts and retained worker-instance details.
@@ -133,7 +163,24 @@ def get_workers_summary(*, stale_after_seconds: float | None = None) -> WorkersS
             now=datetime.now(UTC),
             stale_after_seconds=effective_stale_after,
             db=db,
+            limit=limit,
+            cursor=cursor,
         )
+
+
+async def get_workers_summary_async(
+    *,
+    stale_after_seconds: float | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> WorkersSummary:
+    """Return a worker page without blocking the caller's event loop."""
+    return await asyncio.to_thread(
+        get_workers_summary,
+        stale_after_seconds=stale_after_seconds,
+        limit=limit,
+        cursor=cursor,
+    )
 
 
 def replay_dead_letter_job(job_id: str) -> JobReplayResult:
@@ -158,3 +205,8 @@ def replay_dead_letter_job(job_id: str) -> JobReplayResult:
     with jasil_orm.get_sessionmaker()() as db:
         replayed = jobs_crud.replay_dead_letter_job(job_id, now=now, db=db)
     return JobReplayResult(replayed=replayed)
+
+
+async def replay_dead_letter_job_async(job_id: str) -> JobReplayResult:
+    """Replay a dead-letter job without blocking the caller's event loop."""
+    return await asyncio.to_thread(replay_dead_letter_job, job_id)

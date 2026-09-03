@@ -31,7 +31,8 @@ matter — see below.
 
 With durable jobs enabled, the complete local shape is SQLite, one API process,
 and `start_job_worker()`. That one background consumer drains every named queue
-serially and fairly. It needs neither PostgreSQL nor Redis.
+serially and rotates queues fairly between batches for the lifetime of the
+process. It needs neither PostgreSQL nor Redis.
 
 ## distributed
 
@@ -160,3 +161,9 @@ you want it somewhere other than the log.
 
 Subscriber registration keeps the queue assignment, so no domain code changes.
 That is the point of depending on the providers rather than on infrastructure.
+
+Run the queue migration before deploying queue-aware code. During a rolling
+upgrade, previous-release relays still write `default`; new selective workers
+use the current subscriber registrations to route those compatibility rows to
+exactly one selected queue. Keep subscriber ids and queue assignments consistent
+across the new worker groups before starting them.

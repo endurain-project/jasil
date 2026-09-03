@@ -6,7 +6,10 @@ to provide: it is importable from anywhere in a host's import graph, and it neve
 commits a session the caller handed it — because it is handed none.
 """
 
+import base64
 import inspect
+import json
+import threading
 from datetime import timedelta
 
 import pytest
@@ -21,6 +24,11 @@ from jasil.events import new_event
 from jasil.jobs.models import JobWorker
 
 SUBSCRIBER = "invoice.render"
+
+
+def _opaque_worker_cursor(value: object) -> str:
+    payload = json.dumps(value, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 @pytest.fixture
@@ -47,8 +55,17 @@ def _dead_letter_job(db, now) -> str:
     event = new_event("order.created", {"order_id": 1}, source="api:create_order")
     job = jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=now, db=db)
     claimed_at = now + timedelta(seconds=1)
-    jobs_crud.claim_jobs(worker_id="worker-1", limit=10, lease_seconds=60, now=claimed_at, db=db)
-    jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=1, now=claimed_at, db=db)
+    claimed = jobs_crud.claim_jobs(worker_id="worker-1", limit=10, lease_seconds=60, now=claimed_at, db=db)[0]
+    jobs_crud.mark_job_failed(
+        job.id,
+        "boom",
+        worker_id="worker-1",
+        attempt=claimed.attempts,
+        base_seconds=1,
+        max_seconds=1,
+        now=claimed_at,
+        db=db,
+    )
     return job.id
 
 
@@ -146,6 +163,49 @@ class TestWorkersSummary:
 
         assert worker.active_claimed_jobs == 0
 
+    def test_workers_are_cursor_paginated_with_global_totals(self, platform, db, now):
+        db.add_all(
+            [
+                JobWorker(instance_id=instance_id, started_at=now, last_heartbeat_at=now, active_claimed_jobs=0)
+                for instance_id in ("worker-a", "worker-b", "worker-c")
+            ]
+        )
+        db.commit()
+
+        first = jasil_admin.get_workers_summary(limit=2)
+        second = jasil_admin.get_workers_summary(limit=2, cursor=first.next_cursor)
+
+        assert first.total_workers == second.total_workers == 3
+        assert first.running == second.running == 3
+        assert [worker.instance_id for worker in first.workers] == ["worker-c", "worker-b"]
+        assert [worker.instance_id for worker in second.workers] == ["worker-a"]
+        assert first.next_cursor is not None
+        assert second.next_cursor is None
+
+    @pytest.mark.parametrize("limit", [0, 501, True])
+    def test_worker_page_size_is_bounded(self, platform, limit):
+        with pytest.raises(ValueError, match="limit"):
+            jasil_admin.get_workers_summary(limit=limit)
+
+    @pytest.mark.parametrize("stale_after_seconds", [0, -1])
+    def test_the_stale_threshold_must_be_positive(self, platform, stale_after_seconds):
+        with pytest.raises(ValueError, match="stale_after_seconds"):
+            jasil_admin.get_workers_summary(stale_after_seconds=stale_after_seconds)
+
+    @pytest.mark.parametrize(
+        "cursor",
+        [
+            "",
+            "not-a-cursor",
+            _opaque_worker_cursor({"started_at": "2026-01-01T00:00:00+00:00"}),
+            _opaque_worker_cursor(["2026-01-01T00:00:00", "worker-1"]),
+            _opaque_worker_cursor(["2026-01-01T00:00:00+00:00", ""]),
+        ],
+    )
+    def test_an_invalid_worker_cursor_is_refused(self, platform, cursor):
+        with pytest.raises(ValueError, match="cursor"):
+            jasil_admin.get_workers_summary(cursor=cursor)
+
 
 class TestEventLogSummary:
     def test_it_reports_a_recorded_event(self, platform, db):
@@ -203,6 +263,10 @@ class TestItOwnsItsSessions:
             jasil_admin.get_event_log_summary,
             jasil_admin.get_workers_summary,
             jasil_admin.replay_dead_letter_job,
+            jasil_admin.get_jobs_summary_async,
+            jasil_admin.get_event_log_summary_async,
+            jasil_admin.get_workers_summary_async,
+            jasil_admin.replay_dead_letter_job_async,
         ],
     )
     def test_no_entry_point_accepts_a_session(self, function):
@@ -216,6 +280,35 @@ class TestItOwnsItsSessions:
         assert jasil_admin.get_event_log_summary() is not None
         assert jasil_admin.get_workers_summary() is not None
         assert jasil_admin.replay_dead_letter_job(job_id).replayed is True
+
+
+class TestAsyncEntryPoints:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("async_name", "sync_name", "args", "kwargs"),
+        [
+            ("get_jobs_summary_async", "get_jobs_summary", (), {"hours": 6}),
+            ("get_event_log_summary_async", "get_event_log_summary", (), {"hours": 6}),
+            ("get_workers_summary_async", "get_workers_summary", (), {"limit": 10}),
+            ("replay_dead_letter_job_async", "replay_dead_letter_job", ("job-1",), {}),
+        ],
+    )
+    async def test_sync_database_work_is_offloaded(self, monkeypatch, async_name, sync_name, args, kwargs):
+        calling_thread = threading.current_thread()
+        result = object()
+        worker_thread = None
+
+        def sync_call(*call_args, **call_kwargs):
+            nonlocal worker_thread
+            worker_thread = threading.current_thread()
+            assert call_args == args
+            assert all(call_kwargs[key] == value for key, value in kwargs.items())
+            return result
+
+        monkeypatch.setattr(jasil_admin, sync_name, sync_call)
+
+        assert await getattr(jasil_admin, async_name)(*args, **kwargs) is result
+        assert worker_thread is not calling_thread
 
 
 class TestSchemasAreReExported:

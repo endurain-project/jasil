@@ -36,7 +36,9 @@ deployment never loads `redis`, `boto3`, or `requests`.
 > layer is blocking Python, and the ORM integration expects a synchronous
 > `sessionmaker` — there is no `AsyncSession` support. On an async framework,
 > call into JASIL from a worker thread (a `def` FastAPI route or dependency does
-> this for you). See [the docs](https://jasil.endurain.com/#one-thing-it-cannot-do-yet).
+> this for you). Admin reads and lifecycle shutdown also provide `_async`
+> wrappers that perform their synchronous work off the event-loop thread. See
+> [the docs](https://jasil.endurain.com/#one-thing-it-cannot-do-yet).
 
 ## Installation
 

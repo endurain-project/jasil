@@ -6,6 +6,8 @@ to survive being called when the thing it is stopping was never started, or is
 already broken. Shutdown runs while something else is often already going wrong.
 """
 
+import threading
+
 import pytest
 
 import jasil.container as container
@@ -77,6 +79,21 @@ class TestShutdown:
         jasil_lifecycle.shutdown()
 
         assert order == ["worker", "platform"]
+
+    @pytest.mark.asyncio
+    async def test_async_shutdown_runs_off_the_event_loop_thread(self, monkeypatch):
+        calling_thread = threading.current_thread()
+        shutdown_thread = None
+
+        def record_shutdown():
+            nonlocal shutdown_thread
+            shutdown_thread = threading.current_thread()
+
+        monkeypatch.setattr(jasil_lifecycle, "shutdown", record_shutdown)
+
+        await jasil_lifecycle.shutdown_async()
+
+        assert shutdown_thread is not calling_thread
 
 
 class TestItToleratesAPartialStartup:

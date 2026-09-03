@@ -57,7 +57,8 @@ gets a UUIDv4 instance id on startup and records:
 
 - start, latest heartbeat, and graceful-stop timestamps;
 - its selected queues (`null` means all queues);
-- optional host-supplied role, label, and neutral metadata; and
+- optional host-supplied role, label, and neutral metadata, capped at 16 KiB of
+    serialized JSON; and
 - a heartbeat snapshot of its active claims. Public summaries derive the current
     count directly from `processing_jobs`, so reaping a crashed worker cannot leave
     phantom load on the dashboard.
@@ -69,7 +70,8 @@ are best-effort: a database error is logged and job execution continues.
 ```python
 import jasil.admin as jasil_admin
 
-workers = jasil_admin.get_workers_summary()
+workers = jasil_admin.get_workers_summary(limit=100)
+next_page = jasil_admin.get_workers_summary(limit=100, cursor=workers.next_cursor)
 queues = jasil_admin.get_jobs_summary().by_queue
 ```
 
@@ -82,10 +84,13 @@ Status is derived when read:
 | `stopped` | The worker recorded a graceful stop. |
 
 The default stale threshold is three configured heartbeat intervals; an
-operator can pass `stale_after_seconds=` explicitly. This is telemetry, not a
-health policy. The host owns HTTP routes, authentication, authorization, UI,
-alerts, and whether any worker state affects a container health endpoint. JASIL
-ships no route or UI and never changes host health automatically.
+operator can pass `stale_after_seconds=` explicitly. Status totals cover every
+retained worker, while `workers` is a cursor-paginated page of 100 by default and
+500 at most. In an async route, await `get_workers_summary_async()` instead of
+running the synchronous database query on the event loop. This is telemetry,
+not a health policy. The host owns HTTP routes, authentication, authorization,
+UI, alerts, and whether any worker state affects a container health endpoint.
+JASIL ships no route or UI and never changes host health automatically.
 
 ## Migrations
 

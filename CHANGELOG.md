@@ -6,6 +6,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [Unreleased]
+
+### Added
+
+- Named durable-job queues. Subscriber registrations default to `default` and
+  can select a validated queue; the relay persists it, all-queue workers rotate
+  fairly, and selective workers claim only an explicit non-empty allowlist.
+  `run_job_worker()` is the supported blocking standalone-worker API.
+- A portable `job_workers` registry with restart-unique instance ids, bounded
+  heartbeats that remain live during handlers, graceful-stop timestamps, queue
+  selection, optional host metadata, active-claim counts, derived
+  running/stale/stopped status, cursor-paginated public reads through
+  `jasil.admin`, 16 KiB worker-metadata bounds, and bounded retention.
+- Async admin and lifecycle wrappers that offload synchronous database work and
+  bounded thread joins from an application's event-loop thread.
+- Real PostgreSQL conformance for selective and competing workers,
+  `FOR UPDATE SKIP LOCKED`, deferred queue draining, lease recovery, worker
+  lifecycle status, and queue/worker summaries under concurrent claims.
+
+### Changed
+
+- Durable job leases now use the restart-unique worker instance UUID that also
+  keys telemetry. SQLite is explicitly limited to one API process with one
+  in-process all-queue consumer; standalone selective workers require a
+  concurrency-capable database such as PostgreSQL.
+- The queue migration backfills existing rows and keeps a database-side
+  `default` default so writers from the previous release remain compatible
+  during rolling deployment. Selective workers adopt only their subscribers'
+  legacy `default` rows, and selective `default` workers exclude subscribers
+  assigned to named queues.
+- Job completion and failure use the worker id plus attempt generation as a
+  compare-and-set token, so a handler that outlives its lease cannot overwrite a
+  replacement worker's newer claim.
+
 ## [0.4.0]
 
 ### Breaking
@@ -64,33 +98,6 @@ What counts as a breaking change — and what does not — is defined in [API st
 ### Changed
 
 - The local backend warns once when URL expiry or response-header controls are requested, because those controls belong to the host web server for `local://`. Existing whole-object `save`/`get` behavior remains available for small blobs.
-
-## [Unreleased]
-
-### Added
-
-- Named durable-job queues. Subscriber registrations default to `default` and
-  can select a validated queue; the relay persists it, all-queue workers rotate
-  fairly, and selective workers claim only an explicit non-empty allowlist.
-  `run_job_worker()` is the supported blocking standalone-worker API.
-- A portable `job_workers` registry with restart-unique instance ids, bounded
-  heartbeats that remain live during handlers, graceful-stop timestamps, queue
-  selection, optional host metadata, active-claim counts, derived
-  running/stale/stopped status, public reads through `jasil.admin`, and bounded
-  retention.
-- Real PostgreSQL conformance for selective and competing workers,
-  `FOR UPDATE SKIP LOCKED`, deferred queue draining, lease recovery, worker
-  lifecycle status, and queue/worker summaries under concurrent claims.
-
-### Changed
-
-- Durable job leases now use the restart-unique worker instance UUID that also
-  keys telemetry. SQLite is explicitly limited to one API process with one
-  in-process all-queue consumer; standalone selective workers require a
-  concurrency-capable database such as PostgreSQL.
-- The queue migration backfills existing rows and keeps a database-side
-  `default` default so writers from the previous release remain compatible
-  during rolling deployment.
 
 ## [0.1.1]
 

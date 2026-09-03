@@ -13,8 +13,8 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
-from jasil._core.limits import MAX_WORKER_LABEL_LENGTH, MAX_WORKER_ROLE_LENGTH, check_length
-from jasil._core.threads import signal_and_join
+from jasil._core.threads import STOP_JOIN_TIMEOUT_SECONDS, signal_and_join
+from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.registry import normalize_queue_selector
 from jasil.jobs.runner import JobRunner
 from jasil.providers import ClockProvider
@@ -40,10 +40,7 @@ class WorkerTelemetry:
         if heartbeat_interval_seconds <= 0:
             raise ValueError("heartbeat_interval_seconds must be greater than zero")
         selected_queues = normalize_queue_selector(queues)
-        if role is not None:
-            check_length(role, field="role", limit=MAX_WORKER_ROLE_LENGTH)
-        if label is not None:
-            check_length(label, field="label", limit=MAX_WORKER_LABEL_LENGTH)
+        normalized_metadata = normalize_worker_metadata(role=role, label=label, metadata=metadata)
         self._instance_id = instance_id
         self._clock = clock
         self._session_factory = session_factory
@@ -51,7 +48,7 @@ class WorkerTelemetry:
         self._queues = selected_queues
         self._role = role
         self._label = label
-        self._metadata = dict(metadata) if metadata is not None else None
+        self._metadata = normalized_metadata
         self._started_at: datetime | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -59,7 +56,9 @@ class WorkerTelemetry:
     def start(self) -> None:
         """Record startup and begin bounded periodic heartbeats."""
         if self._thread is not None:
-            return
+            if self._thread.is_alive():
+                return
+            self._thread = None
         self._started_at = self._clock.now()
         self._write_start()
         self._stop.clear()
@@ -70,11 +69,14 @@ class WorkerTelemetry:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
         """Stop periodic heartbeats and record a graceful shutdown."""
-        thread, self._thread = self._thread, None
-        signal_and_join(thread, self._stop)
+        thread = self._thread
+        stopped = signal_and_join(thread, self._stop)
+        if stopped and self._thread is thread:
+            self._thread = None
         self._write_stop()
+        return stopped
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(self._heartbeat_interval_seconds):
@@ -188,6 +190,11 @@ class BackgroundWorker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    @property
+    def is_alive(self) -> bool:
+        """Whether this worker still owns a running thread."""
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         """
         Start the worker thread (idempotent).
@@ -199,7 +206,9 @@ class BackgroundWorker:
             None.
         """
         if self._thread is not None:
-            return
+            if self._thread.is_alive():
+                return
+            self._thread = None
         self._stop.clear()
         self._thread = threading.Thread(
             target=run_worker,
@@ -214,7 +223,7 @@ class BackgroundWorker:
         )
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, timeout: float = STOP_JOIN_TIMEOUT_SECONDS) -> bool:
         """
         Signal the worker thread and wait briefly for it to finish.
 
@@ -222,7 +231,11 @@ class BackgroundWorker:
             None.
 
         Returns:
-            None.
+            True when the worker stopped, otherwise False. A timed-out live
+            thread remains attached so another worker cannot overlap it.
         """
-        thread, self._thread = self._thread, None
-        signal_and_join(thread, self._stop)
+        thread = self._thread
+        stopped = signal_and_join(thread, self._stop, timeout=timeout)
+        if stopped and self._thread is thread:
+            self._thread = None
+        return stopped

@@ -133,7 +133,7 @@ class WorkerInfo(BaseModel):
 
 
 class WorkersSummary(BaseModel):
-    """Current and retained durable-worker telemetry."""
+    """Global worker totals and one bounded page of retained telemetry."""
 
     stale_after_seconds: float
     total_workers: int
@@ -141,3 +141,4 @@ class WorkersSummary(BaseModel):
     stale: int
     stopped: int
     workers: list[WorkerInfo]
+    next_cursor: str | None = None

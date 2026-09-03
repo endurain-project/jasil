@@ -22,6 +22,7 @@ import jasil.jobs._worker_registry as worker_registry
 import jasil.jobs.crud as jobs_crud
 from jasil._core.threads import signal_and_join
 from jasil.events import new_event
+from jasil.jobs._worker_metadata import MAX_WORKER_METADATA_BYTES
 from jasil.jobs.models import JobWorker
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -141,6 +142,19 @@ class SignallingRunner:
         return 0
 
 
+class BlockingRunner:
+    """Hold one handler-like iteration until the test explicitly releases it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run_once(self) -> int:
+        self.started.set()
+        assert self.release.wait(timeout=WAIT_TIMEOUT)
+        return 1
+
+
 class TestBackgroundWorker:
     @pytest.fixture
     def worker(self):
@@ -191,6 +205,25 @@ class TestBackgroundWorker:
 
         assert worker._thread is not None
         assert worker._runner.ran.wait(timeout=WAIT_TIMEOUT)
+
+    def test_a_timed_out_thread_is_retained_and_cannot_be_overlapped(self):
+        runner = BlockingRunner()
+        worker = BackgroundWorker(runner, poll_interval_seconds=0)
+        worker.start()
+        assert runner.started.wait(timeout=WAIT_TIMEOUT)
+        original = worker._thread
+
+        assert worker.stop(timeout=0.01) is False
+        assert worker._thread is original
+        worker.start()
+        assert worker._thread is original
+
+        runner.release.set()
+        original.join(timeout=WAIT_TIMEOUT)
+        assert not original.is_alive()
+        worker.start()
+        assert worker._thread is not original
+        worker.stop()
 
 
 class StepClock:
@@ -297,6 +330,32 @@ class TestWorkerTelemetry:
             assert stopped.stopped_at is not None
             assert stopped.active_claimed_jobs == 0
 
+    def test_heartbeat_recreates_a_missing_start_record(self, worker_database):
+        heartbeat_at = T0 + timedelta(seconds=5)
+        with worker_database() as db:
+            worker_registry.record_worker_heartbeat(
+                "00000000-0000-4000-8000-000000000004",
+                started_at=T0,
+                now=heartbeat_at,
+                queues=("campaign",),
+                role="processor",
+                label="campaign-1",
+                metadata={"zone": "test"},
+                db=db,
+            )
+
+        with worker_database() as db:
+            worker = db.get(JobWorker, "00000000-0000-4000-8000-000000000004")
+            assert worker is not None
+            assert worker.last_heartbeat_at == heartbeat_at.replace(tzinfo=None)
+            assert worker.queues == ["campaign"]
+            assert worker.worker_metadata == {"zone": "test"}
+
+    def test_stopping_an_unknown_worker_is_a_no_op(self, worker_database):
+        with worker_database() as db:
+            worker_registry.record_worker_stop("missing", now=T0, db=db)
+            assert db.get(JobWorker, "missing") is None
+
     def test_a_heartbeat_failure_does_not_kill_job_execution(self, worker_database, monkeypatch, caplog):
         heartbeat_attempted = threading.Event()
         release_handler = threading.Event()
@@ -369,6 +428,25 @@ class TestWorkerTelemetry:
                 heartbeat_interval_seconds=1,
                 queues=None,
                 **kwargs,
+            )
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            {"value": "x" * MAX_WORKER_METADATA_BYTES},
+            {"value": object()},
+            {"value": float("nan")},
+        ],
+    )
+    def test_invalid_worker_metadata_fails_before_a_thread_starts(self, worker_database, metadata):
+        with pytest.raises(ValueError, match="worker metadata"):
+            WorkerTelemetry(
+                instance_id="00000000-0000-4000-8000-000000000003",
+                clock=StepClock(),
+                session_factory=worker_database,
+                heartbeat_interval_seconds=1,
+                queues=None,
+                metadata=metadata,
             )
 
 

@@ -18,18 +18,19 @@ composes them, so the ordering lives in one place instead of in every host::
     async def lifespan(app: FastAPI):
         ...
         yield
-        jasil_lifecycle.shutdown()
+        await jasil_lifecycle.shutdown_async()
 
 What it deliberately leaves alone is what the *host* owns: the APScheduler
 instance passed to ``schedule_job_maintenance``, and the database engine behind
 the session factory. JASIL never created either, so it does not close them.
 """
 
+import asyncio
 import logging
 
 import jasil.runtime as platform_runtime
 
-__all__ = ["shutdown"]
+__all__ = ["shutdown", "shutdown_async"]
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,11 @@ def shutdown() -> None:
     _stop_job_worker()
     _close_platform()
     platform_runtime.reset()
+
+
+async def shutdown_async() -> None:
+    """Run ordered shutdown without blocking the caller's event loop."""
+    await asyncio.to_thread(shutdown)
 
 
 def _stop_job_worker() -> None:

@@ -8,6 +8,7 @@ is asserted is the wiring, since the behaviour underneath is covered by
 :mod:`tests.test_jobs`.
 """
 
+import asyncio
 import threading
 import uuid
 
@@ -20,6 +21,7 @@ import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.jobs.relay as jobs_relay
 import jasil.jobs.service as jobs_service
+import jasil.jobs.worker as jobs_worker
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import new_event
@@ -95,7 +97,7 @@ class TestBuildRunner:
 
 class TestWorkerLifecycle:
     @pytest.fixture(autouse=True)
-    def idle_runner(self, monkeypatch):
+    def idle_runner(self, platform, session_factory, monkeypatch):
         monkeypatch.setattr(jobs_service, "build_runner", IdleRunner)
         monkeypatch.setattr(jobs_service, "_build_worker_telemetry", lambda *args, **kwargs: None)
 
@@ -112,6 +114,14 @@ class TestWorkerLifecycle:
 
         assert jobs_service._worker is first
 
+    def test_a_retained_worker_can_be_replaced_after_its_thread_exits(self, monkeypatch):
+        finished_worker = type("FinishedWorker", (), {"is_alive": False, "stop": lambda self: True})()
+        monkeypatch.setattr(jobs_service, "_worker", finished_worker)
+
+        jobs_service.start_job_worker()
+
+        assert jobs_service._worker is not finished_worker
+
     def test_stopping_clears_the_worker(self):
         jobs_service.start_job_worker()
 
@@ -122,6 +132,40 @@ class TestWorkerLifecycle:
     def test_stopping_when_none_is_running_is_a_no_op(self):
         jobs_service.stop_job_worker()
 
+        assert jobs_service._worker is None
+
+    def test_a_timed_out_worker_handle_is_retained(self, monkeypatch):
+        worker = type("TimedOutWorker", (), {"stop": lambda self: False})()
+        monkeypatch.setattr(jobs_service, "_worker", worker)
+
+        jobs_service.stop_job_worker()
+
+        assert jobs_service._worker is worker
+
+    @pytest.mark.asyncio
+    async def test_async_stop_does_not_block_the_event_loop(self, monkeypatch):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingStopWorker:
+            thread_name: str | None = None
+
+            def stop(self):
+                self.thread_name = threading.current_thread().name
+                started.set()
+                assert release.wait(timeout=WAIT_TIMEOUT)
+                return True
+
+        worker = BlockingStopWorker()
+        monkeypatch.setattr(jobs_service, "_worker", worker)
+        task = asyncio.create_task(jobs_service.stop_job_worker_async())
+        while not started.is_set():
+            await asyncio.sleep(0)
+
+        assert task.done() is False
+        assert worker.thread_name != threading.current_thread().name
+        release.set()
+        await task
         assert jobs_service._worker is None
 
     def test_the_poll_interval_comes_from_settings(self):
@@ -153,6 +197,39 @@ class TestStandaloneWorker:
     def test_an_empty_queue_allowlist_fails_before_the_loop(self, platform, session_factory):
         with pytest.raises(ValueError, match="queues"):
             jobs_service.run_job_worker(queues=(), stop=threading.Event())
+
+    def test_supported_topology_wires_runner_telemetry_and_stop_event(
+        self,
+        platform,
+        session_factory,
+        monkeypatch,
+    ):
+        stop = threading.Event()
+        captured = {}
+
+        def record_run(runner, *, poll_interval_seconds, stop, telemetry):
+            captured.update(
+                runner=runner,
+                poll_interval_seconds=poll_interval_seconds,
+                stop=stop,
+                telemetry=telemetry,
+            )
+
+        monkeypatch.setattr(jobs_service, "_ensure_standalone_topology", lambda: None)
+        monkeypatch.setattr(jobs_worker, "run_worker", record_run)
+
+        jobs_service.run_job_worker(
+            queues=("campaign",),
+            role="domain-worker",
+            label="campaign-1",
+            metadata={"zone": "test"},
+            stop=stop,
+        )
+
+        assert captured["runner"].queues == ("campaign",)
+        assert captured["telemetry"]._queues == ("campaign",)
+        assert captured["telemetry"]._role == "domain-worker"
+        assert captured["stop"] is stop
 
 
 class TestScheduledRelay:

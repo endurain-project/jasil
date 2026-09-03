@@ -155,6 +155,14 @@ class JobHandlerRegistry:
         """
         return frozenset(self._handlers)
 
+    def _subscriber_ids_for_queues(self, queues: Iterable[str]) -> tuple[str, ...]:
+        """Return registered subscriber ids assigned to the selected queues."""
+        selected = normalize_queue_selector(queues)
+        if selected is None:
+            return tuple(self._handlers)
+        selected_set = frozenset(selected)
+        return tuple(subscriber_id for subscriber_id, queue in self._queues.items() if queue in selected_set)
+
     def clear(self) -> None:
         """Remove every registration (used to reset state between tests)."""
         self._handlers.clear()

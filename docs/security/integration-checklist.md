@@ -31,6 +31,9 @@ through.
 - [ ] Upgrade through JASIL's packaged revisions before rolling out queue-aware
       code. The queue column is non-null and has a database-side `default`
       default so previous-release writers remain valid during the rollout.
+      Selective new workers adopt legacy `default` rows only for subscribers
+      assigned to their queues, and a selective `default` worker excludes
+      subscribers assigned to named queues.
 
 ## Secrets and event payloads
 
@@ -38,6 +41,8 @@ through.
       verbatim in three tables, serialized onto the Redis stream, and `metadata`
       is logged in full when a best-effort subscriber fails. Carry identifiers.
 - [ ] Never put a token, password, key, or personal data in either.
+- [ ] Apply the same rule to worker metadata. It appears in operator summaries
+      and is capped at 16 KiB of serialized JSON.
 - [ ] Remember that a dead-lettered job keeps its payload indefinitely — those
       rows are deliberately never pruned.
 
@@ -84,7 +89,9 @@ through.
 - [ ] Remember that durable jobs do not require Redis. Do not introduce a second
       queue as a source of truth beside `processing_jobs`.
 - [ ] Set `lease_seconds` above the longest handler duration. Heartbeats remain
-      live during a long handler, but they do not extend the job lease.
+      live during a long handler, but they do not extend the job lease. A stale
+      worker cannot finalize over a replacement claim, but both handlers may
+      already have performed external side effects, so idempotency still matters.
 
 ## The admin surface
 
@@ -95,6 +102,8 @@ through.
       messages and `event_metadata`.
 - [ ] Expose worker and queue summaries through host-owned authenticated routes.
       JASIL supplies typed reads, not FastAPI routes or UI.
+- [ ] In async routes and lifespans, await the `_async` admin and shutdown APIs.
+      The synchronous variants use database sessions and bounded thread joins.
 - [ ] Treat running/stale/stopped as operator telemetry. Decide alert and
       container-health policy in the host rather than mapping status to health
       automatically.
@@ -112,8 +121,9 @@ through.
 
 ## Shutdown
 
-- [ ] Call `jasil.lifecycle.shutdown()` on the way down. It stops the durable-job
-      worker before releasing the bus its subscribers publish through.
+- [ ] Call `jasil.lifecycle.shutdown()` from synchronous shutdown code, or await
+      `shutdown_async()` from an async lifespan. Both stop the durable-job worker
+      before releasing the bus its subscribers publish through.
 - [ ] Standalone workers must pass a stop event and set it from their signal
       handler so JASIL can record a graceful stop.
 - [ ] Stop your own scheduler and dispose your own engine — JASIL created neither

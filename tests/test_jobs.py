@@ -293,7 +293,7 @@ class TestCompletion:
         job = _enqueue(event, db)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
 
-        jobs_crud.mark_job_completed(job.id, now=T0, db=db)
+        assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
 
         stored = jobs_crud.get_job(job.id, db)
         assert stored.status == jobs_crud.STATUS_COMPLETED
@@ -302,7 +302,7 @@ class TestCompletion:
     def test_a_completed_job_is_never_claimed_again(self, db, event):
         job = _enqueue(event, db)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
-        jobs_crud.mark_job_completed(job.id, now=T0, db=db)
+        jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db)
 
         assert jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db) == []
 
@@ -315,7 +315,16 @@ class TestFailureAndBackoff:
         _enqueue(event, db, max_attempts=3)
         job = self._claim(db)
 
-        status = jobs_crud.mark_job_failed(job.id, "boom", base_seconds=10, max_seconds=100, now=T0, db=db)
+        status = jobs_crud.mark_job_failed(
+            job.id,
+            "boom",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=10,
+            max_seconds=100,
+            now=T0,
+            db=db,
+        )
 
         assert status == jobs_crud.STATUS_PENDING
         assert as_utc(jobs_crud.get_job(job.id, db).available_at) > T0
@@ -324,7 +333,16 @@ class TestFailureAndBackoff:
         _enqueue(event, db)
         job = self._claim(db)
 
-        jobs_crud.mark_job_failed(job.id, "downstream exploded", base_seconds=10, max_seconds=100, now=T0, db=db)
+        jobs_crud.mark_job_failed(
+            job.id,
+            "downstream exploded",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=10,
+            max_seconds=100,
+            now=T0,
+            db=db,
+        )
 
         assert "downstream exploded" in jobs_crud.get_job(job.id, db).last_error
 
@@ -332,7 +350,16 @@ class TestFailureAndBackoff:
         _enqueue(event, db)
         job = self._claim(db)
 
-        jobs_crud.mark_job_failed(job.id, "boom", base_seconds=10, max_seconds=100, now=T0, db=db)
+        jobs_crud.mark_job_failed(
+            job.id,
+            "boom",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=10,
+            max_seconds=100,
+            now=T0,
+            db=db,
+        )
 
         stored = jobs_crud.get_job(job.id, db)
         assert stored.locked_by is None
@@ -342,7 +369,16 @@ class TestFailureAndBackoff:
         _enqueue(event, db, max_attempts=1)
         job = self._claim(db)
 
-        status = jobs_crud.mark_job_failed(job.id, "boom", base_seconds=10, max_seconds=100, now=T0, db=db)
+        status = jobs_crud.mark_job_failed(
+            job.id,
+            "boom",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=10,
+            max_seconds=100,
+            now=T0,
+            db=db,
+        )
 
         assert status == jobs_crud.STATUS_DEAD_LETTER
         assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_DEAD_LETTER
@@ -350,12 +386,33 @@ class TestFailureAndBackoff:
     def test_a_dead_lettered_job_is_never_claimed_again(self, db, event):
         _enqueue(event, db, max_attempts=1)
         job = self._claim(db)
-        jobs_crud.mark_job_failed(job.id, "boom", base_seconds=10, max_seconds=100, now=T0, db=db)
+        jobs_crud.mark_job_failed(
+            job.id,
+            "boom",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=10,
+            max_seconds=100,
+            now=T0,
+            db=db,
+        )
 
         assert jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db) == []
 
     def test_failing_an_unknown_job_reports_no_status(self, db):
-        assert jobs_crud.mark_job_failed("nope", "boom", base_seconds=1, max_seconds=2, now=T0, db=db) == ""
+        assert (
+            jobs_crud.mark_job_failed(
+                "nope",
+                "boom",
+                worker_id="w1",
+                attempt=1,
+                base_seconds=1,
+                max_seconds=2,
+                now=T0,
+                db=db,
+            )
+            == ""
+        )
 
 
 class TestBackoffSchedule:
@@ -436,12 +493,62 @@ class TestLeaseReclamation:
     def test_nothing_to_reclaim_returns_zero(self, db):
         assert jobs_crud.reclaim_expired_leases(now=T0, db=db) == 0
 
+    @pytest.mark.parametrize("outcome", ["completed", "failed"])
+    def test_a_stale_owner_cannot_finalize_a_replacement_claim(self, db, event, outcome):
+        job = _enqueue(event, db, max_attempts=3)
+        first = jobs_crud.claim_jobs(worker_id="worker-a", limit=1, lease_seconds=60, now=T0, db=db)[0]
+        reclaimed_at = T0 + timedelta(seconds=61)
+        jobs_crud.reclaim_expired_leases(now=reclaimed_at, db=db)
+        replacement = jobs_crud.claim_jobs(
+            worker_id="worker-b",
+            limit=1,
+            lease_seconds=60,
+            now=reclaimed_at,
+            db=db,
+        )[0]
+
+        if outcome == "completed":
+            finalized = jobs_crud.mark_job_completed(
+                job.id,
+                worker_id="worker-a",
+                attempt=first.attempts,
+                now=reclaimed_at,
+                db=db,
+            )
+            assert finalized is False
+        else:
+            finalized = jobs_crud.mark_job_failed(
+                job.id,
+                "late failure",
+                worker_id="worker-a",
+                attempt=first.attempts,
+                base_seconds=1,
+                max_seconds=2,
+                now=reclaimed_at,
+                db=db,
+            )
+            assert finalized == ""
+
+        stored = jobs_crud.get_job(job.id, db)
+        assert stored.status == jobs_crud.STATUS_CLAIMED
+        assert stored.locked_by == "worker-b"
+        assert stored.attempts == replacement.attempts
+
 
 class TestDeadLetterReplay:
     def test_a_dead_lettered_job_can_be_replayed(self, db, event):
         _enqueue(event, db, max_attempts=1)
         job = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)[0]
-        jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=2, now=T0, db=db)
+        jobs_crud.mark_job_failed(
+            job.id,
+            "boom",
+            worker_id="w1",
+            attempt=1,
+            base_seconds=1,
+            max_seconds=2,
+            now=T0,
+            db=db,
+        )
 
         replayed = jobs_crud.replay_dead_letter_job(job.id, now=T0, db=db)
 
@@ -640,7 +747,8 @@ class TestJobsSummary:
 
     def test_a_completed_job_is_counted_as_such(self, db, event, now):
         job = _enqueue(event, db, now=now)
-        jobs_crud.mark_job_completed(job.id, now=now, db=db)
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
+        jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
         summary = jobs_crud.get_jobs_summary(db)
 
@@ -660,14 +768,24 @@ class TestJobsSummary:
 
     def test_a_finished_queue_has_no_pending_age(self, db, event, now):
         job = _enqueue(event, db, now=now)
-        jobs_crud.mark_job_completed(job.id, now=now, db=db)
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
+        jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
         assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds is None
 
     def test_dead_letters_are_listed_for_inspection(self, db, event, now):
         job = _enqueue(event, db, max_attempts=1, now=now)
-        jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)
-        jobs_crud.mark_job_failed(job.id, "upstream refused", base_seconds=1, max_seconds=1, now=now, db=db)
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
+        jobs_crud.mark_job_failed(
+            job.id,
+            "upstream refused",
+            worker_id="w1",
+            attempt=claimed.attempts,
+            base_seconds=1,
+            max_seconds=1,
+            now=now,
+            db=db,
+        )
 
         summary = jobs_crud.get_jobs_summary(db)
 
@@ -678,8 +796,17 @@ class TestJobsSummary:
     def test_the_dead_letter_list_is_capped(self, db, now):
         for index in range(5):
             job = _enqueue(new_event("activity.created", {"i": index}, source="test"), db, max_attempts=1, now=now)
-            jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=now, db=db)
-            jobs_crud.mark_job_failed(job.id, "boom", base_seconds=1, max_seconds=1, now=now, db=db)
+            claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
+            jobs_crud.mark_job_failed(
+                job.id,
+                "boom",
+                worker_id="w1",
+                attempt=claimed.attempts,
+                base_seconds=1,
+                max_seconds=1,
+                now=now,
+                db=db,
+            )
 
         summary = jobs_crud.get_jobs_summary(db, dead_letter_limit=2)
 

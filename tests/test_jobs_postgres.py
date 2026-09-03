@@ -13,8 +13,13 @@ import pytest
 from sqlalchemy import event as sqlalchemy_event
 
 import jasil.admin as jasil_admin
+import jasil.container as container
 import jasil.jobs._worker_registry as worker_registry
 import jasil.jobs.crud as jobs_crud
+import jasil.jobs.registry as jobs_registry
+import jasil.jobs.service as jobs_service
+import jasil.runtime as platform_runtime
+import jasil.settings as settings
 from jasil.events import new_event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
@@ -77,6 +82,24 @@ def test_workers_selecting_different_queues_only_run_their_own_handlers(db, sess
 
     assert processed == [1, 1]
     assert seen == {"campaign": [1], "intake": [2]}
+
+
+def test_legacy_default_rows_follow_current_subscriber_queues(db, session_factory):
+    registry = JobHandlerRegistry()
+    seen: list[int] = []
+    registry.register(
+        "work.created", "campaign-handler", lambda event: seen.append(event.payload["item"]), queue="campaign"
+    )
+    registry.register("work.created", "default-handler", lambda event: seen.append(event.payload["item"]))
+    _enqueue(db, subscriber="campaign-handler", queue="default", item=1)
+    _enqueue(db, subscriber="default-handler", queue="default", item=2)
+    default = _runner(registry, session_factory, "default-worker", queues=("default",))
+    campaign = _runner(registry, session_factory, "campaign-worker", queues=("campaign",))
+
+    assert default.run_once() == 1
+    assert seen == [2]
+    assert campaign.run_once() == 1
+    assert seen == [2, 1]
 
 
 def test_same_queue_workers_process_each_job_once_with_skip_locked(db, db_engine, session_factory):
@@ -155,6 +178,66 @@ def test_a_crashed_workers_lease_is_reclaimed_and_drained(db, session_factory):
         == 1
     )
     assert seen == [1]
+
+
+def test_public_standalone_worker_selects_queues_and_records_its_lifecycle(
+    db,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+):
+    platform = container.build_platform(settings.JasilSettings(data_dir=str(tmp_path)))
+    monkeypatch.setattr(platform_runtime, "_active_platform", platform)
+    stop = threading.Event()
+    seen: list[int] = []
+
+    def handle(event):
+        seen.append(event.payload["item"])
+        stop.set()
+
+    jobs_registry.registry.clear()
+    jobs_registry.registry.register("work.created", "campaign-handler", handle, queue="campaign")
+    jobs_registry.registry.register("work.created", "maintenance-handler", lambda _event: None, queue="maintenance")
+    now = platform.clock.now() - timedelta(seconds=1)
+    jobs_crud.enqueue_job(
+        new_event("work.created", {"item": 1}, source="test"),
+        "campaign-handler",
+        queue="campaign",
+        max_attempts=3,
+        now=now,
+        db=db,
+    )
+    jobs_crud.enqueue_job(
+        new_event("work.created", {"item": 2}, source="test"),
+        "maintenance-handler",
+        queue="maintenance",
+        max_attempts=3,
+        now=now,
+        db=db,
+    )
+
+    try:
+        jobs_service.run_job_worker(
+            queues=("campaign",),
+            role="domain-worker",
+            label="campaign-1",
+            metadata={"zone": "test"},
+            stop=stop,
+        )
+    finally:
+        jobs_registry.registry.clear()
+
+    db.rollback()
+    jobs = db.query(ProcessingJob).order_by(ProcessingJob.queue).all()
+    workers = jasil_admin.get_workers_summary(stale_after_seconds=60)
+    assert seen == [1]
+    assert [(job.queue, job.status) for job in jobs] == [
+        ("campaign", jobs_crud.STATUS_COMPLETED),
+        ("maintenance", jobs_crud.STATUS_PENDING),
+    ]
+    assert workers.total_workers == 1
+    assert workers.workers[0].status == "stopped"
+    assert workers.workers[0].queues == ["campaign"]
 
 
 def test_heartbeat_rows_distinguish_running_stale_and_graceful_stop(db):

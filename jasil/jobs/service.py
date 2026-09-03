@@ -9,6 +9,7 @@ single-runner lock — duplicate work is skipped or deduplicated rather than
 serialized. All of this is inert unless durable jobs are enabled.
 """
 
+import asyncio
 import logging
 import threading
 import uuid
@@ -86,7 +87,9 @@ def start_job_worker(
     """Start the in-process job worker (idempotent)."""
     global _worker
     if _worker is not None:
-        return
+        if _worker.is_alive:
+            return
+        _worker = None
     _ensure_in_process_topology()
     from jasil.jobs.worker import BackgroundWorker
 
@@ -111,7 +114,9 @@ def run_job_worker(
     This is the supported process entrypoint for distributed deployments. The
     host configures JASIL, registers its durable subscribers, and calls this
     function without importing runner or CRUD internals. Signal handling remains
-    host-owned: pass an event that the host sets during graceful shutdown.
+    host-owned: pass an event that the host sets during graceful shutdown. This
+    function blocks until that event is set; run it only as a dedicated worker
+    process entrypoint, never on an API request or event-loop thread.
 
     Args:
         queues: Optional non-empty queue allowlist. Omit it to consume all queues.
@@ -149,11 +154,11 @@ def _build_worker_telemetry(
     from jasil.jobs.worker import WorkerTelemetry
 
     return WorkerTelemetry(
-        instance_id=runner._worker_id,
-        clock=runner._clock,
+        instance_id=runner.worker_id,
+        clock=runner.clock,
         session_factory=jasil_orm.get_sessionmaker(),
         heartbeat_interval_seconds=get_settings().jobs.heartbeat_interval_seconds,
-        queues=runner._queues,
+        queues=runner.queues,
         role=role,
         label=label,
         metadata=metadata,
@@ -161,12 +166,18 @@ def _build_worker_telemetry(
 
 
 def stop_job_worker() -> None:
-    """Stop the in-process job worker if it is running."""
+    """Stop the in-process worker from synchronous shutdown code."""
     global _worker
     if _worker is None:
         return
-    _worker.stop()
-    _worker = None
+    worker = _worker
+    if worker.stop() and _worker is worker:
+        _worker = None
+
+
+async def stop_job_worker_async() -> None:
+    """Stop the in-process worker without blocking the caller's event loop."""
+    await asyncio.to_thread(stop_job_worker)
 
 
 def _ensure_in_process_topology() -> None:

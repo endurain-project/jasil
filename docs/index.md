@@ -63,6 +63,12 @@ files. You build a settings object from whatever source you like and install it.
     application is built on `AsyncSession` throughout, the event log and durable
     jobs will not fit without a second, synchronous engine.
 
+    The admin facade supplies `get_jobs_summary_async()`,
+    `get_event_log_summary_async()`, `get_workers_summary_async()`, and
+    `replay_dead_letter_job_async()`. Use `lifecycle.shutdown_async()` from an
+    async lifespan. These wrappers keep blocking database and thread joins off
+    the event loop; they do not add `AsyncSession` support.
+
     Async support is a candidate for a later release; it is not in `0.1.0`.
 
 ## Quick start
@@ -110,12 +116,19 @@ with platform.lock.try_acquire("nightly-backfill") as acquired:
 Nothing above changes when you move to Redis and S3 — only the
 [configuration](configuration.md) does.
 
-On shutdown, call `jasil.lifecycle.shutdown()`:
+From synchronous shutdown code, call `jasil.lifecycle.shutdown()`:
 
 ```python
 import jasil.lifecycle as jasil_lifecycle
 
 jasil_lifecycle.shutdown()
+```
+
+From an async lifespan, await `jasil.lifecycle.shutdown_async()` instead so
+thread joins and provider cleanup do not block the event loop:
+
+```python
+await jasil_lifecycle.shutdown_async()
 ```
 
 It stops the durable-job worker, then releases the platform — the event-bus
