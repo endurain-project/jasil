@@ -6,7 +6,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
-## [Unreleased]
+## [0.5.0] - 2026-09-03
 
 ### Added
 
@@ -161,6 +161,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.5.0]: https://github.com/endurain-project/jasil/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/endurain-project/jasil/releases/tag/v0.4.0
 [0.3.0]: https://github.com/endurain-project/jasil/releases/tag/v0.3.0
 [0.2.0]: https://github.com/endurain-project/jasil/releases/tag/v0.2.0
