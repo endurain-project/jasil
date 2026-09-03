@@ -105,17 +105,33 @@ class TestJobsSummary:
         assert queue.pending == 1
         assert queue.total == 1
 
+    def test_it_reports_backlog_older_than_the_count_window(self, platform, db, now):
+        jobs_crud.enqueue_job(
+            new_event("order.created", {"order_id": 1}, source="api:create_order"),
+            SUBSCRIBER,
+            queue="campaign",
+            max_attempts=3,
+            now=now - timedelta(days=2),
+            db=db,
+        )
+
+        queue = jasil_admin.get_jobs_summary(hours=24).by_queue[0]
+
+        assert queue.queue == "campaign"
+        assert queue.total == 0
+        assert queue.oldest_pending_seconds is not None
+        assert queue.oldest_pending_seconds >= 2 * 24 * 60 * 60
+
 
 class TestWorkersSummary:
     def test_it_derives_running_stale_and_stopped(self, platform, db, now):
         db.add_all(
             [
-                JobWorker(instance_id="running", started_at=now, last_heartbeat_at=now, active_claimed_jobs=2),
+                JobWorker(instance_id="running", started_at=now, last_heartbeat_at=now),
                 JobWorker(
                     instance_id="stale",
                     started_at=now - timedelta(hours=2),
                     last_heartbeat_at=now - timedelta(hours=1),
-                    active_claimed_jobs=1,
                 ),
                 JobWorker(
                     instance_id="stopped",
@@ -126,7 +142,6 @@ class TestWorkersSummary:
                     role="maintenance",
                     label="nightly",
                     worker_metadata={"zone": "a"},
-                    active_claimed_jobs=0,
                 ),
             ]
         )
@@ -147,13 +162,21 @@ class TestWorkersSummary:
 
         assert jasil_admin.get_workers_summary().stale_after_seconds == 21
 
+    def test_status_uses_the_platform_clock(self, platform, db):
+        now = platform.clock.now()
+        db.add(JobWorker(instance_id="worker-1", started_at=now, last_heartbeat_at=now))
+        db.commit()
+
+        worker = jasil_admin.get_workers_summary(stale_after_seconds=60).workers[0]
+
+        assert worker.status == "running"
+
     def test_active_claims_are_derived_from_jobs_not_a_stale_heartbeat_snapshot(self, platform, db, now):
         db.add(
             JobWorker(
                 instance_id="worker-1",
                 started_at=now,
                 last_heartbeat_at=now,
-                active_claimed_jobs=7,
             )
         )
         db.commit()
@@ -165,7 +188,7 @@ class TestWorkersSummary:
     def test_workers_are_cursor_paginated_with_global_totals(self, platform, db, now):
         db.add_all(
             [
-                JobWorker(instance_id=instance_id, started_at=now, last_heartbeat_at=now, active_claimed_jobs=0)
+                JobWorker(instance_id=instance_id, started_at=now, last_heartbeat_at=now)
                 for instance_id in ("worker-a", "worker-b", "worker-c")
             ]
         )

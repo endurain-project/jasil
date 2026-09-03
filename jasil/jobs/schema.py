@@ -30,7 +30,7 @@ class JobSubscriberStats(BaseModel):
 
 
 class JobQueueStats(BaseModel):
-    """Job counts and backlog age for one named queue."""
+    """Windowed job counts and all-time current backlog age for one named queue."""
 
     queue: str
     total: int

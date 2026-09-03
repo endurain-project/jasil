@@ -1,7 +1,7 @@
 """Validation for host-supplied durable-worker descriptors."""
 
 import json
-from typing import Any
+from typing import Any, cast
 
 from jasil._core.limits import MAX_WORKER_LABEL_LENGTH, MAX_WORKER_ROLE_LENGTH, check_length
 
@@ -19,12 +19,11 @@ def normalize_worker_metadata(
         check_length(role, field="role", limit=MAX_WORKER_ROLE_LENGTH)
     if label is not None:
         check_length(label, field="label", limit=MAX_WORKER_LABEL_LENGTH)
-    normalized = dict(metadata) if metadata is not None else None
-    if normalized is None:
+    if metadata is None:
         return None
     try:
         encoded = json.dumps(
-            normalized,
+            metadata,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -35,4 +34,4 @@ def normalize_worker_metadata(
         raise ValueError(
             f"worker metadata is {len(encoded)} bytes, which exceeds the {MAX_WORKER_METADATA_BYTES}-byte limit"
         )
-    return normalized
+    return cast(dict[str, Any], json.loads(encoded))

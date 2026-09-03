@@ -492,16 +492,22 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         for (subscriber_id, event_type), status_counts in sorted(counts.items())
     ]
     queue_rows = db.execute(
-        select(ProcessingJob.queue, ProcessingJob.status, func.count(), func.min(ProcessingJob.created_at))
+        select(ProcessingJob.queue, ProcessingJob.status, func.count())
         .where(ProcessingJob.created_at >= window_start)
         .group_by(ProcessingJob.queue, ProcessingJob.status)
     ).all()
     queue_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    queue_oldest: dict[str, datetime] = {}
-    for queue, status, count, oldest in queue_rows:
+    for queue, status, count in queue_rows:
         queue_counts[queue][status] += count
-        if status in (STATUS_PENDING, STATUS_CLAIMED) and (queue not in queue_oldest or oldest < queue_oldest[queue]):
-            queue_oldest[queue] = oldest
+    queue_oldest: dict[str, datetime] = {
+        queue: oldest
+        for queue, oldest in db.execute(
+            select(ProcessingJob.queue, func.min(ProcessingJob.created_at))
+            .where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))
+            .group_by(ProcessingJob.queue)
+        ).all()
+    }
+    queue_names = queue_counts.keys() | queue_oldest.keys()
     by_queue = [
         jobs_schema.JobQueueStats(
             queue=queue,
@@ -512,7 +518,8 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
             dead_letter=status_counts.get(STATUS_DEAD_LETTER, 0),
             oldest_pending_seconds=age_seconds(queue_oldest.get(queue), now),
         )
-        for queue, status_counts in sorted(queue_counts.items())
+        for queue in sorted(queue_names)
+        for status_counts in (queue_counts[queue],)
     ]
     oldest_pending = db.execute(
         select(func.min(ProcessingJob.created_at)).where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))

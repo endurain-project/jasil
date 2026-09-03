@@ -9,7 +9,7 @@ what goes in them, how to create them, and how to bound their growth.
 | `event_log` | The bus and the publish facade | One row per event, recording its lifecycle. |
 | `event_outbox` | The publish facade | Staged events awaiting relay. |
 | `processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
-| `job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, metadata, and active claims. |
+| `job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
 
 ## The event log
 
@@ -58,10 +58,10 @@ gets a UUIDv4 instance id on startup and records:
 - start, latest heartbeat, and graceful-stop timestamps;
 - its selected queues (`null` means all queues);
 - optional host-supplied role, label, and neutral metadata, capped at 16 KiB of
-    serialized JSON; and
-- a heartbeat snapshot of its active claims. Public summaries derive the current
-    count directly from `processing_jobs`, so reaping a crashed worker cannot leave
-    phantom load on the dashboard.
+    serialized JSON.
+
+Public summaries derive active claim counts directly from `processing_jobs`, so
+reaping a crashed worker cannot leave phantom load on the dashboard.
 
 A dedicated heartbeat thread writes at `heartbeat_interval_seconds`, not on
 every empty poll, and keeps running while a handler is blocked. Heartbeat writes
@@ -74,6 +74,14 @@ workers = jasil_admin.get_workers_summary(limit=100)
 next_page = jasil_admin.get_workers_summary(limit=100, cursor=workers.next_cursor)
 queues = jasil_admin.get_jobs_summary().by_queue
 ```
+
+Queue counts use the requested summary window. Backlog age considers every
+currently pending or claimed job, so a queue with only older unfinished work
+still appears with zero windowed jobs and a non-null `oldest_pending_seconds`.
+
+The admin facade uses synchronous database sessions. A synchronous framework
+route may call it directly; an asynchronous route must run it through the
+framework's thread-pool helper so database I/O does not block the event loop.
 
 Status is derived when read:
 

@@ -47,7 +47,6 @@ def record_worker_start(
     worker.role = role
     worker.label = label
     worker.worker_metadata = normalized_metadata
-    worker.active_claimed_jobs = _active_claim_count(instance_id, db)
     db.commit()
 
 
@@ -78,7 +77,6 @@ def record_worker_heartbeat(
     if worker is None:
         raise RuntimeError("worker telemetry row was not persisted")
     worker.last_heartbeat_at = now
-    worker.active_claimed_jobs = _active_claim_count(instance_id, db)
     db.commit()
 
 
@@ -89,7 +87,6 @@ def record_worker_stop(instance_id: str, *, now: datetime, db: Session) -> None:
         return
     worker.last_heartbeat_at = now
     worker.stopped_at = now
-    worker.active_claimed_jobs = _active_claim_count(instance_id, db)
     db.commit()
 
 
@@ -241,13 +238,3 @@ def prune_worker_records_before(cutoff: datetime, *, db: Session, batch_size: in
         if len(instance_ids) < batch_size:
             break
     return total
-
-
-def _active_claim_count(instance_id: str, db: Session) -> int:
-    return int(
-        db.execute(
-            select(func.count())
-            .select_from(ProcessingJob)
-            .where(ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.locked_by == instance_id)
-        ).scalar_one()
-    )

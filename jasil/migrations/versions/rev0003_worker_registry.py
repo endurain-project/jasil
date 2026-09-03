@@ -47,13 +47,6 @@ def upgrade() -> None:
             nullable=True,
             comment="Optional host-supplied neutral metadata",
         ),
-        sa.Column(
-            "active_claimed_jobs",
-            sa.Integer(),
-            nullable=False,
-            server_default="0",
-            comment="Claimed jobs held by this worker at its latest heartbeat",
-        ),
     )
     op.create_index("idx_job_workers_heartbeat", "job_workers", ["last_heartbeat_at"])
     op.create_index("idx_job_workers_stopped", "job_workers", ["stopped_at"])

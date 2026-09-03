@@ -241,13 +241,6 @@ class JobWorker(Base):
         nullable=True,
         comment="Optional host-supplied neutral metadata",
     )
-    active_claimed_jobs: Mapped[int] = mapped_column(
-        Integer,
-        nullable=False,
-        default=0,
-        server_default="0",
-        comment="Claimed jobs held by this worker at its latest heartbeat",
-    )
 
 
 class EventOutbox(Base):

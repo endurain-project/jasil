@@ -317,7 +317,6 @@ class TestWorkerTelemetry:
         with worker_database() as db:
             running = db.get(JobWorker, runner._worker_id)
             assert running.last_heartbeat_at > running.started_at
-            assert running.active_claimed_jobs == 1
             assert running.queues == ["campaign"]
             assert running.role == "processor"
 
@@ -328,7 +327,6 @@ class TestWorkerTelemetry:
         with worker_database() as db:
             stopped = db.get(JobWorker, runner._worker_id)
             assert stopped.stopped_at is not None
-            assert stopped.active_claimed_jobs == 0
 
     def test_heartbeat_recreates_a_missing_start_record(self, worker_database):
         heartbeat_at = T0 + timedelta(seconds=5)
@@ -448,6 +446,21 @@ class TestWorkerTelemetry:
                 queues=None,
                 metadata=metadata,
             )
+
+    def test_worker_metadata_is_deeply_detached(self, worker_database):
+        metadata = {"deployment": {"zone": "eu-1"}}
+        telemetry = WorkerTelemetry(
+            instance_id="00000000-0000-4000-8000-000000000003",
+            clock=StepClock(),
+            session_factory=worker_database,
+            heartbeat_interval_seconds=1,
+            queues=None,
+            metadata=metadata,
+        )
+
+        metadata["deployment"]["zone"] = object()
+
+        assert telemetry._metadata == {"deployment": {"zone": "eu-1"}}
 
 
 class TestAWedgedThreadIsReported:

@@ -128,16 +128,15 @@ def get_workers_summary(
     Returns:
         Worker counts and retained worker-instance details.
     """
-    from datetime import UTC, datetime
-
     import jasil.jobs._worker_registry as worker_registry
 
     effective_stale_after = (
         stale_after_seconds if stale_after_seconds is not None else get_settings().jobs.heartbeat_interval_seconds * 3
     )
+    now = platform_runtime.get_active_platform().clock.now()
     with jasil_orm.get_sessionmaker()() as db:
         return worker_registry.get_workers_summary(
-            now=datetime.now(UTC),
+            now=now,
             stale_after_seconds=effective_stale_after,
             db=db,
             limit=limit,
