@@ -10,35 +10,16 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
-- Named durable-job queues. Subscriber registrations default to `default` and
-  can select a validated queue; the relay persists it, all-queue workers rotate
-  fairly, and selective workers claim only an explicit non-empty allowlist.
-  `run_job_worker()` is the supported blocking standalone-worker API.
-- A portable `job_workers` registry with restart-unique instance ids, bounded
-  heartbeats that remain live during handlers, graceful-stop timestamps, queue
-  selection, optional host metadata, active-claim counts, derived
-  running/stale/stopped status, cursor-paginated public reads through
-  `jasil.admin`, 16 KiB worker-metadata bounds, and bounded retention.
-- Async admin and lifecycle wrappers that offload synchronous database work and
-  bounded thread joins from an application's event-loop thread.
-- Real PostgreSQL conformance for selective and competing workers,
-  `FOR UPDATE SKIP LOCKED`, deferred queue draining, lease recovery, worker
-  lifecycle status, and queue/worker summaries under concurrent claims.
+- Named durable-job queues. Subscriber registrations default to `default` and can select a validated queue; the relay persists it, all-queue workers rotate fairly, and selective workers claim only an explicit non-empty allowlist. `run_job_worker()` is the supported blocking standalone-worker API.
+- A portable `job_workers` registry with restart-unique instance ids, bounded heartbeats that remain live during handlers, graceful-stop timestamps, queue selection, optional host metadata, active-claim counts, derived running/stale/stopped status, cursor-paginated public reads through `jasil.admin`, 16 KiB worker-metadata bounds, and bounded retention.
+- Async admin and lifecycle wrappers that offload synchronous database work and bounded thread joins from an application's event-loop thread.
+- Real PostgreSQL conformance for selective and competing workers, `FOR UPDATE SKIP LOCKED`, deferred queue draining, lease recovery, worker lifecycle status, and queue/worker summaries under concurrent claims.
 
 ### Changed
 
-- Durable job leases now use the restart-unique worker instance UUID that also
-  keys telemetry. SQLite is explicitly limited to one API process with one
-  in-process all-queue consumer; standalone selective workers require a
-  concurrency-capable database such as PostgreSQL.
-- The queue migration backfills existing rows and keeps a database-side
-  `default` default so writers from the previous release remain compatible
-  during rolling deployment. Selective workers adopt only their subscribers'
-  legacy `default` rows, and selective `default` workers exclude subscribers
-  assigned to named queues.
-- Job completion and failure use the worker id plus attempt generation as a
-  compare-and-set token, so a handler that outlives its lease cannot overwrite a
-  replacement worker's newer claim.
+- Durable job leases now use the restart-unique worker instance UUID that also keys telemetry. SQLite is explicitly limited to one API process with one in-process all-queue consumer; standalone selective workers require a concurrency-capable database such as PostgreSQL.
+- The queue migration backfills existing rows and keeps a database-side `default` default so writers from the previous release remain compatible during rolling deployment. Selective workers adopt only their subscribers' legacy `default` rows, and selective `default` workers exclude subscribers assigned to named queues.
+- Job completion and failure use the worker id plus attempt generation as a compare-and-set token, so a handler that outlives its lease cannot overwrite a replacement worker's newer claim.
 
 ## [0.4.0]
 
