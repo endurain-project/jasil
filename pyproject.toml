@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.5.0"
+version = "0.6.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -52,6 +52,8 @@ postgres = [
     "psycopg[binary]>=3.3.4",
 ]
 # Durable jobs: the outbox relay and lease-expiry schedules.
+# The tested floor remains above 3.10.1, whose package-scope ``pkg_resources``
+# import fails on Python 3.12+ environments without setuptools.
 jobs = [
     "apscheduler>=3.11.3",
 ]

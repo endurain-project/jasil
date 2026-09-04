@@ -1,13 +1,15 @@
 # Observability
 
-JASIL owns three append-only tables. This page covers what goes in them, how to
-create them, and how to stop them growing forever.
+JASIL owns four operational tables. The event/outbox/job tables are append-only;
+the worker registry updates one row per restart-unique instance. This page covers
+what goes in them, how to create them, and how to bound their growth.
 
 | Table | Written by | Purpose |
 |---|---|---|
 | `event_log` | The bus and the publish facade | One row per event, recording its lifecycle. |
 | `event_outbox` | The publish facade | Staged events awaiting relay. |
 | `processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
+| `job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
 
 ## The event log
 
@@ -47,6 +49,56 @@ recent failures, and throughput over a window. It is the counterpart of
 `jasil.admin.get_jobs_summary()`, and like it takes no session — see
 [durable jobs](durable-jobs.md#dead-letters).
 
+## Worker registry
+
+JASIL owns worker identity and persistence because it already owns claims,
+sessions, clocks, and worker start/stop. Each in-process or standalone worker
+gets a UUIDv4 instance id on startup and records:
+
+- start, latest heartbeat, and graceful-stop timestamps;
+- its selected queues (`null` means all queues);
+- optional host-supplied role, label, and neutral metadata, capped at 16 KiB of
+    serialized JSON.
+
+Public summaries derive active claim counts directly from `processing_jobs`, so
+reaping a crashed worker cannot leave phantom load on the dashboard.
+
+A dedicated heartbeat thread writes at `heartbeat_interval_seconds`, not on
+every empty poll, and keeps running while a handler is blocked. Heartbeat writes
+are best-effort: a database error is logged and job execution continues.
+
+```python
+import jasil.admin as jasil_admin
+
+workers = jasil_admin.get_workers_summary(limit=100)
+next_page = jasil_admin.get_workers_summary(limit=100, cursor=workers.next_cursor)
+queues = jasil_admin.get_jobs_summary().by_queue
+```
+
+Queue counts use the requested summary window. Backlog age considers every
+currently pending or claimed job, so a queue with only older unfinished work
+still appears with zero windowed jobs and a non-null `oldest_pending_seconds`.
+
+The admin facade uses synchronous database sessions. A synchronous framework
+route may call it directly; an asynchronous route must run it through the
+framework's thread-pool helper so database I/O does not block the event loop.
+
+Status is derived when read:
+
+| Status | Meaning |
+|---|---|
+| `running` | No graceful stop and heartbeat age is within the threshold. |
+| `stale` | No graceful stop and heartbeat age exceeds the threshold. |
+| `stopped` | The worker recorded a graceful stop. |
+
+The default stale threshold is three configured heartbeat intervals; an
+operator can pass `stale_after_seconds=` explicitly. Status totals cover every
+retained worker, while `workers` is a cursor-paginated page of 100 by default and
+500 at most. This is telemetry, not a health policy. The host owns HTTP routes,
+authentication, authorization, UI, alerts, and whether any worker state affects
+a container health endpoint. JASIL ships no route or UI and never changes host
+health automatically.
+
 ## Migrations
 
 The tables ship as packaged Alembic revisions behind the `migrations` extra:
@@ -76,12 +128,12 @@ migrate" into a clear message at boot rather than a confusing query error later.
 !!! note "It will not touch your tables"
     JASIL's migrations use their own version table, `jasil_alembic_version`, so
     they never collide with your Alembic history. Every operation is scoped to
-    JASIL's three tables, so autogenerate cannot propose dropping yours — even
+    JASIL's four tables, so autogenerate cannot propose dropping yours — even
     though both live in the same registry.
 
 ### Adopting existing tables
 
-`adopt_existing_schema()` is only for a database where all three JASIL-owned
+`adopt_existing_schema()` is only for a database where all four JASIL-owned
 tables already exist but `jasil_alembic_version` does not record a revision. It
 compares their columns, types, nullability, primary keys, unique constraints,
 and required indexes with the schema expected by the
@@ -106,8 +158,8 @@ host wiring, but it is not mandatory.
 
 ## Retention
 
-All three tables are append-only, so they grow without bound. Pruning runs on a
-schedule:
+The append-only rows and retained worker instances grow without bound unless
+pruned. Pruning runs on a schedule:
 
 ```python
 jasil_settings.configure(
@@ -143,6 +195,7 @@ The two windows are independent, and `<= 0` disables either.
 | Any `event_log` row past the window | Unrelayed `event_outbox` rows — pending work |
 | Relayed `event_outbox` rows | `pending` / `claimed` jobs — in flight |
 | `completed` jobs | `dead_letter` jobs — human-actionable |
+| Stopped or stale worker rows past job retention | Recent/running worker rows |
 
 Every `event_log` row is prunable regardless of status: it is a safe-to-lose
 observability trail, and nothing in it is a source of truth. The job tables are

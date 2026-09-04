@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- Named durable-job queues. Subscriber registrations default to `default` and can select a validated queue; the relay persists it, all-queue workers rotate fairly, and selective workers claim only an explicit non-empty allowlist. `run_job_worker()` is the supported blocking standalone-worker API.
+- A portable `job_workers` registry with restart-unique instance ids, bounded heartbeats that remain live during handlers, graceful-stop timestamps, queue selection, optional host metadata, active-claim counts, derived running/stale/stopped status, cursor-paginated public reads through `jasil.admin`, 16 KiB worker-metadata bounds, and bounded retention.
+- Real PostgreSQL conformance for selective and competing workers, `FOR UPDATE SKIP LOCKED`, deferred queue draining, lease recovery, worker lifecycle status, and queue/worker summaries under concurrent claims.
+
+### Changed
+
+- Durable job leases now use the restart-unique worker instance UUID that also keys telemetry. SQLite is explicitly limited to one API process with one in-process all-queue consumer; standalone selective workers require a concurrency-capable database such as PostgreSQL.
+- The queue migration backfills existing rows and keeps a database-side `default` default so writers from the previous release remain compatible during rolling deployment. Selective workers adopt only their subscribers' legacy `default` rows, and selective `default` workers exclude subscribers assigned to named queues.
+- Job completion and failure use the worker id plus attempt generation as a compare-and-set token, so a handler that outlives its lease cannot overwrite a replacement worker's newer claim.
+
 ## [0.5.0]
 
 ### Breaking
@@ -163,6 +177,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.6.0]: https://github.com/endurain-project/jasil/releases/tag/v0.6.0
 [0.5.0]: https://github.com/endurain-project/jasil/releases/tag/v0.5.0
 [0.4.0]: https://github.com/endurain-project/jasil/releases/tag/v0.4.0
 [0.3.0]: https://github.com/endurain-project/jasil/releases/tag/v0.3.0

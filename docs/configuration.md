@@ -58,8 +58,9 @@ fields.
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
+| `heartbeat_interval_seconds` | `15.0` | Bounded interval between worker-registry writes. The default stale threshold is three intervals. |
 | `max_attempts` | `5` | Attempts before a job is dead-lettered. |
-| `retention_days` | `30` | Age at which relayed outbox rows and completed jobs are pruned. `<= 0` disables. |
+| `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, and stopped/stale worker rows are pruned. `<= 0` disables. |
 
 ### `EventLogSettings`
 

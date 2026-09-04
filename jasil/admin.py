@@ -40,10 +40,14 @@ from jasil.event_log.schema import (
 )
 from jasil.jobs.schema import (
     DeadLetterJob,
+    JobQueueStats,
     JobReplayResult,
     JobsSummary,
     JobSubscriberStats,
+    WorkerInfo,
+    WorkersSummary,
 )
+from jasil.settings import get_settings
 
 __all__ = [
     "DeadLetterJob",
@@ -51,11 +55,15 @@ __all__ = [
     "EventLogPending",
     "EventLogSummary",
     "EventTypeStats",
+    "JobQueueStats",
     "JobReplayResult",
     "JobSubscriberStats",
     "JobsSummary",
+    "WorkerInfo",
+    "WorkersSummary",
     "get_event_log_summary",
     "get_jobs_summary",
+    "get_workers_summary",
     "replay_dead_letter_job",
 ]
 
@@ -98,6 +106,42 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
 
     with jasil_orm.get_sessionmaker()() as db:
         return event_log_crud.get_event_log_summary(db, hours=hours, failure_limit=failure_limit)
+
+
+def get_workers_summary(
+    *,
+    stale_after_seconds: float | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> WorkersSummary:
+    """Return global worker totals and one bounded telemetry page.
+
+    Status is operator telemetry only: JASIL does not map it onto a host health
+    endpoint or choose an alert policy.
+
+    Args:
+        stale_after_seconds: Maximum heartbeat age still considered running.
+            Defaults to three configured heartbeat intervals.
+        limit: Page size from 1 through 500.
+        cursor: Opaque cursor returned as ``next_cursor`` by the previous page.
+
+    Returns:
+        Worker counts and retained worker-instance details.
+    """
+    import jasil.jobs._worker_registry as worker_registry
+
+    effective_stale_after = (
+        stale_after_seconds if stale_after_seconds is not None else get_settings().jobs.heartbeat_interval_seconds * 3
+    )
+    now = platform_runtime.get_active_platform().clock.now()
+    with jasil_orm.get_sessionmaker()() as db:
+        return worker_registry.get_workers_summary(
+            now=now,
+            stale_after_seconds=effective_stale_after,
+            db=db,
+            limit=limit,
+            cursor=cursor,
+        )
 
 
 def replay_dead_letter_job(job_id: str) -> JobReplayResult:

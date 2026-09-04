@@ -25,20 +25,22 @@ def signal_and_join(
     stop: threading.Event,
     *,
     timeout: float = STOP_JOIN_TIMEOUT_SECONDS,
-) -> None:
+) -> bool:
     """Set ``stop`` and wait up to ``timeout`` for ``thread`` to finish.
 
     Args:
         thread: The thread to wind down, or ``None`` when none is running.
         stop: The event its loop watches.
         timeout: Seconds to wait before returning regardless.
+
+    Returns:
+        True when no live thread remains, otherwise False.
     """
     stop.set()
     if thread is None:
-        return
+        return True
     thread.join(timeout=timeout)
     if thread.is_alive():
-        # Abandoning it is the right call — it is a daemon thread and shutdown
-        # must not block — but doing so silently makes the next symptom
-        # (work that appears to run after shutdown) impossible to explain.
         logger.warning("Thread %r did not stop within %ss; continuing shutdown without it", thread.name, timeout)
+        return False
+    return True

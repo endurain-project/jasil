@@ -16,9 +16,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
-from jasil._core.limits import MAX_WORKER_ID_LENGTH
+from jasil._core.limits import (
+    MAX_WORKER_ID_LENGTH,
+    MAX_WORKER_LABEL_LENGTH,
+    MAX_WORKER_ROLE_LENGTH,
+)
 from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
-from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH
+from jasil.jobs.registry import DEFAULT_QUEUE, MAX_QUEUE_NAME_LENGTH, MAX_SUBSCRIBER_ID_LENGTH
 from jasil.orm import get_active_base
 
 # Binds to the host-owned declarative base at map_models() time.
@@ -38,6 +42,7 @@ class ProcessingJob(Base):
 
     Attributes:
         id: Job identifier (UUIDv4 string).
+        queue: Named queue used to select which workers may claim the job.
         event_id: The originating envelope ``event_id`` — correlation and, with
             ``subscriber_id``, the idempotent-consumer dedup key.
         event_type: The domain-event channel, e.g. ``order.created``.
@@ -64,17 +69,27 @@ class ProcessingJob(Base):
     __tablename__ = "processing_jobs"
     __table_args__ = (
         UniqueConstraint("event_id", "subscriber_id", name="uq_processing_jobs_event_subscriber"),
-        # The claim query filters ``status = 'pending' AND available_at <= now``
-        # and orders by ``available_at``; this composite index serves both.
+        # Unselected workers discover due work across every queue with this index.
         Index("idx_processing_jobs_claim", "status", "available_at"),
+        # Selective and fair claims order/filter by queue before lifecycle state.
+        Index("idx_processing_jobs_queue_claim", "queue", "status", "available_at"),
         # The reaper scans claimed rows whose lease has expired.
         Index("idx_processing_jobs_lease", "status", "lease_expires_at"),
+        # Heartbeats and worker summaries count active leases by worker.
+        Index("idx_processing_jobs_worker_claim", "status", "locked_by"),
     )
 
     id: Mapped[str] = mapped_column(
         String(36),
         primary_key=True,
         comment="Job identifier (UUIDv4)",
+    )
+    queue: Mapped[str] = mapped_column(
+        String(MAX_QUEUE_NAME_LENGTH),
+        nullable=False,
+        default=DEFAULT_QUEUE,
+        server_default=DEFAULT_QUEUE,
+        comment="Named queue used to select which workers may claim the job",
     )
     event_id: Mapped[str] = mapped_column(
         String(MAX_EVENT_ID_LENGTH),
@@ -174,6 +189,57 @@ class ProcessingJob(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="When the job reached a terminal state (completed/dead_letter)",
+    )
+
+
+class JobWorker(Base):
+    """One restart-unique durable worker instance and its latest heartbeat."""
+
+    __tablename__ = "job_workers"
+    __table_args__ = (
+        Index("idx_job_workers_heartbeat", "last_heartbeat_at"),
+        Index("idx_job_workers_stopped", "stopped_at"),
+    )
+
+    instance_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        comment="Restart-unique worker instance UUID",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When this worker instance started",
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Most recent successful worker heartbeat",
+    )
+    stopped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When this worker stopped gracefully; NULL after a crash",
+    )
+    queues: Mapped[list[str] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+        comment="Selected queue allowlist; NULL means all queues",
+    )
+    role: Mapped[str | None] = mapped_column(
+        String(MAX_WORKER_ROLE_LENGTH),
+        nullable=True,
+        comment="Optional host-supplied worker role",
+    )
+    label: Mapped[str | None] = mapped_column(
+        String(MAX_WORKER_LABEL_LENGTH),
+        nullable=True,
+        comment="Optional host-supplied operator label",
+    )
+    worker_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+        comment="Optional host-supplied neutral metadata",
     )
 
 

@@ -68,9 +68,9 @@ class TestJobRunner:
             backoff_max_seconds=100,
         )
 
-    def _enqueue(self, db, subscriber="s", max_attempts=3):
-        event = new_event("activity.created", {"id": 1}, source="test")
-        return jobs_crud.enqueue_job(event, subscriber, max_attempts=max_attempts, now=T0, db=db)
+    def _enqueue(self, db, subscriber="s", queue="default", max_attempts=3, payload=None):
+        event = new_event("activity.created", payload or {"id": 1}, source="test")
+        return jobs_crud.enqueue_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db)
 
     def test_an_empty_queue_processes_nothing(self, runner):
         assert runner.run_once() == 0
@@ -150,6 +150,48 @@ class TestJobRunner:
         assert processed == 2
         assert len(seen) == 1
 
+    def test_a_finalization_error_does_not_abort_the_batch(self, runner, db, monkeypatch, caplog):
+        self._enqueue(db, payload={"id": 1})
+        self._enqueue(db, payload={"id": 2})
+        finalized = []
+
+        def finalize(job):
+            finalized.append(job.id)
+            if len(finalized) == 1:
+                raise RuntimeError("database unavailable")
+
+        monkeypatch.setattr(runner, "_run_job", finalize)
+
+        with caplog.at_level("ERROR"):
+            processed = runner.run_once()
+
+        assert processed == 2
+        assert len(finalized) == 2
+        assert "Durable job could not be finalized" in caplog.text
+
+    def test_lost_ownership_skips_successful_finalization(self, runner, registry, db, monkeypatch, caplog):
+        registry.register("activity.created", "s", lambda _event: None)
+        self._enqueue(db)
+        monkeypatch.setattr(jobs_crud, "mark_job_completed", lambda *args, **kwargs: False)
+
+        with caplog.at_level("WARNING"):
+            runner.run_once()
+
+        assert "completion skipped because claim ownership was lost" in caplog.text
+
+    def test_lost_ownership_skips_failure_finalization(self, runner, registry, db, monkeypatch, caplog):
+        def fail(_event):
+            raise RuntimeError("handler failed")
+
+        registry.register("activity.created", "s", fail)
+        self._enqueue(db)
+        monkeypatch.setattr(jobs_crud, "mark_job_failed", lambda *args, **kwargs: "")
+
+        with caplog.at_level("WARNING"):
+            runner.run_once()
+
+        assert "failure skipped because claim ownership was lost" in caplog.text
+
     def test_the_batch_size_bounds_a_pass(self, registry, clock, session_factory, db):
         registry.register("activity.created", "s", lambda _e: None)
         for index in range(5):
@@ -168,6 +210,131 @@ class TestJobRunner:
         )
 
         assert runner.run_once() == 2
+
+    def test_one_runner_consumes_multiple_named_queues_fairly(self, registry, clock, session_factory, db):
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.payload["id"]))
+        self._enqueue(db, queue="campaign", payload={"id": 1})
+        self._enqueue(db, queue="campaign", payload={"id": 2})
+        self._enqueue(db, queue="intake", payload={"id": 3})
+        runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="w",
+            lease_seconds=60,
+            batch_size=1,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+        )
+
+        assert [runner.run_once(), runner.run_once(), runner.run_once()] == [1, 1, 1]
+        assert seen[1] == 3
+        assert {seen[0], seen[2]} == {1, 2}
+
+    def test_a_selective_runner_never_processes_another_queue(self, registry, clock, session_factory, db):
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.payload["id"]))
+        self._enqueue(db, queue="campaign", payload={"id": 1})
+        self._enqueue(db, queue="intake", payload={"id": 2})
+        runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="w",
+            lease_seconds=60,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=("campaign",),
+        )
+
+        assert runner.run_once() == 1
+        assert seen == [1]
+        db.rollback()
+        assert db.query(ProcessingJob).filter_by(queue="intake", status=jobs_crud.STATUS_PENDING).count() == 1
+
+    def test_a_selective_runner_adopts_only_its_subscribers_legacy_default_rows(
+        self,
+        registry,
+        clock,
+        session_factory,
+        db,
+    ):
+        seen = []
+        registry.register(
+            "activity.created", "campaign-handler", lambda event: seen.append(event.payload["id"]), queue="campaign"
+        )
+        registry.register("activity.created", "default-handler", lambda event: seen.append(event.payload["id"]))
+        self._enqueue(db, subscriber="campaign-handler", payload={"id": 1})
+        self._enqueue(db, subscriber="default-handler", payload={"id": 2})
+        campaign_runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="campaign-worker",
+            lease_seconds=60,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=("campaign",),
+        )
+        default_runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="default-worker",
+            lease_seconds=60,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=("default",),
+        )
+
+        assert default_runner.run_once() == 1
+        assert seen == [2]
+        assert campaign_runner.run_once() == 1
+        assert seen == [2, 1]
+
+    def test_a_selective_default_runner_still_dead_letters_an_unknown_subscriber(
+        self,
+        registry,
+        clock,
+        session_factory,
+        db,
+    ):
+        registry.register("activity.created", "campaign-handler", lambda _event: None, queue="campaign")
+        self._enqueue(db, subscriber="removed-handler", max_attempts=1)
+        runner = JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="default-worker",
+            lease_seconds=60,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=("default",),
+        )
+
+        assert runner.run_once() == 1
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_DEAD_LETTER
+        assert "no durable handler" in job.last_error
+
+    def test_an_empty_queue_allowlist_is_refused(self, registry, clock, session_factory):
+        with pytest.raises(ValueError, match="queues"):
+            JobRunner(
+                registry=registry,
+                clock=clock,
+                session_factory=session_factory,
+                worker_id="w",
+                lease_seconds=60,
+                batch_size=10,
+                backoff_base_seconds=1,
+                backoff_max_seconds=2,
+                queues=(),
+            )
 
     def test_reaping_requeues_an_expired_lease(self, runner, registry, clock, db):
         registry.register("activity.created", "s", lambda _e: None)

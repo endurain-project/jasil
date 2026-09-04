@@ -1,10 +1,9 @@
-"""Process identity — the value that decides which worker won a job.
+"""Process identity for Redis competing-consumer coordination.
 
-``claim_jobs`` re-selects on ``locked_by == worker_id``, so this string is not
-just a label: two live processes sharing one identity would each be handed the
-other's rows and run the same subscriber twice. It also has to fit a fixed-width
-column, and a hostname is not something the deployment can shorten — which is
-the tension every test here is about.
+Two live Redis consumers sharing one identity would collide in pending-entry
+state. The identity is also persisted in the event log and has to fit a
+fixed-width column, while a hostname is not something the deployment can
+shorten — which is the tension every test here is about.
 """
 
 import socket
@@ -45,10 +44,8 @@ class TestProcessIdentity:
         assert len(process_identity()) < MAX_WORKER_ID_LENGTH
 
 
-class TestItFitsTheLeaseColumn:
-    """A long hostname used to overflow ``locked_by`` and fail the claim UPDATE
-    on PostgreSQL — from inside the worker loop, far from the cause.
-    """
+class TestItFitsPersistedWorkerColumns:
+    """A long hostname must fit wherever a consumer identity is persisted."""
 
     def test_a_long_hostname_is_bounded(self, hostname):
         hostname(LONG_HOSTNAME)
@@ -70,8 +67,7 @@ class TestBoundingPreservesUniqueness:
     """Why the overflow is not simply clipped.
 
     Kubernetes and cloud hostnames share long prefixes, so a plain truncation
-    collapses distinct machines onto one identity — and the claim would then hand
-    a worker rows another worker had leased.
+    collapses distinct machines onto one Redis consumer identity.
     """
 
     def test_two_hosts_sharing_a_prefix_stay_distinct(self, hostname):

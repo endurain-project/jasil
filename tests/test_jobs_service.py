@@ -8,6 +8,9 @@ is asserted is the wiring, since the behaviour underneath is covered by
 :mod:`tests.test_jobs`.
 """
 
+import threading
+import uuid
+
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -17,6 +20,7 @@ import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.jobs.relay as jobs_relay
 import jasil.jobs.service as jobs_service
+import jasil.jobs.worker as jobs_worker
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import new_event
@@ -72,17 +76,29 @@ class TestBuildRunner:
         assert runner._clock is platform.clock
         assert runner._registry is jobs_registry.registry
 
-    def test_the_worker_id_identifies_the_process(self, platform, session_factory):
-        """Competing consumers have to be distinguishable in ``locked_by``."""
-        import os
+    def test_it_passes_a_queue_allowlist_to_the_runner(self, platform, session_factory):
+        runner = jobs_service.build_runner(queues=("campaign", "maintenance"))
 
-        assert str(os.getpid()) in jobs_service.build_runner()._worker_id
+        assert runner._queues == ("campaign", "maintenance")
+
+    def test_omitting_queues_preserves_all_queue_consumption(self, platform, session_factory):
+        assert jobs_service.build_runner()._queues is None
+
+    def test_the_worker_id_is_restart_unique(self, platform, session_factory):
+        """Each restart gets a distinct lease and telemetry identity."""
+        first = jobs_service.build_runner()._worker_id
+        second = jobs_service.build_runner()._worker_id
+
+        assert uuid.UUID(first).version == 4
+        assert uuid.UUID(second).version == 4
+        assert first != second
 
 
 class TestWorkerLifecycle:
     @pytest.fixture(autouse=True)
-    def idle_runner(self, monkeypatch):
+    def idle_runner(self, platform, session_factory, monkeypatch):
         monkeypatch.setattr(jobs_service, "build_runner", IdleRunner)
+        monkeypatch.setattr(jobs_service, "_build_worker_telemetry", lambda *args, **kwargs: None)
 
     def test_starting_installs_a_worker(self):
         jobs_service.start_job_worker()
@@ -97,6 +113,14 @@ class TestWorkerLifecycle:
 
         assert jobs_service._worker is first
 
+    def test_a_retained_worker_can_be_replaced_after_its_thread_exits(self, monkeypatch):
+        finished_worker = type("FinishedWorker", (), {"is_alive": False, "stop": lambda self: True})()
+        monkeypatch.setattr(jobs_service, "_worker", finished_worker)
+
+        jobs_service.start_job_worker()
+
+        assert jobs_service._worker is not finished_worker
+
     def test_stopping_clears_the_worker(self):
         jobs_service.start_job_worker()
 
@@ -109,12 +133,76 @@ class TestWorkerLifecycle:
 
         assert jobs_service._worker is None
 
+    def test_a_timed_out_worker_handle_is_retained(self, monkeypatch):
+        worker = type("TimedOutWorker", (), {"stop": lambda self: False})()
+        monkeypatch.setattr(jobs_service, "_worker", worker)
+
+        jobs_service.stop_job_worker()
+
+        assert jobs_service._worker is worker
+
     def test_the_poll_interval_comes_from_settings(self):
         settings.configure(settings.JasilSettings(jobs=settings.JobSettings(poll_interval_seconds=0.25)))
 
         jobs_service.start_job_worker()
 
         assert jobs_service._worker._poll_interval_seconds == 0.25
+
+    def test_sqlite_refuses_multiple_api_process_consumers(self, platform, session_factory, db_engine):
+        if db_engine.dialect.name != "sqlite":
+            pytest.skip("SQLite-only topology guard")
+        settings.configure(settings.JasilSettings(web_workers=2))
+
+        with pytest.raises(RuntimeError, match="exactly one API process"):
+            jobs_service.start_job_worker()
+
+
+class TestStandaloneWorker:
+    def test_sqlite_is_refused(self, platform, session_factory, db_engine):
+        if db_engine.dialect.name != "sqlite":
+            pytest.skip("SQLite-only topology guard")
+        stop = threading.Event()
+        stop.set()
+
+        with pytest.raises(RuntimeError, match="only one in-process consumer"):
+            jobs_service.run_job_worker(queues=("campaign",), stop=stop)
+
+    def test_an_empty_queue_allowlist_fails_before_the_loop(self, platform, session_factory):
+        with pytest.raises(ValueError, match="queues"):
+            jobs_service.run_job_worker(queues=(), stop=threading.Event())
+
+    def test_supported_topology_wires_runner_telemetry_and_stop_event(
+        self,
+        platform,
+        session_factory,
+        monkeypatch,
+    ):
+        stop = threading.Event()
+        captured = {}
+
+        def record_run(runner, *, poll_interval_seconds, stop, telemetry):
+            captured.update(
+                runner=runner,
+                poll_interval_seconds=poll_interval_seconds,
+                stop=stop,
+                telemetry=telemetry,
+            )
+
+        monkeypatch.setattr(jobs_service, "_ensure_standalone_topology", lambda: None)
+        monkeypatch.setattr(jobs_worker, "run_worker", record_run)
+
+        jobs_service.run_job_worker(
+            queues=("campaign",),
+            role="domain-worker",
+            label="campaign-1",
+            metadata={"zone": "test"},
+            stop=stop,
+        )
+
+        assert captured["runner"].queues == ("campaign",)
+        assert captured["telemetry"]._queues == ("campaign",)
+        assert captured["telemetry"]._role == "domain-worker"
+        assert captured["stop"] is stop
 
 
 class TestScheduledRelay:

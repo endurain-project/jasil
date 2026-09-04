@@ -59,6 +59,7 @@ class JobSettings:
         backoff_base_seconds: First retry delay; doubles per attempt.
         backoff_max_seconds: Ceiling for the exponential backoff.
         poll_interval_seconds: Idle wait between empty polls.
+        heartbeat_interval_seconds: Interval between worker-registry writes.
         max_attempts: Attempts before a job is dead-lettered.
         retention_days: Age at which relayed outbox rows and completed jobs are
             pruned. ``<= 0`` disables pruning.
@@ -70,6 +71,7 @@ class JobSettings:
     backoff_base_seconds: int = 60
     backoff_max_seconds: int = 3600
     poll_interval_seconds: float = 5.0
+    heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
     retention_days: int = 30
 

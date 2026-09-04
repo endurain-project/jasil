@@ -37,7 +37,8 @@ from jasil.container import build_platform
 OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler")
 
 # The tables JASIL maps into the host's registry.
-EXPECTED_TABLES = {"event_log", "processing_jobs", "event_outbox"}
+EXPECTED_TABLES = {"event_log", "processing_jobs", "event_outbox", "job_workers"}
+EXPECTED_REVISIONS = {"rev0001_initial.py", "rev0002_named_job_queues.py", "rev0003_worker_registry.py"}
 
 
 class Base(DeclarativeBase):
@@ -83,8 +84,12 @@ def main() -> int:
     # The packaged revisions are data files, not modules, so a build-config
     # mistake drops them without breaking any import.
     revisions = Path(jasil.__file__).parent / "migrations" / "versions"
-    if not list(revisions.glob("rev*.py")):
-        print(f"FAIL: packaged Alembic revisions missing from the wheel: {revisions}")
+    packaged_revisions = {path.name for path in revisions.glob("rev*.py")}
+    if packaged_revisions != EXPECTED_REVISIONS:
+        print(
+            "FAIL: packaged Alembic revisions differ from the expected set: "
+            f"expected {sorted(EXPECTED_REVISIONS)}, got {sorted(packaged_revisions)}"
+        )
         return 1
 
     leaked = [name for name in OPTIONAL_DISTRIBUTIONS if name in sys.modules]

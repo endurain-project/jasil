@@ -25,7 +25,7 @@ from jasil.backends.lock_noop import NoopLock
 from jasil.backends.storage_local import LocalStorage
 from jasil.event_log.models import EventLog
 from jasil.events import new_event
-from jasil.jobs.models import EventOutbox
+from jasil.jobs.models import EventOutbox, JobWorker
 from jasil.providers import (
     PartRef,
     ServeFile,
@@ -127,6 +127,21 @@ class TestRetention:
 
         assert db.query(EventLog).count() == 1
         assert db.query(EventOutbox).count() == 0
+
+    def test_job_retention_prunes_old_stopped_and_stale_workers(self, platform, session_factory, db):
+        _configure_retention(event_log_days=0, jobs_days=30)
+        db.add_all(
+            [
+                JobWorker(instance_id="stopped", started_at=OLD, last_heartbeat_at=OLD, stopped_at=OLD),
+                JobWorker(instance_id="stale", started_at=OLD, last_heartbeat_at=OLD),
+                JobWorker(instance_id="running", started_at=T0, last_heartbeat_at=T0),
+            ]
+        )
+        db.commit()
+
+        retention.prune_expired_records()
+
+        assert {worker.instance_id for worker in db.query(JobWorker).all()} == {"running"}
 
     def test_it_skips_when_another_replica_holds_the_lock(self, monkeypatch, session_factory, db):
         """Single-runner: the deletes are idempotent, but duplicating the work

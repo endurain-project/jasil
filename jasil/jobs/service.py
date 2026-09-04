@@ -10,11 +10,13 @@ serialized. All of this is inert unless durable jobs are enabled.
 """
 
 import logging
-from typing import TYPE_CHECKING
+import threading
+import uuid
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-import jasil._core.identity as identity
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
@@ -43,17 +45,20 @@ _worker: "BackgroundWorker | None" = None
 
 
 def _worker_id() -> str:
-    """Return a per-process worker identifier (host + pid)."""
-    return identity.process_identity()
+    """Return a restart-unique worker instance identifier."""
+    return str(uuid.uuid4())
 
 
-def build_runner() -> "JobRunner":
+def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
     """
     Build a :class:`JobRunner` from settings and the active platform.
 
     Returns:
         A runner wired to the durable-subscriber registry, the platform clock,
         and the main-database session factory.
+
+    Args:
+        queues: Optional non-empty queue allowlist. Omit it to consume all queues.
     """
     from jasil.jobs.runner import JobRunner
 
@@ -68,28 +73,121 @@ def build_runner() -> "JobRunner":
         batch_size=jobs.batch_size,
         backoff_base_seconds=jobs.backoff_base_seconds,
         backoff_max_seconds=jobs.backoff_max_seconds,
+        queues=queues,
     )
 
 
-def start_job_worker() -> None:
+def start_job_worker(
+    *,
+    role: str | None = None,
+    label: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
     """Start the in-process job worker (idempotent)."""
     global _worker
     if _worker is not None:
-        return
+        if _worker.is_alive:
+            return
+        _worker = None
+    _ensure_in_process_topology()
     from jasil.jobs.worker import BackgroundWorker
 
     # The loop logs its own start and stop, from the thread that actually runs it.
-    _worker = BackgroundWorker(build_runner(), poll_interval_seconds=get_settings().jobs.poll_interval_seconds)
+    runner = build_runner()
+    jobs = get_settings().jobs
+    telemetry = _build_worker_telemetry(runner, role=role, label=label, metadata=metadata)
+    _worker = BackgroundWorker(runner, poll_interval_seconds=jobs.poll_interval_seconds, telemetry=telemetry)
     _worker.start()
 
 
+def run_job_worker(
+    *,
+    queues: Iterable[str] | None = None,
+    role: str | None = None,
+    label: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    stop: threading.Event | None = None,
+) -> None:
+    """Run a blocking standalone durable-job worker.
+
+    This is the supported process entrypoint for distributed deployments. The
+    host configures JASIL, registers its durable subscribers, and calls this
+    function without importing runner or CRUD internals. Signal handling remains
+    host-owned: pass an event that the host sets during graceful shutdown. This
+    function blocks until that event is set; run it only as a dedicated worker
+    process entrypoint, never on an API request or event-loop thread.
+
+    Args:
+        queues: Optional non-empty queue allowlist. Omit it to consume all queues.
+        role: Optional host-supplied worker role.
+        label: Optional host-supplied operator label.
+        metadata: Optional host-supplied neutral metadata.
+        stop: Event ending the loop; a new unset event is used when omitted.
+
+    Raises:
+        RuntimeError: When the configured database is SQLite, which supports
+            only JASIL's one in-process consumer topology.
+        ValueError: When an explicit queue allowlist is empty or invalid.
+    """
+    runner = build_runner(queues=queues)
+    _ensure_standalone_topology()
+    from jasil.jobs.worker import run_worker
+
+    jobs = get_settings().jobs
+    telemetry = _build_worker_telemetry(runner, role=role, label=label, metadata=metadata)
+    run_worker(
+        runner,
+        poll_interval_seconds=jobs.poll_interval_seconds,
+        stop=stop or threading.Event(),
+        telemetry=telemetry,
+    )
+
+
+def _build_worker_telemetry(
+    runner: "JobRunner",
+    *,
+    role: str | None,
+    label: str | None,
+    metadata: dict[str, Any] | None,
+):
+    from jasil.jobs.worker import WorkerTelemetry
+
+    return WorkerTelemetry(
+        instance_id=runner.worker_id,
+        clock=runner.clock,
+        session_factory=jasil_orm.get_sessionmaker(),
+        heartbeat_interval_seconds=get_settings().jobs.heartbeat_interval_seconds,
+        queues=runner.queues,
+        role=role,
+        label=label,
+        metadata=metadata,
+    )
+
+
 def stop_job_worker() -> None:
-    """Stop the in-process job worker if it is running."""
+    """Stop the in-process worker from synchronous shutdown code."""
     global _worker
     if _worker is None:
         return
-    _worker.stop()
-    _worker = None
+    worker = _worker
+    if worker.stop() and _worker is worker:
+        _worker = None
+
+
+def _ensure_in_process_topology() -> None:
+    if jasil_orm.get_engine().dialect.name == "sqlite" and get_settings().web_workers != 1:
+        raise RuntimeError(
+            "SQLite durable jobs support exactly one API process with one in-process consumer; "
+            "configure web_workers=1 or use PostgreSQL workers"
+        )
+
+
+def _ensure_standalone_topology() -> None:
+    if jasil_orm.get_engine().dialect.name == "sqlite":
+        raise RuntimeError(
+            "SQLite durable jobs support only one in-process consumer; "
+            "use start_job_worker() or configure PostgreSQL for standalone workers"
+        )
 
 
 def relay_outbox_scheduled() -> None:

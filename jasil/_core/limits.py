@@ -26,6 +26,8 @@ __all__ = [
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_STORED_ERROR_LENGTH",
     "MAX_WORKER_ID_LENGTH",
+    "MAX_WORKER_LABEL_LENGTH",
+    "MAX_WORKER_ROLE_LENGTH",
     "check_length",
     "fit_length",
 ]
@@ -45,11 +47,16 @@ MAX_STORED_ERROR_LENGTH = 4000
 #: the work completed while the row stayed ``published`` forever.
 MAX_HANDLER_NAME_LENGTH = 500
 
-#: Width of ``event_log.worker_id`` and ``processing_jobs.locked_by``, both of
-#: which hold a process identity. That value derives from the machine's hostname
-#: (see :func:`jasil._core.identity.process_identity`), so a deployment cannot shorten it
-#: and the library has to guarantee the fit itself.
+#: Width of ``event_log.worker_id`` and ``processing_jobs.locked_by``. The event
+#: bus writes a hostname-derived process identity; durable jobs write a UUIDv4
+#: instance id. The former cannot be shortened by a deployment, so the library
+#: guarantees the fit itself.
 MAX_WORKER_ID_LENGTH = 100
+
+#: Widths of optional operator-facing worker metadata. Unlike ``locked_by``,
+#: these values are supplied directly by the host and are rejected if overlong.
+MAX_WORKER_ROLE_LENGTH = 100
+MAX_WORKER_LABEL_LENGTH = 200
 
 _TRUNCATION_MARKER = "..."
 

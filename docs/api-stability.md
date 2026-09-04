@@ -31,13 +31,13 @@ modules:
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
 | `jasil.testing` | `FixedClock`, `install_test_platform`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
-| `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
+| `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `get_workers_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |
-| `jasil.jobs.service` | `start_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
+| `jasil.jobs.service` | `start_job_worker`, `run_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
-| `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |
+| `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract), `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`. |
 
@@ -64,10 +64,10 @@ be able to read what a new one writes, or a rolling deploy breaks.
 
 ### Database schema
 
-The columns, indexes and constraints of `event_log`, `event_outbox` and
-`processing_jobs`. Schema changes ship as Alembic revisions, and a revision must
-be forward-compatible with the previous release: during a rolling deploy the old
-code runs against the new schema.
+The columns, indexes and constraints of `event_log`, `event_outbox`,
+`processing_jobs`, and `job_workers`. Schema changes ship as Alembic revisions,
+and a revision must be forward-compatible with the previous release: during a
+rolling deploy the old code runs against the new schema.
 
 Removing a column is a major change. Adding a nullable one is not.
 

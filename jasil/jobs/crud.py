@@ -21,10 +21,11 @@ single worker is still correct. Callers pass an explicit ``now`` (from the
 
 import uuid
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, and_, case, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -39,6 +40,7 @@ from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.events import Event
 from jasil.jobs.models import ProcessingJob
+from jasil.jobs.registry import DEFAULT_QUEUE, normalize_queue_selector, validate_queue_name
 
 STATUS_PENDING = "pending"
 STATUS_CLAIMED = "claimed"
@@ -52,6 +54,7 @@ def enqueue_job(
     event: Event,
     subscriber_id: str,
     *,
+    queue: str = DEFAULT_QUEUE,
     max_attempts: int,
     now: datetime,
     db: Session,
@@ -69,6 +72,7 @@ def enqueue_job(
     Args:
         event: The originating event envelope.
         subscriber_id: The durable subscriber this job runs.
+        queue: Named queue eligible workers must select; defaults to ``default``.
         max_attempts: Attempt ceiling before the job is dead-lettered.
         now: Current instant (used for created/updated/available timestamps).
         db: Active database session.
@@ -81,9 +85,11 @@ def enqueue_job(
         The inserted job, or ``None`` when a job for this ``(event, subscriber)``
         already existed.
     """
+    validate_queue_name(queue)
     job_id = str(uuid.uuid4())
     values = {
         "id": job_id,
+        "queue": queue,
         "event_id": event.event_id,
         "event_type": event.event_type,
         "subscriber_id": subscriber_id,
@@ -112,6 +118,10 @@ def claim_jobs(
     lease_seconds: int,
     now: datetime,
     db: Session,
+    queues: Iterable[str] | None = None,
+    queue_cursor: str | None = None,
+    default_queue_subscribers: Iterable[str] | None = None,
+    excluded_default_queue_subscribers: Iterable[str] | None = None,
 ) -> list[ProcessingJob]:
     """
     Atomically claim up to ``limit`` due jobs, taking a time-bounded lease.
@@ -122,7 +132,10 @@ def claim_jobs(
     concurrent workers select disjoint sets; where it does not, the update is a
     compare-and-set on ``status = 'pending'`` and only the worker that wins the
     race is handed the rows. The attempt is counted at claim time so a worker that
-    crashes mid-run still consumes an attempt, bounding crash loops.
+    crashes mid-run still consumes an attempt, bounding crash loops. ``queues``
+    is an optional allowlist; omitting it preserves all-queue consumption. The
+    cursor rotates queue ordering between batches so a backlog on one queue
+    cannot permanently starve another.
 
     Args:
         worker_id: Identifier of the claiming worker (the lease holder).
@@ -130,16 +143,44 @@ def claim_jobs(
         lease_seconds: Lease duration; the reaper requeues jobs past it.
         now: Current instant.
         db: Active database session.
+        queues: Optional non-empty queue allowlist.
+        queue_cursor: Queue handled last by this worker, used for fair rotation.
+        default_queue_subscribers: Subscribers whose rows from pre-queue writers
+            may still carry the database-side ``default`` queue.
+        excluded_default_queue_subscribers: Registered subscribers assigned to
+            unselected queues. When ``default`` is selected, their legacy rows
+            must remain available to the worker for their assigned queue.
 
     Returns:
         The jobs this call actually claimed, oldest-available first.
     """
-    id_stmt = (
-        select(ProcessingJob.id)
-        .where(ProcessingJob.status == STATUS_PENDING, ProcessingJob.available_at <= now)
-        .order_by(ProcessingJob.available_at)
-        .limit(limit)
-    )
+    selected_queues = normalize_queue_selector(queues)
+    if queue_cursor is not None:
+        validate_queue_name(queue_cursor)
+    filters = [ProcessingJob.status == STATUS_PENDING, ProcessingJob.available_at <= now]
+    if selected_queues is not None:
+        queue_filter = ProcessingJob.queue.in_(selected_queues)
+        legacy_subscribers = tuple(dict.fromkeys(default_queue_subscribers or ()))
+        excluded_legacy_subscribers = tuple(dict.fromkeys(excluded_default_queue_subscribers or ()))
+        if DEFAULT_QUEUE in selected_queues and excluded_legacy_subscribers:
+            queue_filter = and_(
+                queue_filter,
+                or_(
+                    ProcessingJob.queue != DEFAULT_QUEUE,
+                    ProcessingJob.subscriber_id.not_in(excluded_legacy_subscribers),
+                ),
+            )
+        elif legacy_subscribers and DEFAULT_QUEUE not in selected_queues:
+            queue_filter = or_(
+                queue_filter,
+                and_(
+                    ProcessingJob.queue == DEFAULT_QUEUE,
+                    ProcessingJob.subscriber_id.in_(legacy_subscribers),
+                ),
+            )
+        filters.append(queue_filter)
+    ordering = _queue_order(queue_cursor)
+    id_stmt = select(ProcessingJob.id).where(*filters).order_by(*ordering).limit(limit)
     if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
         id_stmt = id_stmt.with_for_update(skip_locked=True)
     job_ids = list(db.execute(id_stmt).scalars().all())
@@ -181,7 +222,7 @@ def claim_jobs(
                 # nothing and the worker claimed batches it then never ran.
                 ProcessingJob.locked_by == worker_id,
             )
-            .order_by(ProcessingJob.available_at)
+            .order_by(*ordering)
         )
         .scalars()
         .all()
@@ -189,48 +230,85 @@ def claim_jobs(
     return list(claimed)
 
 
-def mark_job_completed(job_id: str, *, now: datetime, db: Session) -> None:
+def _queue_order(queue_cursor: str | None) -> tuple[Any, ...]:
+    """Order queues after the previous cursor, wrapping at the end."""
+    ordering: list[Any] = []
+    if queue_cursor is not None:
+        ordering.append(case((ProcessingJob.queue > queue_cursor, 0), else_=1))
+    ordering.extend((ProcessingJob.queue, ProcessingJob.available_at, ProcessingJob.created_at, ProcessingJob.id))
+    return tuple(ordering)
+
+
+def mark_job_completed(
+    job_id: str,
+    *,
+    worker_id: str,
+    attempt: int,
+    now: datetime,
+    db: Session,
+) -> bool:
     """
     Mark a claimed job ``completed`` and release its lease.
 
     Args:
         job_id: The job to complete.
+        worker_id: Worker that owns the claim being completed.
+        attempt: Claim generation being completed.
         now: Current instant.
         db: Active database session.
 
     Returns:
-        None.
+        True when this exact claim was completed; False when ownership was lost.
     """
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_COMPLETED,
-            completed_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            lease_expires_at=None,
-        )
+    completed = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(*_owned_claim(job_id, worker_id=worker_id, attempt=attempt))
+            .values(
+                status=STATUS_COMPLETED,
+                completed_at=now,
+                updated_at=now,
+                last_error=None,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+            )
+        ),
     )
     db.commit()
+    return completed.rowcount == 1
+
+
+def _owned_claim(job_id: str, *, worker_id: str, attempt: int) -> tuple[Any, ...]:
+    """Match one exact claim generation so a stale worker cannot finalize its replacement."""
+    return (
+        ProcessingJob.id == job_id,
+        ProcessingJob.status == STATUS_CLAIMED,
+        ProcessingJob.locked_by == worker_id,
+        ProcessingJob.attempts == attempt,
+    )
 
 
 def mark_job_failed(
     job_id: str,
     error_message: str,
     *,
+    worker_id: str,
+    attempt: int,
     base_seconds: float,
     max_seconds: float,
     now: datetime,
     db: Session,
 ) -> str:
     """
-    Record a failed attempt: reschedule with backoff, or dead-letter if exhausted.
+    Record a failed attempt if the caller still owns that exact claim.
 
     Args:
         job_id: The job that failed.
         error_message: The failure reason (truncated for storage).
+        worker_id: Worker that owns the failed claim.
+        attempt: Claim generation that failed.
         base_seconds: Backoff base delay.
         max_seconds: Backoff ceiling.
         now: Current instant.
@@ -238,44 +316,56 @@ def mark_job_failed(
 
     Returns:
         The job's new status (``pending`` when rescheduled, ``dead_letter`` when
-        the attempt ceiling was reached), or the empty string when the job was
-        not found.
+        the attempt ceiling was reached), or the empty string when ownership was
+        lost or the job was not found.
     """
-    job = db.get(ProcessingJob, job_id)
-    if job is None:
+    ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
+    attempt_state = db.execute(
+        select(ProcessingJob.attempts, ProcessingJob.max_attempts).where(*ownership)
+    ).one_or_none()
+    if attempt_state is None:
+        db.commit()
         return ""
+    attempts, max_attempts = attempt_state
     truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
-    if job.attempts >= job.max_attempts:
-        db.execute(
-            update(ProcessingJob)
-            .where(ProcessingJob.id == job_id)
-            .values(
-                status=STATUS_DEAD_LETTER,
-                last_error=truncated,
-                completed_at=now,
-                updated_at=now,
-                locked_by=None,
-                lease_expires_at=None,
-            )
+    if attempts >= max_attempts:
+        failed = cast(
+            CursorResult[Any],
+            db.execute(
+                update(ProcessingJob)
+                .where(*ownership)
+                .values(
+                    status=STATUS_DEAD_LETTER,
+                    last_error=truncated,
+                    completed_at=now,
+                    updated_at=now,
+                    locked_by=None,
+                    locked_at=None,
+                    lease_expires_at=None,
+                )
+            ),
         )
         db.commit()
-        return STATUS_DEAD_LETTER
-    delay = jobs_backoff.backoff_seconds(job.attempts, base_seconds=base_seconds, max_seconds=max_seconds)
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_PENDING,
-            last_error=truncated,
-            available_at=now + timedelta(seconds=delay),
-            updated_at=now,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-        )
+        return STATUS_DEAD_LETTER if failed.rowcount == 1 else ""
+    delay = jobs_backoff.backoff_seconds(attempts, base_seconds=base_seconds, max_seconds=max_seconds)
+    failed = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(*ownership)
+            .values(
+                status=STATUS_PENDING,
+                last_error=truncated,
+                available_at=now + timedelta(seconds=delay),
+                updated_at=now,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+            )
+        ),
     )
     db.commit()
-    return STATUS_PENDING
+    return STATUS_PENDING if failed.rowcount == 1 else ""
 
 
 def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> int:
@@ -401,6 +491,36 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         )
         for (subscriber_id, event_type), status_counts in sorted(counts.items())
     ]
+    queue_rows = db.execute(
+        select(ProcessingJob.queue, ProcessingJob.status, func.count())
+        .where(ProcessingJob.created_at >= window_start)
+        .group_by(ProcessingJob.queue, ProcessingJob.status)
+    ).all()
+    queue_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for queue, status, count in queue_rows:
+        queue_counts[queue][status] += count
+    queue_oldest: dict[str, datetime] = {
+        queue: oldest
+        for queue, oldest in db.execute(
+            select(ProcessingJob.queue, func.min(ProcessingJob.created_at))
+            .where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))
+            .group_by(ProcessingJob.queue)
+        ).all()
+    }
+    queue_names = queue_counts.keys() | queue_oldest.keys()
+    by_queue = [
+        jobs_schema.JobQueueStats(
+            queue=queue,
+            total=sum(status_counts.values()),
+            pending=status_counts.get(STATUS_PENDING, 0),
+            claimed=status_counts.get(STATUS_CLAIMED, 0),
+            completed=status_counts.get(STATUS_COMPLETED, 0),
+            dead_letter=status_counts.get(STATUS_DEAD_LETTER, 0),
+            oldest_pending_seconds=age_seconds(queue_oldest.get(queue), now),
+        )
+        for queue in sorted(queue_names)
+        for status_counts in (queue_counts[queue],)
+    ]
     oldest_pending = db.execute(
         select(func.min(ProcessingJob.created_at)).where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))
     ).scalar()
@@ -423,6 +543,7 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         dead_letter=totals.get(STATUS_DEAD_LETTER, 0),
         oldest_pending_seconds=age_seconds(oldest_pending, now),
         by_subscriber=by_subscriber,
+        by_queue=by_queue,
         recent_dead_letter=[jobs_schema.DeadLetterJob.model_validate(job) for job in dead_letter_jobs],
     )
 
@@ -442,26 +563,26 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
     Returns:
         True when a dead-letter job was requeued; False when none matched.
     """
-    job = db.get(ProcessingJob, job_id)
-    if job is None or job.status != STATUS_DEAD_LETTER:
-        return False
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id, ProcessingJob.status == STATUS_DEAD_LETTER)
-        .values(
-            status=STATUS_PENDING,
-            attempts=0,
-            available_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-            completed_at=None,
-        )
+    replayed = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(ProcessingJob.id == job_id, ProcessingJob.status == STATUS_DEAD_LETTER)
+            .values(
+                status=STATUS_PENDING,
+                attempts=0,
+                available_at=now,
+                updated_at=now,
+                last_error=None,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+                completed_at=None,
+            )
+        ),
     )
     db.commit()
-    return True
+    return replayed.rowcount == 1
 
 
 def delete_completed_jobs_before(cutoff: datetime, *, db: Session, batch_size: int = pruning.PRUNE_BATCH_SIZE) -> int:

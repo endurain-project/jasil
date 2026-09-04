@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.5.0` - the API is still settling. Expect breaking changes on
+> **Status:** `0.6.0` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
@@ -25,7 +25,7 @@ capability backends, an event pipeline, durable jobs, and observability.
 | **Backends** | A working implementation of each, selected by URI: `memory://` or `redis://`, `local://` or `s3://`, `noop://` or `postgres-advisory://`. |
 | **Deployment profiles** | `local` runs single-process with zero extra infrastructure. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload schema versioning that survives a rolling deploy. |
-| **Durable jobs** | A transactional outbox relayed into leased per-subscriber jobs, with exponential backoff and a dead-letter queue. |
+| **Durable jobs** | A transactional outbox relayed into named, leased per-subscriber queues, with fair/selective workers, exponential backoff, and a dead-letter queue. |
 | **Observability** | An event lifecycle log and bounded retention pruning for every table it owns. |
 
 A core install depends on **`sqlalchemy` and `pydantic` only**. Every backend
