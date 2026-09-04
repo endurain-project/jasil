@@ -10,7 +10,7 @@ is the guard for that.
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect
 
 from jasil import migrations
 from jasil.orm import jasil_table_names
@@ -33,6 +33,18 @@ def _drop_everything(engine, mapped_base) -> None:
     mapped_base.metadata.drop_all(engine)
     with engine.begin() as connection:
         connection.exec_driver_sql(f"DROP TABLE IF EXISTS {migrations.VERSION_TABLE}")
+
+
+def _drop_version_table(engine) -> None:
+    with engine.begin() as connection:
+        connection.exec_driver_sql(f"DROP TABLE {migrations.VERSION_TABLE}")
+
+
+def _copied_jasil_metadata(mapped_base) -> MetaData:
+    metadata = MetaData()
+    for table_name in jasil_table_names():
+        mapped_base.metadata.tables[table_name].to_metadata(metadata)
+    return metadata
 
 
 def _schema(engine) -> dict[str, dict]:
@@ -139,13 +151,185 @@ class TestDowngrade:
         assert not set(inspect(engine).get_table_names()) & jasil_table_names()
 
 
-class TestStamp:
-    def test_stamping_records_head_without_creating_tables(self, engine):
-        """For a deployment whose tables already exist from ``create_all``."""
-        migrations.stamp(engine)
+class TestAdoptExistingSchema:
+    def test_an_empty_database_is_not_stamped_and_can_be_upgraded(self, engine):
+        assert migrations.adopt_existing_schema(engine) is False
+        assert migrations.db_revision(engine) is None
+
+        migrations.upgrade(engine)
 
         assert migrations.db_revision(engine) == migrations.head_revision()
-        assert not set(inspect(engine).get_table_names()) & jasil_table_names()
+
+    def test_a_complete_unversioned_schema_is_adopted_idempotently(self, engine):
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert migrations.adopt_existing_schema(engine) is False
+
+        migrations.upgrade(engine)
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_a_partial_schema_fails_without_recording_a_revision(self, engine, mapped_base):
+        mapped_base.metadata.create_all(engine)
+        mapped_base.metadata.tables["event_outbox"].drop(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"missing tables: event_outbox"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_column_is_identified_without_recording_a_revision(self, engine, mapped_base):
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        expected_index = next(
+            index
+            for index in mapped_base.metadata.tables["event_outbox"].indexes
+            if index.name == "idx_event_outbox_relayed"
+        )
+        expected_index.drop(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE event_outbox DROP COLUMN relayed_at")
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"event_outbox.*missing column 'relayed_at'"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_an_unexpected_column_is_rejected(self, engine):
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE event_outbox ADD COLUMN legacy_value VARCHAR(20)")
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError, match=r"event_outbox.*unexpected column 'legacy_value'"
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_required_index_is_rejected(self, engine, mapped_base):
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        expected_index = next(
+            index
+            for index in mapped_base.metadata.tables["event_outbox"].indexes
+            if index.name == "idx_event_outbox_relayed"
+        )
+        expected_index.drop(engine)
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError,
+            match=r"event_outbox.*missing index 'idx_event_outbox_relayed'",
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_wrong_column_type_is_rejected(self, engine, mapped_base):
+        metadata = _copied_jasil_metadata(mapped_base)
+        metadata.tables["event_outbox"].c.event_type.type = Integer()
+        metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"event_outbox.event_type.*expected type"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_wrong_nullability_is_rejected(self, engine, mapped_base):
+        metadata = _copied_jasil_metadata(mapped_base)
+        metadata.tables["event_outbox"].c.event_type.nullable = True
+        metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"event_outbox.event_type.*nullable=False"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_primary_key_is_rejected(self, engine, mapped_base):
+        metadata = _copied_jasil_metadata(mapped_base)
+        copied_table = metadata.tables["event_outbox"]
+        columns = [
+            Column(
+                column.name,
+                column.type,
+                nullable=column.nullable,
+                server_default=column.server_default,
+                comment=column.comment,
+            )
+            for column in copied_table.columns
+        ]
+        metadata.remove(copied_table)
+        table = Table("event_outbox", metadata, *columns)
+        Index("idx_event_outbox_relayed", table.c.relayed_at, table.c.created_at)
+        metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"event_outbox.*expected primary key"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_unique_constraint_is_rejected(self, engine, mapped_base):
+        metadata = _copied_jasil_metadata(mapped_base)
+        table = metadata.tables["processing_jobs"]
+        constraint = next(item for item in table.constraints if isinstance(item, UniqueConstraint))
+        table.constraints.remove(constraint)
+        metadata.create_all(engine)
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError,
+            match=r"processing_jobs.*missing unique constraint 'uq_processing_jobs_event_subscriber'",
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_an_additional_non_unique_index_is_allowed(self, engine, mapped_base):
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        table = mapped_base.metadata.tables["event_outbox"]
+        Index("idx_host_event_outbox_event_id", table.c.event_id).create(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_an_existing_head_revision_is_not_restamped(self, engine):
+        migrations.upgrade(engine)
+
+        assert migrations.adopt_existing_schema(engine) is False
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_an_existing_older_revision_is_preserved(self, engine):
+        metadata = MetaData()
+        version_table = Table(
+            migrations.VERSION_TABLE,
+            metadata,
+            Column("version_num", String(32), primary_key=True),
+        )
+        metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(version_table.insert().values(version_num="older_revision"))
+
+        assert migrations.adopt_existing_schema(engine) is False
+        assert migrations.db_revision(engine) == "older_revision"
+
+    def test_postgres_requires_the_metadata_gin_index(self, engine):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("GIN indexes are PostgreSQL-only")
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP INDEX idx_event_log_metadata_gin")
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError,
+            match=r"event_log.*missing index 'idx_event_log_metadata_gin'",
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
 
 
 class TestSchemaVerification:

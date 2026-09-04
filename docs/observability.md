@@ -56,14 +56,16 @@ import jasil.orm as jasil_orm
 from jasil import migrations
 
 jasil_orm.map_models(Base)  # the metadata must exist first
+migrations.adopt_existing_schema(engine)  # validate legacy unversioned tables
 migrations.upgrade(engine)  # create or upgrade JASIL's tables
+migrations.verify_schema_current(engine)  # fail fast if not migrated
 ```
 
 | Function | Use |
 |---|---|
 | `upgrade(engine)` | Create or upgrade to head. Run at deploy time. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
-| `stamp(engine)` | Mark an existing database as at head, without running anything. |
+| `adopt_existing_schema(engine)` | Validate and adopt complete, unversioned JASIL tables. |
 | `head_revision()` | The newest revision shipped in this package. |
 | `db_revision(engine)` | What the database currently records. |
 | `verify_schema_current(engine)` | Raise unless the database is at head. |
@@ -77,14 +79,24 @@ migrate" into a clear message at boot rather than a confusing query error later.
     JASIL's three tables, so autogenerate cannot propose dropping yours — even
     though both live in the same registry.
 
-### Already created the tables with `create_all`?
+### Adopting existing tables
 
-```python
-migrations.stamp(engine)
-```
+`adopt_existing_schema()` is only for a database where all three JASIL-owned
+tables already exist but `jasil_alembic_version` does not record a revision. It
+compares their columns, types, nullability, primary keys, unique constraints,
+and required indexes with the schema expected by the
+installed JASIL migration head. PostgreSQL adoption also requires the metadata
+GIN index and its PostgreSQL-specific definition.
 
-This records head without running the baseline, so future `upgrade()` calls
-apply only genuinely new revisions.
+An empty database is left unversioned for `upgrade()` to create. A partial or
+incompatible schema raises `SchemaCompatibilityError` without changing it or
+recording a revision. Unexpected columns are incompatible; additional ordinary
+non-unique indexes are allowed because they do not change JASIL's write
+contract. JASIL never repairs an incompatible schema automatically.
+
+Do not guess or hardcode a JASIL revision identifier. The adoption API owns the
+installed head and all expected schema details. Calling it again after a
+successful adoption is a no-op.
 
 ### Prefer one unified history?
 
