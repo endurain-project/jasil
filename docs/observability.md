@@ -133,7 +133,7 @@ migrate" into a clear message at boot rather than a confusing query error later.
 
 ### Adopting existing tables
 
-`adopt_existing_schema()` is only for a database where all three JASIL-owned
+`adopt_existing_schema()` is only for a database where all four JASIL-owned
 tables already exist but `jasil_alembic_version` does not record a revision. It
 compares their columns, types, nullability, primary keys, unique constraints,
 and required indexes with the schema expected by the

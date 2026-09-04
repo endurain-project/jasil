@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.5.0"
+!!! warning "Status: 0.6.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
