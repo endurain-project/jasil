@@ -39,7 +39,7 @@ modules:
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract), `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
-| `jasil.migrations` | `upgrade`, `downgrade`, `stamp`, `head_revision`, `db_revision`, `verify_schema_current`. |
+| `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`. |
 
 ### Provider protocols
 
