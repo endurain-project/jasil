@@ -17,7 +17,7 @@ from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
-from jasil.backends.mail_memory import DisabledMail, MemoryMail
+from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
@@ -297,7 +297,7 @@ class TestMailResolution:
         return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())
 
     def test_unset_selects_the_disabled_backend(self):
-        assert isinstance(self._build(), DisabledMail)
+        assert isinstance(self._build(), NullMail)
 
     def test_memory_selects_the_recording_backend(self):
         assert isinstance(self._build(uri="memory://"), MemoryMail)

@@ -1,6 +1,6 @@
 """``MailProvider`` backends that never touch a network.
 
-``DisabledMail`` is what an unconfigured platform gets, so the domain has one
+``NullMail`` is what an unconfigured platform gets, so the domain has one
 code path and always just calls ``send``. ``MemoryMail`` records messages for a
 host's test suite.
 """
@@ -14,8 +14,14 @@ from jasil.providers import ClockProvider, MailMessage, MailNotConfiguredError
 _DEFAULT_SENDER = "jasil@localhost"
 
 
-class DisabledMail:
-    """``MailProvider`` for a deployment with no mail backend configured."""
+class NullMail:
+    """``MailProvider`` for a deployment with no mail backend configured.
+
+    The counterpart of ``NullGeocoding``: "unconfigured" is an explicit backend,
+    so the domain always has a provider and never branches on whether mail
+    exists. The one deliberate difference is that ``send`` raises instead of
+    returning nothing, because mail is not best-effort enrichment.
+    """
 
     def send(self, message: MailMessage) -> str:
         """Always raise: a message must never be dropped silently.

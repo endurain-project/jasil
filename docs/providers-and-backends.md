@@ -429,7 +429,7 @@ platform.mail.send(MailMessage(to=["a@example.com"], subject="Hi", text="Hello")
 
 | Backend | Selected by | Notes |
 |---|---|---|
-| `DisabledMail` | `mail.uri` unset | `send` raises `MailNotConfiguredError`. |
+| `NullMail` | `mail.uri` unset | `send` raises `MailNotConfiguredError`. |
 | `MemoryMail` | `memory://` | Records each `MailMessage` in a public `outbox` list. For tests. |
 | `SmtpMail` | `smtp://host[:port]` / `smtps://host[:port]` | STARTTLS (default port 587) or implicit TLS (465). Standard library only — no extra. |
 

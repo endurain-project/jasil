@@ -35,7 +35,7 @@ from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
-from jasil.backends.mail_memory import DisabledMail, MemoryMail
+from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
@@ -315,7 +315,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         clock: The platform clock, used for the ``Date`` header.
 
     Returns:
-        :class:`DisabledMail` when unset, :class:`MemoryMail` for ``memory://``,
+        :class:`NullMail` when unset, :class:`MemoryMail` for ``memory://``,
         else :class:`SmtpMail`.
 
     Raises:
@@ -327,7 +327,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     mail = settings.mail
     if not mail.uri:
         logger.debug("Mail is not configured; sending will raise MailNotConfiguredError")
-        return DisabledMail()
+        return NullMail()
     # The URI is never echoed in an error: it is operator input, but keeping
     # error text free of it costs nothing and keeps a mistyped credential out of logs.
     try:

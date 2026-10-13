@@ -15,7 +15,7 @@ import pytest
 
 import jasil.backends.mail_smtp as mail_smtp
 from jasil._core.mail_message import build_mime
-from jasil.backends.mail_memory import DisabledMail, MemoryMail
+from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.providers import MailError, MailMessage, MailNotConfiguredError, MailProvider
 
@@ -245,14 +245,14 @@ class TestMemoryMail:
         assert MemoryMail(_Clock()).send(_message()).endswith("@localhost>")
 
 
-class TestDisabledMail:
+class TestNullMail:
     def test_send_raises_not_configured(self):
         with pytest.raises(MailNotConfiguredError):
-            DisabledMail().send(_message())
+            NullMail().send(_message())
 
     def test_not_configured_is_a_mail_error(self):
         with pytest.raises(MailError):
-            DisabledMail().send(_message())
+            NullMail().send(_message())
 
 
 class TestSmtpTransport:
