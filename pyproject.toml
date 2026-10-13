@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.5.0"
+version = "0.5.1"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -21,8 +21,8 @@ classifiers = [
 # Deliberately minimal: the ports are pure, and every backend that needs a
 # client (redis / boto3 / requests) lives behind an extra below.
 dependencies = [
-    "sqlalchemy>=2.0.51",
-    "pydantic>=2.13.4",
+    "sqlalchemy>=2.0.52",
+    "pydantic>=2.13.5",
 ]
 
 [project.urls]
@@ -44,12 +44,12 @@ redis = [
 ]
 # S3-compatible object storage backend.
 s3 = [
-    "boto3>=1.43.64",
+    "boto3>=1.43.93",
 ]
 # PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
 # this extra exists so a host can pull a driver from the same declaration.
 postgres = [
-    "psycopg[binary]>=3.3.4",
+    "psycopg[binary]>=3.3.5",
 ]
 # Durable jobs: the outbox relay and lease-expiry schedules.
 jobs = [
@@ -65,32 +65,32 @@ geocoding = [
 ]
 # Alembic migrations for JASIL's companion tables (jasil.migrations).
 migrations = [
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 # Convenience: every optional backend at once.
 all = [
     "redis>=8.1.0",
-    "boto3>=1.43.64",
-    "psycopg[binary]>=3.3.4",
+    "boto3>=1.43.93",
+    "psycopg[binary]>=3.3.5",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 
 [dependency-groups]
 typecheck = [
-    "mypy>=2.3.0",
-    "types-requests>=2.33.0.20260712",
-    "boto3-stubs[s3]>=1.43.64",
+    "mypy>=2.3.1",
+    "types-requests>=2.33.0.20260906",
+    "boto3-stubs[s3]>=1.43.93",
 ]
 lint = [
-    "ruff>=0.16.1",
-    "import-linter>=2.13",
+    "ruff>=0.16.7",
+    "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.36.0",
-    "hypothesis>=6.165.1",
+    "faker>=40.38.0",
+    "hypothesis>=6.168.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
@@ -99,25 +99,25 @@ test = [
     # Earlier fakeredis releases do not implement XREADGROUP well enough for
     # the Redis Streams bus suite.
     "redis>=8.1.0",
-    "fakeredis[lua]>=2.37.0",
+    "fakeredis[lua]>=2.38.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.64",
+    "boto3>=1.43.93",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
-    "responses>=0.26.2",
+    "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 # Real database drivers for the CI database matrix. The default test run uses
 # in-memory SQLite (built into Python) and needs neither; set
 # JASIL_TEST_DATABASE_URL to run the suite against another backend.
 test-db = [
-    "psycopg[binary]>=3.3.4",
+    "psycopg[binary]>=3.3.5",
     "pymysql>=1.2.0",
 ]
 dev = [
-    "hatch>=1.17.1",
+    "hatch>=1.18.0",
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
@@ -139,6 +139,10 @@ docs = [
 # this floor above the uv that Dependabot bundles silently stops all dependency
 # updates, security ones included. Check what it supports before raising it.
 required-version = ">=0.12.1,<0.13"
+# The locked `uv` is a transitive dependency of hatch, separate from the uv that
+# runs the build. Keep it on the same 0.12 series as `required-version` so the
+# lock never jumps a minor series on an unrelated upgrade.
+constraint-dependencies = ["uv<0.13"]
 # Supply-chain cooldown: refuse dependency versions published in the last 30
 # days, so a compromised release has time to be caught before it can enter a
 # build.
@@ -156,6 +160,20 @@ exclude-newer = "30 days"
 # is a development dependency and never installed by a consumer of this package,
 # but the fix should not sit behind the cooldown regardless.
 cryptography = "0 days"
+# PYSEC-2026-4175, PYSEC-2026-4176 and PYSEC-2026-4177 are fixed in 2.8.0
+# (published 2026-09-15). A runtime transitive dependency of requests and boto3,
+# so the audit workflow fails until the lock moves. Remove once 2.8.0 is older
+# than the window.
+urllib3 = "0 days"
+# GitHub advisories flag mako <= 1.4.1 (fixed in 1.4.2, 2026-09-22), virtualenv
+# <= 21.7.12 (fixed in 21.7.13, 2026-09-18) and uv 0.12.7 - 0.12.17. All three
+# are development-only (alembic's template engine is the exception: mako ships
+# with the `migrations` extra). Dependabot's security job cannot resolve a fix
+# that the cooldown hides, so exempt them until the fixes age out of the window.
+# The uv fix (0.12.18) clears the window on 2026-10-22; drop the `uv` entry then.
+mako = "0 days"
+virtualenv = "0 days"
+uv = "0 days"
 
 [[tool.uv.index]]
 name = "pypi"

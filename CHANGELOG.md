@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.5.1]
+
+### Changed
+
+- Refreshed all Python dependency minimums and the locked dependency graph to the newest releases allowed by the supply-chain cooldown.
+- Updated pinned GitHub Actions to their latest releases: `astral-sh/setup-uv`, `github/codeql-action`, `actions/upload-artifact`, `actions/download-artifact`, and `ossf/scorecard-action`.
+
+### Security
+
+- Updated `urllib3` to 2.8.0, which fixes PYSEC-2026-4175, PYSEC-2026-4176, and PYSEC-2026-4177. It is exempted from the supply-chain cooldown until the release ages out of the window.
+
 ## [0.5.0]
 
 ### Breaking
@@ -163,6 +174,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.5.1]: https://github.com/endurain-project/jasil/releases/tag/v0.5.1
 [0.5.0]: https://github.com/endurain-project/jasil/releases/tag/v0.5.0
 [0.4.0]: https://github.com/endurain-project/jasil/releases/tag/v0.4.0
 [0.3.0]: https://github.com/endurain-project/jasil/releases/tag/v0.3.0
