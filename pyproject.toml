@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.5.0"
+version = "0.5.1"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -21,8 +21,8 @@ classifiers = [
 # Deliberately minimal: the ports are pure, and every backend that needs a
 # client (redis / boto3 / requests) lives behind an extra below.
 dependencies = [
-    "sqlalchemy>=2.0.51",
-    "pydantic>=2.13.4",
+    "sqlalchemy>=2.0.52",
+    "pydantic>=2.13.5",
 ]
 
 [project.urls]
@@ -44,12 +44,12 @@ redis = [
 ]
 # S3-compatible object storage backend.
 s3 = [
-    "boto3>=1.43.64",
+    "boto3>=1.43.93",
 ]
 # PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
 # this extra exists so a host can pull a driver from the same declaration.
 postgres = [
-    "psycopg[binary]>=3.3.4",
+    "psycopg[binary]>=3.3.5",
 ]
 # Durable jobs: the outbox relay and lease-expiry schedules.
 jobs = [
@@ -65,32 +65,32 @@ geocoding = [
 ]
 # Alembic migrations for JASIL's companion tables (jasil.migrations).
 migrations = [
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 # Convenience: every optional backend at once.
 all = [
     "redis>=8.1.0",
-    "boto3>=1.43.64",
-    "psycopg[binary]>=3.3.4",
+    "boto3>=1.43.93",
+    "psycopg[binary]>=3.3.5",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 
 [dependency-groups]
 typecheck = [
-    "mypy>=2.3.0",
-    "types-requests>=2.33.0.20260712",
-    "boto3-stubs[s3]>=1.43.64",
+    "mypy>=2.3.1",
+    "types-requests>=2.33.0.20260906",
+    "boto3-stubs[s3]>=1.43.93",
 ]
 lint = [
-    "ruff>=0.16.1",
-    "import-linter>=2.13",
+    "ruff>=0.16.7",
+    "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.36.0",
-    "hypothesis>=6.165.1",
+    "faker>=40.38.0",
+    "hypothesis>=6.168.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
@@ -99,25 +99,25 @@ test = [
     # Earlier fakeredis releases do not implement XREADGROUP well enough for
     # the Redis Streams bus suite.
     "redis>=8.1.0",
-    "fakeredis[lua]>=2.37.0",
+    "fakeredis[lua]>=2.38.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.64",
+    "boto3>=1.43.93",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
-    "responses>=0.26.2",
+    "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.
-    "alembic>=1.19.0",
+    "alembic>=1.20.0",
 ]
 # Real database drivers for the CI database matrix. The default test run uses
 # in-memory SQLite (built into Python) and needs neither; set
 # JASIL_TEST_DATABASE_URL to run the suite against another backend.
 test-db = [
-    "psycopg[binary]>=3.3.4",
+    "psycopg[binary]>=3.3.5",
     "pymysql>=1.2.0",
 ]
 dev = [
-    "hatch>=1.17.1",
+    "hatch>=1.18.0",
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
