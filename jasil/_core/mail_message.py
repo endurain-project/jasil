@@ -66,16 +66,17 @@ def parse_address(value: str, *, role: str) -> Address:
     # is worse than refusing, so the parsed address must appear verbatim.
     if not (local and separator and domain) or addr_spec not in value:
         raise invalid
+    if not local.isascii():
+        raise invalid
     try:
-        return Address(display_name=display_name, addr_spec=addr_spec)
+        # An internationalised domain travels as its ASCII (punycode) form: the
+        # header parser would otherwise emit an RFC 2047 encoded-word inside the
+        # addr-spec, which is invalid, and a relay without SMTPUTF8 would refuse it.
+        ascii_domain = domain.encode("idna").decode("ascii")
+        return Address(display_name=display_name, username=local, domain=ascii_domain)
     except Exception:
         # Deliberately not chained: the parser's message quotes the address.
         raise invalid from None
-
-
-def sender_domain(sender: Address) -> str:
-    """Return the domain of ``sender``, used for the ``Message-ID``."""
-    return sender.domain
 
 
 def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> EmailMessage:
@@ -109,7 +110,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
         mime["Reply-To"] = reply_to
     mime["Subject"] = message.subject
     mime["Date"] = format_datetime(now)
-    mime["Message-ID"] = make_msgid(domain=sender_domain(from_address))
+    mime["Message-ID"] = make_msgid(domain=from_address.domain)
 
     if message.text and message.html:
         mime.set_content(message.text)

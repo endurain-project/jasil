@@ -81,6 +81,8 @@ class SmtpMail:
             raise MailError("SMTP server refused every recipient") from None
         except smtplib.SMTPResponseException as error:
             raise MailError(f"SMTP server rejected the message (status {error.smtp_code})") from None
+        except smtplib.SMTPNotSupportedError:
+            raise MailError("SMTP server lacks a required feature (AUTH or SMTPUTF8)") from None
         except ssl.SSLError:
             raise MailError("TLS negotiation with the SMTP server failed") from None
         except (smtplib.SMTPException, OSError):
@@ -92,7 +94,7 @@ class SmtpMail:
                 len(refused),
                 len(message.to),
             )
-        logger.info("Mail %s sent to %d recipient(s)", message_id, len(message.to))
+        logger.info("Mail %s sent to %d recipient(s)", message_id, len(message.to) - len(refused))
         return message_id
 
     def _deliver(self, mime) -> dict:
@@ -112,4 +114,5 @@ class SmtpMail:
                 smtp.ehlo()
             if self._username and self._password:
                 smtp.login(self._username, self._password)
-            return smtp.send_message(mime)
+            # Explicit envelope sender: the bare address, never the display name.
+            return smtp.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)

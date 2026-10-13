@@ -51,6 +51,7 @@ class FakeSMTP:
         self.calls: list[str] = []
         self.logged_in_as: str | None = None
         self.sent = None
+        self.envelope_sender: str | None = None
         self.tls_started = False
         FakeSMTP.instances.append(self)
         if FakeSMTP.fail_on == "connect":
@@ -78,15 +79,18 @@ class FakeSMTP:
         if FakeSMTP.fail_on == "auth":
             raise smtplib.SMTPAuthenticationError(535, ("bad creds for " + ADDRESS).encode())
 
-    def send_message(self, mime):
+    def send_message(self, mime, from_addr=None):
         self.calls.append("send")
         self.sent = mime
+        self.envelope_sender = from_addr
         if FakeSMTP.fail_on == "data":
             raise smtplib.SMTPDataError(554, ("srvtext-xyz " + ADDRESS).encode())
         if FakeSMTP.fail_on == "all-refused":
             raise smtplib.SMTPRecipientsRefused({ADDRESS: (550, b"no")})
         if FakeSMTP.fail_on == "tls":
             raise ssl.SSLError("handshake")
+        if FakeSMTP.fail_on == "unsupported":
+            raise smtplib.SMTPNotSupportedError("srvtext-xyz " + ADDRESS)
         return FakeSMTP.refused
 
 
@@ -174,10 +178,15 @@ class TestBuildMime:
 
         assert ADDRESS not in str(caught.value) and caught.value.__cause__ is None
 
-    def test_a_non_ascii_domain_builds(self):
+    def test_a_non_ascii_domain_is_sent_in_its_ascii_form(self):
         mime = build_mime(_message(to=["a@ünï.test"]), sender=SENDER, now=NOW)
 
-        mime.as_bytes()
+        assert mime["To"] == "a@xn--n-nga1b.test"
+        assert b"=?utf-8?" not in mime.as_bytes()
+
+    def test_a_non_ascii_local_part_is_rejected(self):
+        with pytest.raises(ValueError):
+            build_mime(_message(to=["ü@example.com"]), sender=SENDER, now=NOW)
 
     def test_no_recipient_is_rejected(self):
         with pytest.raises(ValueError, match="recipient"):
@@ -311,19 +320,21 @@ class TestSmtpTransport:
 
         _smtp().send(_message())
 
-        sent = FakeSMTP.instances[0].sent
-        assert sent["From"].startswith("Support Team")
-        assert email.utils.parseaddr(sent["From"])[1] == "support@example.com"
+        smtp = FakeSMTP.instances[0]
+        assert smtp.sent["From"].startswith("Support Team")
+        assert email.utils.parseaddr(smtp.sent["From"])[1] == "support@example.com"
+        assert smtp.envelope_sender == "support@example.com"
 
     def test_a_partial_refusal_succeeds_and_warns_with_a_count(self, caplog):
         FakeSMTP.refused = {"gone@example.com": (550, b"unknown")}
 
-        with caplog.at_level(logging.WARNING, logger=mail_smtp.logger.name):
+        with caplog.at_level(logging.INFO, logger=mail_smtp.logger.name):
             message_id = _smtp().send(_message(to=[ADDRESS, "gone@example.com"]))
 
         assert message_id
         warning = next(r for r in caplog.records if r.levelno == logging.WARNING)
         assert "1 of 2" in warning.getMessage()
+        assert any("sent to 1 recipient" in r.getMessage() for r in caplog.records)
         assert "gone@example.com" not in caplog.text
 
 
@@ -336,6 +347,7 @@ class TestFailuresAreRedacted:
             ("data", "status 554"),
             ("all-refused", "refused every recipient"),
             ("tls", "TLS negotiation"),
+            ("unsupported", "lacks a required feature"),
         ],
     )
     def test_each_failure_becomes_a_mail_error_with_no_server_text(self, mode, expect, caplog):

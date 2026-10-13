@@ -339,7 +339,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     scheme = parts.scheme
     if scheme not in ("memory", *_SMTP_PORTS):
         raise ValueError(f"Unsupported mail.uri scheme: {scheme or '(none)'!r}")
-    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+    if parts.username is not None or parts.password is not None:
         raise ValueError("mail.uri must not carry credentials; use mail.username and mail.password")
     if parts.path or parts.query or parts.fragment:
         raise ValueError("mail.uri must be scheme://host[:port] with no path, query or fragment")
@@ -364,13 +364,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     if not mail.from_address:
         raise ValueError("mail.from_address is required for smtp:// and smtps://")
     resolved_port = port or _SMTP_PORTS[scheme]
-    logger.info(
-        "Mail enabled via %s (%s:%d)%s",
-        scheme,
-        hostname,
-        resolved_port,
-        ", authenticated" if mail.username else "",
-    )
+    logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")
     return SmtpMail(
         hostname,
         resolved_port,

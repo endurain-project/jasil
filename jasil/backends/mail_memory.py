@@ -29,7 +29,7 @@ class NullMail:
         Raises:
             MailNotConfiguredError: Always.
         """
-        raise MailNotConfiguredError("Mail is not configured") from None
+        raise MailNotConfiguredError("Mail is not configured")
 
 
 class MemoryMail:
