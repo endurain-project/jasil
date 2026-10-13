@@ -13,6 +13,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 - Refreshed all Python dependency minimums and the locked dependency graph to the newest releases allowed by the supply-chain cooldown.
 - Updated pinned GitHub Actions to their latest releases: `astral-sh/setup-uv`, `github/codeql-action`, `actions/upload-artifact`, `actions/download-artifact`, and `ossf/scorecard-action`.
 
+### Security
+
+- Updated `urllib3` to 2.8.0, which fixes PYSEC-2026-4175, PYSEC-2026-4176, and PYSEC-2026-4177. It is exempted from the supply-chain cooldown until the release ages out of the window.
+
 ## [0.5.0]
 
 ### Breaking

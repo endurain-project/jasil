@@ -156,6 +156,11 @@ exclude-newer = "30 days"
 # is a development dependency and never installed by a consumer of this package,
 # but the fix should not sit behind the cooldown regardless.
 cryptography = "0 days"
+# PYSEC-2026-4175, PYSEC-2026-4176 and PYSEC-2026-4177 are fixed in 2.8.0
+# (published 2026-09-15). A runtime transitive dependency of requests and boto3,
+# so the audit workflow fails until the lock moves. Remove once 2.8.0 is older
+# than the window.
+urllib3 = "0 days"
 
 [[tool.uv.index]]
 name = "pypi"
