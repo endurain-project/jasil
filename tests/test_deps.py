@@ -90,6 +90,11 @@ class TestResolutionOrder:
 
         assert dependency(_request_against(FastAPI())) is getattr(platform, attribute)
 
+    def test_the_process_wide_state_is_the_active_platforms(self, platform):
+        platform_runtime.set_active_platform(platform)
+
+        assert platform_runtime.get_state() is platform.state
+
     def test_an_attached_platform_wins_over_the_process_wide_one(self, request_for, platform, tmp_path):
         """Per-app isolation is the point of ``app.state``; it must not be shadowed."""
         other = container.build_platform(settings.JasilSettings(data_dir=str(tmp_path / "other")))

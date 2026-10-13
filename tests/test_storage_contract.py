@@ -18,7 +18,7 @@ import pytest
 from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 
-from jasil._core.storage_streams import ExactSizeReader
+from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
@@ -227,6 +227,97 @@ class _OverReadingSource:
 def _upload_part(storage, session, part_number, data, *, size=None):
     declared_size = len(data) if size is None else size
     return storage.upload_part(session, part_number, _ReadOnceSource(data), size=declared_size)
+
+
+class _TranslatedError(Exception):
+    """Stands in for a backend's provider-neutral error."""
+
+
+def _translate(error: Exception) -> None:
+    raise _TranslatedError("translated") from error
+
+
+class _FailingSource(io.BytesIO):
+    def __init__(self, data: bytes = b"", *, fail_on: str):
+        super().__init__(data)
+        self._fail_on = fail_on
+
+    def read(self, size=-1):
+        if self._fail_on == "read":
+            raise OSError("read failed")
+        return super().read(size)
+
+    def close(self):
+        # Fail once, but really release the buffer so finalisation stays quiet.
+        failing, self._fail_on = self._fail_on == "close", None
+        super().close()
+        if failing:
+            raise OSError("close failed")
+
+
+class TestNonSeekableReader:
+    def test_it_reads_the_source_once_and_cannot_seek(self):
+        reader = non_seekable_reader(io.BytesIO(b"abcdef"), length=None, translate_error=_translate)
+
+        assert reader.read() == b"abcdef"
+        assert reader.seekable() is False
+
+    def test_a_declared_length_bounds_the_read(self):
+        reader = non_seekable_reader(io.BytesIO(b"abcdef"), length=4, translate_error=_translate)
+
+        assert reader.read() == b"abcd"
+
+    def test_a_source_failure_is_translated(self):
+        reader = non_seekable_reader(_FailingSource(fail_on="read"), length=None, translate_error=_translate)
+
+        with pytest.raises(_TranslatedError) as excinfo:
+            reader.read()
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_a_close_failure_is_translated_and_the_reader_still_closes(self):
+        reader = non_seekable_reader(_FailingSource(fail_on="close"), length=None, translate_error=_translate)
+
+        with pytest.raises(_TranslatedError):
+            reader.close()
+
+        assert reader.closed
+
+    def test_an_untranslatable_failure_propagates_unchanged(self):
+        reader = non_seekable_reader(_FailingSource(fail_on="read"), length=None, translate_error=lambda _e: None)
+
+        with pytest.raises(OSError, match="read failed"):
+            reader.read()
+
+    def test_a_close_failure_the_translator_ignores_propagates_unchanged(self):
+        reader = non_seekable_reader(_FailingSource(fail_on="close"), length=None, translate_error=lambda _e: None)
+
+        with pytest.raises(OSError, match="close failed"):
+            reader.close()
+
+    def test_closing_the_raw_reader_twice_is_harmless(self):
+        raw = non_seekable_reader(io.BytesIO(b"x"), length=None, translate_error=_translate).raw
+
+        raw.close()
+        raw.close()
+
+        assert raw.closed
+
+    def test_closing_twice_is_harmless(self):
+        reader = non_seekable_reader(io.BytesIO(b"x"), length=None, translate_error=_translate)
+
+        reader.close()
+        reader.close()
+
+        assert reader.closed
+
+    def test_reading_after_close_is_refused(self):
+        reader = non_seekable_reader(io.BytesIO(b"x"), length=None, translate_error=_translate)
+        raw = reader.raw
+        reader.close()
+
+        with pytest.raises(ValueError, match="closed file"):
+            raw.readinto(bytearray(1))
 
 
 class TestExactSizeReader:
