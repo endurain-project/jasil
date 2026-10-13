@@ -126,7 +126,9 @@ class MailSettings:
             port 587) or ``smtps://host[:port]`` (implicit TLS, default port
             465). Unset disables mail: sending raises
             :class:`~jasil.providers.MailNotConfiguredError`. Credentials never
-            belong in the URI.
+            belong in the URI. The host is trusted operator configuration and
+            is not checked against the SSRF address denylist (a relay is
+            normally on a private network): never derive it from user input.
         from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
             for the SMTP schemes. Independent of ``username``.
         username: SMTP login, when the server requires authentication.
