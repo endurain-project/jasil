@@ -120,6 +120,15 @@ class TestCapabilityReport:
 
         assert (row.backend, row.source) == ("smtps", "mail.uri")
 
+    @pytest.mark.parametrize("uri", ["user:hunter2@relay.example.com", "smtp:u:hunter2@relay.example.com:587"])
+    def test_a_malformed_mail_uri_is_never_echoed(self, uri):
+        row = next(
+            row for row in build_capability_report(JasilSettings(mail=MailSettings(uri=uri))).rows if row.name == "mail"
+        )
+
+        assert row.backend == "invalid"
+        assert "hunter2" not in row.backend + row.source
+
     def test_the_clock_row_is_always_present(self, report):
         """The clock is the one capability with no alternative backend."""
         clock_rows = [row for row in report.rows if row.name == "clock"]

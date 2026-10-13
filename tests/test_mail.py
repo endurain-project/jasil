@@ -7,7 +7,9 @@ same invalid message production (``SmtpMail``) would.
 
 import logging
 import smtplib
+import socket
 import ssl
+import threading
 from datetime import UTC, datetime
 from typing import ClassVar
 
@@ -45,9 +47,11 @@ class FakeSMTP:
     offers_starttls = True
     refused: ClassVar[dict] = {}
     fail_on: str | None = None
+    quit_code = 221
 
-    def __init__(self, host, port, timeout=None, context=None):
+    def __init__(self, host, port, local_hostname=None, timeout=None, context=None):
         self.host, self.port, self.timeout, self.context = host, port, timeout, context
+        self.local_hostname = local_hostname
         self.calls: list[str] = []
         self.logged_in_as: str | None = None
         self.sent = None
@@ -59,11 +63,13 @@ class FakeSMTP:
         if FakeSMTP.fail_on == "greeting":
             raise smtplib.SMTPConnectError(421, ("srvtext-xyz " + ADDRESS).encode())
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
+    def quit(self):
         self.calls.append("quit")
+        if FakeSMTP.quit_code != 221:
+            raise smtplib.SMTPResponseException(FakeSMTP.quit_code, b"srvtext-xyz")
+
+    def close(self):
+        self.calls.append("close")
 
     def ehlo(self):
         self.calls.append("ehlo")
@@ -102,6 +108,7 @@ def fake_smtp(monkeypatch):
     FakeSMTP.offers_starttls = True
     FakeSMTP.refused = {}
     FakeSMTP.fail_on = None
+    FakeSMTP.quit_code = 221
     monkeypatch.setattr(mail_smtp.smtplib, "SMTP", FakeSMTP)
     monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", FakeSMTP)
 
@@ -185,6 +192,16 @@ class TestBuildMime:
 
         assert mime["To"] == "a@xn--n-nga1b.test"
         assert b"=?utf-8?" not in mime.as_bytes()
+
+    @pytest.mark.parametrize("address", ['"john doe"@example.com', '"a@evil.com"@example.com'])
+    def test_a_quoted_local_part_is_rejected(self, address):
+        with pytest.raises(ValueError):
+            build_mime(_message(to=[address]), sender=SENDER, now=NOW)
+
+    @pytest.mark.parametrize("body", [{"text": 123}, {"html": b"<p>"}])
+    def test_a_non_string_body_is_a_value_error(self, body):
+        with pytest.raises(ValueError, match="strings"):
+            build_mime(_message(**body), sender=SENDER, now=NOW)
 
     def test_a_non_ascii_local_part_is_rejected(self):
         with pytest.raises(ValueError):
@@ -360,6 +377,70 @@ class TestSmtpTransport:
         assert "1 of 2" in warning.getMessage()
         assert any("sent to 1 recipient" in r.getMessage() for r in caplog.records)
         assert "gone@example.com" not in caplog.text
+
+
+class TestSmtpRobustness:
+    def test_a_bad_quit_reply_does_not_fail_an_accepted_message(self):
+        FakeSMTP.quit_code = 500
+
+        assert _smtp().send(_message())
+        assert FakeSMTP.instances[0].calls[-2:] == ["quit", "close"]
+
+    def test_the_connection_is_closed_after_a_failure(self):
+        FakeSMTP.fail_on = "data"
+
+        with pytest.raises(MailError):
+            _smtp().send(_message())
+
+        assert FakeSMTP.instances[0].calls[-2:] == ["quit", "close"]
+
+    def test_an_explicit_local_hostname_avoids_the_fqdn_lookup(self):
+        _smtp().send(_message())
+
+        assert FakeSMTP.instances[0].local_hostname
+
+    @pytest.mark.parametrize(
+        "credentials", [{"username": "ü", "password": "pw"}, {"username": "u", "password": "pässword"}]
+    )
+    def test_non_ascii_credentials_are_refused_at_construction(self, credentials):
+        with pytest.raises(ValueError, match="ASCII"):
+            _smtp(**credentials)
+
+    def test_real_smtplib_never_looks_up_the_fqdn_and_refuses_a_cleartext_server(self, monkeypatch):
+        """No fake: the genuine ``smtplib`` against a loopback server that does
+        not offer STARTTLS."""
+        monkeypatch.undo()  # drop the autouse smtplib fakes
+        monkeypatch.setattr(socket, "getfqdn", lambda *_a: pytest.fail("getfqdn was called"))
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            with conn, conn.makefile("rwb") as f:
+                f.write(b"220 hi\r\n")
+                f.flush()
+                while line := f.readline():
+                    verb = line.split()[0].upper()
+                    if verb == b"EHLO":
+                        f.write(b"250 localhost\r\n")
+                    elif verb == b"QUIT":
+                        f.write(b"221 bye\r\n")
+                        f.flush()
+                        return
+                    else:
+                        f.write(b"250 ok\r\n")
+                    f.flush()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        mail = SmtpMail("127.0.0.1", server.getsockname()[1], implicit_tls=False, from_address=SENDER, clock=_Clock())
+
+        with pytest.raises(MailError, match="STARTTLS"):
+            mail.send(_message())
+
+        thread.join(5)
+        server.close()
 
 
 class TestFailuresAreRedacted:

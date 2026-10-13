@@ -5,6 +5,8 @@ running on process-local memory across replicas, or failing to start. Redis is
 faked at the client boundary so no server is needed.
 """
 
+import logging
+
 import fakeredis
 import pytest
 
@@ -345,6 +347,23 @@ class TestMailResolution:
     def test_a_bad_configuration_fails_the_build(self, mail, match):
         with pytest.raises(ValueError, match=match):
             self._build(**mail)
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "10.0.0.5:25", "[::1]"])
+    def test_an_ip_literal_host_is_refused(self, host):
+        with pytest.raises(ValueError, match="host"):
+            self._build(uri=f"smtp://{host}", from_address="a@b.c")
+
+    def test_non_ascii_credentials_fail_the_build(self):
+        with pytest.raises(ValueError, match="ASCII"):
+            self._build(uri="smtp://relay.test", from_address="a@b.c", username="u", password="pässword")
+
+    def test_memory_in_a_multi_process_deployment_warns(self, caplog):
+        shared = _settings(mail=settings.MailSettings(uri="memory://"), web_workers=2)
+
+        with caplog.at_level(logging.WARNING):
+            container._build_mail(shared, SystemClock())
+
+        assert "never delivered" in caplog.text
 
     def test_the_failure_does_not_echo_the_password(self):
         with pytest.raises(ValueError) as caught:

@@ -21,6 +21,7 @@ silently diverge across processes or nodes stops the build rather than becoming 
 production mystery.
 """
 
+import ipaddress
 import logging
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -40,7 +41,7 @@ from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, resolve_topology
 from jasil.providers import (
     ClockProvider,
     EventBusProvider,
@@ -113,12 +114,15 @@ class Platform:
         redis_clients.close_shared_clients()
 
 
-def build_platform(settings: JasilSettings | None = None) -> Platform:
+def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvider | None = None) -> Platform:
     """Assemble the ``Platform`` for the configured deployment profile.
 
     Args:
         settings: The configuration to build from. Defaults to the settings the
             host installed via ``jasil.settings.configure``.
+        clock: Time source to wire into the platform and the backends that stamp
+            time (mail ``Date``). Defaults to :class:`SystemClock`; a test
+            helper passes a controllable one.
 
     Returns:
         A frozen ``Platform`` wiring each provider to its selected backend.
@@ -139,7 +143,7 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
     recorder = _build_event_recorder(settings)
-    clock = SystemClock()
+    clock = clock or SystemClock()
     return Platform(
         profile=profile,
         state=_build_state(settings),
@@ -354,11 +358,23 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     if scheme == "memory":
         if parts.netloc:
             raise ValueError("mail.uri for memory:// takes no host")
+        if resolve_topology(settings.profile, settings.web_workers).requires_shared_state:
+            logger.warning(
+                "mail.uri is memory:// in a multi-process deployment: messages are recorded "
+                "in this process's memory and never delivered"
+            )
         logger.info("Mail enabled via memory (messages are recorded, not sent)")
         return MemoryMail(clock, mail.from_address)
 
     if not hostname or not network.is_valid_hostname(hostname):
         raise ValueError("mail.uri has no valid host")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    else:
+        # Certificate verification matches names, so an IP literal could never pass it.
+        raise ValueError("mail.uri host must be a DNS name, not an IP address")
     if port == 0:
         raise ValueError("mail.uri has an invalid port")
     if not mail.from_address:

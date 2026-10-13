@@ -454,7 +454,9 @@ Brevo log you in as a generated identity and reject a `From` that is not a
 verified sender. The `From` header keeps any display name; the envelope sender is
 the bare address. If a server refuses *some* recipients the send succeeds and a
 warning logs the refused count, because failing would make a retry re-send to
-recipients that already received it.
+recipients that already received it. Every recipient of a message is visible in
+`To`, and a refused one is only counted in that warning — send one message per
+recipient when either matters.
 
 ## Writing your own backend
 

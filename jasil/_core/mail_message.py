@@ -70,7 +70,9 @@ def parse_address(value: str, *, role: str) -> Address:
     # is worse than refusing, so the parsed address must appear verbatim.
     if not (local and separator and domain) or addr_spec not in value:
         raise invalid
-    if not local.isascii():
+    # A quoted local part would be re-quoted on output, so the address mailed
+    # would not be the one the caller wrote.
+    if not local.isascii() or '"' in local:
         raise invalid
     try:
         # An internationalised domain travels as its ASCII (punycode) form: the
@@ -102,6 +104,9 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     recipients = [parse_address(value, role="recipient") for value in message.to]
     if not recipients:
         raise ValueError("A mail message needs at least one recipient")
+    for body in (message.text, message.html):
+        if body is not None and not isinstance(body, str):
+            raise ValueError("The mail text and html bodies must be strings")
     if not message.text and not message.html:
         raise ValueError("A mail message needs a text or html body")
     if not isinstance(message.subject, str) or "\r" in message.subject or "\n" in message.subject:

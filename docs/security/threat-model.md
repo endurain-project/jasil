@@ -6,8 +6,8 @@ library handles this" and "you handle this" has to be explicit rather than
 assumed.
 
 JASIL's attack surface is narrow by design: it serves no requests, and it makes
-exactly **two** outbound connections: reverse geocoding, and — only when
-configured — SMTP. Most of what follows is about
+exactly **two** kinds of outbound call to a third party: reverse geocoding, and —
+only when configured — SMTP. Most of what follows is about
 values flowing *through* it from your application.
 
 ## Server-side request forgery (CWE-918)

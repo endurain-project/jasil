@@ -29,6 +29,16 @@ def _clean_process_state():
 
 
 class TestFixedClock:
+    def test_mail_is_recorded_with_the_fixed_clock(self, tmp_path):
+        from jasil.providers import MailMessage
+
+        clock = jasil_testing.FixedClock()
+        platform = jasil_testing.install_test_platform(tmp_path, clock=clock)
+
+        platform.mail.send(MailMessage(to=["a@example.com"], subject="s", text="t"))
+
+        assert platform.mail.built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
+
     def test_it_satisfies_the_clock_provider(self):
         assert isinstance(jasil_testing.FixedClock(), ClockProvider)
 

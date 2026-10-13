@@ -14,6 +14,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
+- `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults `mail.uri` to `memory://`.
 - `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured); an invalid message raises `ValueError`.
 - `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is mandatory and verified. Standard library only — no new dependency.
 - `jasil.deps.get_mail`, and a `mail` row in the startup capability report.

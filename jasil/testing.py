@@ -93,16 +93,19 @@ def install_test_platform(
         settings: Base configuration to build from. Defaults to an all-defaults
             :class:`~jasil.settings.JasilSettings`; ``data_dir`` is applied on top
             either way. It is also installed via ``jasil.settings.configure`` so
-            code reading the settings directly agrees with the platform.
+            code reading the settings directly agrees with the platform. When
+            ``mail.uri`` is unset it becomes ``memory://``, so sent messages land
+            in ``platform.mail.outbox``.
 
     Returns:
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
     """
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
+    if configured.mail.uri is None:
+        # Unconfigured mail would raise on every send; a test wants it recorded.
+        configured = replace(configured, mail=replace(configured.mail, uri="memory://"))
     jasil_settings.configure(configured)
-    # Substituted after the build rather than wired in: the clock has no URI, so
-    # the composition root has no seam for it.
-    platform = replace(build_platform(configured), clock=clock or FixedClock())
+    platform = build_platform(configured, clock=clock or FixedClock())
     platform_runtime.set_active_platform(platform)
     return platform
 

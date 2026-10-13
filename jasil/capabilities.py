@@ -111,6 +111,19 @@ def _scheme_of(uri: str) -> str:
     return scheme if separator else uri
 
 
+def _mail_backend_of(uri: str | None) -> str:
+    """Name the mail backend for the report without ever echoing the value.
+
+    A mail URI is operator input that may carry a mistyped credential, and the
+    report is logged before the URI is validated, so a value with no ``://`` is
+    reported as ``invalid`` rather than as itself.
+    """
+    if not uri:
+        return "disabled"
+    scheme, separator, _ = uri.partition("://")
+    return scheme if separator and scheme.isalnum() else "invalid"
+
+
 def _source_of(configured: str | None, label: str) -> str:
     """Name what supplied a capability URI: the host's setting, or the profile."""
     return label if configured else _PROFILE_DEFAULT
@@ -142,7 +155,7 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
         CapabilityRow(
             "mail",
-            _scheme_of(settings.mail.uri) if settings.mail.uri else "disabled",
+            _mail_backend_of(settings.mail.uri),
             "mail.uri" if settings.mail.uri else "not configured",
         ),
         CapabilityRow("clock", "system", "always the system clock"),

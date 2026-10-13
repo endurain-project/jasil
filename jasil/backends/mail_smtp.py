@@ -13,8 +13,10 @@ Security:
 One connection per ``send``: stateless, thread-safe, nothing to close.
 """
 
+import contextlib
 import logging
 import smtplib
+import socket
 import ssl
 from email.message import EmailMessage
 
@@ -54,6 +56,10 @@ class SmtpMail:
     ) -> None:
         if bool(username) != bool(password):
             raise ValueError("username and password must be set together")
+        # ``smtplib`` ASCII-encodes credentials; refuse here, at build time, rather
+        # than raising a ``UnicodeEncodeError`` from every ``send``.
+        if not ((username or "").isascii() and (password or "").isascii()):
+            raise ValueError("username and password must be ASCII")
         self._host = host
         self._port = port
         self._implicit_tls = implicit_tls
@@ -105,19 +111,31 @@ class SmtpMail:
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
         context = ssl.create_default_context()
+        # An explicit name: otherwise ``smtplib`` calls ``socket.getfqdn()`` on
+        # every connection, a DNS lookup that no socket timeout bounds.
+        local_hostname = socket.gethostname() or "localhost"
         connection: smtplib.SMTP
         if self._implicit_tls:
-            connection = smtplib.SMTP_SSL(self._host, self._port, timeout=_TIMEOUT_SECONDS, context=context)
+            connection = smtplib.SMTP_SSL(
+                self._host, self._port, local_hostname=local_hostname, timeout=_TIMEOUT_SECONDS, context=context
+            )
         else:
-            connection = smtplib.SMTP(self._host, self._port, timeout=_TIMEOUT_SECONDS)
-        with connection as smtp:
+            connection = smtplib.SMTP(self._host, self._port, local_hostname=local_hostname, timeout=_TIMEOUT_SECONDS)
+        try:
             if not self._implicit_tls:
-                smtp.ehlo()
-                if not smtp.has_extn("starttls"):
+                connection.ehlo()
+                if not connection.has_extn("starttls"):
                     raise MailError("SMTP server does not offer STARTTLS")
-                smtp.starttls(context=context)
-                smtp.ehlo()
+                connection.starttls(context=context)
+                connection.ehlo()
             if self._username and self._password:
-                smtp.login(self._username, self._password)
+                connection.login(self._username, self._password)
             # Explicit envelope sender: the bare address, never the display name.
-            return smtp.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
+            return connection.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
+        finally:
+            # Not ``with``: its exit raises on a non-221 reply to QUIT, which would
+            # report a message the server already accepted as a failure (a retry
+            # would then send it twice).
+            with contextlib.suppress(smtplib.SMTPException, OSError):
+                connection.quit()
+            connection.close()
