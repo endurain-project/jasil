@@ -56,6 +56,8 @@ class FakeSMTP:
         FakeSMTP.instances.append(self)
         if FakeSMTP.fail_on == "connect":
             raise OSError("connect failed for " + ADDRESS)
+        if FakeSMTP.fail_on == "greeting":
+            raise smtplib.SMTPConnectError(421, ("srvtext-xyz " + ADDRESS).encode())
 
     def __enter__(self):
         return self
@@ -207,6 +209,28 @@ def backend(request) -> MailProvider:
     return _memory() if request.param == "memory" else _smtp()
 
 
+class TestEncodingAndInputs:
+    def test_a_non_ascii_body_is_not_sent_as_raw_8bit(self):
+        mime = build_mime(_message(text="olá", subject="é"), sender=SENDER, now=_Clock().now())
+
+        assert mime["Content-Transfer-Encoding"] in ("quoted-printable", "base64")
+        mime.as_bytes().decode("ascii")
+
+    def test_a_bare_string_recipient_is_rejected_with_a_clear_message(self):
+        with pytest.raises(ValueError, match="not a single string"):
+            build_mime(_message(to=ADDRESS), sender=SENDER, now=_Clock().now())
+
+    def test_half_credentials_are_refused(self):
+        with pytest.raises(ValueError, match="together"):
+            _smtp(username="u")
+
+    def test_the_memory_backend_keeps_the_built_message(self):
+        mail = _memory()
+        message_id = mail.send(_message())
+
+        assert [m["Message-ID"] for m in mail.built] == [message_id]
+
+
 class TestConformance:
     """Both real backends honour the same contract."""
 
@@ -343,6 +367,7 @@ class TestFailuresAreRedacted:
         ("mode", "expect"),
         [
             ("connect", "unreachable"),
+            ("greeting", "unreachable"),
             ("auth", "authentication failed (status 535)"),
             ("data", "status 554"),
             ("all-refused", "refused every recipient"),

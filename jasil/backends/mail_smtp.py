@@ -16,6 +16,7 @@ One connection per ``send``: stateless, thread-safe, nothing to close.
 import logging
 import smtplib
 import ssl
+from email.message import EmailMessage
 
 from jasil._core.mail_message import build_mime
 from jasil.providers import ClockProvider, MailError, MailMessage
@@ -51,6 +52,8 @@ class SmtpMail:
         username: str | None = None,
         password: str | None = None,
     ) -> None:
+        if bool(username) != bool(password):
+            raise ValueError("username and password must be set together")
         self._host = host
         self._port = port
         self._implicit_tls = implicit_tls
@@ -79,6 +82,8 @@ class SmtpMail:
             raise MailError(f"SMTP authentication failed (status {error.smtp_code})") from None
         except smtplib.SMTPRecipientsRefused:
             raise MailError("SMTP server refused every recipient") from None
+        except smtplib.SMTPConnectError:
+            raise MailError("SMTP server unreachable or connection lost") from None
         except smtplib.SMTPResponseException as error:
             raise MailError(f"SMTP server rejected the message (status {error.smtp_code})") from None
         except smtplib.SMTPNotSupportedError:
@@ -97,7 +102,7 @@ class SmtpMail:
         logger.info("Mail %s sent to %d recipient(s)", message_id, len(message.to) - len(refused))
         return message_id
 
-    def _deliver(self, mime) -> dict:
+    def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
         context = ssl.create_default_context()
         connection: smtplib.SMTP

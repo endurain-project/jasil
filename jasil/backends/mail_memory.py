@@ -6,6 +6,7 @@ host's test suite.
 """
 
 import threading
+from email.message import EmailMessage
 
 from jasil._core.mail_message import build_mime
 from jasil.providers import ClockProvider, MailMessage, MailNotConfiguredError
@@ -49,6 +50,9 @@ class MemoryMail:
         self._from_address = from_address or _DEFAULT_SENDER
         self._lock = threading.Lock()
         self.outbox: list[MailMessage] = []
+        #: The built MIME message for each ``outbox`` entry, same order, so a
+        #: test can assert on the generated headers and ``Message-ID``.
+        self.built: list[EmailMessage] = []
 
     def send(self, message: MailMessage) -> str:
         """Validate ``message``, record it, and return its ``Message-ID``.
@@ -59,4 +63,5 @@ class MemoryMail:
         mime = build_mime(message, sender=self._from_address, now=self._clock.now())
         with self._lock:
             self.outbox.append(message)
+            self.built.append(mime)
         return str(mime["Message-ID"])

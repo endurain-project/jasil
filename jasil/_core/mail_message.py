@@ -19,6 +19,10 @@ from email.message import EmailMessage
 from email.utils import format_datetime, getaddresses, make_msgid
 from typing import Protocol
 
+# Bodies are 7-bit safe (quoted-printable/base64 when non-ASCII): ``smtplib`` does
+# not declare ``BODY=8BITMIME``, so a raw 8bit body is not valid for a strict relay.
+_MIME_POLICY = policy.SMTP.clone(cte_type="7bit")
+
 
 class MailMessageLike(Protocol):
     """The shape :func:`build_mime` reads; ``jasil.providers.MailMessage`` fits.
@@ -93,6 +97,8 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     Raises:
         ValueError: When the message or sender is invalid.
     """
+    if isinstance(message.to, str):
+        raise ValueError("The mail recipients must be a sequence of addresses, not a single string")
     recipients = [parse_address(value, role="recipient") for value in message.to]
     if not recipients:
         raise ValueError("A mail message needs at least one recipient")
@@ -103,7 +109,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     from_address = parse_address(sender, role="sender")
     reply_to = parse_address(message.reply_to, role="reply-to") if message.reply_to else None
 
-    mime = EmailMessage(policy=policy.SMTP)
+    mime = EmailMessage(policy=_MIME_POLICY)
     mime["From"] = from_address
     mime["To"] = recipients
     if reply_to is not None:
