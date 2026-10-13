@@ -6,7 +6,8 @@ library handles this" and "you handle this" has to be explicit rather than
 assumed.
 
 JASIL's attack surface is narrow by design: it serves no requests, and it makes
-exactly **one** outbound call to a third party. Most of what follows is about
+exactly **two** outbound connections: reverse geocoding, and — only when
+configured — SMTP. Most of what follows is about
 values flowing *through* it from your application.
 
 ## Server-side request forgery (CWE-918)
@@ -48,6 +49,29 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
 - `socket.getaddrinfo` takes no timeout, so resolution is bounded by your
   resolver configuration rather than by JASIL. At startup this shows up as a
   slow boot rather than a hung request.
+
+## Outbound mail
+
+**Header injection (CWE-93).** Addresses are parsed, never concatenated; the
+`SMTP` email policy rejects CR/LF in a header value; and `MailMessage` has no
+field through which a caller could set an arbitrary header.
+
+**Transport.** TLS is mandatory and verified, with no opt-out; `smtp://` refuses
+a server that does not offer STARTTLS rather than downgrading, and AUTH is sent
+only after TLS is up. Every socket operation has a fixed timeout.
+
+**Personal data and secrets in logs and job rows.** The job runner persists
+`str(error)` and logs `exc_info`, so `MailError` carries only a category and an
+SMTP status code and is raised `from None`. Log lines record the recipient count,
+`Message-ID` and outcome, never addresses, subjects or bodies. The password is
+excluded from `repr(settings)`, and credentials are refused in the URI so they
+cannot end up in a logged string.
+
+**The SSRF address denylist is not applied to the SMTP host — a decision, not an
+omission.** The denylist exists for geocoding because that backend fetches a
+response from an operator-named host and hands it to the caller. A mail relay is
+normally on a private network or loopback, and the SMTP backend returns nothing
+from the server to its caller.
 
 ## Path traversal (CWE-22)
 

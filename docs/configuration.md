@@ -46,6 +46,7 @@ fields.
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |
+| `mail` | `MailSettings()` | Outbound mail backend. |
 | `network` | `NetworkSettings()` | Outbound egress. |
 
 ### `JobSettings`
@@ -84,6 +85,18 @@ because you installed it.
 | `photon_host` | `""` | Bare `host[:port]` authority. |
 | `photon_use_https` | `True` | |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
+
+### `MailSettings`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path or query. |
+| `from_address` | `""` | `"addr"` or `"Name <addr>"`. Required for the SMTP schemes. Independent of `username`. |
+| `username` | `None` | SMTP login. Must be set together with `password`. |
+| `password` | `None` | SMTP password. Hidden from `repr`. |
+
+A bad value fails `build_platform` with `ValueError`; no connection is attempted
+at startup, so a mail server that is down does not block boot.
 
 ### `NetworkSettings`
 

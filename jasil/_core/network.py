@@ -33,7 +33,7 @@ _NON_PUBLIC = "resolves to a non-public address"
 _NOT_AN_AUTHORITY = "is not a bare host[:port] authority"
 
 
-def _is_valid_hostname(value: str) -> bool:
+def is_valid_hostname(value: str) -> bool:
     """Return True when ``value`` is a syntactically valid RFC 1123 hostname.
 
     Rejects values carrying URL schemes, ports, or other non-hostname characters
@@ -193,7 +193,7 @@ def host_rejection_reason(
     elif not (port.isdigit() and len(port) <= 5):
         return _NOT_AN_AUTHORITY
 
-    if not _is_valid_hostname(hostname):
+    if not is_valid_hostname(hostname):
         return _NOT_AN_AUTHORITY
 
     return _address_rejection_reason(hostname, allowed_hosts=allowed_hosts, purpose=purpose)

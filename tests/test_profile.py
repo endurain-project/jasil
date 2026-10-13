@@ -15,7 +15,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import JasilSettings
+from jasil.settings import JasilSettings, MailSettings
 
 
 class TestParseProfile:
@@ -106,7 +106,19 @@ class TestCapabilityReport:
         names = [row.name for row in report.rows]
 
         assert sorted(names) == sorted(set(names))
-        assert {"state", "storage", "events", "lock", "clock"} == set(names)
+        assert {"state", "storage", "events", "lock", "mail", "clock"} == set(names)
+
+    def test_mail_reports_disabled_when_unset(self, report):
+        row = next(row for row in report.rows if row.name == "mail")
+
+        assert (row.backend, row.source) == ("disabled", "not configured")
+
+    def test_mail_reports_its_scheme_without_the_host_or_credentials(self):
+        settings = JasilSettings(mail=MailSettings(uri="smtps://relay.test", from_address="a@b.c"))
+
+        row = next(row for row in build_capability_report(settings).rows if row.name == "mail")
+
+        assert (row.backend, row.source) == ("smtps", "mail.uri")
 
     def test_the_clock_row_is_always_present(self, report):
         """The clock is the one capability with no alternative backend."""

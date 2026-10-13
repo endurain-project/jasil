@@ -18,7 +18,8 @@ it once at startup::
 Every component reads the installed settings through :func:`get_settings`.
 
 **Shape.** Configuration is grouped by concern — :class:`JobSettings`,
-:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`NetworkSettings` —
+:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
+:class:`NetworkSettings` —
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
 
@@ -38,6 +39,7 @@ __all__ = [
     "GeocodingSettings",
     "JasilSettings",
     "JobSettings",
+    "MailSettings",
     "NetworkSettings",
     "configure",
     "get_settings",
@@ -116,6 +118,28 @@ class GeocodingSettings:
 
 
 @dataclass(frozen=True)
+class MailSettings:
+    """Outbound-mail backend configuration.
+
+    Attributes:
+        uri: ``memory://`` (tests), ``smtp://host[:port]`` (STARTTLS, default
+            port 587) or ``smtps://host[:port]`` (implicit TLS, default port
+            465). Unset disables mail: sending raises
+            :class:`~jasil.providers.MailNotConfiguredError`. Credentials never
+            belong in the URI.
+        from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
+            for the SMTP schemes. Independent of ``username``.
+        username: SMTP login, when the server requires authentication.
+        password: SMTP password. Required with ``username``, and the reverse.
+    """
+
+    uri: str | None = None
+    from_address: str = ""
+    username: str | None = None
+    password: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True)
 class NetworkSettings:
     """Outbound-egress configuration.
 
@@ -164,6 +188,7 @@ class JasilSettings:
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
         geocoding: Reverse-geocoding backend configuration.
+        mail: Outbound-mail backend configuration.
         network: Outbound-egress configuration.
     """
 
@@ -178,6 +203,7 @@ class JasilSettings:
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
+    mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
 
     def _resolve(self, name: str) -> str:

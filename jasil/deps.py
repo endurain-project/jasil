@@ -20,7 +20,14 @@ from fastapi import Request
 
 import jasil.runtime as platform_runtime
 from jasil.container import Platform
-from jasil.providers import ClockProvider, EventBusProvider, LockProvider, StateProvider, StorageProvider
+from jasil.providers import (
+    ClockProvider,
+    EventBusProvider,
+    LockProvider,
+    MailProvider,
+    StateProvider,
+    StorageProvider,
+)
 
 
 def get_platform(request: Request) -> Platform:
@@ -65,3 +72,8 @@ def get_lock(request: Request) -> LockProvider:
 def get_clock(request: Request) -> ClockProvider:
     """Return the clock provider."""
     return get_platform(request).clock
+
+
+def get_mail(request: Request) -> MailProvider:
+    """Return the outbound-mail provider."""
+    return get_platform(request).mail

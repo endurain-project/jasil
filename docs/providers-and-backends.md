@@ -421,6 +421,41 @@ capability exists.
     See [Configuration](configuration.md#networksettings) for the allowlist
     escape hatch.
 
+## MailProvider
+
+```python
+platform.mail.send(MailMessage(to=["a@example.com"], subject="Hi", text="Hello"))
+```
+
+| Backend | Selected by | Notes |
+|---|---|---|
+| `DisabledMail` | `mail.uri` unset | `send` raises `MailNotConfiguredError`. |
+| `MemoryMail` | `memory://` | Records each `MailMessage` in a public `outbox` list. For tests. |
+| `SmtpMail` | `smtp://host[:port]` / `smtps://host[:port]` | STARTTLS (default port 587) or implicit TLS (465). Standard library only — no extra. |
+
+`send` returns the `Message-ID` header of the message it built, angle brackets
+included. It raises `MailError` on any delivery failure — mail is not
+best-effort, so a raised error is what makes a durable job retry — and
+`ValueError` for an invalid message (no recipient, no body, a malformed address,
+CR/LF in a header value). `MemoryMail` validates through the same builder as
+`SmtpMail`, so a test fails on the message production would reject.
+
+!!! danger "TLS is mandatory and verified"
+    There is no cleartext scheme and no opt-out. `smtp://` refuses a server that
+    does not offer STARTTLS rather than falling back, certificates and hostnames
+    are verified, and AUTH is sent only after TLS is up. A bad configuration
+    fails `build_platform`; no connection is made at startup.
+
+`MailError` messages carry a failure category and SMTP status code only — never
+an address, subject, body or server text.
+
+The sender is `from_address`, independent of the SMTP `username`: relays such as
+Brevo log you in as a generated identity and reject a `From` that is not a
+verified sender. The `From` header keeps any display name; the envelope sender is
+the bare address. If a server refuses *some* recipients the send succeeds and a
+warning logs the refused count, because failing would make a retry re-send to
+recipients that already received it.
+
 ## Writing your own backend
 
 A backend is any object satisfying the protocol. The provider protocols are
@@ -534,6 +569,7 @@ platform = Platform(
     lock=...,
     clock=...,
     geocoding=...,
+    mail=...,
     recorder=None,
 )
 ```

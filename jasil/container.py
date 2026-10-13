@@ -23,15 +23,20 @@ production mystery.
 
 import logging
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
+import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
+from jasil._core.mail_message import parse_address
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
+from jasil.backends.mail_memory import DisabledMail, MemoryMail
+from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -42,6 +47,7 @@ from jasil.providers import (
     EventRecorder,
     GeocodingProvider,
     LockProvider,
+    MailProvider,
     StateProvider,
     StorageProvider,
 )
@@ -67,6 +73,10 @@ class Platform:
         geocoding: Reverse-geocoding provider. Always present — when geocoding is
             unconfigured or misconfigured this is a no-op backend, so callers
             never branch on whether the capability exists.
+        mail: Outbound-mail provider. Always present — when mail is unconfigured
+            this is a backend whose ``send`` raises
+            :class:`~jasil.providers.MailNotConfiguredError`, so a message is
+            never dropped silently.
         recorder: Event-log recorder, or ``None`` when event logging is disabled.
             Shared by the event bus (best-effort delivery) and the publish facade
             (durable delivery) so both paths land in the event_log dashboard.
@@ -79,6 +89,7 @@ class Platform:
     lock: LockProvider
     clock: ClockProvider
     geocoding: GeocodingProvider
+    mail: MailProvider
     recorder: EventRecorder | None
 
     def close(self) -> None:
@@ -114,8 +125,9 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
 
     Raises:
         ValueError: When a capability URI uses an unsupported scheme, is unset
-            under a profile that has no default for it, or when the resolved
-            wiring contradicts the deployment topology.
+            under a profile that has no default for it, when the resolved
+            wiring contradicts the deployment topology, or when ``mail`` is
+            configured incorrectly.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
@@ -127,14 +139,16 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
     recorder = _build_event_recorder(settings)
+    clock = SystemClock()
     return Platform(
         profile=profile,
         state=_build_state(settings),
         storage=_build_storage(settings),
         events=_build_events(settings, recorder),
         lock=_build_lock(settings),
-        clock=SystemClock(),
+        clock=clock,
         geocoding=_build_geocoding(settings),
+        mail=_build_mail(settings, clock),
         recorder=recorder,
     )
 
@@ -282,4 +296,87 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
         api_key=api_key,
         min_interval_seconds=min_interval,
         user_agent=geo.user_agent,
+    )
+
+
+#: Default ports of the SMTP schemes.
+_SMTP_PORTS = {"smtp": 587, "smtps": 465}
+
+
+def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
+    """Resolve the mail backend.
+
+    Unlike geocoding, a bad mail configuration fails the build: a deployment that
+    believes it can send mail and cannot is worse than one that refuses to start.
+    No connection is attempted, so a mail server that is down does not block boot.
+
+    Args:
+        settings: The application settings.
+        clock: The platform clock, used for the ``Date`` header.
+
+    Returns:
+        :class:`DisabledMail` when unset, :class:`MemoryMail` for ``memory://``,
+        else :class:`SmtpMail`.
+
+    Raises:
+        ValueError: On an unsupported scheme; a URI carrying userinfo, a path, a
+            query or a fragment; an invalid host or port; a missing or
+            malformed ``from_address``; or ``username`` without ``password``
+            (or the reverse).
+    """
+    mail = settings.mail
+    if not mail.uri:
+        logger.debug("Mail is not configured; sending will raise MailNotConfiguredError")
+        return DisabledMail()
+    # The URI is never echoed in an error: it is operator input, but keeping
+    # error text free of it costs nothing and keeps a mistyped credential out of logs.
+    try:
+        parts = urlsplit(mail.uri)
+        port = parts.port
+        hostname = parts.hostname
+    except ValueError:
+        raise ValueError("mail.uri is not a valid URI") from None
+    scheme = parts.scheme
+    if scheme not in ("memory", *_SMTP_PORTS):
+        raise ValueError(f"Unsupported mail.uri scheme: {scheme or '(none)'!r}")
+    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+        raise ValueError("mail.uri must not carry credentials; use mail.username and mail.password")
+    if parts.path or parts.query or parts.fragment:
+        raise ValueError("mail.uri must be scheme://host[:port] with no path, query or fragment")
+    if bool(mail.username) != bool(mail.password):
+        raise ValueError("mail.username and mail.password must be set together")
+    if mail.from_address:
+        try:
+            parse_address(mail.from_address, role="sender")
+        except ValueError:
+            raise ValueError("mail.from_address is not a valid email address") from None
+
+    if scheme == "memory":
+        if parts.netloc:
+            raise ValueError("mail.uri for memory:// takes no host")
+        logger.info("Mail enabled via memory (messages are recorded, not sent)")
+        return MemoryMail(clock, mail.from_address)
+
+    if not hostname or not network.is_valid_hostname(hostname):
+        raise ValueError("mail.uri has no valid host")
+    if port == 0:
+        raise ValueError("mail.uri has an invalid port")
+    if not mail.from_address:
+        raise ValueError("mail.from_address is required for smtp:// and smtps://")
+    resolved_port = port or _SMTP_PORTS[scheme]
+    logger.info(
+        "Mail enabled via %s (%s:%d)%s",
+        scheme,
+        hostname,
+        resolved_port,
+        ", authenticated" if mail.username else "",
+    )
+    return SmtpMail(
+        hostname,
+        resolved_port,
+        implicit_tls=scheme == "smtps",
+        from_address=mail.from_address,
+        clock=clock,
+        username=mail.username,
+        password=mail.password,
     )

@@ -50,6 +50,17 @@ through.
 - [ ] Treat the host check as start-up-time only. If the upstream is somewhere an
       attacker could later repoint DNS at, put egress policy in the network too.
 
+## Outbound mail
+
+- [ ] Use `smtp://` (STARTTLS) or `smtps://`. Cleartext SMTP is not supported.
+- [ ] Put credentials in `MailSettings.username` / `password`, never in the URI.
+- [ ] Set `from_address` to an identity your relay has verified.
+- [ ] Remember the SMTP host is **not** SSRF-checked — it is expected to be an
+      internal relay. Keep that setting out of attacker-influenced configuration.
+- [ ] Do not put a rendered body or secrets in an event payload that drives a
+      mail job; build the message in the handler (see
+      [Durable jobs](../durable-jobs.md#sending-mail)).
+
 ## Storage
 
 - [ ] Keep keys server-generated. Traversal is rejected either way, but a key

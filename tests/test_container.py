@@ -17,6 +17,8 @@ from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
+from jasil.backends.mail_memory import DisabledMail, MemoryMail
+from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -285,3 +287,75 @@ class TestDeploymentConsistencyGate:
 
         assert "JASIL platform capabilities" in caplog.text
         assert "Deployment profile: local" in caplog.text
+
+
+class TestMailResolution:
+    """A mail misconfiguration fails the build; an unset one never drops silently."""
+
+    @staticmethod
+    def _build(**mail):
+        return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())
+
+    def test_unset_selects_the_disabled_backend(self):
+        assert isinstance(self._build(), DisabledMail)
+
+    def test_memory_selects_the_recording_backend(self):
+        assert isinstance(self._build(uri="memory://"), MemoryMail)
+
+    def test_smtp_defaults_to_starttls_on_587(self):
+        mail = self._build(uri="smtp://relay.test", from_address="a@example.com")
+
+        assert isinstance(mail, SmtpMail)
+        assert (mail._host, mail._port, mail._implicit_tls) == ("relay.test", 587, False)
+
+    def test_smtps_defaults_to_implicit_tls_on_465(self):
+        mail = self._build(uri="smtps://relay.test", from_address="a@example.com")
+
+        assert (mail._port, mail._implicit_tls) == (465, True)
+
+    def test_an_explicit_port_wins(self):
+        mail = self._build(uri="smtp://relay.test:2525", from_address="a@example.com")
+
+        assert mail._port == 2525
+
+    @pytest.mark.parametrize(
+        ("mail", "match"),
+        [
+            pytest.param({"uri": "http://relay.test"}, "Unsupported mail.uri scheme", id="scheme"),
+            pytest.param({"uri": "smtp://u:p@relay.test", "from_address": "a@b.c"}, "credentials", id="userinfo"),
+            pytest.param({"uri": "smtp://relay.test/x", "from_address": "a@b.c"}, "no path", id="path"),
+            pytest.param({"uri": "smtp://relay.test?x=1", "from_address": "a@b.c"}, "no path", id="query"),
+            pytest.param({"uri": "smtp://bad_host!", "from_address": "a@b.c"}, "valid host", id="host"),
+            pytest.param({"uri": "smtp://relay.test:abc", "from_address": "a@b.c"}, "not a valid URI", id="port"),
+            pytest.param({"uri": "smtp://relay.test:0", "from_address": "a@b.c"}, "invalid port", id="port-zero"),
+            pytest.param({"uri": "memory://host"}, "takes no host", id="memory-host"),
+            pytest.param({"uri": "smtp://relay.test"}, "from_address is required", id="no-sender"),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "not an address"}, "from_address", id="bad-sender"
+            ),
+            pytest.param({"uri": "memory://", "from_address": "nope"}, "from_address", id="bad-memory-sender"),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "username": "u"}, "together", id="user-only"
+            ),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "password": "p"}, "together", id="password-only"
+            ),
+        ],
+    )
+    def test_a_bad_configuration_fails_the_build(self, mail, match):
+        with pytest.raises(ValueError, match=match):
+            self._build(**mail)
+
+    def test_the_failure_does_not_echo_the_password(self):
+        with pytest.raises(ValueError) as caught:
+            self._build(uri="smtp://u:hunter2@relay.test", from_address="a@b.c")
+
+        assert "hunter2" not in str(caught.value)
+
+    def test_the_platform_carries_the_provider(self, tmp_path):
+        built = container.build_platform(_settings(data_dir=str(tmp_path), mail=settings.MailSettings(uri="memory://")))
+
+        assert isinstance(built.mail, MemoryMail)
+
+    def test_the_password_is_not_in_the_settings_repr(self):
+        assert "hunter2" not in repr(settings.MailSettings(username="u", password="hunter2"))

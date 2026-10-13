@@ -173,6 +173,18 @@ the dead-letter list, for an operations dashboard.
     given. `jasil.admin` is importable from anywhere and takes no session, so an
     admin route cannot accidentally hand JASIL its own open transaction.
 
+## Sending mail
+
+There is no mail queue: durable jobs are the queue. Publish an event, and have a
+durable subscriber call `platform.mail.send(...)`. A raised `MailError` gets
+backoff, retries and the dead-letter queue like any other failure.
+
+- **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
+  message twice.
+- **Do not put secrets or rendered bodies in the event payload.** Payloads are
+  stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
+  build the message inside the handler.
+
 ## Tuning
 
 | Setting | Raise it when | Lower it when |

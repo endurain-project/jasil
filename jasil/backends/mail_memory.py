@@ -1,0 +1,56 @@
+"""``MailProvider`` backends that never touch a network.
+
+``DisabledMail`` is what an unconfigured platform gets, so the domain has one
+code path and always just calls ``send``. ``MemoryMail`` records messages for a
+host's test suite.
+"""
+
+import threading
+
+from jasil._core.mail_message import build_mime
+from jasil.providers import ClockProvider, MailMessage, MailNotConfiguredError
+
+# Used only when ``memory://`` is configured without a ``from_address``.
+_DEFAULT_SENDER = "jasil@localhost"
+
+
+class DisabledMail:
+    """``MailProvider`` for a deployment with no mail backend configured."""
+
+    def send(self, message: MailMessage) -> str:
+        """Always raise: a message must never be dropped silently.
+
+        Raises:
+            MailNotConfiguredError: Always.
+        """
+        raise MailNotConfiguredError("Mail is not configured") from None
+
+
+class MemoryMail:
+    """``MailProvider`` that appends each message to :attr:`outbox`.
+
+    Messages are validated and given a real ``Message-ID`` by the same builder
+    the SMTP backend uses, so a test fails on the same invalid message
+    production would reject.
+
+    Args:
+        clock: Time source for the ``Date`` header.
+        from_address: Sender identity; a placeholder when empty.
+    """
+
+    def __init__(self, clock: ClockProvider, from_address: str = "") -> None:
+        self._clock = clock
+        self._from_address = from_address or _DEFAULT_SENDER
+        self._lock = threading.Lock()
+        self.outbox: list[MailMessage] = []
+
+    def send(self, message: MailMessage) -> str:
+        """Validate ``message``, record it, and return its ``Message-ID``.
+
+        Raises:
+            ValueError: When the message is invalid.
+        """
+        mime = build_mime(message, sender=self._from_address, now=self._clock.now())
+        with self._lock:
+            self.outbox.append(message)
+        return str(mime["Message-ID"])

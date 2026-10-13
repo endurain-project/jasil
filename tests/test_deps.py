@@ -59,6 +59,7 @@ class TestPlatformDependencies:
             pytest.param(deps.get_events, "events", id="events"),
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
+            pytest.param(deps.get_mail, "mail", id="mail"),
         ],
     )
     def test_each_capability_resolves_to_its_provider(self, request_for, platform, dependency, attribute):
@@ -81,6 +82,7 @@ class TestResolutionOrder:
             pytest.param(deps.get_events, "events", id="events"),
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
+            pytest.param(deps.get_mail, "mail", id="mail"),
         ],
     )
     def test_every_capability_falls_back_too(self, platform, dependency, attribute):

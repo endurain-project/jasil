@@ -73,7 +73,7 @@ def main() -> int:
 
     missing = [
         name
-        for name in ("state", "storage", "events", "lock", "clock", "geocoding")
+        for name in ("state", "storage", "events", "lock", "clock", "geocoding", "mail")
         if getattr(platform, name, None) is None
     ]
     if missing:

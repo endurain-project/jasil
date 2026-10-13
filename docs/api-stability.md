@@ -34,7 +34,7 @@ modules:
 | `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
 | `jasil.subscribers` | `best_effort`. |
-| `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |
+| `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry`, `MAX_SUBSCRIBER_ID_LENGTH`, and the process-wide `registry`. |
@@ -42,6 +42,10 @@ modules:
 | `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`. |
 
 ### Provider protocols
+
+`MailProvider.send` returns the `Message-ID` as a `str`, and `MailError` /
+`MailNotConfiguredError` are covered. Adding a field to `MailMessage` with a
+default is additive.
 
 Adding a method to a protocol is **breaking** — every host-supplied backend would
 have to implement it. Adding an optional keyword argument with a default is not.

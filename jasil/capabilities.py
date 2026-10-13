@@ -1,6 +1,6 @@
 """Startup capability report and deployment-consistency checks.
 
-Renders how each infrastructure capability (state, storage, events, lock, clock)
+Renders how each infrastructure capability (state, storage, events, lock, mail, clock)
 is wired for a human-readable startup log, and detects fatal inconsistencies — a
 deployment that *requires* a shared backend but resolves one to a process- or
 node-local implementation.
@@ -76,7 +76,7 @@ class CapabilityRow:
     """One line of the capability report.
 
     Attributes:
-        name: Capability name (state / storage / events / lock / clock).
+        name: Capability name (state / storage / events / lock / mail / clock).
         backend: The resolved backend (e.g. ``memory``, ``local``, ``system``).
         source: Where the value came from (setting name or ``profile default``).
     """
@@ -140,6 +140,11 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
             "events", _scheme_of(settings.resolved_events_uri), _source_of(settings.events_uri, "events_uri")
         ),
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
+        CapabilityRow(
+            "mail",
+            _scheme_of(settings.mail.uri) if settings.mail.uri else "disabled",
+            "mail.uri" if settings.mail.uri else "not configured",
+        ),
         CapabilityRow("clock", "system", "always the system clock"),
     )
     return CapabilityReport(topology=resolve_topology(settings.profile, settings.web_workers), rows=rows)

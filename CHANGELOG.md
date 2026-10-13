@@ -6,6 +6,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.7.0]
+
+### Breaking
+
+- `Platform` gains a required `mail` field. Hosts that construct `Platform` directly must pass a `MailProvider`; `build_platform` supplies one automatically.
+
+### Added
+
+- `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured); an invalid message raises `ValueError`.
+- `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is mandatory and verified. Standard library only — no new dependency.
+- `jasil.deps.get_mail`, and a `mail` row in the startup capability report.
+
 ## [0.5.1]
 
 ### Changed
