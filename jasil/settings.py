@@ -63,8 +63,8 @@ class JobSettings:
         poll_interval_seconds: Idle wait between empty polls.
         heartbeat_interval_seconds: Interval between worker-registry writes.
         max_attempts: Attempts before a job is dead-lettered.
-        retention_days: Age at which relayed outbox rows and completed jobs are
-            pruned. ``<= 0`` disables pruning.
+        retention_days: Age at which relayed outbox rows, completed jobs, and
+            stopped and stale worker rows are pruned. ``<= 0`` disables pruning.
     """
 
     enabled: bool = False
