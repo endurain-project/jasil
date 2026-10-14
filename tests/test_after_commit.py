@@ -23,10 +23,25 @@ def test_a_raising_callback_is_logged_and_does_not_stop_the_rest(db, caplog):
 
 
 def test_a_failed_flush_discards_the_callbacks(db):
+    from datetime import UTC, datetime
+
     from jasil.jobs.models import EventOutbox
 
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    row = {
+        "id": "x",
+        "event_id": "x",
+        "event_type": "t",
+        "source": "s",
+        "timestamp": now,
+        "payload": {},
+        "schema_version": 1,
+        "created_at": now,
+    }
     ran = []
-    db.add(EventOutbox(id="x", event_id="x"))  # missing NOT NULL columns: the commit fails
+    db.add(EventOutbox(**row))
+    db.commit()
+    db.add(EventOutbox(**row))  # duplicate primary key: IntegrityError on every dialect
     run_after_commit(db, lambda: ran.append(1))
 
     with pytest.raises(IntegrityError):
