@@ -25,4 +25,6 @@ class TestSystemClock:
 
         time.sleep(0.001)
 
-        assert clock.monotonic() > first
+        # ``>=``: Windows' monotonic clock ticks every ~15 ms, so a short sleep
+        # can read the same value.
+        assert clock.monotonic() >= first
