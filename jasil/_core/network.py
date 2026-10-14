@@ -56,6 +56,9 @@ def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address)
     reserved. Any of these would let an attacker pivot to internal
     infrastructure or a cloud metadata service.
     """
+    # Python 3.12.0-3.12.3 call ``::ffff:8.8.8.8`` private; judge the embedded IPv4.
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
     return (
         addr.is_private
         or addr.is_loopback
@@ -162,11 +165,15 @@ def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
         return [], _UNRESOLVABLE
     addresses: list[str] = []
     for info in infos:
-        text = str(info[4][0]).split("%", 1)[0]
+        # The scope id (``fe80::1%eth0``) stays: a link-local address cannot be
+        # dialed without it.
+        text = str(info[4][0])
         try:
             addr = ipaddress.ip_address(text)
         except ValueError:
             return [], _UNPARSEABLE
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
         if not (addr.is_private or addr.is_loopback or addr.is_link_local) or addr.is_multicast:
             return [], "resolves to a public address"
         if text not in addresses:

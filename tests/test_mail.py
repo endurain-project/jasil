@@ -16,6 +16,7 @@ from typing import ClassVar
 
 import pytest
 
+import jasil._core.network as network
 import jasil.backends.mail_smtp as mail_smtp
 from jasil._core.mail_message import build_mime
 from jasil.backends.mail_memory import MemoryMail, NullMail
@@ -428,6 +429,78 @@ class TestSmtpTransport:
 
         assert "connect" not in FakeSMTP.instances[0].calls
 
+    def test_cleartext_falls_through_to_the_next_vetted_address(self, monkeypatch):
+        """``localhost`` resolves to ``::1`` first; a relay on 127.0.0.1 must still work."""
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
+        original = FakeSMTP.connect
+        tried: list[str] = []
+
+        def connect(self, host, port):
+            tried.append(host)
+            if host == "::1":
+                raise OSError("refused for " + ADDRESS)
+            return original(self, host, port)
+
+        monkeypatch.setattr(FakeSMTP, "connect", connect)
+
+        _smtp(tls=False).send(_message())
+
+        assert tried == ["::1", "127.0.0.1"]
+        assert FakeSMTP.instances[0].sent is not None
+
+    def test_cleartext_reports_an_error_once_every_address_failed(self, monkeypatch):
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
+        FakeSMTP.fail_on = "connect"
+
+        with pytest.raises(MailError, match="unreachable") as raised:
+            _smtp(tls=False).send(_message())
+
+        assert ADDRESS not in str(raised.value)
+
+    @pytest.mark.parametrize("implicit_tls", [True, False])
+    def test_a_stalled_tls_handshake_cannot_outlive_the_deadline(self, monkeypatch, implicit_tls):
+        """The handshake reads from a socket ``connection.sock`` no longer names."""
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
+        monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 10)
+        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.5)
+        monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                with conn, conn.makefile("rb") as f:
+                    if not implicit_tls:
+                        conn.sendall(b"220 hi\r\n")
+                        f.readline()  # EHLO
+                        conn.sendall(b"250-hi\r\n250 STARTTLS\r\n")
+                        f.readline()  # STARTTLS
+                        conn.sendall(b"220 go\r\n")
+                    time.sleep(5)  # never speak TLS
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+        mail = SmtpMail(
+            "127.0.0.1", server.getsockname()[1], implicit_tls=implicit_tls, from_address=SENDER, clock=_Clock()
+        )
+
+        try:
+            started = time.monotonic()
+            with pytest.raises(MailError, match="deadline"):
+                mail.send(_message())
+            assert time.monotonic() - started < 3
+        finally:
+            server.close()
+
+    @pytest.mark.parametrize("value", ["a@-bad-.com", "a@bad-.com", "a@a..com"])
+    def test_a_malformed_domain_is_refused(self, value):
+        with pytest.raises(ValueError, match="valid email"):
+            build_mime(_message(to=[value]), sender=SENDER, now=NOW)
+
     def test_a_message_is_hashable_with_a_list_of_recipients(self):
         assert hash(_message()) == hash(_message())
 
@@ -658,3 +731,25 @@ class TestFailuresAreRedacted:
             _smtp().send(_message(subject="Top secret subject"))
 
         assert ADDRESS not in caplog.text and "Top secret subject" not in caplog.text
+
+
+class TestResolvePrivateAddresses:
+    @staticmethod
+    def _answer(monkeypatch, *addresses):
+        infos = [(0, 0, 0, "", (address, 0)) for address in addresses]
+        monkeypatch.setattr(network.socket, "getaddrinfo", lambda *_a: infos)
+
+    def test_a_link_local_address_keeps_its_scope(self, monkeypatch):
+        self._answer(monkeypatch, "fe80::1%eth0")
+
+        assert network.resolve_private_addresses("relay") == (["fe80::1%eth0"], None)
+
+    def test_an_ipv4_mapped_public_address_is_public(self, monkeypatch):
+        self._answer(monkeypatch, "::ffff:8.8.8.8")
+
+        assert network.resolve_private_addresses("relay") == ([], "resolves to a public address")
+
+    def test_an_ipv4_mapped_private_address_is_private(self, monkeypatch):
+        self._answer(monkeypatch, "::ffff:10.0.0.5")
+
+        assert network.resolve_private_addresses("relay") == (["::ffff:10.0.0.5"], None)

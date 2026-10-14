@@ -143,7 +143,7 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
     recorder = _build_event_recorder(settings)
-    clock = clock or SystemClock()
+    clock = clock if clock is not None else SystemClock()
     return Platform(
         profile=profile,
         state=_build_state(settings),

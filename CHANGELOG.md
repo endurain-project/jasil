@@ -17,6 +17,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - A fourth deployment-consistency rule, `jasil.capabilities.check_mail_consistency`: `memory://` mail is refused in a multi-process deployment, where no message would be delivered.
 - `jasil.testing.MemoryMail` and `memory_mail(platform)` for a typed outbox; `MemoryMail.clear()`.
 - `jasil.deps.get_mail`, and a `mail` row in the startup capability report.
+- Mail addresses whose domain is not a valid hostname (`a@-bad-.com`) are refused.
 
 ## [0.5.1]
 

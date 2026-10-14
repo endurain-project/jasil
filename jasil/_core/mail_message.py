@@ -19,6 +19,8 @@ from email.message import EmailMessage
 from email.utils import format_datetime, getaddresses, make_msgid
 from typing import Protocol
 
+from jasil._core.network import is_valid_hostname
+
 # Bodies are 7-bit safe (quoted-printable/base64 when non-ASCII): ``smtplib`` does
 # not declare ``BODY=8BITMIME``, so a raw 8bit body is not valid for a strict relay.
 _MIME_POLICY = policy.SMTP.clone(cte_type="7bit")
@@ -90,6 +92,8 @@ def parse_address(value: str, *, role: str) -> Address:
         # The ``idna`` codec is IDNA 2003 and silently maps some labels to a
         # different name (``straße.de`` -> ``strasse.de``, a final sigma, a
         # dropped joiner). Anything that does not round-trip is refused.
+        if not is_valid_hostname(ascii_domain):
+            raise invalid
         if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
             raise invalid
         return Address(display_name=display_name, username=local, domain=ascii_domain)

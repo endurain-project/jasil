@@ -67,7 +67,10 @@ rather than to the name, so a DNS change cannot redirect cleartext mail to a
 public host. Every
 socket operation has a fixed timeout, and a whole send has a 90-second deadline
 that a watchdog enforces by shutting the socket down — a per-read timeout alone
-would let a relay that drips its replies hold a send open indefinitely.
+would let a relay that drips its replies hold a send open indefinitely. The
+deadline covers the TLS handshake and every read after the connection is made;
+the DNS lookup and the TCP connect (30 seconds per address) are bounded by their
+own timeouts only.
 
 **Personal data and secrets in logs and job rows.** The job runner persists
 `str(error)` and logs `exc_info`, so `MailError` carries only a category and an

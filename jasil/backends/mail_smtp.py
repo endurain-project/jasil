@@ -15,6 +15,7 @@ One connection per ``send``: stateless, thread-safe, nothing to close.
 """
 
 import contextlib
+import functools
 import logging
 import smtplib
 import socket
@@ -36,7 +37,10 @@ _TIMEOUT_SECONDS = 30
 # it: every read restarts the timeout, so a server dripping its reply a byte at a
 # time never trips one. A watchdog shuts the socket down when it expires, and
 # keeps doing so until the send ends: the socket may not exist yet at the
-# deadline (a slow connect), and a single shutdown would then be missed.
+# deadline (a slow connect), and a single shutdown would then be missed. The
+# watchdog holds a duplicate of the raw socket, because during a TLS handshake
+# ``connection.sock`` is the pre-wrap socket, which the wrap has already detached.
+# A DNS lookup is the one step it cannot interrupt.
 _DEADLINE_SECONDS = 90
 _WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
@@ -50,6 +54,33 @@ def _default_local_hostname() -> str:
     """
     name = socket.gethostname()
     return name if name and network.is_valid_hostname(name) else "localhost"
+
+
+@functools.cache
+def _tracked(base: type[smtplib.SMTP]) -> type[smtplib.SMTP]:
+    """Subclass ``base`` so the raw socket it dials stays reachable to the watchdog.
+
+    ``watched`` is a duplicate of the connected socket made *before* any TLS wrap,
+    so shutting it down unblocks a handshake that is still reading.
+    """
+
+    class Tracked(base):  # type: ignore[valid-type, misc]
+        watched: socket.socket | None = None
+
+        def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
+            if issubclass(base, smtplib.SMTP_SSL):
+                raw = socket.create_connection((host, port), timeout, self.source_address)
+                self.watched = raw.dup()
+                try:
+                    return self.context.wrap_socket(raw, server_hostname=self._host)
+                except BaseException:
+                    raw.close()
+                    raise
+            raw = super()._get_socket(host, port, timeout)
+            self.watched = raw.dup()
+            return raw
+
+    return Tracked
 
 
 class SmtpMail:
@@ -166,7 +197,7 @@ class SmtpMail:
             return
         expired.set()
         while not finished.is_set():
-            sock = getattr(connection, "sock", None)
+            sock = getattr(connection, "watched", None) or getattr(connection, "sock", None)
             if sock is not None:
                 # The plain-socket method, on purpose: ``SSLSocket.shutdown`` also
                 # tears down TLS state the blocked thread is still using.
@@ -174,23 +205,36 @@ class SmtpMail:
                     socket.socket.shutdown(sock, socket.SHUT_RDWR)
             finished.wait(_WATCH_INTERVAL_SECONDS)
 
-    def _connect_host(self) -> str:
-        """The host to dial: the configured name, or for cleartext a vetted address.
+    def _connect_hosts(self) -> list[str]:
+        """The hosts to dial, in order: the configured name, or vetted addresses.
 
         Cleartext is allowed only to a private relay, and the name was checked
         once at startup. DNS can change since, so it is resolved and checked again
-        for each send, and the connection goes to the address that was checked
+        for each send, and the connection goes to an address that was checked
         rather than to the name, so it cannot be re-resolved in between.
 
         Raises:
             MailError: When the host no longer resolves to private addresses.
         """
         if self._tls:
-            return self._host
+            return [self._host]
         addresses, reason = network.resolve_private_addresses(self._host)
         if reason is not None or not addresses:
             raise MailError("SMTP relay no longer resolves to a private address; cleartext refused")
-        return addresses[0]
+        return addresses
+
+    def _connect(self, connection: smtplib.SMTP) -> tuple[int, bytes]:
+        """Connect to the first reachable host; ``smtplib`` would also try each address."""
+        hosts = self._connect_hosts()
+        for index, host in enumerate(hosts):
+            try:
+                return connection.connect(host, self._port)
+            except OSError:
+                if index == len(hosts) - 1:
+                    raise
+                # A socket left half-open by the failed attempt must not leak.
+                connection.close()
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
@@ -200,18 +244,18 @@ class SmtpMail:
         # the greeting is a read like any other, and can be dripped as slowly.
         connection: smtplib.SMTP
         if self._implicit_tls:
-            connection = smtplib.SMTP_SSL(
+            connection = _tracked(smtplib.SMTP_SSL)(  # type: ignore[call-arg]
                 local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS, context=context
             )
         else:
-            connection = smtplib.SMTP(local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS)
+            connection = _tracked(smtplib.SMTP)(local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS)
         expired = threading.Event()
         finished = threading.Event()
         watchdog = threading.Thread(target=self._watch, args=(connection, expired, finished), daemon=True)
         watchdog.start()
         try:
             try:
-                code, reply = connection.connect(self._connect_host(), self._port)
+                code, reply = self._connect(connection)
                 if code != 220:
                     raise smtplib.SMTPConnectError(code, reply)
                 if self._tls and not self._implicit_tls:
@@ -229,8 +273,9 @@ class SmtpMail:
                 # Explicit envelope sender: the bare address, never the display name.
                 return connection.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
             except (smtplib.SMTPException, OSError):
-                # The watchdog's shutdown surfaces as a dropped connection.
-                if expired.is_set():
+                # The watchdog's shutdown surfaces as a dropped connection, and the
+                # last step's socket timeout is the time left, so it can fire first.
+                if expired.is_set() or time.monotonic() >= deadline:
                     raise MailError(_DEADLINE_EXCEEDED) from None
                 raise
         finally:
@@ -241,6 +286,9 @@ class SmtpMail:
                 connection.quit()
             finished.set()
             connection.close()
+            watched = getattr(connection, "watched", None)
+            if watched is not None:
+                watched.close()
 
     @staticmethod
     def _login(connection: smtplib.SMTP, username: str, password: str) -> None:
