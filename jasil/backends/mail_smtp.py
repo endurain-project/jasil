@@ -281,6 +281,9 @@ class SmtpMail:
             # left, and the dial itself stops at the deadline between addresses,
             # so a connect begun near the deadline cannot run past it.
             connection.timeout = max(min(_TIMEOUT_SECONDS, deadline - time.monotonic()), 0.001)
+            # Before 3.13 ``connect`` leaves ``_host`` unset, and the TLS handshake
+            # takes its SNI/verification name from it.
+            connection._host = host  # type: ignore[attr-defined]
             try:
                 return connection.connect(host, self._port)
             # ``SMTPException`` is an ``OSError``, so this also covers a server

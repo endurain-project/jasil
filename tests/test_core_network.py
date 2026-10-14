@@ -230,8 +230,6 @@ class TestAllowlist:
 
 @pytest.mark.parametrize("address", ["64:ff9b:1::808:808", "2001:0:4136:e378:8000:63bf:3fff:fdd2"])
 def test_tunnelled_ipv6_ranges_are_not_private_for_cleartext(monkeypatch, address):
-    monkeypatch.setattr(
-        network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))]
-    )
+    monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
     addresses, reason = network.resolve_private_addresses("relay.internal")
     assert addresses == [] and reason is not None
