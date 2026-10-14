@@ -111,6 +111,41 @@ Behaviour depends on the delivery route:
 `publish_many_committing` is the batch form, for producers that touch many rows
 in one unit of work. An empty batch still commits exactly once.
 
+### Publishing without owning the commit
+
+`publish_committing` makes the publisher own the commit, so a function that
+publishes cannot be composed with other writes. When the transaction belongs to
+someone else, stage the event and let that owner commit:
+
+```python
+from jasil.publisher import publish_many_on_commit, publish_on_commit
+
+publish_on_commit(
+    "order.created",
+    {"order_id": 42},
+    source="api:create_order",
+    db=db,
+)
+# ... more writes, more events ...
+db.commit()  # whoever owns the transaction
+```
+
+- **Durable** — the outbox row is staged on your session immediately and commits
+  or rolls back atomically with your domain rows. A staging failure raises.
+- **Best-effort** — the event is held on the session and dispatched **after the
+  outermost commit**, in publish order. A rolled-back (or closed) transaction, or a
+  rolled-back savepoint, discards its events; events from a released savepoint
+  wait for the outermost commit. Dispatch failures are logged and swallowed.
+
+Details worth knowing: the envelope (and ambient request id) is captured when you
+publish, not when you commit; publishing starts the session's transaction if none
+is active; "outermost" means the session's outermost transaction, so a session
+joined to an external transaction (`join_transaction_mode="create_savepoint"`)
+dispatches on its own commit; an event published from a subscriber during
+dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op.
+Only synchronous `Session` objects are supported; anything else (an `AsyncSession`,
+a `scoped_session` proxy) raises `TypeError`.
+
 ## Delivery routing
 
 An event takes the durable route only when **both** are true:
@@ -196,5 +231,5 @@ committing variants, the outbox write is not atomic with the domain change, so a
 crash between them can drop an event.
 
 "Durable" means *retryable once written*, not *never lost*. Use
-`publish_committing` when you need the stronger guarantee, and give every
+`publish_committing` or `publish_on_commit` when you need the stronger guarantee, and give every
 subscriber a [reconciliation net](durable-jobs.md#reconciliation-nets) regardless.
