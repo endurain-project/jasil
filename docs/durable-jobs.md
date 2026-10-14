@@ -179,6 +179,9 @@ There is no mail queue: durable jobs are the queue. Publish an event, and have a
 durable subscriber call `platform.mail.send(...)`. A raised `MailError` gets
 backoff, retries and the dead-letter queue like any other failure.
 
+- **An unconfigured mail backend is retried too.** `MailNotConfiguredError` is a
+  `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
+  budget before dead-lettering. Catch it in the handler if that is not wanted.
 - **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
   message twice.
 - **Do not put secrets or rendered bodies in the event payload.** Payloads are

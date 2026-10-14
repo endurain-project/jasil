@@ -97,6 +97,10 @@ because you installed it.
 | `password` | `None` | SMTP password. Hidden from `repr`. |
 | `ehlo_hostname` | `None` | Name announced in `EHLO`. Defaults to the machine's hostname; set a fully qualified one for a relay that rejects a bare name. |
 
+Host names follow RFC 1123, so a name with an underscore (some Docker Compose
+service names) is refused for `uri` and `ehlo_hostname`; use an IP literal or a
+network alias without one.
+
 A bad value fails `build_platform` with `ValueError`; no connection is attempted
 at startup, so a mail server that is down does not block boot. With
 `secure = False` the host is resolved at startup to confirm it is private, so

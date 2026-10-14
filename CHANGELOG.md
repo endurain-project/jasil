@@ -18,6 +18,11 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `jasil.testing.MemoryMail` and `memory_mail(platform)` for a typed outbox; `MemoryMail.clear()`.
 - `jasil.deps.get_mail`, and a `mail` row in the startup capability report.
 
+### Fixed
+
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
+- A mail address with a leading, trailing or doubled dot in the local part is refused with `ValueError` instead of being retried against a relay that will always reject it.
+
 ## [0.5.1]
 
 ### Changed

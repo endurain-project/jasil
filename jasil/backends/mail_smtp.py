@@ -62,6 +62,11 @@ def _tracked(base: type[smtplib.SMTP]) -> type[smtplib.SMTP]:
 
     ``watched`` is a duplicate of the connected socket made *before* any TLS wrap,
     so shutting it down unblocks a handshake that is still reading.
+
+    This leans on private ``smtplib`` details: ``SMTP._get_socket``, and the
+    ``_host``, ``context`` and ``source_address`` attributes of ``SMTP_SSL``.
+    ``tests/test_mail.py`` pins their shape so an interpreter change fails loudly
+    instead of silently disarming the watchdog.
     """
 
     class Tracked(base):  # type: ignore[valid-type, misc]
@@ -231,6 +236,9 @@ class SmtpMail:
             # after the deadline.
             if time.monotonic() >= deadline:
                 raise MailError(_DEADLINE_EXCEEDED)
+            # ``smtplib`` dials with ``connection.timeout``; cap it to the time
+            # left so a connect begun near the deadline cannot run past it.
+            connection.timeout = max(min(_TIMEOUT_SECONDS, deadline - time.monotonic()), 0.001)
             try:
                 return connection.connect(host, self._port)
             except OSError:

@@ -149,6 +149,10 @@ class TestAddressIsMailedAsWritten:
             "junk bob@example.com",
             "a\\b@example.com",
             "a@example.com (Comment)",
+            '"x <a@example.com>" <a@exa mple.com>',
+            ".a@example.com",
+            "a.@example.com",
+            "a..b@example.com",
         ],
     )
     def test_an_address_the_parser_would_rewrite_is_refused(self, value):
@@ -792,3 +796,18 @@ class TestResolvePrivateAddresses:
         self._answer(monkeypatch, "::ffff:10.0.0.5")
 
         assert network.resolve_private_addresses("relay") == (["::ffff:10.0.0.5"], None)
+
+
+class TestSmtplibShapeTheWatchdogRelaysOn:
+    """``_tracked`` overrides private ``smtplib`` hooks; fail loudly if they move."""
+
+    def test_the_private_hooks_still_exist(self):
+        import inspect
+
+        for base in (REAL_SMTP, REAL_SMTP_SSL):
+            params = list(inspect.signature(base._get_socket).parameters)
+            assert params == ["self", "host", "port", "timeout"]
+        init_source = inspect.getsource(REAL_SMTP_SSL._get_socket)
+        assert "self._host" in init_source
+        assert "self.context" in init_source
+        assert "self.source_address" in inspect.getsource(REAL_SMTP._get_socket)

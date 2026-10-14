@@ -81,12 +81,19 @@ def parse_address(value: str, *, role: str) -> Address:
     # A substring test is not enough: ``alice:bob@example.com`` parses as a group
     # label plus ``bob@example.com``. The address must be the whole value, or the
     # one inside the angle brackets.
-    written = f"<{addr_spec}>" in value if "<" in value else value.strip() == addr_spec
+    # ``endswith``, not ``in``: ``"x <a@b.com>" <a@b c.com>`` would otherwise be
+    # satisfied by the display name's text.
+    written = value.rstrip().endswith(f"<{addr_spec}>") if "<" in value else value.strip() == addr_spec
     if not (local and separator and domain) or not written:
         raise invalid
     # A quoted local part would be re-quoted on output, so the address mailed
     # would not be the one the caller wrote.
     if not local.isascii() or '"' in local:
+        raise invalid
+    # A dot-atom local part (RFC 5322): a strict relay answers a leading, trailing
+    # or doubled dot with a permanent 5xx, which would retry a job that can never
+    # succeed. Refuse it here, as a ``ValueError``, instead.
+    if local.startswith(".") or local.endswith(".") or ".." in local:
         raise invalid
     try:
         # An internationalised domain travels as its ASCII (punycode) form: the

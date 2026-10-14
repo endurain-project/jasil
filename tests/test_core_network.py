@@ -73,6 +73,18 @@ class TestPublicHosts:
         assert network.host_rejection_reason("rebind.example.com") == network._NON_PUBLIC
 
 
+class TestIPv4MappedAddresses:
+    def test_a_mapped_public_address_is_judged_as_its_ipv4(self, resolve):
+        resolve("::ffff:93.184.216.34")
+
+        assert network.host_rejection_reason("example.com") is None
+
+    def test_a_mapped_private_address_is_refused(self, resolve):
+        resolve("::ffff:10.0.0.5")
+
+        assert network.host_rejection_reason("internal.example.com") == network._NON_PUBLIC
+
+
 class TestNonPublicAddresses:
     @pytest.mark.parametrize(
         "ip",
