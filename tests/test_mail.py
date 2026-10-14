@@ -868,3 +868,9 @@ class TestSmtplibShapeTheWatchdogRelaysOn:
         assert "self._host" in init_source
         assert "self.context" in init_source
         assert "self.source_address" in inspect.getsource(REAL_SMTP._get_socket)
+
+
+def test_idn_domain_with_uppercase_ascii_label_is_accepted():
+    from jasil._core.mail_message import parse_address
+
+    assert parse_address("a@Bücher.DE", role="recipient").domain == "xn--bcher-kva.DE"

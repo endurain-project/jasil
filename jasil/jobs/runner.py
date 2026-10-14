@@ -116,6 +116,10 @@ class JobRunner:
         The batch was claimed under one lease, but jobs run in turn: each one gets
         a full lease from the start of its turn. A job the reaper already requeued
         belongs to another worker now and must not be run here as well.
+
+        Renewing the whole remainder before each job is quadratic in the batch
+        size (one UPDATE per job at most ``batch_size`` rows); deliberate, as it
+        keeps every waiting job's lease alive while an earlier one runs.
         """
         with self._session_factory() as db:
             renewed = jobs_crud.renew_leases(

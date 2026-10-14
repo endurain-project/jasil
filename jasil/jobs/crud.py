@@ -219,17 +219,19 @@ def renew_leases(
     """
     if not job_ids:
         return set()
-    renewed = db.execute(
+    held = [
+        ProcessingJob.id.in_(job_ids),
+        ProcessingJob.status == STATUS_CLAIMED,
+        ProcessingJob.locked_by == worker_id,
+    ]
+    db.execute(
         update(ProcessingJob)
-        .where(
-            ProcessingJob.id.in_(job_ids),
-            ProcessingJob.status == STATUS_CLAIMED,
-            ProcessingJob.locked_by == worker_id,
-        )
+        .where(*held)
         .values(lease_expires_at=now + timedelta(seconds=lease_seconds), updated_at=now)
-        .returning(ProcessingJob.id)
     )
-    ids = set(renewed.scalars().all())
+    # No ``UPDATE ... RETURNING``: MySQL and MariaDB do not support it. Same
+    # transaction, so the rows read back are the ones just renewed.
+    ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
     db.commit()
     return ids
 

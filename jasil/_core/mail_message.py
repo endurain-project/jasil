@@ -68,6 +68,7 @@ def parse_address(value: str, *, role: str) -> Address:
     if not isinstance(value, str) or _has_control_character(value):
         raise invalid
     # ``getaddresses`` accepts ``Name <addr`` (no closing bracket) and repairs it.
+    # Conservative: a display name that itself holds ``<`` or ``>`` is refused too.
     if value.count("<") != value.count(">"):
         raise invalid
     parsed = getaddresses([value])
@@ -109,7 +110,7 @@ def parse_address(value: str, *, role: str) -> Address:
         # (``a@1.2.3.4``), not a domain: a relay answers it with a permanent 5xx.
         if ascii_domain.rsplit(".", 1)[-1].isdigit():
             raise invalid
-        if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
+        if not domain.isascii() and ascii_domain.encode("ascii").decode("idna").lower() != domain.lower():
             raise invalid
         # A written ``xn--`` label must be valid punycode: a relay answers one that
         # is not with a permanent 5xx, which would retry a job that can never succeed.

@@ -375,7 +375,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
             raise ValueError("mail.uri for memory:// takes no host")
         if not mail.secure:
             raise ValueError("mail.secure=False applies only to smtp://")
-        logger.info("Mail enabled via memory (messages are recorded, not sent)")
+        logger.warning("Mail is memory:// (messages are recorded in the process outbox, never delivered)")
         return MemoryMail(clock, mail.from_address)
 
     if not hostname:
