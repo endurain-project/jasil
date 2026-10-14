@@ -36,6 +36,8 @@ from datetime import datetime
 from functools import partial
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
@@ -97,12 +99,17 @@ def _publish_on_bus(
     metadata: dict | None,
     schema_version: int,
 ) -> None:
-    """Dispatch one event on the bus, logging and swallowing any failure."""
+    """Mint and dispatch one event on the bus, logging and swallowing any failure."""
     try:
-        platform = platform_runtime.get_active_platform()
-        platform.events.publish(_mint(event_type, payload, source, metadata, schema_version))
+        event = _mint(event_type, payload, source, metadata, schema_version)
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+        return
+    _dispatch_event(event)
+
+
+def _no_metadata(_payload: dict) -> dict | None:
+    return None
 
 
 def _dispatch_event(event: Event) -> None:
@@ -179,8 +186,7 @@ def publish(
             # appears not to have been processed, and nothing else records it.
             logger.debug("Staged %s (%s) in the outbox for durable delivery", event_type, event.event_id)
         else:
-            platform.events.publish(event)
-            logger.debug("Dispatched %s (%s) on the event bus", event_type, event.event_id)
+            _dispatch_event(event)
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
 
@@ -274,7 +280,7 @@ def publish_many_committing(
     Returns:
         None.
     """
-    metadata_of = metadata_for if metadata_for is not None else (lambda _payload: None)
+    metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if db is not None and _durable_delivery_enabled(event_type):
         # Atomic path: stage every outbox row inside the caller's transaction.
         _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
@@ -372,17 +378,20 @@ def publish_many_on_commit(
         None.
     """
     if db is None:
-        raise ValueError("publish_on_commit requires the producer's session as `db`")
+        raise ValueError("publish_on_commit/publish_many_on_commit require the producer's session as `db`")
+    if not isinstance(db, Session):
+        raise TypeError(
+            f"publish_on_commit/publish_many_on_commit need a synchronous sqlalchemy.orm.Session, got {type(db).__name__}"
+        )
     if not payloads:
         return
-    metadata_of: Callable[[dict], dict | None] = metadata_for if metadata_for is not None else (lambda _payload: None)
+    metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if _durable_delivery_enabled(event_type):
         _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
         return
     for payload in payloads:
         try:
             event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+            run_after_commit(db, partial(_dispatch_event, event))
         except Exception as err:
             logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
-            continue
-        run_after_commit(db, partial(_dispatch_event, event))

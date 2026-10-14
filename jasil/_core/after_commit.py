@@ -43,9 +43,13 @@ def run_after_commit(db: Session, callback: Callable[[], None]) -> None:
         callback: Zero-arg callable to run after the outermost commit.
     """
     if _PENDING not in db.info:
-        db.info[_PENDING] = []
-        event.listen(db, "after_commit", _on_commit)
+        # Listeners first: if attaching fails, the session must not look set up,
+        # or later callbacks would queue on a session that never runs them.
+        # ``insert=True`` records the commit before any other listener on this
+        # session can raise and skip ours, which would drop committed work.
+        event.listen(db, "after_commit", _on_commit, insert=True)
         event.listen(db, "after_transaction_end", _on_transaction_end)
+        db.info[_PENDING] = []
     if not db.in_transaction():
         db.begin()
     transaction = db.get_nested_transaction() or db.get_transaction()
@@ -60,7 +64,7 @@ def _on_commit(session: Session) -> None:
 
 def _on_transaction_end(session: Session, transaction: SessionTransaction) -> None:
     committed = session.info.pop(_COMMITTED, False)
-    pending: list[tuple[SessionTransaction, Callable[[], None]]] = session.info[_PENDING]
+    pending: list[tuple[SessionTransaction, Callable[[], None]]] | None = session.info.get(_PENDING)
     if not pending:
         return
 

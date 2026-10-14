@@ -143,7 +143,8 @@ is active; "outermost" means the session's outermost transaction, so a session
 joined to an external transaction (`join_transaction_mode="create_savepoint"`)
 dispatches on its own commit; an event published from a subscriber during
 dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op.
-Only synchronous `Session` objects are supported.
+Only synchronous `Session` objects are supported; anything else (an `AsyncSession`,
+a `scoped_session` proxy) raises `TypeError`.
 
 ## Delivery routing
 

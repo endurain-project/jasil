@@ -13,7 +13,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `jasil.publisher.publish_on_commit` and `publish_many_on_commit` publish a domain event without owning the commit. The caller stages the event and whoever owns the transaction commits when it likes, so a function that publishes can now be composed with other writes in one atomic unit of work.
   - **Durable route:** the outbox row is staged on the session immediately, uncommitted, and commits or rolls back with the caller's domain rows. A staging failure raises.
   - **Best-effort route:** the event is minted at publish time (capturing the ambient request id) and dispatched on the bus only after the session's **outermost** transaction commits, in publish order. Events published in a rolled-back SAVEPOINT, or in a rolled-back or closed transaction, are never dispatched; events from a released SAVEPOINT wait for the outermost commit. Dispatch failures are logged and swallowed. Pending events live in `Session.info`, so sessions never see each other's, and a session that never publishes gets no listeners.
-  - Publishing starts the session's transaction if none is active; an empty `publish_many_on_commit` is a no-op. Only synchronous `Session` objects are supported.
+  - Publishing starts the session's transaction if none is active; an empty `publish_many_on_commit` is a no-op. Only synchronous `Session` objects are supported; anything else (an `AsyncSession`, a `scoped_session` proxy) raises `TypeError`.
 
 `publish_committing` and `publish_many_committing` are unchanged; hosts can adopt the new functions incrementally.
 

@@ -301,6 +301,20 @@ class TestPublishManyCommitting:
 
         assert len(bus.published) == 1
 
+    def test_a_mint_failure_on_the_bus_path_is_logged_and_swallowed(self, platform, db, monkeypatch, caplog):
+        def _refuse(*_args, **_kwargs):
+            raise RuntimeError("cannot mint")
+
+        monkeypatch.setattr(publisher, "new_event", _refuse)
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_committing(
+                "activity.deleted", [{"id": 1}], source="test", db=db, commit=lambda: None
+            )
+
+        assert platform.events.published == []
+        assert "Failed to publish event activity.deleted" in caplog.text
+
 
 def _bus_failure_platform(monkeypatch):
     monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=ExplodingBus()))
@@ -454,6 +468,18 @@ class TestPublishOnCommitBestEffort:
     def test_a_missing_session_is_rejected(self, platform):
         with pytest.raises(ValueError):
             publisher.publish_on_commit("activity.created", {}, source="test", db=None)
+
+    def test_a_non_session_is_rejected_before_anything_is_queued(self, platform, session_factory):
+        from sqlalchemy.orm import scoped_session
+
+        scoped = scoped_session(session_factory)
+        with pytest.raises(TypeError):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=scoped)
+        scoped.remove()
+
+        with session_factory() as other:
+            other.commit()  # no listener leaked onto the factory
+        assert platform.events.published == []
 
     def test_a_session_that_never_publishes_gets_no_listeners(self, platform, session_factory):
         with session_factory() as session:
