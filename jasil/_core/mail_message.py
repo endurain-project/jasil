@@ -78,7 +78,11 @@ def parse_address(value: str, *, role: str) -> Address:
     # The parser is lenient and silently repairs some input (``a@exa mple.com``
     # -> ``a@example.com``); mailing a different address than the caller wrote
     # is worse than refusing, so the parsed address must appear verbatim.
-    if not (local and separator and domain) or addr_spec not in value:
+    # A substring test is not enough: ``alice:bob@example.com`` parses as a group
+    # label plus ``bob@example.com``. The address must be the whole value, or the
+    # one inside the angle brackets.
+    written = f"<{addr_spec}>" in value if "<" in value else value.strip() == addr_spec
+    if not (local and separator and domain) or not written:
         raise invalid
     # A quoted local part would be re-quoted on output, so the address mailed
     # would not be the one the caller wrote.
@@ -96,7 +100,12 @@ def parse_address(value: str, *, role: str) -> Address:
             raise invalid
         if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
             raise invalid
-        return Address(display_name=display_name, username=local, domain=ascii_domain)
+        address = Address(display_name=display_name, username=local, domain=ascii_domain)
+        # ``Address`` re-quotes a local part holding a space, a backslash or other
+        # specials; the address mailed must be the one the caller wrote.
+        if address.addr_spec != f"{local}@{ascii_domain}":
+            raise invalid
+        return address
     except Exception:
         # Deliberately not chained: the parser's message quotes the address.
         raise invalid from None

@@ -139,6 +139,28 @@ def _memory() -> MemoryMail:
     return MemoryMail(_Clock(), SENDER)
 
 
+class TestAddressIsMailedAsWritten:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "alice:bob@example.com",
+            "Team: bob@example.com;",
+            "x:y:bob@example.com",
+            "junk bob@example.com",
+            "a\\b@example.com",
+            "a@example.com (Comment)",
+        ],
+    )
+    def test_an_address_the_parser_would_rewrite_is_refused(self, value):
+        with pytest.raises(ValueError, match="not a single valid email address"):
+            build_mime(_message(to=[value]), sender=SENDER, now=NOW)
+
+    def test_a_display_name_form_is_kept(self):
+        mime = build_mime(_message(to=["Bob <bob@example.com>"]), sender=SENDER, now=NOW)
+
+        assert mime["To"] == "Bob <bob@example.com>"
+
+
 class TestBuildMime:
     def test_text_only_is_a_single_part(self):
         mime = build_mime(_message(), sender=SENDER, now=NOW)

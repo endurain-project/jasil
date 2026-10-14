@@ -223,10 +223,14 @@ class SmtpMail:
             raise MailError("SMTP relay no longer resolves to a private address; cleartext refused")
         return addresses
 
-    def _connect(self, connection: smtplib.SMTP) -> tuple[int, bytes]:
+    def _connect(self, connection: smtplib.SMTP, deadline: float) -> tuple[int, bytes]:
         """Connect to the first reachable host; ``smtplib`` would also try each address."""
         hosts = self._connect_hosts()
         for index, host in enumerate(hosts):
+            # A connect is not interruptible by the watchdog, so do not start one
+            # after the deadline.
+            if time.monotonic() >= deadline:
+                raise MailError(_DEADLINE_EXCEEDED)
             try:
                 return connection.connect(host, self._port)
             except OSError:
@@ -234,6 +238,10 @@ class SmtpMail:
                     raise
                 # A socket left half-open by the failed attempt must not leak.
                 connection.close()
+                watched = getattr(connection, "watched", None)
+                if watched is not None:
+                    connection.watched = None  # type: ignore[attr-defined]
+                    watched.close()
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
@@ -255,7 +263,7 @@ class SmtpMail:
         watchdog.start()
         try:
             try:
-                code, reply = self._connect(connection)
+                code, reply = self._connect(connection, deadline)
                 if code != 220:
                     raise smtplib.SMTPConnectError(code, reply)
                 if self._tls and not self._implicit_tls:
