@@ -479,6 +479,23 @@ class TestSmtpTransport:
 
         assert ADDRESS not in str(raised.value)
 
+    def test_cleartext_does_not_dial_another_address_after_the_deadline(self, monkeypatch):
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
+        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.05)
+        tried: list[str] = []
+
+        def connect(self, host, port):
+            tried.append(host)
+            time.sleep(0.15)
+            raise OSError("slow failure")
+
+        monkeypatch.setattr(FakeSMTP, "connect", connect)
+
+        with pytest.raises(MailError, match="deadline"):
+            _smtp(tls=False).send(_message())
+
+        assert tried == ["::1"]
+
     @pytest.mark.parametrize("implicit_tls", [True, False])
     def test_a_stalled_tls_handshake_cannot_outlive_the_deadline(self, monkeypatch, implicit_tls):
         """The handshake reads from a socket ``connection.sock`` no longer names."""
