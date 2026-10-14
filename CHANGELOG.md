@@ -12,7 +12,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 - `Platform.mail`, defaulting to a `NullMail` that raises `MailNotConfiguredError`. `Platform.geocoding` and `Platform.recorder` now default to `NullGeocoding()` and `None`, so a `Platform` built by hand need not supply them.
 - `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults an unset or empty `mail.uri` to `memory://`, except in a multi-process deployment that enforces consistency.
-- `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured); an invalid message raises `ValueError`.
+- `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured), whose `status` and `permanent` expose the SMTP status so a handler can stop retrying a 5xx; an invalid message raises `ValueError`.
 - `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is verified by default; `MailSettings.secure = False` permits cleartext `smtp://` only to a private/loopback relay and never with credentials. `MailSettings.ehlo_hostname` overrides the name announced in `EHLO`. Standard library only — no new dependency.
 - A fourth deployment-consistency rule, `jasil.capabilities.check_mail_consistency`: `memory://` mail is refused in a multi-process deployment, where no message would be delivered.
 - `jasil.testing.MemoryMail` and `memory_mail(platform)` for a typed outbox; `MemoryMail.clear()`.
@@ -22,14 +22,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 - `JobRunner` renews the lease of the remaining jobs of a batch as each one starts, so a late job in a batch is no longer requeued (and run twice) while still running.
 - A job whose handler outlives its lease is no longer marked completed or failed by the worker that lost it: the reaper has requeued it, and its state now belongs to the worker that claimed it next. The late result is logged and discarded.
-- An SMTP connect to a name with several unreachable addresses no longer runs past the 90-second send deadline.
-- `SmtpMail` validates `from_address` at construction instead of failing every `send`.
-- `install_test_platform` no longer fails for settings with `mail.secure = False` and no `mail.uri`.
 - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
-- A mail address with a leading, trailing or doubled dot in the local part, or with an all-numeric last domain label (an unbracketed IP such as `a@1.2.3.4`), is refused with `ValueError` before any connection is made, rather than after a round trip to a relay that will always reject it.
-- `MailError.status` and `MailError.permanent` expose the SMTP status code, so a handler can stop retrying a 5xx without parsing the message.
-- The cleartext private-relay check also refuses the NAT64 local-use (`64:ff9b:1::/48`) and Teredo (`2001::/32`) ranges, which a gateway carries to public hosts.
-- `SmtpMail` waits for its deadline watchdog before closing the sockets.
 
 ## [0.5.1]
 
