@@ -16,7 +16,7 @@ same code runs single-process on a laptop and multi-replica in production.
 
 | Layer | What it does |
 |---|---|
-| **Providers** | Narrow protocols domain services can depend on, plus complete aggregates such as `StorageProvider` for the assembled platform. |
+| **Providers** | Narrow protocols domain services can depend on, plus complete aggregates such as `StorageProvider` for the assembled platform. Capabilities: state, storage, events, lock, clock, geocoding, mail. |
 | **Backends** | A working implementation of each, selected by URI. |
 | **Deployment profiles** | `local` needs no infrastructure at all. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload versioning that survives a rolling deploy. |

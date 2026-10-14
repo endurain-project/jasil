@@ -129,10 +129,23 @@ class JobRunner:
         if snapshots:
             self._queue_cursor = snapshots[-1].queue
             logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
-        for snapshot in snapshots:
+        for index, snapshot in enumerate(snapshots):
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.
             try:
+                if index:
+                    try:
+                        held = self._still_held(snapshot, snapshots[index:])
+                    except Exception as error:
+                        # Not run: the lease is unknown, and the reaper requeues it.
+                        logger.error(
+                            "Durable job lease could not be renewed; skipping",
+                            exc_info=error,
+                            extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
+                        )
+                        continue
+                    if not held:
+                        continue
                 self._run_job(snapshot)
             except Exception as error:
                 logger.error(
@@ -141,6 +154,33 @@ class JobRunner:
                     extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                 )
         return len(snapshots)
+
+    def _still_held(self, job: ClaimedJob, remaining: list[ClaimedJob]) -> bool:
+        """Renew the leases of the rest of the batch; False when ``job`` was lost.
+
+        The batch was claimed under one lease, but jobs run in turn: each one gets
+        a full lease from the start of its turn. A job the reaper already requeued
+        belongs to another worker now and must not be run here as well.
+
+        Renewing the whole remainder before each job is quadratic in the batch
+        size (one UPDATE per job at most ``batch_size`` rows); deliberate, as it
+        keeps every waiting job's lease alive while an earlier one runs.
+        """
+        with self._session_factory() as db:
+            renewed = jobs_crud.renew_leases(
+                {item.id: item.attempts for item in remaining},
+                worker_id=self._worker_id,
+                lease_seconds=self._lease_seconds,
+                now=self._clock.now(),
+                db=db,
+            )
+        if job.id in renewed:
+            return True
+        logger.warning(
+            "Durable job lease was lost before its turn; skipping",
+            extra={"job_id": job.id, "subscriber": job.subscriber_id},
+        )
+        return False
 
     def reap_once(self) -> int:
         """
@@ -208,7 +248,7 @@ class JobRunner:
                 "subscriber": job.subscriber_id,
                 "event_type": job.event_type,
                 "attempts": job.attempts,
-                "job_status": status or "unknown",
+                "job_status": status,
             },
         )
 

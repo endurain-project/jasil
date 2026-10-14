@@ -6,6 +6,7 @@ from jasil.capabilities import (
     StateSource,
     build_capability_report,
     check_deployment_consistency,
+    check_mail_consistency,
 )
 from jasil.profile import (
     DeploymentProfile,
@@ -15,7 +16,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import JasilSettings
+from jasil.settings import JasilSettings, MailSettings
 
 
 class TestParseProfile:
@@ -106,7 +107,35 @@ class TestCapabilityReport:
         names = [row.name for row in report.rows]
 
         assert sorted(names) == sorted(set(names))
-        assert {"state", "storage", "events", "lock", "clock"} == set(names)
+        assert {"state", "storage", "events", "lock", "mail", "clock"} == set(names)
+
+    def test_mail_reports_disabled_when_unset(self, report):
+        row = next(row for row in report.rows if row.name == "mail")
+
+        assert (row.backend, row.source) == ("disabled", "not configured")
+
+    def test_mail_reports_its_scheme_without_the_host_or_credentials(self):
+        settings = JasilSettings(mail=MailSettings(uri="smtps://relay.test", from_address="a@b.c"))
+
+        row = next(row for row in build_capability_report(settings).rows if row.name == "mail")
+
+        assert (row.backend, row.source) == ("smtps", "mail.uri")
+
+    def test_a_cleartext_relay_says_so(self):
+        settings = JasilSettings(mail=MailSettings(uri="smtp://127.0.0.1", from_address="a@b.c", secure=False))
+
+        row = next(row for row in build_capability_report(settings).rows if row.name == "mail")
+
+        assert row.backend == "smtp (cleartext)"
+
+    @pytest.mark.parametrize("uri", ["user:hunter2@relay.example.com", "smtp:u:hunter2@relay.example.com:587"])
+    def test_a_malformed_mail_uri_is_never_echoed(self, uri):
+        row = next(
+            row for row in build_capability_report(JasilSettings(mail=MailSettings(uri=uri))).rows if row.name == "mail"
+        )
+
+        assert row.backend == "invalid"
+        assert "hunter2" not in row.backend + row.source
 
     def test_the_clock_row_is_always_present(self, report):
         """The clock is the one capability with no alternative backend."""
@@ -171,6 +200,32 @@ class TestDeploymentConsistency:
         issues = check_deployment_consistency(JasilSettings(web_workers=4))
 
         assert any("events_uri resolves to process-local memory" in issue for issue in issues)
+
+    def test_multiple_workers_on_memory_mail_are_refused(self):
+        """Each process would keep its own outbox and nothing would be delivered."""
+        issues = check_deployment_consistency(JasilSettings(web_workers=4, mail=MailSettings(uri="memory://")))
+
+        assert any("mail.uri resolves to the in-memory mail recorder" in issue for issue in issues)
+
+    def test_the_distributed_profile_on_memory_mail_is_refused(self):
+        issues = check_mail_consistency(
+            profile=DeploymentProfile.DISTRIBUTED, web_workers=1, mail_uri="MEMORY://", mail_label="mail.uri"
+        )
+
+        assert len(issues) == 1 and "profile=distributed" in issues[0]
+
+    @pytest.mark.parametrize(
+        ("profile", "web_workers", "uri"),
+        [
+            pytest.param(DeploymentProfile.LOCAL, 1, "memory://", id="single-process"),
+            pytest.param(DeploymentProfile.CUSTOM, 4, "memory://", id="custom"),
+            pytest.param(DeploymentProfile.LOCAL, 4, "smtp://relay.test", id="relay"),
+            pytest.param(DeploymentProfile.LOCAL, 4, None, id="unset"),
+            pytest.param(DeploymentProfile.LOCAL, 4, "", id="empty"),
+        ],
+    )
+    def test_mail_that_cannot_silently_go_nowhere_is_accepted(self, profile, web_workers, uri):
+        assert check_mail_consistency(profile=profile, web_workers=web_workers, mail_uri=uri, mail_label="m") == []
 
     def test_multiple_workers_on_a_no_op_lock_are_refused(self):
         """Otherwise every worker runs every scheduled job."""

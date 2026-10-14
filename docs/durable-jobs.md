@@ -254,6 +254,27 @@ the next call. See [Observability](observability.md#worker-registry).
     given. `jasil.admin` is importable from anywhere and takes no session, so an
     admin route cannot accidentally hand JASIL its own open transaction.
 
+## Sending mail
+
+There is no mail queue: durable jobs are the queue. Publish an event, and have a
+durable subscriber call `platform.mail.send(...)`. A raised `MailError` gets
+backoff, retries and the dead-letter queue like any other failure.
+
+- **An unconfigured mail backend is retried too.** `MailNotConfiguredError` is a
+  `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
+  budget before dead-lettering. Catch it in the handler if that is not wanted.
+- **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
+  message twice.
+- **Size `jobs.lease_seconds` for the whole handler, not one send.** One SMTP
+  send can take up to 90 seconds, and the DNS lookups before it are not counted
+  against that deadline. A handler that sends N messages can take N times that.
+  The runner renews a job's lease when its turn in a batch begins, but a lease
+  shorter than the handler lets the reaper requeue a job that is still being
+  delivered: it is then sent twice, and the late worker's result is discarded.
+- **Do not put secrets or rendered bodies in the event payload.** Payloads are
+  stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
+  build the message inside the handler.
+
 ## Tuning
 
 | Setting | Raise it when | Lower it when |

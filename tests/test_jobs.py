@@ -307,6 +307,58 @@ class TestCompletion:
         assert jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db) == []
 
 
+class TestFinishingGuardedByTheLeaseHolder:
+    """A job requeued mid-run belongs to its new holder; the late worker must not finish it."""
+
+    def _claim_then_lose(self, db, event):
+        job = _enqueue(event, db)
+        jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+        jobs_crud.reclaim_expired_leases(now=T0 + timedelta(seconds=61), db=db)
+        jobs_crud.claim_jobs(worker_id="w2", limit=10, lease_seconds=60, now=T0 + timedelta(seconds=61), db=db)
+        return job
+
+    def test_the_holder_can_complete(self, db, event):
+        job = _enqueue(event, db)
+        jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+
+        assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
+        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+
+    def test_a_late_worker_cannot_complete(self, db, event):
+        job = self._claim_then_lose(db, event)
+
+        assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is False
+        stored = jobs_crud.get_job(job.id, db)
+        assert stored.status == jobs_crud.STATUS_CLAIMED
+        assert stored.locked_by == "w2"
+
+    def test_a_late_worker_cannot_record_a_failure(self, db, event):
+        job = self._claim_then_lose(db, event)
+
+        status = jobs_crud.mark_job_failed(
+            job.id, "boom", worker_id="w1", attempt=1, base_seconds=1, max_seconds=2, now=T0, db=db
+        )
+
+        assert status == ""
+        stored = jobs_crud.get_job(job.id, db)
+        assert stored.status == jobs_crud.STATUS_CLAIMED
+        assert stored.locked_by == "w2"
+        assert stored.last_error != "boom"
+
+    def test_a_finished_job_cannot_be_finished_again_by_its_old_holder(self, db, event):
+        job = _enqueue(event, db)
+        jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
+        jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db)
+
+        assert (
+            jobs_crud.mark_job_failed(
+                job.id, "boom", worker_id="w1", attempt=1, base_seconds=1, max_seconds=2, now=T0, db=db
+            )
+            == ""
+        )
+        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+
+
 class TestFailureAndBackoff:
     def _claim(self, db):
         return jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)[0]

@@ -394,3 +394,75 @@ class GeocodingProvider(Protocol):
     """
 
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None: ...
+
+
+@dataclass(frozen=True)
+class MailMessage:
+    """One outbound email, already built by the host.
+
+    Attributes:
+        to: Recipient addresses, each a bare ``addr`` or ``"Name <addr>"``.
+        subject: Subject line. Must not contain CR or LF.
+        text: Plain-text body. At least one of ``text`` / ``html`` is required.
+        html: HTML body. With ``text`` as well, the message is
+            ``multipart/alternative``.
+        reply_to: Optional single ``Reply-To`` address.
+    """
+
+    to: Sequence[str]
+    subject: str
+    text: str | None = None
+    html: str | None = None
+    reply_to: str | None = None
+
+    def __hash__(self) -> int:
+        # ``to`` is usually a list, which the generated hash cannot digest.
+        recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
+        return hash((recipients, self.subject, self.text, self.html, self.reply_to))
+
+
+class MailError(RuntimeError):
+    """A message could not be handed to the mail server.
+
+    The message carries a failure category and, when there is one, the SMTP
+    status code — never an address, a subject, a body or server-supplied text,
+    because a job runner persists ``str(error)`` and logs it.
+
+    Attributes:
+        status: The SMTP status code, or ``None`` when the failure had none
+            (unreachable server, TLS failure, deadline).
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def permanent(self) -> bool:
+        """True for a 5xx reply: the server will refuse a retry the same way."""
+        return self.status is not None and 500 <= self.status < 600
+
+
+class MailNotConfiguredError(MailError):
+    """Mail was sent while no backend is configured."""
+
+
+@runtime_checkable
+class MailProvider(Protocol):
+    """Outbound email — hand a built message to a mail server.
+
+    Unlike geocoding, mail is not best-effort enrichment: a silently dropped
+    message is a bug, and a raised exception is what makes a durable job retry.
+
+    ``send`` returns the ``Message-ID`` the backend assigned, angle brackets
+    included, exactly as it appears in the header.
+
+    Raises:
+        MailError: On any delivery failure (:class:`MailNotConfiguredError` when
+            no backend is configured).
+        ValueError: On an invalid message — no recipient, no body, a malformed
+            address, or CR/LF in a header value. A programming error, not a
+            delivery error.
+    """
+
+    def send(self, message: MailMessage) -> str: ...

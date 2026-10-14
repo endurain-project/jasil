@@ -11,6 +11,7 @@ different contract:
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import update
 
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
@@ -343,6 +344,119 @@ class TestJobRunner:
         clock.advance(61)
 
         assert runner.reap_once() == 1
+
+    def test_later_jobs_of_a_batch_get_a_fresh_lease_when_their_turn_comes(self, runner, registry, clock, db):
+        leases = []
+
+        def _handler(_event):
+            clock.advance(50)  # each job eats most of the 60 s lease
+            db.rollback()
+            leases.append([j.lease_expires_at for j in db.query(ProcessingJob).filter_by(status="claimed")])
+
+        registry.register("activity.created", "s", _handler)
+        registry.register("activity.created", "t", _handler)
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        assert runner.run_once() == 2
+
+        # While the second job runs, its lease was renewed past the first job's 50 s.
+        (second,) = leases[1]
+        assert second.replace(tzinfo=None) == (T0 + timedelta(seconds=50 + 60)).replace(tzinfo=None)
+
+    def test_a_job_whose_lease_was_lost_mid_batch_is_not_run_again(self, runner, registry, db):
+        ran = []
+
+        def _handler(name, other):
+            def _run(_event):
+                ran.append(name)
+                # The reaper requeued the other job and another worker took it.
+                db.execute(
+                    update(ProcessingJob).where(ProcessingJob.subscriber_id == other).values(locked_by="other-worker")
+                )
+                db.commit()
+
+            return _run
+
+        registry.register("activity.created", "s", _handler("s", "t"))
+        registry.register("activity.created", "t", _handler("t", "s"))
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        runner.run_once()
+
+        assert len(ran) == 1
+
+    def test_a_job_the_same_worker_reclaimed_mid_batch_is_not_run_from_the_old_snapshot(self, runner, registry, db):
+        ran = []
+
+        def _handler(name, other):
+            def _run(_event):
+                ran.append(name)
+                # Requeued and claimed again by this same worker: still held by it,
+                # but a later attempt than the snapshot this batch holds.
+                db.execute(
+                    update(ProcessingJob)
+                    .where(ProcessingJob.subscriber_id == other)
+                    .values(attempts=ProcessingJob.attempts + 1)
+                )
+                db.commit()
+
+            return _run
+
+        registry.register("activity.created", "s", _handler("s", "t"))
+        registry.register("activity.created", "t", _handler("t", "s"))
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        runner.run_once()
+
+        assert len(ran) == 1
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_a_job_that_outran_its_lease_is_left_to_its_new_holder(self, runner, registry, db, caplog, fails):
+        def _handler(_event):
+            # The lease expired mid-run; the reaper requeued it and another worker took it.
+            db.execute(update(ProcessingJob).values(locked_by="other-worker"))
+            db.commit()
+            if fails:
+                raise RuntimeError("boom")
+
+        registry.register("activity.created", "s", _handler)
+        self._enqueue(db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.runner"):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_CLAIMED
+        assert job.locked_by == "other-worker"
+        assert job.last_error is None
+        assert "claim ownership was lost" in caplog.text
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_a_job_the_same_worker_reclaimed_is_not_finished_by_the_earlier_run(
+        self, runner, registry, db, caplog, fails
+    ):
+        def _handler(_event):
+            # Requeued and claimed again by this same worker: the row still looks
+            # held by it, but it is a later attempt.
+            db.execute(update(ProcessingJob).values(attempts=ProcessingJob.attempts + 1))
+            db.commit()
+            if fails:
+                raise RuntimeError("boom")
+
+        registry.register("activity.created", "s", _handler)
+        self._enqueue(db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.runner"):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_CLAIMED
+        assert job.attempts == 2
+        assert job.last_error is None
+        assert "claim ownership was lost" in caplog.text
 
 
 class TestInProcessBus:

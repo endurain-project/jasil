@@ -201,6 +201,41 @@ class TestTieredFailureConformance:
         assert outcome.locked_until_epoch - int(time.time()) > 60
 
 
+class TestTtlConformance:
+    """A TTL passed to the compound operations reaches the key on both backends."""
+
+    def test_incr_with_a_ttl_still_counts(self, state):
+        state.incr("counter", ttl_seconds=60)
+
+        assert state.incr("counter", ttl_seconds=60) == 2
+
+    def test_set_if_absent_with_a_ttl_claims_then_refuses(self, state):
+        assert state.set_if_absent("lock", b"first", ttl_seconds=60) is True
+        assert state.set_if_absent("lock", b"second", ttl_seconds=60) is False
+        assert state.get("lock") == b"first"
+
+
+class TestRedisTtlIsArmed:
+    @pytest.fixture
+    def client(self):
+        return fakeredis.FakeStrictRedis(decode_responses=False)
+
+    def test_incr_arms_the_expiry_when_asked(self, client):
+        RedisState(client).incr("counter", ttl_seconds=60)
+
+        assert 0 < client.ttl("counter") <= 60
+
+    def test_incr_without_a_ttl_leaves_the_key_persistent(self, client):
+        RedisState(client).incr("counter")
+
+        assert client.ttl("counter") == -1
+
+    def test_set_if_absent_arms_the_expiry_when_asked(self, client):
+        RedisState(client).set_if_absent("lock", b"owner", ttl_seconds=60)
+
+        assert 0 < client.ttl("lock") <= 60
+
+
 class TestMemoryBackendExpiry:
     """Expiry mechanics, driven by a fake clock rather than by sleeping."""
 
@@ -244,6 +279,22 @@ class TestMemoryBackendExpiry:
         clock["now"] += 11
 
         assert state.get("counter") is None
+
+    def test_an_elapsed_lockout_lifts_and_can_lock_again(self, monkeypatch):
+        """The gate is wall-clock; once it passes the caller is let back in, and
+        the surviving counter means the next failure re-locks at once."""
+        state = MemoryState()
+        tiers = ((1, 60),)
+        locked = state.record_tiered_failure("counter", "gate", tiers, 900)
+        assert locked.newly_locked is True
+        real_time = time.time
+        monkeypatch.setattr("jasil.backends.state_memory.time.time", lambda: real_time() + 61)
+
+        outcome = state.record_tiered_failure("counter", "gate", tiers, 900)
+
+        assert outcome.count == 2
+        assert outcome.newly_locked is True
+        assert outcome.locked_until_epoch > locked.locked_until_epoch
 
     def test_expired_keys_are_not_listed(self, clock):
         state = MemoryState()

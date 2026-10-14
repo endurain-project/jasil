@@ -21,17 +21,24 @@ silently diverge across processes or nodes stops the build rather than becoming 
 production mystery.
 """
 
+import ipaddress
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
+import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
+from jasil._core.mail_message import parse_address
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
+from jasil.backends.mail_memory import MemoryMail, NullMail
+from jasil.backends.mail_smtp import SEND_DEADLINE_SECONDS as SMTP_SEND_DEADLINE_SECONDS
+from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -42,6 +49,7 @@ from jasil.providers import (
     EventRecorder,
     GeocodingProvider,
     LockProvider,
+    MailProvider,
     StateProvider,
     StorageProvider,
 )
@@ -70,6 +78,10 @@ class Platform:
         recorder: Event-log recorder, or ``None`` when event logging is disabled.
             Shared by the event bus (best-effort delivery) and the publish facade
             (durable delivery) so both paths land in the event_log dashboard.
+        mail: Outbound-mail provider. Always present — when mail is unconfigured
+            this is a backend whose ``send`` raises
+            :class:`~jasil.providers.MailNotConfiguredError`, so a message is
+            never dropped silently.
     """
 
     profile: DeploymentProfile
@@ -78,8 +90,9 @@ class Platform:
     events: EventBusProvider
     lock: LockProvider
     clock: ClockProvider
-    geocoding: GeocodingProvider
-    recorder: EventRecorder | None
+    geocoding: GeocodingProvider = field(default_factory=NullGeocoding)
+    recorder: EventRecorder | None = None
+    mail: MailProvider = field(default_factory=NullMail)
 
     def close(self) -> None:
         """Release what the platform owns: the bus consumer and the Redis clients.
@@ -102,20 +115,24 @@ class Platform:
         redis_clients.close_shared_clients()
 
 
-def build_platform(settings: JasilSettings | None = None) -> Platform:
+def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvider | None = None) -> Platform:
     """Assemble the ``Platform`` for the configured deployment profile.
 
     Args:
         settings: The configuration to build from. Defaults to the settings the
             host installed via ``jasil.settings.configure``.
+        clock: Time source to wire into the platform and the backends that stamp
+            time (mail ``Date``). Defaults to :class:`SystemClock`; a test
+            helper passes a controllable one.
 
     Returns:
         A frozen ``Platform`` wiring each provider to its selected backend.
 
     Raises:
         ValueError: When a capability URI uses an unsupported scheme, is unset
-            under a profile that has no default for it, or when the resolved
-            wiring contradicts the deployment topology.
+            under a profile that has no default for it, when the resolved
+            wiring contradicts the deployment topology, or when ``mail`` is
+            configured incorrectly.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
@@ -127,14 +144,19 @@ def build_platform(settings: JasilSettings | None = None) -> Platform:
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
     recorder = _build_event_recorder(settings)
+    clock = clock if clock is not None else SystemClock()
+    # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
+    # mistyped mail setting fails before any Redis client is connected and left open.
+    mail = _build_mail(settings, clock)
     return Platform(
         profile=profile,
         state=_build_state(settings),
         storage=_build_storage(settings),
         events=_build_events(settings, recorder),
         lock=_build_lock(settings),
-        clock=SystemClock(),
+        clock=clock,
         geocoding=_build_geocoding(settings),
+        mail=mail,
         recorder=recorder,
     )
 
@@ -282,4 +304,122 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
         api_key=api_key,
         min_interval_seconds=min_interval,
         user_agent=geo.user_agent,
+    )
+
+
+#: Default ports of the SMTP schemes.
+_SMTP_PORTS = {"smtp": 587, "smtps": 465}
+
+
+def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
+    """Resolve the mail backend.
+
+    Unlike geocoding, a bad mail configuration fails the build: a deployment that
+    believes it can send mail and cannot is worse than one that refuses to start.
+    No connection is attempted, so a mail server that is down does not block boot.
+    The one network call is a DNS lookup of the host when ``secure`` is off, to
+    confirm it is private; a resolver that cannot answer fails the build.
+
+    Args:
+        settings: The application settings.
+        clock: The platform clock, used for the ``Date`` header.
+
+    Returns:
+        :class:`NullMail` when unset, :class:`MemoryMail` for ``memory://``,
+        else :class:`SmtpMail`.
+
+    Raises:
+        ValueError: On an unsupported scheme; a URI carrying userinfo, a path, a
+            query or a fragment; an invalid host or port; a missing or
+            malformed ``from_address`` or ``ehlo_hostname``; ``username``
+            without ``password`` (or the reverse); or ``secure=False`` outside
+            its narrow case.
+    """
+    mail = settings.mail
+    if not mail.uri:
+        logger.debug("Mail is not configured; sending will raise MailNotConfiguredError")
+        return NullMail()
+    # The URI is never echoed in an error: it is operator input, but keeping
+    # error text free of it costs nothing and keeps a mistyped credential out of logs.
+    # ``urlsplit`` quietly strips whitespace and accepts ``memory:``; require the
+    # literal form so what is built is what the consistency check inspected.
+    if mail.uri != mail.uri.strip() or "://" not in mail.uri:
+        raise ValueError("mail.uri is not a valid URI")
+    try:
+        parts = urlsplit(mail.uri)
+        port = parts.port
+        hostname = parts.hostname
+    except ValueError:
+        raise ValueError("mail.uri is not a valid URI") from None
+    scheme = parts.scheme
+    if scheme not in ("memory", *_SMTP_PORTS):
+        raise ValueError(f"Unsupported mail.uri scheme: {scheme or '(none)'!r}")
+    if parts.username is not None or parts.password is not None:
+        raise ValueError("mail.uri must not carry credentials; use mail.username and mail.password")
+    if parts.path or parts.query or parts.fragment:
+        raise ValueError("mail.uri must be scheme://host[:port] with no path, query or fragment")
+    if bool(mail.username) != bool(mail.password):
+        raise ValueError("mail.username and mail.password must be set together")
+    if mail.from_address:
+        try:
+            parse_address(mail.from_address, role="sender")
+        except ValueError:
+            raise ValueError("mail.from_address is not a valid email address") from None
+    if mail.ehlo_hostname is not None and not network.is_valid_hostname(mail.ehlo_hostname):
+        raise ValueError("mail.ehlo_hostname is not a valid hostname")
+
+    # A multi-process memory:// is refused by the deployment-consistency check,
+    # which has already run.
+    if scheme == "memory":
+        if parts.netloc:
+            raise ValueError("mail.uri for memory:// takes no host")
+        if not mail.secure:
+            raise ValueError("mail.secure=False applies only to smtp://")
+        logger.warning("Mail is memory:// (messages are recorded in the process outbox, never delivered)")
+        return MemoryMail(clock, mail.from_address)
+
+    if not hostname:
+        raise ValueError("mail.uri has no valid host")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        if not network.is_valid_hostname(hostname):
+            raise ValueError("mail.uri has no valid host") from None
+    if port == 0:
+        raise ValueError("mail.uri has an invalid port")
+    if not mail.from_address:
+        raise ValueError("mail.from_address is required for smtp:// and smtps://")
+    if not mail.secure:
+        # Cleartext is an explicit, narrow exception: a relay on the same host or
+        # private network (a local MTA, a dev catcher). AUTH is never sent over it.
+        if scheme == "smtps":
+            raise ValueError("mail.secure=False cannot be combined with smtps://")
+        if mail.username or mail.password:
+            raise ValueError("mail.secure=False cannot be combined with credentials")
+        reason = network.non_public_rejection_reason(hostname)
+        if reason is not None:
+            raise ValueError(f"mail.secure=False requires a private or loopback relay; the host {reason}")
+        logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
+    if settings.jobs.enabled and settings.jobs.lease_seconds <= SMTP_SEND_DEADLINE_SECONDS:
+        # One send can take up to the SMTP deadline; a shorter lease lets the reaper
+        # requeue a job that is still being delivered, so it is sent twice. Only the
+        # floor is checkable here: a handler sending N messages needs N times this.
+        logger.warning(
+            "jobs.lease_seconds (%d) is not above the SMTP send deadline (%d s, per "
+            "message); a slow send can be requeued and delivered twice",
+            settings.jobs.lease_seconds,
+            SMTP_SEND_DEADLINE_SECONDS,
+        )
+    resolved_port = port or _SMTP_PORTS[scheme]
+    logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")
+    return SmtpMail(
+        hostname,
+        resolved_port,
+        implicit_tls=scheme == "smtps",
+        tls=mail.secure,
+        from_address=mail.from_address,
+        clock=clock,
+        username=mail.username,
+        password=mail.password,
+        local_hostname=mail.ehlo_hostname,
     )

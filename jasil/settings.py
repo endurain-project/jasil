@@ -18,7 +18,8 @@ it once at startup::
 Every component reads the installed settings through :func:`get_settings`.
 
 **Shape.** Configuration is grouped by concern — :class:`JobSettings`,
-:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`NetworkSettings` —
+:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
+:class:`NetworkSettings` —
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
 
@@ -38,6 +39,7 @@ __all__ = [
     "GeocodingSettings",
     "JasilSettings",
     "JobSettings",
+    "MailSettings",
     "NetworkSettings",
     "configure",
     "get_settings",
@@ -118,6 +120,44 @@ class GeocodingSettings:
 
 
 @dataclass(frozen=True)
+class MailSettings:
+    """Outbound-mail backend configuration.
+
+    Attributes:
+        uri: ``memory://`` (tests), ``smtp://host[:port]`` (STARTTLS, default
+            port 587) or ``smtps://host[:port]`` (implicit TLS, default port
+            465). Unset disables mail: sending raises
+            :class:`~jasil.providers.MailNotConfiguredError`. Credentials never
+            belong in the URI. The host is trusted operator configuration and
+            is not checked against the SSRF address denylist (a relay is
+            normally on a private network): never derive it from user input.
+            ``memory://`` is refused in a multi-process deployment (see
+            ``enforce_deployment_consistency``), where no message would ever be
+            delivered.
+        from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
+            for the SMTP schemes. Independent of ``username``.
+        secure: ``True`` (the default) requires verified TLS. ``False`` sends
+            over a cleartext connection and is accepted only for ``smtp://``,
+            only when the host resolves exclusively to private, loopback or
+            link-local addresses (re-checked on every send), and never together with ``username`` / ``password``.
+            That check resolves the host while the platform is built, so it
+            needs a working resolver at startup.
+        username: SMTP login, when the server requires authentication.
+        password: SMTP password. Required with ``username``, and the reverse.
+        ehlo_hostname: Name announced in ``EHLO``. Defaults to this machine's
+            hostname; set a fully qualified one for a relay that rejects a bare
+            name.
+    """
+
+    uri: str | None = None
+    from_address: str = ""
+    secure: bool = True
+    username: str | None = None
+    password: str | None = field(default=None, repr=False)
+    ehlo_hostname: str | None = None
+
+
+@dataclass(frozen=True)
 class NetworkSettings:
     """Outbound-egress configuration.
 
@@ -166,6 +206,7 @@ class JasilSettings:
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
         geocoding: Reverse-geocoding backend configuration.
+        mail: Outbound-mail backend configuration.
         network: Outbound-egress configuration.
     """
 
@@ -180,6 +221,7 @@ class JasilSettings:
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
+    mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
 
     def _resolve(self, name: str) -> str:

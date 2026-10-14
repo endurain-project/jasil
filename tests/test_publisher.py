@@ -12,7 +12,9 @@ Two behaviours matter most and are easy to regress:
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.orm import Session
 
+import jasil.correlation as correlation
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.registry as jobs_registry
 import jasil.publisher as publisher
@@ -298,3 +300,299 @@ class TestPublishManyCommitting:
         )
 
         assert len(bus.published) == 1
+
+    def test_a_mint_failure_on_the_bus_path_is_logged_and_swallowed(self, platform, db, monkeypatch, caplog):
+        def _refuse(*_args, **_kwargs):
+            raise RuntimeError("cannot mint")
+
+        monkeypatch.setattr(publisher, "new_event", _refuse)
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_committing(
+                "activity.deleted", [{"id": 1}], source="test", db=db, commit=lambda: None
+            )
+
+        assert platform.events.published == []
+        assert "Failed to publish event activity.deleted" in caplog.text
+
+
+def _bus_failure_platform(monkeypatch):
+    monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=ExplodingBus()))
+
+
+def _outbox_count(engine) -> int:
+    with Session(engine) as other:
+        return other.query(EventOutbox).count()
+
+
+class TestPublishOnCommitDurable:
+    @pytest.fixture(autouse=True)
+    def _durable(self, platform):
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+    def test_the_row_is_staged_in_the_open_transaction_before_commit(self, platform, db, db_engine):
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        assert db.in_transaction()
+        assert db.query(EventOutbox).count() == 1
+
+    def test_the_row_is_absent_after_rollback(self, platform, db, db_engine):
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+        db.rollback()
+
+        assert _outbox_count(db_engine) == 0
+
+    def test_the_row_is_present_after_commit(self, platform, db, db_engine):
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+        db.commit()
+
+        assert _outbox_count(db_engine) == 1
+        assert platform.events.published == []
+
+    def test_domain_rows_and_outbox_row_share_one_transaction(self, platform, db, db_engine):
+        """A stand-in domain row and the outbox row land or vanish together."""
+        db.add(EventOutbox(**_outbox_kwargs("domain-row")))
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+        db.commit()
+        assert _outbox_count(db_engine) == 2
+
+        db.add(EventOutbox(**_outbox_kwargs("domain-row-2")))
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+        db.rollback()
+        assert _outbox_count(db_engine) == 2
+
+    def test_a_staging_failure_raises_to_the_caller(self, platform, db, monkeypatch):
+        monkeypatch.setattr(
+            jobs_outbox, "add_to_outbox", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("db down"))
+        )
+
+        with pytest.raises(RuntimeError, match="db down"):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+
+def _outbox_kwargs(event_id: str) -> dict:
+    return {
+        "id": event_id,
+        "event_id": event_id,
+        "event_type": "domain.row",
+        "source": "test",
+        "timestamp": T0,
+        "payload": {},
+        "schema_version": 1,
+        "created_at": T0,
+    }
+
+
+class TestPublishOnCommitBestEffort:
+    def test_nothing_is_dispatched_before_commit(self, platform, db):
+        publisher.publish_on_commit("activity.created", {"id": 1}, source="test", db=db)
+
+        assert platform.events.published == []
+
+    def test_one_dispatch_after_commit(self, platform, db):
+        publisher.publish_on_commit("activity.created", {"id": 1}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload for e in platform.events.published] == [{"id": 1}]
+
+    def test_nothing_is_dispatched_after_rollback(self, platform, db):
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+        db.rollback()
+        db.commit()
+
+        assert platform.events.published == []
+
+    def test_nothing_is_dispatched_when_the_session_is_closed_uncommitted(self, platform, session_factory):
+        with session_factory() as session:
+            publisher.publish_on_commit("activity.created", {}, source="test", db=session)
+            session.close()
+            session.commit()
+
+        assert platform.events.published == []
+
+    def test_a_subscriber_failure_does_not_reach_the_committer(self, monkeypatch, db, caplog):
+        _bus_failure_platform(monkeypatch)
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        with caplog.at_level("ERROR"):
+            db.commit()
+
+        assert "Failed to publish event activity.created" in caplog.text
+
+    def test_ambient_request_id_is_merged_like_publish_committing(self, platform, db):
+        correlation.set_correlation_id("req-9")
+        publisher.publish_on_commit("activity.created", {}, source="test", metadata={"user_id": 3}, db=db)
+        correlation.reset()  # the commit may happen outside the request context
+        db.commit()
+
+        assert platform.events.published[0].metadata == {META_REQUEST_ID: "req-9", "user_id": 3}
+
+    def test_a_session_that_commits_twice_dispatches_each_batch_once(self, platform, db):
+        publisher.publish_on_commit("activity.created", {"id": 1}, source="test", db=db)
+        db.commit()
+        db.commit()
+        publisher.publish_on_commit("activity.created", {"id": 2}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload["id"] for e in platform.events.published] == [1, 2]
+
+    def test_events_dispatch_in_publish_order(self, platform, db):
+        publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        publisher.publish_many_on_commit("a.two", [{"n": 2}, {"n": 3}], source="test", db=db)
+        publisher.publish_on_commit("a.one", {"n": 4}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [1, 2, 3, 4]
+
+    def test_an_event_published_during_dispatch_waits_for_the_next_commit(self, platform, db):
+        def _republish(event):
+            platform.events.published.append(event)
+            if event.payload["n"] == 1:
+                publisher.publish_on_commit("a.one", {"n": 2}, source="test", db=db)
+
+        platform.events.publish = _republish
+        publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        db.commit()
+        assert [e.payload["n"] for e in platform.events.published] == [1]
+
+        db.commit()
+        assert [e.payload["n"] for e in platform.events.published] == [1, 2]
+
+    def test_an_empty_batch_is_a_no_op(self, platform, db):
+        publisher.publish_many_on_commit("activity.deleted", [], source="test", db=db)
+
+        assert not db.in_transaction()
+        assert "jasil.after_commit.pending" not in db.info
+
+    def test_a_missing_session_is_rejected(self, platform):
+        with pytest.raises(ValueError):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=None)
+
+    def test_a_non_session_is_rejected_before_anything_is_queued(self, platform, session_factory):
+        from sqlalchemy.orm import scoped_session
+
+        scoped = scoped_session(session_factory)
+        with pytest.raises(TypeError):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=scoped)
+        scoped.remove()
+
+        with session_factory() as other:
+            other.commit()  # no listener leaked onto the factory
+        assert platform.events.published == []
+
+    def test_a_session_that_never_publishes_gets_no_listeners(self, platform, session_factory):
+        with session_factory() as session:
+            session.commit()
+
+            assert session.info == {}
+
+
+class TestPublishOnCommitSavepoints:
+    def test_a_rolled_back_savepoint_drops_only_its_events(self, platform, db):
+        publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        savepoint = db.begin_nested()
+        publisher.publish_on_commit("a.one", {"n": 2}, source="test", db=db)
+        savepoint.rollback()
+        publisher.publish_on_commit("a.one", {"n": 3}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [1, 3]
+
+    def test_a_released_savepoint_dispatches_only_on_the_outer_commit(self, platform, db):
+        with db.begin_nested():
+            publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        assert platform.events.published == []
+
+        publisher.publish_on_commit("a.one", {"n": 2}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [1, 2]
+
+    def test_nested_savepoints_release_into_their_parents_in_order(self, platform, db):
+        publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        with db.begin_nested():
+            publisher.publish_on_commit("a.one", {"n": 2}, source="test", db=db)
+            with db.begin_nested():
+                publisher.publish_on_commit("a.one", {"n": 3}, source="test", db=db)
+            publisher.publish_on_commit("a.one", {"n": 4}, source="test", db=db)
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [1, 2, 3, 4]
+
+    def test_a_released_savepoint_is_discarded_by_an_outer_rollback(self, platform, db):
+        with db.begin_nested():
+            publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        db.rollback()
+        db.commit()
+
+        assert platform.events.published == []
+
+    def test_rolling_back_an_outer_savepoint_drops_its_released_children(self, platform, db):
+        outer = db.begin_nested()
+        with db.begin_nested():
+            publisher.publish_on_commit("a.one", {"n": 1}, source="test", db=db)
+        outer.rollback()
+        db.commit()
+
+        assert platform.events.published == []
+
+
+class TestPublishOnCommitIsolation:
+    def test_two_sessions_do_not_leak_events_into_each_other(self, platform, session_factory):
+        with session_factory() as first, session_factory() as second:
+            publisher.publish_on_commit("a.one", {"owner": "first"}, source="test", db=first)
+            publisher.publish_on_commit("a.one", {"owner": "second"}, source="test", db=second)
+
+            second.rollback()
+            first.commit()
+            second.commit()
+
+        assert [e.payload["owner"] for e in platform.events.published] == ["first"]
+
+    def test_concurrent_threads_each_dispatch_only_their_own_events(self, platform, session_factory):
+        import threading
+
+        barrier = threading.Barrier(4)
+
+        def _work(n: int) -> None:
+            with session_factory() as session:
+                publisher.publish_on_commit("a.one", {"n": n}, source="test", db=session)
+                barrier.wait()
+                if n % 2:
+                    session.rollback()
+                else:
+                    session.commit()
+
+        threads = [threading.Thread(target=_work, args=(n,)) for n in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert sorted(e.payload["n"] for e in platform.events.published) == [0, 2]
+
+
+class TestPublishCommittingStillOwnsItsCommit:
+    def test_it_does_not_register_session_listeners(self, platform, db):
+        publisher.publish_committing("activity.created", {}, source="test", db=db, commit=lambda: None)
+
+        assert db.info == {}
+        assert len(platform.events.published) == 1
+
+
+class TestPublishOnCommitMintFailure:
+    def test_a_metadata_builder_failure_is_logged_and_skips_only_that_event(self, platform, db, caplog):
+        def _metadata(payload):
+            if payload["n"] == 1:
+                raise RuntimeError("bad metadata")
+            return None
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_on_commit(
+                "a.one", [{"n": 1}, {"n": 2}], source="test", metadata_for=_metadata, db=db
+            )
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [2]
+        assert "Failed to publish event a.one" in caplog.text

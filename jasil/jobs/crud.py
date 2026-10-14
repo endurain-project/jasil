@@ -239,6 +239,60 @@ def _queue_order(queue_cursor: str | None) -> tuple[Any, ...]:
     return tuple(ordering)
 
 
+def renew_leases(
+    job_attempts: dict[str, int],
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    now: datetime,
+    db: Session,
+) -> set[str]:
+    """
+    Extend the lease of claimed jobs this worker still holds.
+
+    A batch is claimed under one lease but run one job after another, so a late
+    job would otherwise start with most of its lease already spent, or expired and
+    requeued to another worker while this one still runs it. Only rows still
+    ``claimed`` by ``worker_id`` at the given attempt are touched: a job the reaper
+    already requeued is never taken back, even when this worker has since claimed
+    it again (a later attempt, whose lease is not this snapshot's to renew).
+
+    Args:
+        job_attempts: The jobs to renew, as ``{job_id: attempt number of the
+            claim being renewed}``.
+        worker_id: The lease holder.
+        lease_seconds: New lease duration from ``now``.
+        now: Current instant.
+        db: Active database session.
+
+    Returns:
+        The ids whose lease was renewed. A job missing from the result is no
+        longer held by this worker and must not be run.
+    """
+    if not job_attempts:
+        return set()
+    held = [
+        or_(
+            *(
+                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
+                for job_id, attempts in job_attempts.items()
+            )
+        ),
+        ProcessingJob.status == STATUS_CLAIMED,
+        ProcessingJob.locked_by == worker_id,
+    ]
+    db.execute(
+        update(ProcessingJob)
+        .where(*held)
+        .values(lease_expires_at=now + timedelta(seconds=lease_seconds), updated_at=now)
+    )
+    # No ``UPDATE ... RETURNING``: MySQL and MariaDB do not support it. Same
+    # transaction, so the rows read back are the ones just renewed.
+    ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
+    db.commit()
+    return ids
+
+
 def mark_job_completed(
     job_id: str,
     *,

@@ -30,11 +30,11 @@ modules:
 | `jasil.capabilities` | `check_deployment_consistency` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
-| `jasil.testing` | `FixedClock`, `install_test_platform`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
+| `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
 | `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `get_workers_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
-| `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`. |
+| `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`, `publish_on_commit`, `publish_many_on_commit`. |
 | `jasil.subscribers` | `best_effort`. |
-| `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, and the order they resolve a platform in. |
+| `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `run_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract), `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
@@ -42,6 +42,10 @@ modules:
 | `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`. |
 
 ### Provider protocols
+
+`MailProvider.send` returns the `Message-ID` as a `str`, and `MailError` /
+`MailNotConfiguredError` are covered. Adding a field to `MailMessage` with a
+default is additive.
 
 Adding a method to a protocol is **breaking** — every host-supplied backend would
 have to implement it. Adding an optional keyword argument with a default is not.

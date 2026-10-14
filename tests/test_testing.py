@@ -29,6 +29,57 @@ def _clean_process_state():
 
 
 class TestFixedClock:
+    def test_mail_is_recorded_with_the_fixed_clock(self, tmp_path):
+        from jasil.providers import MailMessage
+
+        clock = jasil_testing.FixedClock()
+        platform = jasil_testing.install_test_platform(tmp_path, clock=clock)
+
+        platform.mail.send(MailMessage(to=["a@example.com"], subject="s", text="t"))
+
+        assert jasil_testing.memory_mail(platform).built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
+
+
+class TestTestMail:
+    def test_an_empty_mail_uri_is_recorded_too(self, tmp_path):
+        """An empty value (an unset environment variable) means unset, as in the build."""
+        configured = jasil_settings.JasilSettings(mail=jasil_settings.MailSettings(uri=""))
+
+        platform = jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert isinstance(jasil_testing.memory_mail(platform), jasil_testing.MemoryMail)
+
+    def test_an_unset_uri_with_secure_false_is_still_recorded(self, tmp_path):
+        """``secure=False`` is valid with no URI (the build ignores it); it must not break the helper."""
+        configured = jasil_settings.JasilSettings(mail=jasil_settings.MailSettings(secure=False))
+
+        platform = jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert isinstance(jasil_testing.memory_mail(platform), jasil_testing.MemoryMail)
+
+    def test_a_real_backend_is_refused_by_memory_mail(self, tmp_path):
+        configured = jasil_settings.JasilSettings(
+            mail=jasil_settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c")
+        )
+        platform = jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        with pytest.raises(TypeError, match="memory://"):
+            jasil_testing.memory_mail(platform)
+
+    @pytest.mark.parametrize(("enforce", "expected"), [(True, None), (False, "memory://")])
+    def test_a_multi_process_deployment_gets_recording_mail_only_without_enforcement(
+        self, tmp_path, monkeypatch, enforce, expected
+    ):
+        """``memory://`` would fail an enforced multi-process build, so it is not injected there."""
+        built = []
+        monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
+        monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
+        configured = jasil_settings.JasilSettings(web_workers=4, enforce_deployment_consistency=enforce)
+
+        jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert built[0].mail.uri == expected
+
     def test_it_satisfies_the_clock_provider(self):
         assert isinstance(jasil_testing.FixedClock(), ClockProvider)
 

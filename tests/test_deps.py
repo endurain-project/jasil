@@ -59,6 +59,7 @@ class TestPlatformDependencies:
             pytest.param(deps.get_events, "events", id="events"),
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
+            pytest.param(deps.get_mail, "mail", id="mail"),
         ],
     )
     def test_each_capability_resolves_to_its_provider(self, request_for, platform, dependency, attribute):
@@ -81,12 +82,18 @@ class TestResolutionOrder:
             pytest.param(deps.get_events, "events", id="events"),
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
+            pytest.param(deps.get_mail, "mail", id="mail"),
         ],
     )
     def test_every_capability_falls_back_too(self, platform, dependency, attribute):
         platform_runtime.set_active_platform(platform)
 
         assert dependency(_request_against(FastAPI())) is getattr(platform, attribute)
+
+    def test_the_process_wide_state_is_the_active_platforms(self, platform):
+        platform_runtime.set_active_platform(platform)
+
+        assert platform_runtime.get_state() is platform.state
 
     def test_an_attached_platform_wins_over_the_process_wide_one(self, request_for, platform, tmp_path):
         """Per-app isolation is the point of ``app.state``; it must not be shadowed."""
