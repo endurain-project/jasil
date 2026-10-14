@@ -184,10 +184,12 @@ backoff, retries and the dead-letter queue like any other failure.
   budget before dead-lettering. Catch it in the handler if that is not wanted.
 - **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
   message twice.
-- **Keep `jobs.lease_seconds` above 90.** One SMTP send can take up to 90 seconds.
+- **Size `jobs.lease_seconds` for the whole handler, not one send.** One SMTP
+  send can take up to 90 seconds, and the DNS lookups before it are not counted
+  against that deadline. A handler that sends N messages can take N times that.
   The runner renews a job's lease when its turn in a batch begins, but a lease
-  shorter than one send lets the reaper requeue a job that is still being
-  delivered, and it is then sent twice.
+  shorter than the handler lets the reaper requeue a job that is still being
+  delivered: it is then sent twice, and the late worker's result is discarded.
 - **Do not put secrets or rendered bodies in the event payload.** Payloads are
   stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
   build the message inside the handler.

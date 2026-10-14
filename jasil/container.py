@@ -37,7 +37,7 @@ from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_re
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
-from jasil.backends.mail_smtp import _DEADLINE_SECONDS as _SMTP_DEADLINE_SECONDS
+from jasil.backends.mail_smtp import SEND_DEADLINE_SECONDS as SMTP_SEND_DEADLINE_SECONDS
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
@@ -400,14 +400,15 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         if reason is not None:
             raise ValueError(f"mail.secure=False requires a private or loopback relay; the host {reason}")
         logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
-    if settings.jobs.enabled and settings.jobs.lease_seconds <= _SMTP_DEADLINE_SECONDS:
+    if settings.jobs.enabled and settings.jobs.lease_seconds <= SMTP_SEND_DEADLINE_SECONDS:
         # One send can take up to the SMTP deadline; a shorter lease lets the reaper
-        # requeue a job that is still being delivered, so it is sent twice.
+        # requeue a job that is still being delivered, so it is sent twice. Only the
+        # floor is checkable here: a handler sending N messages needs N times this.
         logger.warning(
-            "jobs.lease_seconds (%d) is not above the SMTP send deadline (%d s); "
-            "a slow send can be requeued and delivered twice",
+            "jobs.lease_seconds (%d) is not above the SMTP send deadline (%d s, per "
+            "message); a slow send can be requeued and delivered twice",
             settings.jobs.lease_seconds,
-            _SMTP_DEADLINE_SECONDS,
+            SMTP_SEND_DEADLINE_SECONDS,
         )
     resolved_port = port or _SMTP_PORTS[scheme]
     logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")

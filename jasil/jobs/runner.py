@@ -156,7 +156,14 @@ class JobRunner:
             return
         now = self._clock.now()
         with self._session_factory() as db:
-            jobs_crud.mark_job_completed(job.id, now=now, db=db)
+            completed = jobs_crud.mark_job_completed(job.id, worker_id=self._worker_id, now=now, db=db)
+        if not completed:
+            # The handler outran the lease: the job was requeued and may be running
+            # elsewhere, so its state belongs to that worker now.
+            logger.warning(
+                "Durable job lease expired while it ran; its completion is not recorded",
+                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            )
 
     def _fail(self, job: ClaimedJob, error: Exception) -> None:
         now = self._clock.now()
@@ -164,11 +171,19 @@ class JobRunner:
             status = jobs_crud.mark_job_failed(
                 job.id,
                 str(error),
+                worker_id=self._worker_id,
                 base_seconds=self._backoff_base_seconds,
                 max_seconds=self._backoff_max_seconds,
                 now=now,
                 db=db,
             )
+        if not status:
+            logger.warning(
+                "Durable job lease expired while it ran; its failure is not recorded",
+                exc_info=error,
+                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            )
+            return
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
@@ -179,7 +194,7 @@ class JobRunner:
                 "subscriber": job.subscriber_id,
                 "event_type": job.event_type,
                 "attempts": job.attempts,
-                "job_status": status or "unknown",
+                "job_status": status,
             },
         )
 

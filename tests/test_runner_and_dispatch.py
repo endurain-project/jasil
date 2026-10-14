@@ -220,6 +220,27 @@ class TestJobRunner:
 
         assert len(ran) == 1
 
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_a_job_that_outran_its_lease_is_left_to_its_new_holder(self, runner, registry, db, caplog, fails):
+        def _handler(_event):
+            # The lease expired mid-run; the reaper requeued it and another worker took it.
+            db.execute(update(ProcessingJob).values(locked_by="other-worker"))
+            db.commit()
+            if fails:
+                raise RuntimeError("boom")
+
+        registry.register("activity.created", "s", _handler)
+        self._enqueue(db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.runner"):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_CLAIMED
+        assert job.locked_by == "other-worker"
+        assert job.last_error is None
+        assert "lease expired while it ran" in caplog.text
+
 
 class TestInProcessBus:
     def test_a_published_event_reaches_its_subscriber(self):

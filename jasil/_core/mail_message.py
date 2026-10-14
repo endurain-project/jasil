@@ -105,6 +105,10 @@ def parse_address(value: str, *, role: str) -> Address:
         # dropped joiner). Anything that does not round-trip is refused.
         if not is_valid_hostname(ascii_domain):
             raise invalid
+        # An all-numeric last label is an IP written without brackets
+        # (``a@1.2.3.4``), not a domain: a relay answers it with a permanent 5xx.
+        if ascii_domain.rsplit(".", 1)[-1].isdigit():
+            raise invalid
         if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
             raise invalid
         # A written ``xn--`` label must be valid punycode: a relay answers one that

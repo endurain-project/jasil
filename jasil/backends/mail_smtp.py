@@ -32,18 +32,18 @@ logger = logging.getLogger(__name__)
 
 # Applied to every socket operation of a send (seconds).
 _TIMEOUT_SECONDS = 30
-# Ceiling on a whole send. It bounds one job; ``JobRunner`` renews the lease of
-# each job in a batch when its turn starts, so a lease longer than this is what
-# keeps a slow server from being delivered to after a requeue. A socket timeout
-# alone cannot enforce
-# it: every read restarts the timeout, so a server dripping its reply a byte at a
-# time never trips one. A watchdog shuts the socket down when it expires, and
+# Ceiling on one ``send`` (public: the composition root compares the job lease to
+# it). It bounds one message, not one job: a handler sending N messages can take N
+# times this, plus the DNS lookups it cannot interrupt, and its lease must cover
+# all of that or the reaper requeues it mid-delivery. A socket timeout alone
+# cannot enforce it: every read restarts the timeout, so a server dripping its
+# reply a byte at a time never trips one. A watchdog shuts the socket down when it expires, and
 # keeps doing so until the send ends: the socket may not exist yet at the
 # deadline (a slow connect), and a single shutdown would then be missed. The
 # watchdog holds a duplicate of the raw socket, because during a TLS handshake
 # ``connection.sock`` is the pre-wrap socket, which the wrap has already detached.
 # A DNS lookup is the one step it cannot interrupt.
-_DEADLINE_SECONDS = 90
+SEND_DEADLINE_SECONDS = 90
 _WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
 
@@ -231,7 +231,7 @@ class SmtpMail:
     @staticmethod
     def _watch(connection: smtplib.SMTP, expired: threading.Event, finished: threading.Event) -> None:
         """Watchdog: at the deadline, flag it and keep unblocking reads until done."""
-        if finished.wait(_DEADLINE_SECONDS):
+        if finished.wait(SEND_DEADLINE_SECONDS):
             return
         expired.set()
         while not finished.is_set():
@@ -275,6 +275,8 @@ class SmtpMail:
             connection.timeout = max(min(_TIMEOUT_SECONDS, deadline - time.monotonic()), 0.001)
             try:
                 return connection.connect(host, self._port)
+            # ``SMTPException`` is an ``OSError``, so this also covers a server
+            # that drops the connection before greeting (``SMTPServerDisconnected``).
             except OSError:
                 if index == len(hosts) - 1:
                     raise
@@ -289,7 +291,7 @@ class SmtpMail:
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
         context = self._context
-        deadline = time.monotonic() + _DEADLINE_SECONDS
+        deadline = time.monotonic() + SEND_DEADLINE_SECONDS
         # Built without a host so nothing is dialed before the watchdog is armed:
         # the greeting is a read like any other, and can be dripped as slowly.
         connection: smtplib.SMTP

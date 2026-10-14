@@ -251,6 +251,17 @@ class TestBuildMime:
         with pytest.raises(ValueError):
             build_mime(_message(to=[address]), sender=SENDER, now=NOW)
 
+    @pytest.mark.parametrize("address", ["a@1.2.3.4", "a@example.123", "a@localhost.0"])
+    def test_an_all_numeric_last_label_is_rejected(self, address):
+        """An unbracketed IP is not a domain; a relay would refuse it permanently."""
+        with pytest.raises(ValueError):
+            build_mime(_message(to=[address]), sender=SENDER, now=NOW)
+
+    def test_a_numeric_label_before_the_last_is_kept(self):
+        mime = build_mime(_message(to=["a@123.example.com"]), sender=SENDER, now=NOW)
+
+        assert mime["To"] == "a@123.example.com"
+
     def test_none_and_non_sequence_recipients_are_value_errors(self):
         for to in (None, {"a@b.com"}):
             with pytest.raises(ValueError):
@@ -479,6 +490,24 @@ class TestSmtpTransport:
         assert tried == ["::1", "127.0.0.1"]
         assert FakeSMTP.instances[0].sent is not None
 
+    def test_cleartext_falls_through_when_an_address_drops_before_greeting(self, monkeypatch):
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
+        original = FakeSMTP.connect
+        tried: list[str] = []
+
+        def connect(self, host, port):
+            tried.append(host)
+            if host == "::1":
+                raise smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+            return original(self, host, port)
+
+        monkeypatch.setattr(FakeSMTP, "connect", connect)
+
+        _smtp(tls=False).send(_message())
+
+        assert tried == ["::1", "127.0.0.1"]
+        assert FakeSMTP.instances[0].sent is not None
+
     def test_cleartext_reports_an_error_once_every_address_failed(self, monkeypatch):
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
         FakeSMTP.fail_on = "connect"
@@ -490,7 +519,7 @@ class TestSmtpTransport:
 
     def test_cleartext_does_not_dial_another_address_after_the_deadline(self, monkeypatch):
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
-        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.05)
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.05)
         tried: list[str] = []
 
         def connect(self, host, port):
@@ -511,7 +540,7 @@ class TestSmtpTransport:
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
         monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 10)
-        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.5)
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.5)
         monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
@@ -616,7 +645,7 @@ class TestSmtpRobustness:
     def test_a_slow_connect_cannot_outlive_the_deadline_either(self, monkeypatch):
         """The watchdog fires before any socket exists; it must keep trying."""
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
-        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.3)
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.3)
         monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
@@ -658,7 +687,7 @@ class TestSmtpRobustness:
         watchdog can stop the send. Real ``smtplib``, loopback server."""
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 1)
-        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.5)
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.5)
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
         server.listen(1)
