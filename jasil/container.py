@@ -41,7 +41,7 @@ from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
-from jasil.profile import DeploymentProfile, resolve_topology
+from jasil.profile import DeploymentProfile
 from jasil.providers import (
     ClockProvider,
     EventBusProvider,
@@ -313,6 +313,8 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     Unlike geocoding, a bad mail configuration fails the build: a deployment that
     believes it can send mail and cannot is worse than one that refuses to start.
     No connection is attempted, so a mail server that is down does not block boot.
+    The one network call is a DNS lookup of the host when ``secure`` is off, to
+    confirm it is private; a resolver that cannot answer fails the build.
 
     Args:
         settings: The application settings.
@@ -325,8 +327,9 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     Raises:
         ValueError: On an unsupported scheme; a URI carrying userinfo, a path, a
             query or a fragment; an invalid host or port; a missing or
-            malformed ``from_address``; or ``username`` without ``password``
-            (or the reverse).
+            malformed ``from_address`` or ``ehlo_hostname``; ``username``
+            without ``password`` (or the reverse); or ``secure=False`` outside
+            its narrow case.
     """
     mail = settings.mail
     if not mail.uri:
@@ -354,15 +357,16 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
             parse_address(mail.from_address, role="sender")
         except ValueError:
             raise ValueError("mail.from_address is not a valid email address") from None
+    if mail.ehlo_hostname is not None and not network.is_valid_hostname(mail.ehlo_hostname):
+        raise ValueError("mail.ehlo_hostname is not a valid hostname")
 
+    # A multi-process memory:// is refused by the deployment-consistency check,
+    # which has already run.
     if scheme == "memory":
         if parts.netloc:
             raise ValueError("mail.uri for memory:// takes no host")
-        if resolve_topology(settings.profile, settings.web_workers).requires_shared_state:
-            logger.warning(
-                "mail.uri is memory:// in a multi-process deployment: messages are recorded "
-                "in this process's memory and never delivered"
-            )
+        if not mail.secure:
+            raise ValueError("mail.secure=False applies only to smtp://")
         logger.info("Mail enabled via memory (messages are recorded, not sent)")
         return MemoryMail(clock, mail.from_address)
 
@@ -399,4 +403,5 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         clock=clock,
         username=mail.username,
         password=mail.password,
+        local_hostname=mail.ehlo_hostname,
     )

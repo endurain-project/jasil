@@ -5,7 +5,9 @@ code path and always just calls ``send``. ``MemoryMail`` records messages for a
 host's test suite.
 """
 
+import copy
 import threading
+from dataclasses import replace
 from email.message import EmailMessage
 
 from jasil._core.mail_message import build_mime
@@ -61,8 +63,12 @@ class MemoryMail:
             ValueError: When the message is invalid.
         """
         mime = build_mime(message, sender=self._from_address, now=self._clock.now())
+        # Recipients copied as sent: the caller's list may be reused or mutated
+        # after ``send`` returns, which would rewrite what the test asserts on. A
+        # shallow copy keeps the type, so ``outbox == [message]`` still holds.
+        recorded = replace(message, to=copy.copy(message.to))
         with self._lock:
-            self.outbox.append(message)
+            self.outbox.append(recorded)
             self.built.append(mime)
         return str(mime["Message-ID"])
 

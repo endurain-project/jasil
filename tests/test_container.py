@@ -331,11 +331,18 @@ class TestMailResolution:
             pytest.param({"uri": "smtp://relay.test:abc", "from_address": "a@b.c"}, "not a valid URI", id="port"),
             pytest.param({"uri": "smtp://relay.test:0", "from_address": "a@b.c"}, "invalid port", id="port-zero"),
             pytest.param({"uri": "memory://host"}, "takes no host", id="memory-host"),
+            pytest.param({"uri": "smtp://:25", "from_address": "a@b.c"}, "valid host", id="port-only"),
             pytest.param({"uri": "smtp://relay.test"}, "from_address is required", id="no-sender"),
             pytest.param(
                 {"uri": "smtp://relay.test", "from_address": "not an address"}, "from_address", id="bad-sender"
             ),
             pytest.param({"uri": "memory://", "from_address": "nope"}, "from_address", id="bad-memory-sender"),
+            pytest.param({"uri": "memory://", "secure": False}, "only to smtp://", id="memory-cleartext"),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "ehlo_hostname": "not a host"},
+                "ehlo_hostname",
+                id="bad-ehlo",
+            ),
             pytest.param(
                 {"uri": "smtp://relay.test", "from_address": "a@b.c", "username": "u"}, "together", id="user-only"
             ),
@@ -375,13 +382,16 @@ class TestMailResolution:
         with pytest.raises(ValueError, match="ASCII"):
             self._build(uri="smtp://relay.test", from_address="a@b.c", username="u", password="pässword")
 
-    def test_memory_in_a_multi_process_deployment_warns(self, caplog):
-        shared = _settings(mail=settings.MailSettings(uri="memory://"), web_workers=2)
+    def test_the_ehlo_name_reaches_the_backend(self):
+        mail = self._build(uri="smtp://relay.test", from_address="a@b.c", ehlo_hostname="mta.example.com")
 
-        with caplog.at_level(logging.WARNING):
-            container._build_mail(shared, SystemClock())
+        assert mail._local_hostname == "mta.example.com"
 
-        assert "never delivered" in caplog.text
+    def test_memory_in_a_multi_process_deployment_fails_the_build(self, tmp_path):
+        shared = _settings(data_dir=str(tmp_path), mail=settings.MailSettings(uri="memory://"), web_workers=2)
+
+        with pytest.raises(ValueError, match=r"mail\.uri resolves to the in-memory mail recorder"):
+            container.build_platform(shared)
 
     def test_the_failure_does_not_echo_the_password(self):
         with pytest.raises(ValueError) as caught:

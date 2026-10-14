@@ -10,6 +10,7 @@ import smtplib
 import socket
 import ssl
 import threading
+import time
 from datetime import UTC, datetime
 from typing import ClassVar
 
@@ -49,9 +50,11 @@ class FakeSMTP:
     refused: ClassVar[dict] = {}
     fail_on: str | None = None
     quit_code = 221
+    sock = None
 
-    def __init__(self, host, port, local_hostname=None, timeout=None, context=None):
-        self.host, self.port, self.timeout, self.context = host, port, timeout, context
+    def __init__(self, host="", port=0, local_hostname=None, timeout=None, context=None):
+        assert not host, "the backend must connect explicitly, after arming its watchdog"
+        self.host, self.port, self.timeout, self.context = None, None, timeout, context
         self.local_hostname = local_hostname
         self.calls: list[str] = []
         self.logged_in_as: str | None = None
@@ -59,10 +62,15 @@ class FakeSMTP:
         self.envelope_sender: str | None = None
         self.tls_started = False
         FakeSMTP.instances.append(self)
+
+    def connect(self, host, port):
+        self.calls.append("connect")
+        self.host, self.port = host, port
         if FakeSMTP.fail_on == "connect":
             raise OSError("connect failed for " + ADDRESS)
         if FakeSMTP.fail_on == "greeting":
-            raise smtplib.SMTPConnectError(421, ("srvtext-xyz " + ADDRESS).encode())
+            return 421, ("srvtext-xyz " + ADDRESS).encode()
+        return 220, b"hi"
 
     def quit(self):
         self.calls.append("quit")
@@ -87,6 +95,8 @@ class FakeSMTP:
         self.logged_in_as = username
         if FakeSMTP.fail_on == "auth":
             raise smtplib.SMTPAuthenticationError(535, ("bad creds for " + ADDRESS).encode())
+        if FakeSMTP.fail_on == "no-mechanism":
+            raise smtplib.SMTPException("No suitable authentication method found.")
 
     def send_message(self, mime, from_addr=None):
         self.calls.append("send")
@@ -317,6 +327,16 @@ class TestMemoryMail:
     def test_a_placeholder_sender_is_used_when_none_is_configured(self):
         assert MemoryMail(_Clock()).send(_message()).endswith("@localhost>")
 
+    def test_reusing_the_recipient_list_does_not_rewrite_the_outbox(self):
+        mail = _memory()
+        recipients = [ADDRESS]
+        sent = _message(to=recipients)
+
+        mail.send(sent)
+        recipients[0] = "someone.else@example.com"
+
+        assert mail.outbox[0].to == [ADDRESS]
+
 
 class TestNullMail:
     def test_send_raises_not_configured(self):
@@ -438,6 +458,70 @@ class TestSmtpRobustness:
 
         assert FakeSMTP.instances[0].local_hostname
 
+    def test_the_ehlo_name_is_configurable(self):
+        _smtp(local_hostname="mta.example.com").send(_message())
+
+        assert FakeSMTP.instances[0].local_hostname == "mta.example.com"
+
+    @pytest.mark.parametrize("name", ["", "João's laptop"])
+    def test_an_unusable_machine_hostname_falls_back_to_localhost(self, monkeypatch, name):
+        """``smtplib`` ASCII-encodes EHLO; a bad name would fail every send."""
+        monkeypatch.setattr(mail_smtp.socket, "gethostname", lambda: name)
+
+        _smtp().send(_message())
+
+        assert FakeSMTP.instances[0].local_hostname == "localhost"
+
+    @pytest.mark.parametrize("slow", ["greeting", "MAIL"])
+    def test_a_server_dripping_its_reply_cannot_outlive_the_deadline(self, monkeypatch, slow):
+        """Each byte arrives well inside the per-read timeout, so only the
+        watchdog can stop the send. Real ``smtplib``, loopback server."""
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 1)
+        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.5)
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def reply(conn, line, drip):
+            if not drip:
+                conn.sendall(line)
+                return
+            # Long enough that, dripped, it would outlast the deadline twice over.
+            for byte in line[:4] + b"x" * 10 + line[4:]:
+                conn.sendall(bytes([byte]))
+                time.sleep(0.1)
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                with conn, conn.makefile("rb") as f:
+                    reply(conn, b"220 hi\r\n", drip=slow == "greeting")
+                    while line := f.readline():
+                        verb = line.split()[0].upper()
+                        reply(conn, b"250 ok\r\n", drip=verb.decode() == slow)
+            except OSError:
+                pass  # the client's watchdog hung up mid-reply
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        mail = SmtpMail(
+            "127.0.0.1", server.getsockname()[1], implicit_tls=False, tls=False, from_address=SENDER, clock=_Clock()
+        )
+
+        try:
+            started = time.monotonic()
+            with pytest.raises(MailError, match="deadline"):
+                mail.send(_message())
+            assert time.monotonic() - started < 1.0
+            thread.join(5)
+        finally:
+            server.close()
+
+    def test_cleartext_cannot_be_combined_with_implicit_tls(self):
+        with pytest.raises(ValueError, match="implicit TLS"):
+            _smtp(tls=False, implicit_tls=True)
+
     @pytest.mark.parametrize(
         "credentials", [{"username": "ü", "password": "pw"}, {"username": "u", "password": "pässword"}]
     )
@@ -489,8 +573,9 @@ class TestFailuresAreRedacted:
         ("mode", "expect"),
         [
             ("connect", "unreachable"),
-            ("greeting", "unreachable"),
+            ("greeting", "refused the connection (status 421)"),
             ("auth", "authentication failed (status 535)"),
+            ("no-mechanism", "no supported authentication mechanism"),
             ("data", "status 554"),
             ("all-refused", "refused every recipient (status 550)"),
             ("tls", "TLS negotiation"),

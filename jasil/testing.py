@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jasil._core.redis_clients as redis_clients
+import jasil.capabilities as capabilities
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
@@ -95,16 +96,27 @@ def install_test_platform(
             :class:`~jasil.settings.JasilSettings`; ``data_dir`` is applied on top
             either way. It is also installed via ``jasil.settings.configure`` so
             code reading the settings directly agrees with the platform. When
-            ``mail.uri`` is unset it becomes ``memory://``, so sent messages land
-            in the outbox :func:`memory_mail` returns.
+            ``mail.uri`` is unset (or empty) it becomes ``memory://``, so sent
+            messages land in the outbox :func:`memory_mail` returns — unless the
+            settings describe a multi-process deployment that enforces
+            consistency, where ``memory://`` would fail the build; mail then
+            stays unset and sending raises.
 
     Returns:
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
     """
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
-    if configured.mail.uri is None:
+    if not configured.mail.uri:
         # Unconfigured mail would raise on every send; a test wants it recorded.
-        configured = replace(configured, mail=replace(configured.mail, uri="memory://"))
+        recording = replace(configured, mail=replace(configured.mail, uri="memory://"))
+        refused = capabilities.check_mail_consistency(
+            profile=recording.profile,
+            web_workers=recording.web_workers,
+            mail_uri=recording.mail.uri,
+            mail_label="mail.uri",
+        )
+        if not refused or not recording.enforce_deployment_consistency:
+            configured = recording
     jasil_settings.configure(configured)
     platform = build_platform(configured, clock=clock or FixedClock())
     platform_runtime.set_active_platform(platform)

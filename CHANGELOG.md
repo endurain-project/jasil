@@ -14,9 +14,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
-- `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults `mail.uri` to `memory://`.
+- `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults an unset or empty `mail.uri` to `memory://`, except in a multi-process deployment that enforces consistency.
 - `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured); an invalid message raises `ValueError`.
-- `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is verified by default; `MailSettings.secure = False` permits cleartext `smtp://` only to a private/loopback relay and never with credentials. Standard library only — no new dependency.
+- `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is verified by default; `MailSettings.secure = False` permits cleartext `smtp://` only to a private/loopback relay and never with credentials. `MailSettings.ehlo_hostname` overrides the name announced in `EHLO`. Standard library only — no new dependency.
+- A fourth deployment-consistency rule, `jasil.capabilities.check_mail_consistency`: `memory://` mail is refused in a multi-process deployment, where no message would be delivered.
 - `jasil.testing.MemoryMail` and `memory_mail(platform)` for a typed outbox; `MemoryMail.clear()`.
 - `jasil.deps.get_mail`, and a `mail` row in the startup capability report.
 

@@ -129,14 +129,22 @@ class MailSettings:
             belong in the URI. The host is trusted operator configuration and
             is not checked against the SSRF address denylist (a relay is
             normally on a private network): never derive it from user input.
+            ``memory://`` is refused in a multi-process deployment (see
+            ``enforce_deployment_consistency``), where no message would ever be
+            delivered.
         from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
             for the SMTP schemes. Independent of ``username``.
         secure: ``True`` (the default) requires verified TLS. ``False`` sends
             over a cleartext connection and is accepted only for ``smtp://``,
             only when the host resolves exclusively to private or loopback
             addresses, and never together with ``username`` / ``password``.
+            That check resolves the host while the platform is built, so it
+            needs a working resolver at startup.
         username: SMTP login, when the server requires authentication.
         password: SMTP password. Required with ``username``, and the reverse.
+        ehlo_hostname: Name announced in ``EHLO``. Defaults to this machine's
+            hostname; set a fully qualified one for a relay that rejects a bare
+            name.
     """
 
     uri: str | None = None
@@ -144,6 +152,7 @@ class MailSettings:
     secure: bool = True
     username: str | None = None
     password: str | None = field(default=None, repr=False)
+    ehlo_hostname: str | None = None
 
 
 @dataclass(frozen=True)

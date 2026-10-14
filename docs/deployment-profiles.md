@@ -84,6 +84,10 @@ valid there.
 **Coordination lock.** The lock must not resolve to the in-process `noop` lock
 when more than one process could run the same scheduled job.
 
+**Mail.** `mail.uri` must not be `memory://` when the deployment runs more than
+one process: each would record messages in its own memory and none would ever be
+delivered. Leaving mail unset is not flagged, because every send then raises.
+
 Note that **worker count matters as much as profile**. A `local` deployment with
 four web workers is four processes, and process-local memory cannot be shared
 between them, so tell JASIL how many you run:
@@ -95,7 +99,7 @@ jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
 #     web_workers=4 requires a backend shared across processes. ...
 ```
 
-The `custom` profile opts out of the state and lock rules: it promises no
+The `custom` profile opts out of the state, lock and mail rules: it promises no
 defaults, so there is nothing for a setting to contradict.
 
 On a development machine you may knowingly want an inconsistent setup — the

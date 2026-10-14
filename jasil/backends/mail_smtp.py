@@ -19,9 +19,11 @@ import logging
 import smtplib
 import socket
 import ssl
+import threading
 import time
 from email.message import EmailMessage
 
+import jasil._core.network as network
 from jasil._core.mail_message import build_mime
 from jasil.providers import ClockProvider, MailError, MailMessage
 
@@ -30,8 +32,21 @@ logger = logging.getLogger(__name__)
 # Applied to every socket operation of a send (seconds).
 _TIMEOUT_SECONDS = 30
 # Ceiling on a whole send, so a slow server cannot outlive a job lease and be
-# requeued while still being delivered to.
+# requeued while still being delivered to. A socket timeout alone cannot enforce
+# it: every read restarts the timeout, so a server dripping its reply a byte at a
+# time never trips one. A watchdog shuts the socket down when it expires.
 _DEADLINE_SECONDS = 90
+_DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
+
+
+def _default_local_hostname() -> str:
+    """The EHLO name when none is configured: this host's name, if usable.
+
+    ``smtplib`` ASCII-encodes commands, so a name that is not a valid hostname
+    would surface as a ``UnicodeEncodeError`` from every send.
+    """
+    name = socket.gethostname()
+    return name if name and network.is_valid_hostname(name) else "localhost"
 
 
 class SmtpMail:
@@ -48,6 +63,8 @@ class SmtpMail:
         clock: Time source for the ``Date`` header.
         username: Login, or ``None`` for an unauthenticated relay.
         password: Password for ``username``.
+        local_hostname: Name announced in ``EHLO``. Defaults to this host's name;
+            set a fully qualified one for a relay that rejects a bare hostname.
     """
 
     def __init__(
@@ -61,6 +78,7 @@ class SmtpMail:
         clock: ClockProvider,
         username: str | None = None,
         password: str | None = None,
+        local_hostname: str | None = None,
     ) -> None:
         if bool(username) != bool(password):
             raise ValueError("username and password must be set together")
@@ -82,6 +100,9 @@ class SmtpMail:
         self._clock = clock
         self._username = username
         self._password = password
+        # An explicit name: otherwise ``smtplib`` calls ``socket.getfqdn()`` on
+        # every connection, a DNS lookup that no socket timeout bounds.
+        self._local_hostname = local_hostname or _default_local_hostname()
 
     def send(self, message: MailMessage) -> str:
         """Build and deliver ``message``, returning its ``Message-ID``.
@@ -105,8 +126,8 @@ class SmtpMail:
             # Codes only: 4xx (greylisting, retry) and 5xx (unknown user) differ.
             codes = sorted({code for code, _ in error.recipients.values()})
             raise MailError("SMTP server refused every recipient (status " + ", ".join(map(str, codes)) + ")") from None
-        except smtplib.SMTPConnectError:
-            raise MailError("SMTP server unreachable or connection lost") from None
+        except smtplib.SMTPConnectError as error:
+            raise MailError(f"SMTP server refused the connection (status {error.smtp_code})") from None
         except smtplib.SMTPResponseException as error:
             raise MailError(f"SMTP server rejected the message (status {error.smtp_code})") from None
         except smtplib.SMTPNotSupportedError:
@@ -130,44 +151,80 @@ class SmtpMail:
         """Cap the next step to the time left, or abort when none is."""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise MailError("SMTP send exceeded its overall deadline")
+            raise MailError(_DEADLINE_EXCEEDED)
         sock = getattr(connection, "sock", None)
         if sock is not None:
             sock.settimeout(min(_TIMEOUT_SECONDS, remaining))
+
+    @staticmethod
+    def _expire(connection: smtplib.SMTP, expired: threading.Event) -> None:
+        """Watchdog: flag the deadline and unblock whatever read is in progress."""
+        expired.set()
+        sock = getattr(connection, "sock", None)
+        if sock is not None:
+            # The plain-socket method, on purpose: ``SSLSocket.shutdown`` also
+            # tears down TLS state the blocked thread is still using.
+            with contextlib.suppress(OSError):
+                socket.socket.shutdown(sock, socket.SHUT_RDWR)
 
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
         context = self._context
         deadline = time.monotonic() + _DEADLINE_SECONDS
-        # An explicit name: otherwise ``smtplib`` calls ``socket.getfqdn()`` on
-        # every connection, a DNS lookup that no socket timeout bounds.
-        local_hostname = socket.gethostname() or "localhost"
+        # Built without a host so nothing is dialed before the watchdog is armed:
+        # the greeting is a read like any other, and can be dripped as slowly.
         connection: smtplib.SMTP
         if self._implicit_tls:
             connection = smtplib.SMTP_SSL(
-                self._host, self._port, local_hostname=local_hostname, timeout=_TIMEOUT_SECONDS, context=context
+                local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS, context=context
             )
         else:
-            connection = smtplib.SMTP(self._host, self._port, local_hostname=local_hostname, timeout=_TIMEOUT_SECONDS)
+            connection = smtplib.SMTP(local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS)
+        expired = threading.Event()
+        watchdog = threading.Timer(_DEADLINE_SECONDS, self._expire, (connection, expired))
+        watchdog.daemon = True
+        watchdog.start()
         try:
-            if self._tls and not self._implicit_tls:
+            try:
+                code, reply = connection.connect(self._host, self._port)
+                if code != 220:
+                    raise smtplib.SMTPConnectError(code, reply)
+                if self._tls and not self._implicit_tls:
+                    self._arm(connection, deadline)
+                    connection.ehlo()
+                    if not connection.has_extn("starttls"):
+                        raise MailError("SMTP server does not offer STARTTLS")
+                    self._arm(connection, deadline)
+                    connection.starttls(context=context)
+                    connection.ehlo()
+                if self._username and self._password:
+                    self._arm(connection, deadline)
+                    self._login(connection, self._username, self._password)
                 self._arm(connection, deadline)
-                connection.ehlo()
-                if not connection.has_extn("starttls"):
-                    raise MailError("SMTP server does not offer STARTTLS")
-                self._arm(connection, deadline)
-                connection.starttls(context=context)
-                connection.ehlo()
-            if self._username and self._password:
-                self._arm(connection, deadline)
-                connection.login(self._username, self._password)
-            self._arm(connection, deadline)
-            # Explicit envelope sender: the bare address, never the display name.
-            return connection.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
+                # Explicit envelope sender: the bare address, never the display name.
+                return connection.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
+            except (smtplib.SMTPException, OSError):
+                # The watchdog's shutdown surfaces as a dropped connection.
+                if expired.is_set():
+                    raise MailError(_DEADLINE_EXCEEDED) from None
+                raise
         finally:
             # Not ``with``: its exit raises on a non-221 reply to QUIT, which would
             # report a message the server already accepted as a failure (a retry
-            # would then send it twice).
+            # would then send it twice). Still under the watchdog, so QUIT is bounded.
             with contextlib.suppress(smtplib.SMTPException, OSError):
                 connection.quit()
+            watchdog.cancel()
             connection.close()
+
+    @staticmethod
+    def _login(connection: smtplib.SMTP, username: str, password: str) -> None:
+        """Authenticate, naming the one failure ``smtplib`` raises untyped."""
+        try:
+            connection.login(username, password)
+        except smtplib.SMTPException as error:
+            # A bare ``SMTPException`` from ``login`` means the server advertises
+            # AUTH but no mechanism ``smtplib`` implements.
+            if type(error) is smtplib.SMTPException:
+                raise MailError("SMTP server offers no supported authentication mechanism") from None
+            raise

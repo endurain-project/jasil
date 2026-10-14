@@ -62,7 +62,9 @@ not offer STARTTLS rather than downgrading, and AUTH is sent only after TLS is
 up. The one opt-out, `mail.secure = False`, is cleartext and is accepted only for
 `smtp://`, only when the host resolves exclusively to private, loopback or
 link-local addresses (checked at startup), and never with credentials. Every
-socket operation has a fixed timeout and a whole send has a 90-second deadline.
+socket operation has a fixed timeout, and a whole send has a 90-second deadline
+that a watchdog enforces by shutting the socket down — a per-read timeout alone
+would let a relay that drips its replies hold a send open indefinitely.
 
 **Personal data and secrets in logs and job rows.** The job runner persists
 `str(error)` and logs `exc_info`, so `MailError` carries only a category and an

@@ -5,7 +5,7 @@ is wired for a human-readable startup log, and detects fatal inconsistencies —
 deployment that *requires* a shared backend but resolves one to a process- or
 node-local implementation.
 
-Three consistency rules are enforced:
+Four consistency rules are enforced:
 
 - **Cross-process backends** — ephemeral *state* (rate limiting, throttling,
   single-use tokens) and the *event* bus — must not resolve to process-local
@@ -21,11 +21,15 @@ Three consistency rules are enforced:
   whenever the deployment runs more than one process (the ``distributed`` profile
   or any multi-worker deployment), or every process would run every scheduled
   job. Validated by :func:`check_lock_consistency`.
+- **Mail** must not resolve to the recording ``memory://`` backend whenever the
+  deployment runs more than one process: every process would keep its own
+  outbox and no message would ever be delivered. Validated by
+  :func:`check_mail_consistency`.
 
 The *clock* is always the system clock, so its default is never a fatal choice
 here.
 
-:func:`check_deployment_consistency` applies all three to a
+:func:`check_deployment_consistency` applies all four to a
 :class:`~jasil.settings.JasilSettings`, and ``jasil.container.build_platform``
 calls it at startup: an inconsistency raises unless the host sets
 ``enforce_deployment_consistency=False``, which downgrades it to a warning.
@@ -111,17 +115,19 @@ def _scheme_of(uri: str) -> str:
     return scheme if separator else uri
 
 
-def _mail_backend_of(uri: str | None) -> str:
+def _mail_backend_of(uri: str | None, *, secure: bool) -> str:
     """Name the mail backend for the report without ever echoing the value.
 
     A mail URI is operator input that may carry a mistyped credential, and the
     report is logged before the URI is validated, so a value with no ``://`` is
-    reported as ``invalid`` rather than as itself.
+    reported as ``invalid`` rather than as itself. A cleartext relay says so.
     """
     if not uri:
         return "disabled"
     scheme, separator, _ = uri.partition("://")
-    return scheme if separator and scheme.isalnum() else "invalid"
+    if not (separator and scheme.isalnum()):
+        return "invalid"
+    return f"{scheme} (cleartext)" if scheme == "smtp" and not secure else scheme
 
 
 def _source_of(configured: str | None, label: str) -> str:
@@ -155,7 +161,7 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
         CapabilityRow(
             "mail",
-            _mail_backend_of(settings.mail.uri),
+            _mail_backend_of(settings.mail.uri, secure=settings.mail.secure),
             "mail.uri" if settings.mail.uri else "not configured",
         ),
         CapabilityRow("clock", "system", "always the system clock"),
@@ -167,7 +173,7 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
     """Return every fatal wiring inconsistency in ``settings`` (empty when sound).
 
     The entry point ``build_platform`` uses: it resolves the capability URIs the
-    profile would actually build from, then applies all three rules to them.
+    profile would actually build from, then applies all four rules to them.
 
     Args:
         settings: The configuration the platform is being built from.
@@ -200,6 +206,12 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
             web_workers=web_workers,
             lock_uri=settings.resolved_lock_uri,
             lock_label="lock_uri",
+        ),
+        *check_mail_consistency(
+            profile=profile,
+            web_workers=web_workers,
+            mail_uri=settings.mail.uri,
+            mail_label="mail.uri",
         ),
     ]
 
@@ -324,4 +336,44 @@ def check_lock_consistency(
         f"profile={profile.value} with web_workers={topology.web_workers} "
         f"runs multiple processes that would each run scheduled jobs. Point it at "
         f"the shared database lock (postgres-advisory://)."
+    ]
+
+
+def check_mail_consistency(
+    *,
+    profile: DeploymentProfile,
+    web_workers: int,
+    mail_uri: str | None,
+    mail_label: str,
+) -> list[str]:
+    """Return a fatal issue when a multi-process deployment records mail in memory.
+
+    ``memory://`` keeps each message in the sending process's outbox and never
+    delivers it. In a single process that is a test fixture; in a deployment that
+    runs several processes (:attr:`~jasil.profile.DeploymentTopology.requires_shared_state`)
+    it is production mail silently going nowhere. Unset mail is not flagged: it
+    raises on every send, so it cannot drop a message unnoticed.
+
+    Args:
+        profile: The deployment profile.
+        web_workers: Configured worker count.
+        mail_uri: The configured mail URI, or ``None`` when mail is unset.
+        mail_label: The setting backing mail (for the message).
+
+    Returns:
+        A single-item issue list when misconfigured; empty otherwise. The
+        ``custom`` profile is exempt — it promises no defaults.
+    """
+    if profile is DeploymentProfile.CUSTOM or not mail_uri:
+        return []
+    topology = resolve_topology(profile, web_workers)
+    if not topology.requires_shared_state:
+        return []
+    if not mail_uri.strip().lower().startswith("memory://"):
+        return []
+    return [
+        f"{mail_label} resolves to the in-memory mail recorder, but "
+        f"profile={profile.value} with web_workers={topology.web_workers} "
+        f"runs multiple processes, and no message would ever be delivered. Point it "
+        f"at a relay (smtp:// or smtps://), or leave it unset."
     ]
