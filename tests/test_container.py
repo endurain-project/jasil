@@ -5,6 +5,8 @@ running on process-local memory across replicas, or failing to start. Redis is
 faked at the client boundary so no server is needed.
 """
 
+import logging
+
 import fakeredis
 import pytest
 
@@ -17,6 +19,8 @@ from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
+from jasil.backends.mail_memory import MemoryMail, NullMail
+from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -285,3 +289,171 @@ class TestDeploymentConsistencyGate:
 
         assert "JASIL platform capabilities" in caplog.text
         assert "Deployment profile: local" in caplog.text
+
+
+class TestMailResolution:
+    """A mail misconfiguration fails the build; an unset one never drops silently."""
+
+    @pytest.mark.parametrize("uri", ["memory:", " memory://", "memory://\n"])
+    def test_a_non_literal_memory_uri_is_refused(self, uri):
+        with pytest.raises(ValueError, match="not a valid URI"):
+            container._build_mail(_settings(mail=settings.MailSettings(uri=uri)), SystemClock())
+
+    def test_a_multi_process_memory_uri_variant_cannot_slip_past_the_gate(self):
+        for uri in ("memory:", "Memory://"):
+            s = _settings(web_workers=4, mail=settings.MailSettings(uri=uri))
+            try:
+                container.build_platform(s)
+            except ValueError:
+                continue
+            raise AssertionError(f"{uri!r} built in a multi-process deployment")
+
+    def test_a_platform_built_by_hand_defaults_geocoding_and_mail(self):
+        from jasil.backends.geocoding_http import NullGeocoding
+
+        base = container.build_platform(_settings())
+        bare = container.Platform(
+            profile=base.profile,
+            state=base.state,
+            storage=base.storage,
+            events=base.events,
+            lock=base.lock,
+            clock=base.clock,
+        )
+
+        assert isinstance(bare.mail, NullMail)
+        assert isinstance(bare.geocoding, NullGeocoding)
+        assert bare.recorder is None
+
+    @staticmethod
+    def _build(**mail):
+        return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())
+
+    def test_a_lease_not_above_the_smtp_deadline_warns(self, caplog):
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "lease_seconds" in caplog.text
+
+    def test_a_longer_lease_does_not_warn(self, caplog):
+        jobs = settings.JobSettings(enabled=True, lease_seconds=300)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "lease_seconds" not in caplog.text
+
+    def test_unset_selects_the_disabled_backend(self):
+        assert isinstance(self._build(), NullMail)
+
+    def test_memory_selects_the_recording_backend(self):
+        assert isinstance(self._build(uri="memory://"), MemoryMail)
+
+    def test_smtp_defaults_to_starttls_on_587(self):
+        mail = self._build(uri="smtp://relay.test", from_address="a@example.com")
+
+        assert isinstance(mail, SmtpMail)
+        assert (mail._host, mail._port, mail._implicit_tls) == ("relay.test", 587, False)
+
+    def test_smtps_defaults_to_implicit_tls_on_465(self):
+        mail = self._build(uri="smtps://relay.test", from_address="a@example.com")
+
+        assert (mail._port, mail._implicit_tls) == (465, True)
+
+    def test_an_explicit_port_wins(self):
+        mail = self._build(uri="smtp://relay.test:2525", from_address="a@example.com")
+
+        assert mail._port == 2525
+
+    @pytest.mark.parametrize(
+        ("mail", "match"),
+        [
+            pytest.param({"uri": "http://relay.test"}, "Unsupported mail.uri scheme", id="scheme"),
+            pytest.param({"uri": "smtp://u:p@relay.test", "from_address": "a@b.c"}, "credentials", id="userinfo"),
+            pytest.param({"uri": "smtp://relay.test/x", "from_address": "a@b.c"}, "no path", id="path"),
+            pytest.param({"uri": "smtp://relay.test?x=1", "from_address": "a@b.c"}, "no path", id="query"),
+            pytest.param({"uri": "smtp://bad_host!", "from_address": "a@b.c"}, "valid host", id="host"),
+            pytest.param({"uri": "smtp://relay.test:abc", "from_address": "a@b.c"}, "not a valid URI", id="port"),
+            pytest.param({"uri": "smtp://relay.test:0", "from_address": "a@b.c"}, "invalid port", id="port-zero"),
+            pytest.param({"uri": "memory://host"}, "takes no host", id="memory-host"),
+            pytest.param({"uri": "smtp://:25", "from_address": "a@b.c"}, "valid host", id="port-only"),
+            pytest.param({"uri": "smtp://relay.test"}, "from_address is required", id="no-sender"),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "not an address"}, "from_address", id="bad-sender"
+            ),
+            pytest.param({"uri": "memory://", "from_address": "nope"}, "from_address", id="bad-memory-sender"),
+            pytest.param({"uri": "memory://", "secure": False}, "only to smtp://", id="memory-cleartext"),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "ehlo_hostname": "not a host"},
+                "ehlo_hostname",
+                id="bad-ehlo",
+            ),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "username": "u"}, "together", id="user-only"
+            ),
+            pytest.param(
+                {"uri": "smtp://relay.test", "from_address": "a@b.c", "password": "p"}, "together", id="password-only"
+            ),
+        ],
+    )
+    def test_a_bad_configuration_fails_the_build(self, mail, match):
+        with pytest.raises(ValueError, match=match):
+            self._build(**mail)
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "10.0.0.5:25", "[::1]"])
+    def test_an_ip_literal_host_is_accepted(self, host):
+        assert isinstance(self._build(uri=f"smtp://{host}", from_address="a@b.c"), SmtpMail)
+
+    def test_cleartext_to_a_loopback_relay_is_allowed_and_warns(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            mail = self._build(uri="smtp://127.0.0.1:25", from_address="a@b.c", secure=False)
+
+        assert mail._tls is False
+        assert "CLEARTEXT" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("mail", "match"),
+        [
+            pytest.param({"uri": "smtp://8.8.8.8"}, "private or loopback", id="public-ip"),
+            pytest.param({"uri": "smtps://127.0.0.1"}, "smtps", id="smtps"),
+            pytest.param({"uri": "smtp://127.0.0.1", "username": "u", "password": "p"}, "credentials", id="creds"),
+        ],
+    )
+    def test_cleartext_is_refused_outside_its_narrow_case(self, mail, match):
+        with pytest.raises(ValueError, match=match):
+            self._build(from_address="a@b.c", secure=False, **mail)
+
+    def test_non_ascii_credentials_fail_the_build(self):
+        with pytest.raises(ValueError, match="ASCII"):
+            self._build(uri="smtp://relay.test", from_address="a@b.c", username="u", password="pässword")
+
+    def test_the_ehlo_name_reaches_the_backend(self):
+        mail = self._build(uri="smtp://relay.test", from_address="a@b.c", ehlo_hostname="mta.example.com")
+
+        assert mail._local_hostname == "mta.example.com"
+
+    def test_memory_in_a_multi_process_deployment_fails_the_build(self, tmp_path):
+        shared = _settings(data_dir=str(tmp_path), mail=settings.MailSettings(uri="memory://"), web_workers=2)
+
+        with pytest.raises(ValueError, match=r"mail\.uri resolves to the in-memory mail recorder"):
+            container.build_platform(shared)
+
+    def test_the_failure_does_not_echo_the_password(self):
+        with pytest.raises(ValueError) as caught:
+            self._build(uri="smtp://u:hunter2@relay.test", from_address="a@b.c")
+
+        assert "hunter2" not in str(caught.value)
+
+    def test_the_platform_carries_the_provider(self, tmp_path):
+        built = container.build_platform(_settings(data_dir=str(tmp_path), mail=settings.MailSettings(uri="memory://")))
+
+        assert isinstance(built.mail, MemoryMail)
+
+    def test_the_password_is_not_in_the_settings_repr(self):
+        assert "hunter2" not in repr(settings.MailSettings(username="u", password="hunter2"))

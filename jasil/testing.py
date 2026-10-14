@@ -23,13 +23,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jasil._core.redis_clients as redis_clients
+import jasil.capabilities as capabilities
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 import jasil.settings as jasil_settings
+from jasil.backends.mail_memory import MemoryMail
 from jasil.container import Platform, build_platform
 
-__all__ = ["FixedClock", "install_test_platform", "reset_all"]
+__all__ = ["FixedClock", "MemoryMail", "install_test_platform", "memory_mail", "reset_all"]
 
 #: An arbitrary but stable instant for a clock nobody bothered to set. Chosen far
 #: enough from any real boundary that a test asserting on it reads unambiguously.
@@ -93,18 +95,54 @@ def install_test_platform(
         settings: Base configuration to build from. Defaults to an all-defaults
             :class:`~jasil.settings.JasilSettings`; ``data_dir`` is applied on top
             either way. It is also installed via ``jasil.settings.configure`` so
-            code reading the settings directly agrees with the platform.
+            code reading the settings directly agrees with the platform. When
+            ``mail.uri`` is unset (or empty) it becomes ``memory://``, so sent
+            messages land in the outbox :func:`memory_mail` returns — unless the
+            settings describe a multi-process deployment that enforces
+            consistency, where ``memory://`` would fail the build; mail then
+            stays unset and sending raises.
 
     Returns:
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
     """
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
+    if not configured.mail.uri:
+        # Unconfigured mail would raise on every send; a test wants it recorded.
+        recording = replace(configured, mail=replace(configured.mail, uri="memory://", secure=True))
+        refused = capabilities.check_mail_consistency(
+            profile=recording.profile,
+            web_workers=recording.web_workers,
+            mail_uri=recording.mail.uri,
+            mail_label="mail.uri",
+        )
+        if not refused or not recording.enforce_deployment_consistency:
+            configured = recording
     jasil_settings.configure(configured)
-    # Substituted after the build rather than wired in: the clock has no URI, so
-    # the composition root has no seam for it.
-    platform = replace(build_platform(configured), clock=clock or FixedClock())
+    platform = build_platform(configured, clock=clock or FixedClock())
     platform_runtime.set_active_platform(platform)
     return platform
+
+
+def memory_mail(platform: Platform) -> MemoryMail:
+    """Return the recording mail backend of a test platform, typed.
+
+    ``Platform.mail`` is a :class:`~jasil.providers.MailProvider`, which has no
+    ``outbox``; this narrows it for a type checker and fails loudly when the
+    platform was built with a real backend.
+
+    Args:
+        platform: The platform from :func:`install_test_platform`.
+
+    Returns:
+        The ``MemoryMail`` whose ``outbox`` holds every message sent.
+
+    Raises:
+        TypeError: When ``platform.mail`` is not the in-memory backend.
+    """
+    mail = platform.mail
+    if not isinstance(mail, MemoryMail):
+        raise TypeError("platform.mail is not the in-memory backend; configure mail.uri as memory://")
+    return mail
 
 
 def reset_all() -> None:

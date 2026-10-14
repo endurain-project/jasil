@@ -46,6 +46,7 @@ fields.
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |
+| `mail` | `MailSettings()` | Outbound mail backend. |
 | `network` | `NetworkSettings()` | Outbound egress. |
 
 ### `JobSettings`
@@ -84,6 +85,26 @@ because you installed it.
 | `photon_host` | `""` | Bare `host[:port]` authority. |
 | `photon_use_https` | `True` | |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
+
+### `MailSettings`
+
+| Field | Default | Meaning |
+|---|---|---|
+| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path or query. The host is a DNS name or an IP literal. `memory://` is refused in a multi-process deployment. |
+| `secure` | `True` | Verified TLS. `False` allows cleartext `smtp://` and only to a host that resolves exclusively to private, loopback or link-local addresses (re-checked on every send, and the connection is pinned to the checked addresses, tried in order; the shared address space `100.64.0.0/10` used by carrier-grade NAT and Tailscale is not private for this purpose), with no `username` / `password`; anything else, including `memory://`, fails `build_platform`. |
+| `from_address` | `""` | `"addr"` or `"Name <addr>"`. Required for the SMTP schemes. Independent of `username`. |
+| `username` | `None` | SMTP login. Must be set together with `password`. |
+| `password` | `None` | SMTP password. Hidden from `repr`. |
+| `ehlo_hostname` | `None` | Name announced in `EHLO`. Defaults to the machine's hostname; set a fully qualified one for a relay that rejects a bare name. |
+
+Host names follow RFC 1123, so a name with an underscore (some Docker Compose
+service names) is refused for `uri` and `ehlo_hostname`; use an IP literal or a
+network alias without one.
+
+A bad value fails `build_platform` with `ValueError`; no connection is attempted
+at startup, so a mail server that is down does not block boot. With
+`secure = False` the host is resolved at startup to confirm it is private, so
+that one case does need a working DNS resolver to boot.
 
 ### `NetworkSettings`
 

@@ -10,12 +10,25 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
+- `Platform.mail`, defaulting to a `NullMail` that raises `MailNotConfiguredError`. `Platform.geocoding` and `Platform.recorder` now default to `NullGeocoding()` and `None`, so a `Platform` built by hand need not supply them.
+- `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults an unset or empty `mail.uri` to `memory://`, except in a multi-process deployment that enforces consistency.
+- `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured), whose `status` and `permanent` expose the SMTP status so a handler can stop retrying a 5xx; an invalid message raises `ValueError`.
+- `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is verified by default; `MailSettings.secure = False` permits cleartext `smtp://` only to a private/loopback relay and never with credentials. `MailSettings.ehlo_hostname` overrides the name announced in `EHLO`. Standard library only — no new dependency.
+- A fourth deployment-consistency rule, `jasil.capabilities.check_mail_consistency`: `memory://` mail is refused in a multi-process deployment, where no message would be delivered.
+- `jasil.testing.MemoryMail` and `memory_mail(platform)` for a typed outbox; `MemoryMail.clear()`.
+- `jasil.deps.get_mail`, and a `mail` row in the startup capability report.
 - `jasil.publisher.publish_on_commit` and `publish_many_on_commit` publish a domain event without owning the commit. The caller stages the event and whoever owns the transaction commits when it likes, so a function that publishes can now be composed with other writes in one atomic unit of work.
   - **Durable route:** the outbox row is staged on the session immediately, uncommitted, and commits or rolls back with the caller's domain rows. A staging failure raises.
   - **Best-effort route:** the event is minted at publish time (capturing the ambient request id) and dispatched on the bus only after the session's **outermost** transaction commits, in publish order. Events published in a rolled-back SAVEPOINT, or in a rolled-back or closed transaction, are never dispatched; events from a released SAVEPOINT wait for the outermost commit. Dispatch failures are logged and swallowed. Pending events live in `Session.info`, so sessions never see each other's, and a session that never publishes gets no listeners.
   - Publishing starts the session's transaction if none is active; an empty `publish_many_on_commit` is a no-op. Only synchronous `Session` objects are supported; anything else (an `AsyncSession`, a `scoped_session` proxy) raises `TypeError`.
 
 `publish_committing` and `publish_many_committing` are unchanged; hosts can adopt the new functions incrementally.
+
+### Fixed
+
+- `JobRunner` renews the lease of the remaining jobs of a batch as each one starts, so a late job in a batch is no longer requeued (and run twice) while still running.
+- A job whose handler outlives its lease is no longer marked completed or failed by the worker that lost it: the reaper has requeued it, and its state now belongs to the worker that claimed it next. The late result is logged and discarded.
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
 
 ## [0.5.1]
 

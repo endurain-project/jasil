@@ -24,7 +24,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, and_, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -189,37 +189,126 @@ def claim_jobs(
     return list(claimed)
 
 
-def mark_job_completed(job_id: str, *, now: datetime, db: Session) -> None:
+def renew_leases(
+    job_attempts: dict[str, int],
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    now: datetime,
+    db: Session,
+) -> set[str]:
+    """
+    Extend the lease of claimed jobs this worker still holds.
+
+    A batch is claimed under one lease but run one job after another, so a late
+    job would otherwise start with most of its lease already spent, or expired and
+    requeued to another worker while this one still runs it. Only rows still
+    ``claimed`` by ``worker_id`` at the given attempt are touched: a job the reaper
+    already requeued is never taken back, even when this worker has since claimed
+    it again (a later attempt, whose lease is not this snapshot's to renew).
+
+    Args:
+        job_attempts: The jobs to renew, as ``{job_id: attempt number of the
+            claim being renewed}``.
+        worker_id: The lease holder.
+        lease_seconds: New lease duration from ``now``.
+        now: Current instant.
+        db: Active database session.
+
+    Returns:
+        The ids whose lease was renewed. A job missing from the result is no
+        longer held by this worker and must not be run.
+    """
+    if not job_attempts:
+        return set()
+    held = [
+        or_(
+            *(
+                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
+                for job_id, attempts in job_attempts.items()
+            )
+        ),
+        ProcessingJob.status == STATUS_CLAIMED,
+        ProcessingJob.locked_by == worker_id,
+    ]
+    db.execute(
+        update(ProcessingJob)
+        .where(*held)
+        .values(lease_expires_at=now + timedelta(seconds=lease_seconds), updated_at=now)
+    )
+    # No ``UPDATE ... RETURNING``: MySQL and MariaDB do not support it. Same
+    # transaction, so the rows read back are the ones just renewed.
+    ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
+    db.commit()
+    return ids
+
+
+def _finishable(job_id: str, worker_id: str | None, attempts: int | None = None) -> list[Any]:
+    """The ``WHERE`` clauses for finishing ``job_id``, guarded by its lease holder.
+
+    With ``worker_id``, only a row still ``claimed`` by that worker matches: a job
+    whose lease expired mid-run was requeued, and may already be running on
+    another worker, whose state must not be overwritten. ``attempts`` narrows
+    that to the claim the caller ran, so a requeue that the *same* worker then
+    reclaims is not finished by the earlier run either.
+    """
+    clauses: list[Any] = [ProcessingJob.id == job_id]
+    if worker_id is not None:
+        clauses += [ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.locked_by == worker_id]
+        if attempts is not None:
+            clauses.append(ProcessingJob.attempts == attempts)
+    return clauses
+
+
+def mark_job_completed(
+    job_id: str,
+    *,
+    worker_id: str | None = None,
+    attempts: int | None = None,
+    now: datetime,
+    db: Session,
+) -> bool:
     """
     Mark a claimed job ``completed`` and release its lease.
 
     Args:
         job_id: The job to complete.
+        worker_id: The lease holder. When given, the job is completed only if
+            this worker still holds it.
+        attempts: The attempt number of the claim being finished; with
+            ``worker_id``, a later claim of the job is left alone.
         now: Current instant.
         db: Active database session.
 
     Returns:
-        None.
+        True when the job was completed; False when it was not found or, with
+        ``worker_id``, is no longer held by that worker.
     """
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_COMPLETED,
-            completed_at=now,
-            updated_at=now,
-            last_error=None,
-            locked_by=None,
-            lease_expires_at=None,
-        )
+    completed = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(*_finishable(job_id, worker_id, attempts))
+            .values(
+                status=STATUS_COMPLETED,
+                completed_at=now,
+                updated_at=now,
+                last_error=None,
+                locked_by=None,
+                lease_expires_at=None,
+            )
+        ),
     )
     db.commit()
+    return completed.rowcount > 0
 
 
 def mark_job_failed(
     job_id: str,
     error_message: str,
     *,
+    worker_id: str | None = None,
+    attempts: int | None = None,
     base_seconds: float,
     max_seconds: float,
     now: datetime,
@@ -231,6 +320,11 @@ def mark_job_failed(
     Args:
         job_id: The job that failed.
         error_message: The failure reason (truncated for storage).
+        worker_id: The lease holder. When given, the failure is recorded only if
+            this worker still holds the job.
+        attempts: The attempt number of the claim that failed; with ``worker_id``,
+            a later claim of the job is left alone. Defaults to the value read
+            here, which still covers a reclaim between that read and the write.
         base_seconds: Backoff base delay.
         max_seconds: Backoff ceiling.
         now: Current instant.
@@ -239,43 +333,40 @@ def mark_job_failed(
     Returns:
         The job's new status (``pending`` when rescheduled, ``dead_letter`` when
         the attempt ceiling was reached), or the empty string when the job was
-        not found.
+        not found or, with ``worker_id``, is no longer held by that worker.
     """
     job = db.get(ProcessingJob, job_id)
     if job is None:
         return ""
     truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
     if job.attempts >= job.max_attempts:
+        status = STATUS_DEAD_LETTER
+        values: dict[str, Any] = {"completed_at": now}
+    else:
+        status = STATUS_PENDING
+        delay = jobs_backoff.backoff_seconds(job.attempts, base_seconds=base_seconds, max_seconds=max_seconds)
+        values = {"available_at": now + timedelta(seconds=delay), "locked_at": None}
+    # The guard is re-asserted in the ``UPDATE`` rather than read off ``job``: the
+    # reaper can requeue the row between the read and the write. ``attempts`` ties
+    # the decision above to the claim that ran, so a reclaim by the same worker
+    # is not overwritten with a stale outcome.
+    failed = cast(
+        CursorResult[Any],
         db.execute(
             update(ProcessingJob)
-            .where(ProcessingJob.id == job_id)
+            .where(*_finishable(job_id, worker_id, job.attempts if attempts is None else attempts))
             .values(
-                status=STATUS_DEAD_LETTER,
+                status=status,
                 last_error=truncated,
-                completed_at=now,
                 updated_at=now,
                 locked_by=None,
                 lease_expires_at=None,
+                **values,
             )
-        )
-        db.commit()
-        return STATUS_DEAD_LETTER
-    delay = jobs_backoff.backoff_seconds(job.attempts, base_seconds=base_seconds, max_seconds=max_seconds)
-    db.execute(
-        update(ProcessingJob)
-        .where(ProcessingJob.id == job_id)
-        .values(
-            status=STATUS_PENDING,
-            last_error=truncated,
-            available_at=now + timedelta(seconds=delay),
-            updated_at=now,
-            locked_by=None,
-            locked_at=None,
-            lease_expires_at=None,
-        )
+        ),
     )
     db.commit()
-    return STATUS_PENDING
+    return status if failed.rowcount > 0 else ""
 
 
 def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> int:

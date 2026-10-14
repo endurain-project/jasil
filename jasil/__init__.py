@@ -7,6 +7,7 @@ Public (pure) surface — safe to import anywhere; pulls in no backends:
             aggregate.
         - ``StateProvider`` / ``EventBusProvider`` / ``LockProvider`` /
             ``ClockProvider`` - the other capability providers.
+        - ``MailProvider`` / ``MailMessage`` and its ``MailError`` family.
 
 The composition root (``Platform`` / ``build_platform``) lives in
 ``jasil.container`` and is imported explicitly where the platform is
@@ -23,6 +24,10 @@ from jasil.providers import (
     ClockProvider,
     EventBusProvider,
     LockProvider,
+    MailError,
+    MailMessage,
+    MailNotConfiguredError,
+    MailProvider,
     ObjectStat,
     PartRef,
     ResumableUploads,
@@ -57,6 +62,10 @@ __all__ = [
     "Event",
     "EventBusProvider",
     "LockProvider",
+    "MailError",
+    "MailMessage",
+    "MailNotConfiguredError",
+    "MailProvider",
     "ObjectStat",
     "PartRef",
     "ResumableUploads",
