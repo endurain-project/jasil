@@ -171,7 +171,9 @@ class JobRunner:
             return
         now = self._clock.now()
         with self._session_factory() as db:
-            completed = jobs_crud.mark_job_completed(job.id, worker_id=self._worker_id, now=now, db=db)
+            completed = jobs_crud.mark_job_completed(
+                job.id, worker_id=self._worker_id, attempts=job.attempts, now=now, db=db
+            )
         if not completed:
             # The handler outran the lease: the job was requeued and may be running
             # elsewhere, so its state belongs to that worker now.
@@ -187,6 +189,7 @@ class JobRunner:
                 job.id,
                 str(error),
                 worker_id=self._worker_id,
+                attempts=job.attempts,
                 base_seconds=self._backoff_base_seconds,
                 max_seconds=self._backoff_max_seconds,
                 now=now,

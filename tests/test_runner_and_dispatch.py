@@ -241,6 +241,30 @@ class TestJobRunner:
         assert job.last_error is None
         assert "lease expired while it ran" in caplog.text
 
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_a_job_the_same_worker_reclaimed_is_not_finished_by_the_earlier_run(
+        self, runner, registry, db, caplog, fails
+    ):
+        def _handler(_event):
+            # Requeued and claimed again by this same worker: the row still looks
+            # held by it, but it is a later attempt.
+            db.execute(update(ProcessingJob).values(attempts=ProcessingJob.attempts + 1))
+            db.commit()
+            if fails:
+                raise RuntimeError("boom")
+
+        registry.register("activity.created", "s", _handler)
+        self._enqueue(db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.runner"):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_CLAIMED
+        assert job.attempts == 2
+        assert job.last_error is None
+        assert "lease expired while it ran" in caplog.text
+
 
 class TestInProcessBus:
     def test_a_published_event_reaches_its_subscriber(self):

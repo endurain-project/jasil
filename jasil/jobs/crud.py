@@ -236,20 +236,31 @@ def renew_leases(
     return ids
 
 
-def _finishable(job_id: str, worker_id: str | None) -> list[Any]:
+def _finishable(job_id: str, worker_id: str | None, attempts: int | None = None) -> list[Any]:
     """The ``WHERE`` clauses for finishing ``job_id``, guarded by its lease holder.
 
     With ``worker_id``, only a row still ``claimed`` by that worker matches: a job
     whose lease expired mid-run was requeued, and may already be running on
-    another worker, whose state must not be overwritten.
+    another worker, whose state must not be overwritten. ``attempts`` narrows
+    that to the claim the caller ran, so a requeue that the *same* worker then
+    reclaims is not finished by the earlier run either.
     """
     clauses: list[Any] = [ProcessingJob.id == job_id]
     if worker_id is not None:
         clauses += [ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.locked_by == worker_id]
+        if attempts is not None:
+            clauses.append(ProcessingJob.attempts == attempts)
     return clauses
 
 
-def mark_job_completed(job_id: str, *, worker_id: str | None = None, now: datetime, db: Session) -> bool:
+def mark_job_completed(
+    job_id: str,
+    *,
+    worker_id: str | None = None,
+    attempts: int | None = None,
+    now: datetime,
+    db: Session,
+) -> bool:
     """
     Mark a claimed job ``completed`` and release its lease.
 
@@ -257,6 +268,8 @@ def mark_job_completed(job_id: str, *, worker_id: str | None = None, now: dateti
         job_id: The job to complete.
         worker_id: The lease holder. When given, the job is completed only if
             this worker still holds it.
+        attempts: The attempt number of the claim being finished; with
+            ``worker_id``, a later claim of the job is left alone.
         now: Current instant.
         db: Active database session.
 
@@ -268,7 +281,7 @@ def mark_job_completed(job_id: str, *, worker_id: str | None = None, now: dateti
         CursorResult[Any],
         db.execute(
             update(ProcessingJob)
-            .where(*_finishable(job_id, worker_id))
+            .where(*_finishable(job_id, worker_id, attempts))
             .values(
                 status=STATUS_COMPLETED,
                 completed_at=now,
@@ -288,6 +301,7 @@ def mark_job_failed(
     error_message: str,
     *,
     worker_id: str | None = None,
+    attempts: int | None = None,
     base_seconds: float,
     max_seconds: float,
     now: datetime,
@@ -301,6 +315,9 @@ def mark_job_failed(
         error_message: The failure reason (truncated for storage).
         worker_id: The lease holder. When given, the failure is recorded only if
             this worker still holds the job.
+        attempts: The attempt number of the claim that failed; with ``worker_id``,
+            a later claim of the job is left alone. Defaults to the value read
+            here, which still covers a reclaim between that read and the write.
         base_seconds: Backoff base delay.
         max_seconds: Backoff ceiling.
         now: Current instant.
@@ -324,13 +341,13 @@ def mark_job_failed(
         values = {"available_at": now + timedelta(seconds=delay), "locked_at": None}
     # The guard is re-asserted in the ``UPDATE`` rather than read off ``job``: the
     # reaper can requeue the row between the read and the write. ``attempts`` ties
-    # the decision above to the claim this worker observed, so a reclaim by the
-    # same worker in that window is not overwritten with a stale outcome.
+    # the decision above to the claim that ran, so a reclaim by the same worker
+    # is not overwritten with a stale outcome.
     failed = cast(
         CursorResult[Any],
         db.execute(
             update(ProcessingJob)
-            .where(*_finishable(job_id, worker_id), ProcessingJob.attempts == job.attempts)
+            .where(*_finishable(job_id, worker_id, job.attempts if attempts is None else attempts))
             .values(
                 status=status,
                 last_error=truncated,
