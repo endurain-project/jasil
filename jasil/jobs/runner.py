@@ -95,10 +95,23 @@ class JobRunner:
             snapshots = [self._snapshot(job) for job in claimed]
         if snapshots:
             logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
-        for snapshot in snapshots:
+        for index, snapshot in enumerate(snapshots):
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.
             try:
+                if index:
+                    try:
+                        held = self._still_held(snapshot, snapshots[index:])
+                    except Exception as error:
+                        # Not run: the lease is unknown, and the reaper requeues it.
+                        logger.error(
+                            "Durable job lease could not be renewed; skipping",
+                            exc_info=error,
+                            extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
+                        )
+                        continue
+                    if not held:
+                        continue
                 self._run_job(snapshot)
             except Exception as error:
                 logger.error(
@@ -107,6 +120,33 @@ class JobRunner:
                     extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                 )
         return len(snapshots)
+
+    def _still_held(self, job: ClaimedJob, remaining: list[ClaimedJob]) -> bool:
+        """Renew the leases of the rest of the batch; False when ``job`` was lost.
+
+        The batch was claimed under one lease, but jobs run in turn: each one gets
+        a full lease from the start of its turn. A job the reaper already requeued
+        belongs to another worker now and must not be run here as well.
+
+        Renewing the whole remainder before each job is quadratic in the batch
+        size (one UPDATE per job at most ``batch_size`` rows); deliberate, as it
+        keeps every waiting job's lease alive while an earlier one runs.
+        """
+        with self._session_factory() as db:
+            renewed = jobs_crud.renew_leases(
+                {item.id: item.attempts for item in remaining},
+                worker_id=self._worker_id,
+                lease_seconds=self._lease_seconds,
+                now=self._clock.now(),
+                db=db,
+            )
+        if job.id in renewed:
+            return True
+        logger.warning(
+            "Durable job lease was lost before its turn; skipping",
+            extra={"job_id": job.id, "subscriber": job.subscriber_id},
+        )
+        return False
 
     def reap_once(self) -> int:
         """
@@ -131,7 +171,16 @@ class JobRunner:
             return
         now = self._clock.now()
         with self._session_factory() as db:
-            jobs_crud.mark_job_completed(job.id, now=now, db=db)
+            completed = jobs_crud.mark_job_completed(
+                job.id, worker_id=self._worker_id, attempts=job.attempts, now=now, db=db
+            )
+        if not completed:
+            # The handler outran the lease: the job was requeued and may be running
+            # elsewhere, so its state belongs to that worker now.
+            logger.warning(
+                "Durable job lease expired while it ran; its completion is not recorded",
+                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            )
 
     def _fail(self, job: ClaimedJob, error: Exception) -> None:
         now = self._clock.now()
@@ -139,11 +188,20 @@ class JobRunner:
             status = jobs_crud.mark_job_failed(
                 job.id,
                 str(error),
+                worker_id=self._worker_id,
+                attempts=job.attempts,
                 base_seconds=self._backoff_base_seconds,
                 max_seconds=self._backoff_max_seconds,
                 now=now,
                 db=db,
             )
+        if not status:
+            logger.warning(
+                "Durable job lease expired while it ran; its failure is not recorded",
+                exc_info=error,
+                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            )
+            return
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
@@ -154,7 +212,7 @@ class JobRunner:
                 "subscriber": job.subscriber_id,
                 "event_type": job.event_type,
                 "attempts": job.attempts,
-                "job_status": status or "unknown",
+                "job_status": status,
             },
         )
 

@@ -33,7 +33,7 @@ _NON_PUBLIC = "resolves to a non-public address"
 _NOT_AN_AUTHORITY = "is not a bare host[:port] authority"
 
 
-def _is_valid_hostname(value: str) -> bool:
+def is_valid_hostname(value: str) -> bool:
     """Return True when ``value`` is a syntactically valid RFC 1123 hostname.
 
     Rejects values carrying URL schemes, ports, or other non-hostname characters
@@ -56,6 +56,9 @@ def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address)
     reserved. Any of these would let an attacker pivot to internal
     infrastructure or a cloud metadata service.
     """
+    # Python 3.12.0-3.12.3 call ``::ffff:8.8.8.8`` private; judge the embedded IPv4.
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
     return (
         addr.is_private
         or addr.is_loopback
@@ -141,6 +144,64 @@ def _address_rejection_reason(
     return None
 
 
+# ``is_private`` is True for these, but a gateway carries them to a public IPv4
+# host (NAT64 local-use prefix, Teredo), so they do not "stay inside the network".
+_TUNNELLED_NETWORKS = (
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("2001::/32"),
+)
+
+
+def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
+    """Resolve ``hostname`` and require every address to be private.
+
+    For traffic that must *stay* inside the network (cleartext mail to a local
+    relay). Every address the name resolves to must be private, loopback or
+    link-local; one public answer, or a name that does not resolve, refuses it.
+    Returning the addresses lets a caller connect to the one it validated, which
+    closes the gap between this check and the connection (DNS rebinding).
+
+    Args:
+        hostname: A DNS name or IP literal, without a port.
+
+    Returns:
+        ``(addresses, None)`` when all are non-public, else ``([], reason)``.
+    """
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except (socket.gaierror, UnicodeError):
+        return [], _UNRESOLVABLE
+    addresses: list[str] = []
+    for info in infos:
+        # The scope id (``fe80::1%eth0``) stays: a link-local address cannot be
+        # dialed without it.
+        text = str(info[4][0])
+        try:
+            addr = ipaddress.ip_address(text)
+        except ValueError:
+            return [], _UNPARSEABLE
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        if (
+            not (addr.is_private or addr.is_loopback or addr.is_link_local)
+            or addr.is_multicast
+            or any(addr in net for net in _TUNNELLED_NETWORKS)
+        ):
+            return [], "resolves to a public address"
+        if text not in addresses:
+            addresses.append(text)
+    return addresses, None
+
+
+def non_public_rejection_reason(hostname: str) -> str | None:
+    """Return why ``hostname`` is not a purely private destination, or None.
+
+    See :func:`resolve_private_addresses`; this is the check-only form used when
+    the platform is built.
+    """
+    return resolve_private_addresses(hostname)[1]
+
+
 def host_rejection_reason(
     host: str | None,
     *,
@@ -193,7 +254,7 @@ def host_rejection_reason(
     elif not (port.isdigit() and len(port) <= 5):
         return _NOT_AN_AUTHORITY
 
-    if not _is_valid_hostname(hostname):
+    if not is_valid_hostname(hostname):
         return _NOT_AN_AUTHORITY
 
     return _address_rejection_reason(hostname, allowed_hosts=allowed_hosts, purpose=purpose)

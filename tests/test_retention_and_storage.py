@@ -1096,3 +1096,89 @@ class TestRuntimeHandle:
 
         assert runtime.get_active_platform() is installed
         monkeypatch.setattr(runtime, "_active_platform", None)
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions enforced on the caller")
+class TestLocalStorageFilesystemFailures:
+    """Real filesystem faults, not stubs: a backend that cannot write must say so
+    in provider-neutral terms and leave no half-written object behind."""
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), url_prefix="/media")
+
+    @pytest.fixture
+    def read_only(self):
+        """Make directories unwritable for the test, restoring them afterwards."""
+        changed: list[tuple[Path, int]] = []
+
+        def lock(path: Path, mode: int = 0o500) -> None:
+            changed.append((path, path.stat().st_mode))
+            path.chmod(mode)
+
+        yield lock
+        for path, mode in reversed(changed):
+            path.chmod(mode)
+
+    @staticmethod
+    def _leftovers(directory: Path) -> list[str]:
+        return [entry.name for entry in directory.iterdir() if entry.name.startswith(".")]
+
+    def test_a_new_key_in_an_unwritable_area_is_unavailable(self, storage, read_only):
+        storage.save("thumbnails", "first.webp", b"x")
+        keys_directory = storage._resolve("thumbnails", "first.webp").parent.parent.parent
+        read_only(keys_directory)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save("thumbnails", "second.webp", b"y")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert storage.get("thumbnails", "second.webp") is None
+
+    def test_an_identity_blocked_by_a_regular_file_is_unavailable(self, storage, tmp_path):
+        """A path component that is a file, not a directory, is an I/O fault
+        rather than a missing identity."""
+        objects = tmp_path / storage_local._OBJECTS_DIRECTORY
+        objects.write_bytes(b"not a directory")
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save("thumbnails", "1.webp", b"x")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_overwriting_a_read_only_payload_is_unavailable(self, storage, read_only):
+        storage.save("thumbnails", "1.webp", b"original")
+        read_only(storage._resolve("thumbnails", "1.webp"), 0o400)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("thumbnails", "1.webp", b"replacement")
+
+        assert storage.get("thumbnails", "1.webp") == b"original"
+
+    def test_a_stream_into_an_unwritable_object_directory_is_unavailable(self, storage, read_only):
+        storage.save("thumbnails", "1.webp", b"original")
+        read_only(storage._resolve("thumbnails", "1.webp").parent)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save_stream("thumbnails", "1.webp", io.BytesIO(b"replacement"))
+
+        assert storage.get("thumbnails", "1.webp") == b"original"
+
+    def test_a_stream_that_cannot_be_committed_leaves_no_temporary_file(self, storage):
+        """The commit step fails when a directory squats on the payload path."""
+        storage.save("thumbnails", "1.webp", b"original")
+        payload = storage._resolve("thumbnails", "1.webp")
+        payload.unlink()
+        payload.mkdir()
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save_stream("thumbnails", "1.webp", io.BytesIO(b"replacement"))
+
+        assert self._leftovers(payload.parent) == []
+
+    def test_a_vanished_key_identity_blocks_reads_as_unavailable(self, storage):
+        storage.save("thumbnails", "1.webp", b"x")
+        (storage._resolve("thumbnails", "1.webp").parent / storage_local._OBJECT_KEY_FILE).unlink()
+
+        with pytest.raises(StorageBackendUnavailableError, match="identity is unavailable"):
+            storage.get("thumbnails", "1.webp")

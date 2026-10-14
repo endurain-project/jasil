@@ -16,6 +16,8 @@ import textwrap
 
 import pytest
 
+from jasil._core.optional_deps import require
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Distributions behind an optional extra. None may be loaded as a side effect of
@@ -119,3 +121,19 @@ def test_redis_module_rejects_an_unknown_attribute():
 
     with pytest.raises(AttributeError, match="no attribute 'Nonsense'"):
         _ = redis_clients.Nonsense
+
+
+class TestRequire:
+    def test_an_imported_module_is_returned_unchanged(self):
+        module = object()
+
+        assert require(module, package="redis", extra="redis", feature="Redis state") is module
+
+    def test_a_missing_module_names_the_package_and_the_extra_to_install(self):
+        with pytest.raises(ImportError) as excinfo:
+            require(None, package="redis", extra="redis", feature="Redis state")
+
+        message = str(excinfo.value)
+        assert "Redis state" in message
+        assert "'redis' package" in message
+        assert "pip install 'jasil[redis]'" in message

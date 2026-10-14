@@ -21,8 +21,8 @@ capability backends, an event pipeline, durable jobs, and observability.
 
 | Layer | What it does |
 |---|---|
-| **Providers** | Small composable protocols - state, storage, events, lock, clock, geocoding - that domain code depends on instead of Redis, S3, or Postgres. Complete aggregate protocols keep URI-selected backends interchangeable. |
-| **Backends** | A working implementation of each, selected by URI: `memory://` or `redis://`, `local://` or `s3://`, `noop://` or `postgres-advisory://`. |
+| **Providers** | Small composable protocols - state, storage, events, lock, clock, geocoding, mail - that domain code depends on instead of Redis, S3, or Postgres. Complete aggregate protocols keep URI-selected backends interchangeable. |
+| **Backends** | A working implementation of each, selected by URI: `memory://` or `redis://`, `local://` or `s3://`, `noop://` or `postgres-advisory://`, `smtp://` or `smtps://`. |
 | **Deployment profiles** | `local` runs single-process with zero extra infrastructure. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload schema versioning that survives a rolling deploy. |
 | **Durable jobs** | A transactional outbox relayed into leased per-subscriber jobs, with exponential backoff and a dead-letter queue. |
