@@ -349,9 +349,27 @@ class TestMailResolution:
             self._build(**mail)
 
     @pytest.mark.parametrize("host", ["127.0.0.1", "10.0.0.5:25", "[::1]"])
-    def test_an_ip_literal_host_is_refused(self, host):
-        with pytest.raises(ValueError, match="host"):
-            self._build(uri=f"smtp://{host}", from_address="a@b.c")
+    def test_an_ip_literal_host_is_accepted(self, host):
+        assert isinstance(self._build(uri=f"smtp://{host}", from_address="a@b.c"), SmtpMail)
+
+    def test_cleartext_to_a_loopback_relay_is_allowed_and_warns(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            mail = self._build(uri="smtp://127.0.0.1:25", from_address="a@b.c", secure=False)
+
+        assert mail._tls is False
+        assert "CLEARTEXT" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("mail", "match"),
+        [
+            pytest.param({"uri": "smtp://8.8.8.8"}, "private or loopback", id="public-ip"),
+            pytest.param({"uri": "smtps://127.0.0.1"}, "smtps", id="smtps"),
+            pytest.param({"uri": "smtp://127.0.0.1", "username": "u", "password": "p"}, "credentials", id="creds"),
+        ],
+    )
+    def test_cleartext_is_refused_outside_its_narrow_case(self, mail, match):
+        with pytest.raises(ValueError, match=match):
+            self._build(from_address="a@b.c", secure=False, **mail)
 
     def test_non_ascii_credentials_fail_the_build(self):
         with pytest.raises(ValueError, match="ASCII"):

@@ -21,6 +21,7 @@ from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.providers import MailError, MailMessage, MailNotConfiguredError, MailProvider
 
+REAL_SMTP, REAL_SMTP_SSL = smtplib.SMTP, smtplib.SMTP_SSL
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
 SENDER = "Support Team <support@example.com>"
 ADDRESS = "secret.person@private.example"
@@ -203,6 +204,21 @@ class TestBuildMime:
         with pytest.raises(ValueError, match="strings"):
             build_mime(_message(**body), sender=SENDER, now=NOW)
 
+    @pytest.mark.parametrize("address", ["a@straße.de", "a@βόλος.gr", "a@b.c\u200d"])
+    def test_a_domain_the_idna_codec_would_rewrite_is_rejected(self, address):
+        with pytest.raises(ValueError):
+            build_mime(_message(to=[address]), sender=SENDER, now=NOW)
+
+    def test_none_and_non_sequence_recipients_are_value_errors(self):
+        for to in (None, {"a@b.com"}):
+            with pytest.raises(ValueError):
+                build_mime(_message(to=to), sender=SENDER, now=NOW)
+
+    @pytest.mark.parametrize("subject", ["a\x00b", "a\x7fb"])
+    def test_control_characters_in_the_subject_are_rejected(self, subject):
+        with pytest.raises(ValueError):
+            build_mime(_message(subject=subject), sender=SENDER, now=NOW)
+
     def test_a_non_ascii_local_part_is_rejected(self):
         with pytest.raises(ValueError):
             build_mime(_message(to=["ü@example.com"]), sender=SENDER, now=NOW)
@@ -291,6 +307,13 @@ class TestMemoryMail:
 
         assert mail.outbox == []
 
+    def test_clear_forgets_every_message(self):
+        mail = _memory()
+        mail.send(_message())
+        mail.clear()
+
+        assert mail.outbox == [] and mail.built == []
+
     def test_a_placeholder_sender_is_used_when_none_is_configured(self):
         assert MemoryMail(_Clock()).send(_message()).endswith("@localhost>")
 
@@ -366,6 +389,22 @@ class TestSmtpTransport:
         assert email.utils.parseaddr(smtp.sent["From"])[1] == "support@example.com"
         assert smtp.envelope_sender == "support@example.com"
 
+    def test_cleartext_skips_starttls_and_refuses_credentials(self):
+        _smtp(tls=False).send(_message())
+
+        assert "starttls" not in FakeSMTP.instances[0].calls
+        with pytest.raises(ValueError, match="never sent"):
+            _smtp(tls=False, username="u", password="p")
+
+    def test_a_send_past_its_deadline_is_aborted(self, monkeypatch):
+        ticks = iter([0.0, 0.0, 1000.0, 1000.0, 1000.0])
+        monkeypatch.setattr(mail_smtp.time, "monotonic", lambda: next(ticks))
+
+        with pytest.raises(MailError, match="deadline"):
+            _smtp().send(_message())
+
+        assert "send" not in FakeSMTP.instances[0].calls
+
     def test_a_partial_refusal_succeeds_and_warns_with_a_count(self, caplog):
         FakeSMTP.refused = {"gone@example.com": (550, b"unknown")}
 
@@ -409,7 +448,8 @@ class TestSmtpRobustness:
     def test_real_smtplib_never_looks_up_the_fqdn_and_refuses_a_cleartext_server(self, monkeypatch):
         """No fake: the genuine ``smtplib`` against a loopback server that does
         not offer STARTTLS."""
-        monkeypatch.undo()  # drop the autouse smtplib fakes
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
         monkeypatch.setattr(socket, "getfqdn", lambda *_a: pytest.fail("getfqdn was called"))
         server = socket.socket()
         server.bind(("127.0.0.1", 0))
@@ -436,11 +476,12 @@ class TestSmtpRobustness:
         thread.start()
         mail = SmtpMail("127.0.0.1", server.getsockname()[1], implicit_tls=False, from_address=SENDER, clock=_Clock())
 
-        with pytest.raises(MailError, match="STARTTLS"):
-            mail.send(_message())
-
-        thread.join(5)
-        server.close()
+        try:
+            with pytest.raises(MailError, match="STARTTLS"):
+                mail.send(_message())
+            thread.join(5)
+        finally:
+            server.close()
 
 
 class TestFailuresAreRedacted:
@@ -451,7 +492,7 @@ class TestFailuresAreRedacted:
             ("greeting", "unreachable"),
             ("auth", "authentication failed (status 535)"),
             ("data", "status 554"),
-            ("all-refused", "refused every recipient"),
+            ("all-refused", "refused every recipient (status 550)"),
             ("tls", "TLS negotiation"),
             ("unsupported", "lacks a required feature"),
         ],

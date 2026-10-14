@@ -131,12 +131,17 @@ class MailSettings:
             normally on a private network): never derive it from user input.
         from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
             for the SMTP schemes. Independent of ``username``.
+        secure: ``True`` (the default) requires verified TLS. ``False`` sends
+            over a cleartext connection and is accepted only for ``smtp://``,
+            only when the host resolves exclusively to private or loopback
+            addresses, and never together with ``username`` / ``password``.
         username: SMTP login, when the server requires authentication.
         password: SMTP password. Required with ``username``, and the reverse.
     """
 
     uri: str | None = None
     from_address: str = ""
+    secure: bool = True
     username: str | None = None
     password: str | None = field(default=None, repr=False)
 

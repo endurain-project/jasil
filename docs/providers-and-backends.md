@@ -440,11 +440,13 @@ best-effort, so a raised error is what makes a durable job retry — and
 CR/LF in a header value). `MemoryMail` validates through the same builder as
 `SmtpMail`, so a test fails on the message production would reject.
 
-!!! danger "TLS is mandatory and verified"
-    There is no cleartext scheme and no opt-out. `smtp://` refuses a server that
-    does not offer STARTTLS rather than falling back, certificates and hostnames
-    are verified, and AUTH is sent only after TLS is up. A bad configuration
-    fails `build_platform`; no connection is made at startup.
+!!! danger "TLS is verified unless you opt out, narrowly"
+    `smtp://` refuses a server that does not offer STARTTLS rather than falling
+    back, certificates and hostnames are verified, and AUTH is sent only after
+    TLS is up. `mail.secure = False` sends in cleartext, and is accepted only
+    for `smtp://` to a host resolving exclusively to private, loopback or
+    link-local addresses, and never with credentials. A bad configuration fails
+    `build_platform`; no connection is made at startup.
 
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.

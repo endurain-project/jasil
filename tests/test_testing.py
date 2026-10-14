@@ -37,7 +37,7 @@ class TestFixedClock:
 
         platform.mail.send(MailMessage(to=["a@example.com"], subject="s", text="t"))
 
-        assert platform.mail.built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
+        assert jasil_testing.memory_mail(platform).built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
 
     def test_it_satisfies_the_clock_provider(self):
         assert isinstance(jasil_testing.FixedClock(), ClockProvider)

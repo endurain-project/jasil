@@ -12,8 +12,9 @@ values flowing *through* it from your application.
 
 ## Server-side request forgery (CWE-918)
 
-**Where.** Reverse geocoding is the only capability that dials a host JASIL did
-not choose. The host is operator-configured, which makes it attacker-influenced
+**Where.** Reverse geocoding is the capability that dials a host JASIL did
+not choose and then returns its response (SMTP is covered under
+[Outbound mail](#outbound-mail)). The host is operator-configured, which makes it attacker-influenced
 whenever configuration is.
 
 **Mitigations.**
@@ -56,9 +57,12 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
 `SMTP` email policy rejects CR/LF in a header value; and `MailMessage` has no
 field through which a caller could set an arbitrary header.
 
-**Transport.** TLS is mandatory and verified, with no opt-out; `smtp://` refuses
-a server that does not offer STARTTLS rather than downgrading, and AUTH is sent
-only after TLS is up. Every socket operation has a fixed timeout.
+**Transport.** TLS is verified by default; `smtp://` refuses a server that does
+not offer STARTTLS rather than downgrading, and AUTH is sent only after TLS is
+up. The one opt-out, `mail.secure = False`, is cleartext and is accepted only for
+`smtp://`, only when the host resolves exclusively to private, loopback or
+link-local addresses (checked at startup), and never with credentials. Every
+socket operation has a fixed timeout and a whole send has a 90-second deadline.
 
 **Personal data and secrets in logs and job rows.** The job runner persists
 `str(error)` and logs `exc_info`, so `MailError` carries only a category and an

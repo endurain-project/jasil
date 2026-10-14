@@ -90,7 +90,8 @@ because you installed it.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path or query. The host must be a DNS name; IP literals (IPv4 or IPv6) are not accepted. |
+| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path or query. The host is a DNS name or an IP literal. |
+| `secure` | `True` | Verified TLS. `False` allows cleartext `smtp://` and only to a host that resolves exclusively to private, loopback or link-local addresses, with no `username` / `password`; anything else fails `build_platform`. |
 | `from_address` | `""` | `"addr"` or `"Name <addr>"`. Required for the SMTP schemes. Independent of `username`. |
 | `username` | `None` | SMTP login. Must be set together with `password`. |
 | `password` | `None` | SMTP password. Hidden from `repr`. |

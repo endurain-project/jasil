@@ -366,25 +366,35 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         logger.info("Mail enabled via memory (messages are recorded, not sent)")
         return MemoryMail(clock, mail.from_address)
 
-    if not hostname or not network.is_valid_hostname(hostname):
+    if not hostname:
         raise ValueError("mail.uri has no valid host")
     try:
         ipaddress.ip_address(hostname)
     except ValueError:
-        pass
-    else:
-        # Certificate verification matches names, so an IP literal could never pass it.
-        raise ValueError("mail.uri host must be a DNS name, not an IP address")
+        if not network.is_valid_hostname(hostname):
+            raise ValueError("mail.uri has no valid host") from None
     if port == 0:
         raise ValueError("mail.uri has an invalid port")
     if not mail.from_address:
         raise ValueError("mail.from_address is required for smtp:// and smtps://")
+    if not mail.secure:
+        # Cleartext is an explicit, narrow exception: a relay on the same host or
+        # private network (a local MTA, a dev catcher). AUTH is never sent over it.
+        if scheme == "smtps":
+            raise ValueError("mail.secure=False cannot be combined with smtps://")
+        if mail.username or mail.password:
+            raise ValueError("mail.secure=False cannot be combined with credentials")
+        reason = network.non_public_rejection_reason(hostname)
+        if reason is not None:
+            raise ValueError(f"mail.secure=False requires a private or loopback relay; the host {reason}")
+        logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
     resolved_port = port or _SMTP_PORTS[scheme]
     logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")
     return SmtpMail(
         hostname,
         resolved_port,
         implicit_tls=scheme == "smtps",
+        tls=mail.secure,
         from_address=mail.from_address,
         clock=clock,
         username=mail.username,

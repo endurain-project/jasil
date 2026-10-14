@@ -43,6 +43,11 @@ class MailMessageLike(Protocol):
     def reply_to(self) -> str | None: ...
 
 
+def _has_control_character(value: str) -> bool:
+    """True when ``value`` has a C0/C1 control character other than a tab."""
+    return any((ord(c) < 32 and c != "\t") or 127 <= ord(c) < 160 for c in value)
+
+
 def parse_address(value: str, *, role: str) -> Address:
     """Parse exactly one ``addr`` or ``Name <addr>`` into an :class:`Address`.
 
@@ -58,7 +63,7 @@ def parse_address(value: str, *, role: str) -> Address:
         ValueError: When ``value`` is not exactly one well-formed address.
     """
     invalid = ValueError(f"The {role} address is not a single valid email address")
-    if not isinstance(value, str) or "\r" in value or "\n" in value:
+    if not isinstance(value, str) or _has_control_character(value):
         raise invalid
     parsed = getaddresses([value])
     if len(parsed) != 1:
@@ -79,6 +84,11 @@ def parse_address(value: str, *, role: str) -> Address:
         # header parser would otherwise emit an RFC 2047 encoded-word inside the
         # addr-spec, which is invalid, and a relay without SMTPUTF8 would refuse it.
         ascii_domain = domain.encode("idna").decode("ascii")
+        # The ``idna`` codec is IDNA 2003 and silently maps some labels to a
+        # different name (``straße.de`` -> ``strasse.de``, a final sigma, a
+        # dropped joiner). Anything that does not round-trip is refused.
+        if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
+            raise invalid
         return Address(display_name=display_name, username=local, domain=ascii_domain)
     except Exception:
         # Deliberately not chained: the parser's message quotes the address.
@@ -99,7 +109,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     Raises:
         ValueError: When the message or sender is invalid.
     """
-    if isinstance(message.to, str):
+    if isinstance(message.to, str) or not isinstance(message.to, Sequence):
         raise ValueError("The mail recipients must be a sequence of addresses, not a single string")
     recipients = [parse_address(value, role="recipient") for value in message.to]
     if not recipients:
@@ -109,7 +119,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
             raise ValueError("The mail text and html bodies must be strings")
     if not message.text and not message.html:
         raise ValueError("A mail message needs a text or html body")
-    if not isinstance(message.subject, str) or "\r" in message.subject or "\n" in message.subject:
+    if not isinstance(message.subject, str) or _has_control_character(message.subject):
         raise ValueError("The mail subject must be a single line")
     from_address = parse_address(sender, role="sender")
     reply_to = parse_address(message.reply_to, role="reply-to") if message.reply_to else None

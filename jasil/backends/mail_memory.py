@@ -65,3 +65,9 @@ class MemoryMail:
             self.outbox.append(message)
             self.built.append(mime)
         return str(mime["Message-ID"])
+
+    def clear(self) -> None:
+        """Forget every recorded message, e.g. between two phases of a test."""
+        with self._lock:
+            self.outbox.clear()
+            self.built.clear()
