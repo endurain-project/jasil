@@ -256,10 +256,22 @@ the next call. See [Observability](observability.md#worker-registry).
 
 ## Sending mail
 
-There is no mail queue: durable jobs are the queue. Publish an event, and have a
-durable subscriber call `platform.mail.send(...)`. A raised `MailError` gets
-backoff, retries and the dead-letter queue like any other failure.
+There is no separate mail queue: durable jobs are the queue. Publish an event,
+and have a durable subscriber call `platform.mail.send(...)`. A raised
+`MailError` gets backoff, retries and the dead-letter queue like any other
+failure.
 
+- **Give mail its own named queue.** Register the mail subscriber with
+  `queue="mail"` (or similar), so a slow relay cannot hold up other subscribers'
+  jobs. The isolation comes from a dedicated worker group calling
+  `run_job_worker(queues=("mail",))`: the single local consumer still runs mail
+  serially with everything else.
+- **Configure the worker processes with a real relay.** In the distributed
+  shape the handler runs in the worker process, so that process's `mail.uri`
+  is the one that sends. `memory://` there records every message in that
+  process's memory and completes the job, with nothing delivered. The
+  [consistency checks](deployment-profiles.md#consistency-checks) count only
+  `web_workers`, so they cannot see a standalone worker to refuse it.
 - **An unconfigured mail backend is retried too.** `MailNotConfiguredError` is a
   `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
   budget before dead-lettering. Catch it in the handler if that is not wanted.
@@ -271,6 +283,10 @@ backoff, retries and the dead-letter queue like any other failure.
   The runner renews a job's lease when its turn in a batch begins, but a lease
   shorter than the handler lets the reaper requeue a job that is still being
   delivered: it is then sent twice, and the late worker's result is discarded.
+  The claiming worker stamps the lease, so a dedicated mail worker group can run
+  with a longer `jobs.lease_seconds` without slowing crash recovery for other
+  queues. Give it a small `jobs.batch_size` too, so that one process does not hold
+  claimed messages while the rest of the group sits idle.
 - **Do not put secrets or rendered bodies in the event payload.** Payloads are
   stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
   build the message inside the handler.

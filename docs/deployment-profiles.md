@@ -73,6 +73,12 @@ Queue-specific process counts provide independent concurrency, while several
 processes selecting the same queue compete through `SKIP LOCKED`. Redis may
 back state or the event bus, but durable jobs themselves do not use it.
 
+A standalone worker is still a process, and its handlers use its own platform.
+The [consistency checks](#consistency-checks) count only `web_workers`, so they
+do not see worker processes. Give workers the same shared capabilities as the
+API, and in particular a real mail relay: `memory://` mail in a worker records
+every message in that process and delivers none.
+
 ## custom
 
 No defaults at all; every capability is explicit. For deployments that do not
