@@ -323,12 +323,14 @@ def mark_job_failed(
         delay = jobs_backoff.backoff_seconds(job.attempts, base_seconds=base_seconds, max_seconds=max_seconds)
         values = {"available_at": now + timedelta(seconds=delay), "locked_at": None}
     # The guard is re-asserted in the ``UPDATE`` rather than read off ``job``: the
-    # reaper can requeue the row between the read and the write.
+    # reaper can requeue the row between the read and the write. ``attempts`` ties
+    # the decision above to the claim this worker observed, so a reclaim by the
+    # same worker in that window is not overwritten with a stale outcome.
     failed = cast(
         CursorResult[Any],
         db.execute(
             update(ProcessingJob)
-            .where(*_finishable(job_id, worker_id))
+            .where(*_finishable(job_id, worker_id), ProcessingJob.attempts == job.attempts)
             .values(
                 status=status,
                 last_error=truncated,

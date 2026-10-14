@@ -661,13 +661,21 @@ class TestSmtpRobustness:
             except OSError:
                 pass
 
-        real_get_socket = REAL_SMTP._get_socket
+        real_tracked = mail_smtp._tracked
 
-        def slow_get_socket(self, *args):
-            time.sleep(0.6)  # slow DNS / first address unreachable
-            return real_get_socket(self, *args)
+        def slow_tracked(base):
+            tracked = real_tracked(base)
+            real_dial = tracked._dial
 
-        monkeypatch.setattr(REAL_SMTP, "_get_socket", slow_get_socket)
+            def slow_dial(self, *args):
+                sock = real_dial(self, *args)
+                time.sleep(0.6)  # the socket is handed over only after the deadline
+                return sock
+
+            tracked._dial = slow_dial
+            return tracked
+
+        monkeypatch.setattr(mail_smtp, "_tracked", slow_tracked)
         threading.Thread(target=serve, daemon=True).start()
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["127.0.0.1"], None))
         mail = SmtpMail(
