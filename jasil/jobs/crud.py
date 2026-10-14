@@ -24,7 +24,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, func, select, update
+from sqlalchemy import CursorResult, and_, func, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -190,7 +190,7 @@ def claim_jobs(
 
 
 def renew_leases(
-    job_ids: list[str],
+    job_attempts: dict[str, int],
     *,
     worker_id: str,
     lease_seconds: int,
@@ -203,11 +203,13 @@ def renew_leases(
     A batch is claimed under one lease but run one job after another, so a late
     job would otherwise start with most of its lease already spent, or expired and
     requeued to another worker while this one still runs it. Only rows still
-    ``claimed`` by ``worker_id`` are touched: a job the reaper already requeued is
-    never taken back.
+    ``claimed`` by ``worker_id`` at the given attempt are touched: a job the reaper
+    already requeued is never taken back, even when this worker has since claimed
+    it again (a later attempt, whose lease is not this snapshot's to renew).
 
     Args:
-        job_ids: The jobs to renew.
+        job_attempts: The jobs to renew, as ``{job_id: attempt number of the
+            claim being renewed}``.
         worker_id: The lease holder.
         lease_seconds: New lease duration from ``now``.
         now: Current instant.
@@ -217,10 +219,15 @@ def renew_leases(
         The ids whose lease was renewed. A job missing from the result is no
         longer held by this worker and must not be run.
     """
-    if not job_ids:
+    if not job_attempts:
         return set()
     held = [
-        ProcessingJob.id.in_(job_ids),
+        or_(
+            *(
+                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
+                for job_id, attempts in job_attempts.items()
+            )
+        ),
         ProcessingJob.status == STATUS_CLAIMED,
         ProcessingJob.locked_by == worker_id,
     ]

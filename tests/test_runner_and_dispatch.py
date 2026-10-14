@@ -220,6 +220,32 @@ class TestJobRunner:
 
         assert len(ran) == 1
 
+    def test_a_job_the_same_worker_reclaimed_mid_batch_is_not_run_from_the_old_snapshot(self, runner, registry, db):
+        ran = []
+
+        def _handler(name, other):
+            def _run(_event):
+                ran.append(name)
+                # Requeued and claimed again by this same worker: still held by it,
+                # but a later attempt than the snapshot this batch holds.
+                db.execute(
+                    update(ProcessingJob)
+                    .where(ProcessingJob.subscriber_id == other)
+                    .values(attempts=ProcessingJob.attempts + 1)
+                )
+                db.commit()
+
+            return _run
+
+        registry.register("activity.created", "s", _handler("s", "t"))
+        registry.register("activity.created", "t", _handler("t", "s"))
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        runner.run_once()
+
+        assert len(ran) == 1
+
     @pytest.mark.parametrize("fails", [False, True])
     def test_a_job_that_outran_its_lease_is_left_to_its_new_holder(self, runner, registry, db, caplog, fails):
         def _handler(_event):

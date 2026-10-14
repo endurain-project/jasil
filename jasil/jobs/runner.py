@@ -134,7 +134,7 @@ class JobRunner:
         """
         with self._session_factory() as db:
             renewed = jobs_crud.renew_leases(
-                [item.id for item in remaining],
+                {item.id: item.attempts for item in remaining},
                 worker_id=self._worker_id,
                 lease_seconds=self._lease_seconds,
                 now=self._clock.now(),
