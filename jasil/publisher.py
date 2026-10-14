@@ -20,12 +20,12 @@ and mints the envelope. Delivery then takes one of two routes:
 
 **Delivery guarantee.** The producer's domain row is the source of truth; this
 publish is *best-effort* from the producer's perspective — failures are logged and
-swallowed so publishing never breaks the producer's own work. The outbox is not
-committed in the same transaction as the domain change (the ingestion path commits
-per-CRUD), so a crash between the domain commit and the outbox write can drop an
-event. Every subscriber must therefore have a reconciliation net — a backfill or
-sweeper that re-derives missed work). A future unit-of-work refactor can upgrade this to a genuinely
-atomic outbox; until then, "durable" means *retryable once written*, not *never
+swallowed so publishing never breaks the producer's own work. Plain :func:`publish`
+commits the outbox row on its own, so a crash between the domain commit and the
+outbox write can drop an event; :func:`publish_committing` and
+:func:`publish_on_commit` stage it in the caller's transaction instead. Every
+subscriber should still have a reconciliation net — a backfill or sweeper that
+re-derives missed work. "Durable" means *retryable once written*, not *never
 lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
 """
@@ -33,11 +33,13 @@ layer only knows the generic envelope.
 import logging
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
+from jasil._core.after_commit import run_after_commit
 from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
 from jasil.providers import EventRecorder
 from jasil.settings import get_settings
@@ -101,6 +103,45 @@ def _publish_on_bus(
         platform.events.publish(_mint(event_type, payload, source, metadata, schema_version))
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+
+
+def _dispatch_event(event: Event) -> None:
+    """Dispatch an already-minted event on the bus, logging and swallowing failure."""
+    try:
+        platform_runtime.get_active_platform().events.publish(event)
+        logger.debug("Dispatched %s (%s) on the event bus", event.event_type, event.event_id)
+    except Exception as err:
+        logger.error("Failed to publish event %s: %s", event.event_type, err, exc_info=err)
+
+
+def _stage_batch(
+    event_type: str,
+    payloads: Sequence[dict],
+    source: str,
+    metadata_of: Callable[[dict], dict | None],
+    schema_version: int,
+    db: Any,
+) -> None:
+    """Stage one outbox row per payload on ``db`` without committing.
+
+    A failure is logged and re-raised so the caller's unit of work rolls back as
+    a whole — no partial domain change, no orphaned event.
+    """
+    try:
+        platform = platform_runtime.get_active_platform()
+        now = platform.clock.now()
+        for payload in payloads:
+            event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+            _stage_in_outbox(platform.recorder, event, db=db, now=now, commit=False)
+    except Exception as err:
+        logger.error(
+            "Failed to stage %d %s event(s) in the domain transaction: %s",
+            len(payloads),
+            event_type,
+            err,
+            exc_info=err,
+        )
+        raise
 
 
 def publish(
@@ -235,24 +276,8 @@ def publish_many_committing(
     """
     metadata_of = metadata_for if metadata_for is not None else (lambda _payload: None)
     if db is not None and _durable_delivery_enabled(event_type):
-        # Atomic path: stage every outbox row inside the caller's transaction, so
-        # a failure here leaves it uncommitted and the caller rolls back as a
-        # whole — no partial domain change, no orphaned event.
-        try:
-            platform = platform_runtime.get_active_platform()
-            now = platform.clock.now()
-            for payload in payloads:
-                event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
-                _stage_in_outbox(platform.recorder, event, db=db, now=now, commit=False)
-        except Exception as err:
-            logger.error(
-                "Failed to stage %d %s event(s) in the domain transaction: %s",
-                len(payloads),
-                event_type,
-                err,
-                exc_info=err,
-            )
-            raise
+        # Atomic path: stage every outbox row inside the caller's transaction.
+        _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
         commit()
     else:
         # Best-effort path: the domain change is the source of truth, so commit it
@@ -261,3 +286,103 @@ def publish_many_committing(
         commit()
         for payload in payloads:
             _publish_on_bus(event_type, payload, source, metadata_of(payload), schema_version)
+
+
+def publish_on_commit(
+    event_type: str,
+    payload: dict,
+    *,
+    source: str,
+    metadata: dict | None = None,
+    db: Any,
+    schema_version: int = INITIAL_SCHEMA_VERSION,
+) -> None:
+    """Publish a domain event tied to ``db``'s commit, without owning the commit.
+
+    The caller stages the event and whoever owns the transaction commits whenever
+    it likes, so the publishing function composes with other writes in one atomic
+    unit of work.
+
+    * **Durable delivery enabled** (durable jobs on + a durable subscriber for
+      ``event_type``): the outbox row is staged on ``db`` immediately, uncommitted,
+      and commits (or rolls back) atomically with the caller's domain rows. A
+      staging failure propagates to the caller.
+    * **Otherwise** (best-effort bus path): the event is minted now (so the ambient
+      request id is captured) and held on the session. It is dispatched on the bus
+      only after ``db``'s **outermost** transaction commits, in publish order.
+      An event published inside a SAVEPOINT that is rolled back, or in a
+      transaction that is rolled back or closed, is discarded and never
+      dispatched. Dispatch failures are logged and swallowed.
+
+    "Outermost" is the session's outermost transaction. If the session joined an
+    external transaction (``join_transaction_mode="create_savepoint"``), its
+    ``commit()`` is that session's outermost commit even though the enclosing
+    transaction may still roll back.
+
+    Publishing starts the session's transaction if none is active. Sessions are
+    synchronous ``sqlalchemy.orm.Session`` instances; each carries its own pending
+    events, so concurrent sessions never see each other's.
+
+    Args:
+        event_type: The domain-owned channel, e.g. ``order.created``.
+        payload: Domain data for the event.
+        source: Origin label, e.g. ``api:create_order``.
+        metadata: Optional correlation context; merged with the ambient request id.
+        db: The producer's SQLAlchemy session (holds the uncommitted change).
+        schema_version: Payload schema version.
+
+    Returns:
+        None.
+    """
+    publish_many_on_commit(
+        event_type,
+        [payload],
+        source=source,
+        metadata_for=lambda _payload: metadata,
+        db=db,
+        schema_version=schema_version,
+    )
+
+
+def publish_many_on_commit(
+    event_type: str,
+    payloads: Sequence[dict],
+    *,
+    source: str,
+    metadata_for: Callable[[dict], dict | None] | None = None,
+    db: Any,
+    schema_version: int = INITIAL_SCHEMA_VERSION,
+) -> None:
+    """Publish many same-type events tied to ``db``'s commit.
+
+    The batch counterpart of :func:`publish_on_commit`, with the same delivery
+    routing and the same guarantee: best-effort events dispatch, in order, only
+    after the session's outermost transaction commits. An empty sequence is a
+    no-op; it neither stages anything nor starts a transaction.
+
+    Args:
+        event_type: The domain-owned channel shared by every event in the batch.
+        payloads: One payload per event.
+        source: Origin label, e.g. ``api:bulk_delete``.
+        metadata_for: Optional per-payload correlation metadata builder.
+        db: The producer's SQLAlchemy session (holds the uncommitted change).
+        schema_version: Payload schema version.
+
+    Returns:
+        None.
+    """
+    if db is None:
+        raise ValueError("publish_on_commit requires the producer's session as `db`")
+    if not payloads:
+        return
+    metadata_of: Callable[[dict], dict | None] = metadata_for if metadata_for is not None else (lambda _payload: None)
+    if _durable_delivery_enabled(event_type):
+        _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
+        return
+    for payload in payloads:
+        try:
+            event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+        except Exception as err:
+            logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+            continue
+        run_after_commit(db, partial(_dispatch_event, event))
