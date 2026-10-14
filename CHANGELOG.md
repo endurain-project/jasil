@@ -26,7 +26,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `SmtpMail` validates `from_address` at construction instead of failing every `send`.
 - `install_test_platform` no longer fails for settings with `mail.secure = False` and no `mail.uri`.
 - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
-- A mail address with a leading, trailing or doubled dot in the local part, or with an all-numeric last domain label (an unbracketed IP such as `a@1.2.3.4`), is refused with `ValueError` instead of being retried against a relay that will always reject it.
+- A mail address with a leading, trailing or doubled dot in the local part, or with an all-numeric last domain label (an unbracketed IP such as `a@1.2.3.4`), is refused with `ValueError` before any connection is made, rather than after a round trip to a relay that will always reject it.
+- `MailError.status` and `MailError.permanent` expose the SMTP status code, so a handler can stop retrying a 5xx without parsing the message.
+- The cleartext private-relay check also refuses the NAT64 local-use (`64:ff9b:1::/48`) and Teredo (`2001::/32`) ranges, which a gateway carries to public hosts.
+- `SmtpMail` waits for its deadline watchdog before closing the sockets.
 
 ## [0.5.1]
 

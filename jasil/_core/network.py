@@ -144,6 +144,14 @@ def _address_rejection_reason(
     return None
 
 
+# ``is_private`` is True for these, but a gateway carries them to a public IPv4
+# host (NAT64 local-use prefix, Teredo), so they do not "stay inside the network".
+_TUNNELLED_NETWORKS = (
+    ipaddress.IPv6Network("64:ff9b:1::/48"),
+    ipaddress.IPv6Network("2001::/32"),
+)
+
+
 def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
     """Resolve ``hostname`` and require every address to be private.
 
@@ -174,7 +182,11 @@ def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
             return [], _UNPARSEABLE
         if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
             addr = addr.ipv4_mapped
-        if not (addr.is_private or addr.is_loopback or addr.is_link_local) or addr.is_multicast:
+        if (
+            not (addr.is_private or addr.is_loopback or addr.is_link_local)
+            or addr.is_multicast
+            or any(addr in net for net in _TUNNELLED_NETWORKS)
+        ):
             return [], "resolves to a public address"
         if text not in addresses:
             addresses.append(text)

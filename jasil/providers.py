@@ -427,7 +427,20 @@ class MailError(RuntimeError):
     The message carries a failure category and, when there is one, the SMTP
     status code — never an address, a subject, a body or server-supplied text,
     because a job runner persists ``str(error)`` and logs it.
+
+    Attributes:
+        status: The SMTP status code, or ``None`` when the failure had none
+            (unreachable server, TLS failure, deadline).
     """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+    @property
+    def permanent(self) -> bool:
+        """True for a 5xx reply: the server will refuse a retry the same way."""
+        return self.status is not None and 500 <= self.status < 600
 
 
 class MailNotConfiguredError(MailError):

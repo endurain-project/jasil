@@ -145,8 +145,8 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
     # so the event_log dashboard never goes dark when durable jobs are enabled.
     recorder = _build_event_recorder(settings)
     clock = clock if clock is not None else SystemClock()
-    # Built first: it is pure validation, so a mistyped mail setting fails before
-    # any Redis client is connected and left open.
+    # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
+    # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_mail(settings, clock)
     return Platform(
         profile=profile,

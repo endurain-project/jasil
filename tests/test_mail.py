@@ -874,3 +874,11 @@ def test_idn_domain_with_uppercase_ascii_label_is_accepted():
     from jasil._core.mail_message import parse_address
 
     assert parse_address("a@Bücher.DE", role="recipient").domain == "xn--bcher-kva.DE"
+
+
+def test_mail_error_permanent_follows_the_status_code():
+    from jasil.providers import MailError
+
+    assert MailError("x", status=550).permanent
+    assert not MailError("x", status=451).permanent
+    assert not MailError("x").permanent

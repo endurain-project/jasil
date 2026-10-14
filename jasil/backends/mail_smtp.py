@@ -193,15 +193,23 @@ class SmtpMail:
         except MailError:
             raise
         except smtplib.SMTPAuthenticationError as error:
-            raise MailError(f"SMTP authentication failed (status {error.smtp_code})") from None
+            raise MailError(f"SMTP authentication failed (status {error.smtp_code})", status=error.smtp_code) from None
         except smtplib.SMTPRecipientsRefused as error:
             # Codes only: 4xx (greylisting, retry) and 5xx (unknown user) differ.
             codes = sorted({code for code, _ in error.recipients.values()})
-            raise MailError("SMTP server refused every recipient (status " + ", ".join(map(str, codes)) + ")") from None
+            # ``min``: one 4xx among 5xx is worth a retry, so it is not permanent.
+            raise MailError(
+                "SMTP server refused every recipient (status " + ", ".join(map(str, codes)) + ")",
+                status=codes[0] if codes else None,
+            ) from None
         except smtplib.SMTPConnectError as error:
-            raise MailError(f"SMTP server refused the connection (status {error.smtp_code})") from None
+            raise MailError(
+                f"SMTP server refused the connection (status {error.smtp_code})", status=error.smtp_code
+            ) from None
         except smtplib.SMTPResponseException as error:
-            raise MailError(f"SMTP server rejected the message (status {error.smtp_code})") from None
+            raise MailError(
+                f"SMTP server rejected the message (status {error.smtp_code})", status=error.smtp_code
+            ) from None
         except smtplib.SMTPNotSupportedError:
             raise MailError("SMTP server lacks a required feature (AUTH or SMTPUTF8)") from None
         except ssl.SSLError:
@@ -338,6 +346,9 @@ class SmtpMail:
             with contextlib.suppress(smtplib.SMTPException, OSError):
                 connection.quit()
             finished.set()
+            # Joined before the sockets are closed: a shutdown still in flight
+            # could otherwise hit a descriptor another thread has since reused.
+            watchdog.join()
             connection.close()
             watched = getattr(connection, "watched", None)
             if watched is not None:

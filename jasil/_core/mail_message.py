@@ -92,8 +92,8 @@ def parse_address(value: str, *, role: str) -> Address:
     if not local.isascii() or '"' in local:
         raise invalid
     # A dot-atom local part (RFC 5322): a strict relay answers a leading, trailing
-    # or doubled dot with a permanent 5xx, which would retry a job that can never
-    # succeed. Refuse it here, as a ``ValueError``, instead.
+    # or doubled dot with a permanent 5xx. Refuse it here, as a ``ValueError``,
+    # before a connection is spent on a message that can never be delivered.
     if local.startswith(".") or local.endswith(".") or ".." in local:
         raise invalid
     try:
@@ -113,7 +113,7 @@ def parse_address(value: str, *, role: str) -> Address:
         if not domain.isascii() and ascii_domain.encode("ascii").decode("idna").lower() != domain.lower():
             raise invalid
         # A written ``xn--`` label must be valid punycode: a relay answers one that
-        # is not with a permanent 5xx, which would retry a job that can never succeed.
+        # is not with a permanent 5xx; refuse it here without a round trip.
         if any(label.startswith("xn--") for label in ascii_domain.lower().split(".")):
             ascii_domain.encode("ascii").decode("idna")
         address = Address(display_name=display_name, username=local, domain=ascii_domain)

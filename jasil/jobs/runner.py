@@ -99,8 +99,19 @@ class JobRunner:
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.
             try:
-                if index and not self._still_held(snapshot, snapshots[index:]):
-                    continue
+                if index:
+                    try:
+                        held = self._still_held(snapshot, snapshots[index:])
+                    except Exception as error:
+                        # Not run: the lease is unknown, and the reaper requeues it.
+                        logger.error(
+                            "Durable job lease could not be renewed; skipping",
+                            exc_info=error,
+                            extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
+                        )
+                        continue
+                    if not held:
+                        continue
                 self._run_job(snapshot)
             except Exception as error:
                 logger.error(
