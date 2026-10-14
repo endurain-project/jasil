@@ -189,6 +189,47 @@ def claim_jobs(
     return list(claimed)
 
 
+def renew_leases(
+    job_ids: list[str],
+    *,
+    worker_id: str,
+    lease_seconds: int,
+    now: datetime,
+    db: Session,
+) -> None:
+    """
+    Extend the lease of claimed jobs this worker still holds.
+
+    A batch is claimed under one lease but run one job after another, so a late
+    job would otherwise start with most of its lease already spent, or expired and
+    requeued to another worker while this one still runs it. Only rows still
+    ``claimed`` by ``worker_id`` are touched: a job the reaper already requeued is
+    never taken back.
+
+    Args:
+        job_ids: The jobs to renew.
+        worker_id: The lease holder.
+        lease_seconds: New lease duration from ``now``.
+        now: Current instant.
+        db: Active database session.
+
+    Returns:
+        None.
+    """
+    if not job_ids:
+        return
+    db.execute(
+        update(ProcessingJob)
+        .where(
+            ProcessingJob.id.in_(job_ids),
+            ProcessingJob.status == STATUS_CLAIMED,
+            ProcessingJob.locked_by == worker_id,
+        )
+        .values(lease_expires_at=now + timedelta(seconds=lease_seconds), updated_at=now)
+    )
+    db.commit()
+
+
 def mark_job_completed(job_id: str, *, now: datetime, db: Session) -> None:
     """
     Mark a claimed job ``completed`` and release its lease.

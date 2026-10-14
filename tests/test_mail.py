@@ -693,6 +693,29 @@ class TestSmtpRobustness:
         finally:
             server.close()
 
+    def test_a_name_with_many_dead_addresses_cannot_connect_past_the_deadline(self, monkeypatch):
+        entries = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{n}", 587)) for n in range(1, 6)]
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: entries)
+        dialed: list[str] = []
+
+        def connect(self, address):
+            dialed.append(address[0])
+            time.sleep(0.1)
+            raise OSError("unreachable")
+
+        monkeypatch.setattr(socket.socket, "connect", connect)
+        connection = mail_smtp._tracked(smtplib.SMTP)(local_hostname="localhost", timeout=30)
+        connection.deadline = time.monotonic() + 0.25
+
+        with pytest.raises(OSError):
+            connection._get_socket("relay.test", 587, 30)
+
+        assert 1 < len(dialed) < 5
+
+    def test_a_malformed_sender_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="sender address"):
+            _smtp(from_address="not an address")
+
     def test_cleartext_cannot_be_combined_with_implicit_tls(self):
         with pytest.raises(ValueError, match="implicit TLS"):
             _smtp(tls=False, implicit_tls=True)

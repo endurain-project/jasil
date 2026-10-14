@@ -108,7 +108,7 @@ def install_test_platform(
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
     if not configured.mail.uri:
         # Unconfigured mail would raise on every send; a test wants it recorded.
-        recording = replace(configured, mail=replace(configured.mail, uri="memory://"))
+        recording = replace(configured, mail=replace(configured.mail, uri="memory://", secure=True))
         refused = capabilities.check_mail_consistency(
             profile=recording.profile,
             web_workers=recording.web_workers,

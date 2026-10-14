@@ -25,15 +25,17 @@ import time
 from email.message import EmailMessage
 
 import jasil._core.network as network
-from jasil._core.mail_message import build_mime
+from jasil._core.mail_message import build_mime, parse_address
 from jasil.providers import ClockProvider, MailError, MailMessage
 
 logger = logging.getLogger(__name__)
 
 # Applied to every socket operation of a send (seconds).
 _TIMEOUT_SECONDS = 30
-# Ceiling on a whole send, so a slow server cannot outlive a job lease and be
-# requeued while still being delivered to. A socket timeout alone cannot enforce
+# Ceiling on a whole send. It bounds one job; ``JobRunner`` renews the lease of
+# each job in a batch when its turn starts, so a lease longer than this is what
+# keeps a slow server from being delivered to after a requeue. A socket timeout
+# alone cannot enforce
 # it: every read restarts the timeout, so a server dripping its reply a byte at a
 # time never trips one. A watchdog shuts the socket down when it expires, and
 # keeps doing so until the send ends: the socket may not exist yet at the
@@ -71,17 +73,45 @@ def _tracked(base: type[smtplib.SMTP]) -> type[smtplib.SMTP]:
 
     class Tracked(base):  # type: ignore[valid-type, misc]
         watched: socket.socket | None = None
+        deadline: float | None = None
+
+        def _dial(self, host: str, port: int, timeout: float) -> socket.socket:
+            """Connect like ``socket.create_connection``, stopping at the deadline.
+
+            ``create_connection`` gives every address of a multi-homed name the
+            full timeout, which the watchdog cannot interrupt (there is no socket
+            yet), so a few dead addresses would run the connect past the deadline.
+            """
+            source = getattr(self, "source_address", None)
+            if self.deadline is None:
+                return socket.create_connection((host, port), timeout, source)
+            error: OSError = TimeoutError(_DEADLINE_EXCEEDED)
+            for family, kind, proto, _, address in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                candidate = socket.socket(family, kind, proto)
+                try:
+                    candidate.settimeout(min(timeout, remaining))
+                    if source:
+                        candidate.bind(source)
+                    candidate.connect(address)
+                    return candidate
+                except OSError as failure:
+                    error = failure
+                    candidate.close()
+            raise error
 
         def _get_socket(self, host: str, port: int, timeout: float) -> socket.socket:
             if issubclass(base, smtplib.SMTP_SSL):
-                raw = socket.create_connection((host, port), timeout, self.source_address)
+                raw = self._dial(host, port, timeout)
                 self.watched = raw.dup()
                 try:
                     return self.context.wrap_socket(raw, server_hostname=self._host)
                 except BaseException:
                     raw.close()
                     raise
-            raw = super()._get_socket(host, port, timeout)
+            raw = self._dial(host, port, timeout)
             self.watched = raw.dup()
             return raw
 
@@ -125,6 +155,9 @@ class SmtpMail:
         # than raising a ``UnicodeEncodeError`` from every ``send``.
         if not ((username or "").isascii() and (password or "").isascii()):
             raise ValueError("username and password must be ASCII")
+        # Parsed here so a bad sender fails at build time, not as a ``ValueError``
+        # from every ``send`` that a job runner would retry to exhaustion.
+        parse_address(from_address, role="sender")
         if not tls and (username or password):
             raise ValueError("credentials are never sent without TLS")
         if not tls and implicit_tls:
@@ -236,8 +269,9 @@ class SmtpMail:
             # after the deadline.
             if time.monotonic() >= deadline:
                 raise MailError(_DEADLINE_EXCEEDED)
-            # ``smtplib`` dials with ``connection.timeout``; cap it to the time
-            # left so a connect begun near the deadline cannot run past it.
+            # ``connection.timeout`` bounds each address tried; cap it to the time
+            # left, and the dial itself stops at the deadline between addresses,
+            # so a connect begun near the deadline cannot run past it.
             connection.timeout = max(min(_TIMEOUT_SECONDS, deadline - time.monotonic()), 0.001)
             try:
                 return connection.connect(host, self._port)
@@ -265,6 +299,7 @@ class SmtpMail:
             )
         else:
             connection = _tracked(smtplib.SMTP)(local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS)
+        connection.deadline = deadline  # type: ignore[attr-defined]
         expired = threading.Event()
         finished = threading.Event()
         watchdog = threading.Thread(target=self._watch, args=(connection, expired, finished), daemon=True)

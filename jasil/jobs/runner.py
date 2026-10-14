@@ -95,10 +95,14 @@ class JobRunner:
             snapshots = [self._snapshot(job) for job in claimed]
         if snapshots:
             logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
-        for snapshot in snapshots:
+        for index, snapshot in enumerate(snapshots):
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.
             try:
+                if index:
+                    # The batch was claimed under one lease, but jobs run in turn:
+                    # give the rest a full lease from this job's start.
+                    self._renew(snapshots[index:])
                 self._run_job(snapshot)
             except Exception as error:
                 logger.error(
@@ -107,6 +111,16 @@ class JobRunner:
                     extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                 )
         return len(snapshots)
+
+    def _renew(self, remaining: list[ClaimedJob]) -> None:
+        with self._session_factory() as db:
+            jobs_crud.renew_leases(
+                [job.id for job in remaining],
+                worker_id=self._worker_id,
+                lease_seconds=self._lease_seconds,
+                now=self._clock.now(),
+                db=db,
+            )
 
     def reap_once(self) -> int:
         """

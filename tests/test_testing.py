@@ -49,6 +49,14 @@ class TestTestMail:
 
         assert isinstance(jasil_testing.memory_mail(platform), jasil_testing.MemoryMail)
 
+    def test_an_unset_uri_with_secure_false_is_still_recorded(self, tmp_path):
+        """``secure=False`` is valid with no URI (the build ignores it); it must not break the helper."""
+        configured = jasil_settings.JasilSettings(mail=jasil_settings.MailSettings(secure=False))
+
+        platform = jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert isinstance(jasil_testing.memory_mail(platform), jasil_testing.MemoryMail)
+
     def test_a_real_backend_is_refused_by_memory_mail(self, tmp_path):
         configured = jasil_settings.JasilSettings(
             mail=jasil_settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c")

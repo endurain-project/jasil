@@ -177,6 +177,25 @@ class TestJobRunner:
 
         assert runner.reap_once() == 1
 
+    def test_later_jobs_of_a_batch_get_a_fresh_lease_when_their_turn_comes(self, runner, registry, clock, db):
+        leases = []
+
+        def _handler(_event):
+            clock.advance(50)  # each job eats most of the 60 s lease
+            db.rollback()
+            leases.append([j.lease_expires_at for j in db.query(ProcessingJob).filter_by(status="claimed")])
+
+        registry.register("activity.created", "s", _handler)
+        registry.register("activity.created", "t", _handler)
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        assert runner.run_once() == 2
+
+        # While the second job runs, its lease was renewed past the first job's 50 s.
+        (second,) = leases[1]
+        assert second.replace(tzinfo=None) == (T0 + timedelta(seconds=50 + 60)).replace(tzinfo=None)
+
 
 class TestInProcessBus:
     def test_a_published_event_reaches_its_subscriber(self):

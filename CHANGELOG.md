@@ -20,6 +20,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Fixed
 
+- `JobRunner` renews the lease of the remaining jobs of a batch as each one starts, so a late job in a batch is no longer requeued (and run twice) while still running.
+- An SMTP connect to a name with several unreachable addresses no longer runs past the 90-second send deadline.
+- `SmtpMail` validates `from_address` at construction instead of failing every `send`.
+- `install_test_platform` no longer fails for settings with `mail.secure = False` and no `mail.uri`.
 - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
 - A mail address with a leading, trailing or doubled dot in the local part is refused with `ValueError` instead of being retried against a relay that will always reject it.
 
