@@ -107,6 +107,10 @@ def parse_address(value: str, *, role: str) -> Address:
             raise invalid
         if not domain.isascii() and ascii_domain.encode("ascii").decode("idna") != domain.lower():
             raise invalid
+        # A written ``xn--`` label must be valid punycode: a relay answers one that
+        # is not with a permanent 5xx, which would retry a job that can never succeed.
+        if any(label.startswith("xn--") for label in ascii_domain.lower().split(".")):
+            ascii_domain.encode("ascii").decode("idna")
         address = Address(display_name=display_name, username=local, domain=ascii_domain)
         # ``Address`` re-quotes a local part holding a space, a backslash or other
         # specials; the address mailed must be the one the caller wrote.

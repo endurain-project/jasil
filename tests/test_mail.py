@@ -246,6 +246,11 @@ class TestBuildMime:
         with pytest.raises(ValueError):
             build_mime(_message(to=[address]), sender=SENDER, now=NOW)
 
+    @pytest.mark.parametrize("address", ["a@xn--zz.com", "a@ok.xn--a-.com"])
+    def test_an_invalid_punycode_label_is_rejected(self, address):
+        with pytest.raises(ValueError):
+            build_mime(_message(to=[address]), sender=SENDER, now=NOW)
+
     def test_none_and_non_sequence_recipients_are_value_errors(self):
         for to in (None, {"a@b.com"}):
             with pytest.raises(ValueError):

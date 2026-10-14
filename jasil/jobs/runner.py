@@ -99,10 +99,8 @@ class JobRunner:
             # A DB error finishing one job must not abort the rest of the batch;
             # its lease simply expires and the reaper requeues it.
             try:
-                if index:
-                    # The batch was claimed under one lease, but jobs run in turn:
-                    # give the rest a full lease from this job's start.
-                    self._renew(snapshots[index:])
+                if index and not self._still_held(snapshot, snapshots[index:]):
+                    continue
                 self._run_job(snapshot)
             except Exception as error:
                 logger.error(
@@ -112,15 +110,28 @@ class JobRunner:
                 )
         return len(snapshots)
 
-    def _renew(self, remaining: list[ClaimedJob]) -> None:
+    def _still_held(self, job: ClaimedJob, remaining: list[ClaimedJob]) -> bool:
+        """Renew the leases of the rest of the batch; False when ``job`` was lost.
+
+        The batch was claimed under one lease, but jobs run in turn: each one gets
+        a full lease from the start of its turn. A job the reaper already requeued
+        belongs to another worker now and must not be run here as well.
+        """
         with self._session_factory() as db:
-            jobs_crud.renew_leases(
-                [job.id for job in remaining],
+            renewed = jobs_crud.renew_leases(
+                [item.id for item in remaining],
                 worker_id=self._worker_id,
                 lease_seconds=self._lease_seconds,
                 now=self._clock.now(),
                 db=db,
             )
+        if job.id in renewed:
+            return True
+        logger.warning(
+            "Durable job lease was lost before its turn; skipping",
+            extra={"job_id": job.id, "subscriber": job.subscriber_id},
+        )
+        return False
 
     def reap_once(self) -> int:
         """

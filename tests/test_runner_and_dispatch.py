@@ -11,6 +11,7 @@ different contract:
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import update
 
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
@@ -195,6 +196,29 @@ class TestJobRunner:
         # While the second job runs, its lease was renewed past the first job's 50 s.
         (second,) = leases[1]
         assert second.replace(tzinfo=None) == (T0 + timedelta(seconds=50 + 60)).replace(tzinfo=None)
+
+    def test_a_job_whose_lease_was_lost_mid_batch_is_not_run_again(self, runner, registry, db):
+        ran = []
+
+        def _handler(name, other):
+            def _run(_event):
+                ran.append(name)
+                # The reaper requeued the other job and another worker took it.
+                db.execute(
+                    update(ProcessingJob).where(ProcessingJob.subscriber_id == other).values(locked_by="other-worker")
+                )
+                db.commit()
+
+            return _run
+
+        registry.register("activity.created", "s", _handler("s", "t"))
+        registry.register("activity.created", "t", _handler("t", "s"))
+        self._enqueue(db, subscriber="s")
+        self._enqueue(db, subscriber="t")
+
+        runner.run_once()
+
+        assert len(ran) == 1
 
 
 class TestInProcessBus:

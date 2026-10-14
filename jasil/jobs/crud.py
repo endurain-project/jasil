@@ -196,7 +196,7 @@ def renew_leases(
     lease_seconds: int,
     now: datetime,
     db: Session,
-) -> None:
+) -> set[str]:
     """
     Extend the lease of claimed jobs this worker still holds.
 
@@ -214,11 +214,12 @@ def renew_leases(
         db: Active database session.
 
     Returns:
-        None.
+        The ids whose lease was renewed. A job missing from the result is no
+        longer held by this worker and must not be run.
     """
     if not job_ids:
-        return
-    db.execute(
+        return set()
+    renewed = db.execute(
         update(ProcessingJob)
         .where(
             ProcessingJob.id.in_(job_ids),
@@ -226,8 +227,11 @@ def renew_leases(
             ProcessingJob.locked_by == worker_id,
         )
         .values(lease_expires_at=now + timedelta(seconds=lease_seconds), updated_at=now)
+        .returning(ProcessingJob.id)
     )
+    ids = set(renewed.scalars().all())
     db.commit()
+    return ids
 
 
 def mark_job_completed(job_id: str, *, now: datetime, db: Session) -> None:
