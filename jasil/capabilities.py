@@ -127,6 +127,7 @@ def _mail_backend_of(uri: str | None, *, secure: bool) -> str:
     scheme, separator, _ = uri.partition("://")
     if not (separator and scheme.isalnum()):
         return "invalid"
+    scheme = scheme.lower()
     return f"{scheme} (cleartext)" if scheme == "smtp" and not secure else scheme
 
 
@@ -369,7 +370,9 @@ def check_mail_consistency(
     topology = resolve_topology(profile, web_workers)
     if not topology.requires_shared_state:
         return []
-    if not mail_uri.strip().lower().startswith("memory://"):
+    # ``build_platform`` accepts only the literal ``scheme://`` form, so this is
+    # the same test the builder applies.
+    if mail_uri.partition("://")[0].lower() != "memory":
         return []
     return [
         f"{mail_label} resolves to the in-memory mail recorder, but "

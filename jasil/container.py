@@ -23,7 +23,7 @@ production mystery.
 
 import ipaddress
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
 import jasil._core.network as network
@@ -74,13 +74,13 @@ class Platform:
         geocoding: Reverse-geocoding provider. Always present — when geocoding is
             unconfigured or misconfigured this is a no-op backend, so callers
             never branch on whether the capability exists.
+        recorder: Event-log recorder, or ``None`` when event logging is disabled.
+            Shared by the event bus (best-effort delivery) and the publish facade
+            (durable delivery) so both paths land in the event_log dashboard.
         mail: Outbound-mail provider. Always present — when mail is unconfigured
             this is a backend whose ``send`` raises
             :class:`~jasil.providers.MailNotConfiguredError`, so a message is
             never dropped silently.
-        recorder: Event-log recorder, or ``None`` when event logging is disabled.
-            Shared by the event bus (best-effort delivery) and the publish facade
-            (durable delivery) so both paths land in the event_log dashboard.
     """
 
     profile: DeploymentProfile
@@ -89,9 +89,9 @@ class Platform:
     events: EventBusProvider
     lock: LockProvider
     clock: ClockProvider
-    geocoding: GeocodingProvider
-    mail: MailProvider
-    recorder: EventRecorder | None
+    geocoding: GeocodingProvider = field(default_factory=NullGeocoding)
+    recorder: EventRecorder | None = None
+    mail: MailProvider = field(default_factory=NullMail)
 
     def close(self) -> None:
         """Release what the platform owns: the bus consumer and the Redis clients.
@@ -337,6 +337,10 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         return NullMail()
     # The URI is never echoed in an error: it is operator input, but keeping
     # error text free of it costs nothing and keeps a mistyped credential out of logs.
+    # ``urlsplit`` quietly strips whitespace and accepts ``memory:``; require the
+    # literal form so what is built is what the consistency check inspected.
+    if mail.uri != mail.uri.strip() or "://" not in mail.uri:
+        raise ValueError("mail.uri is not a valid URI")
     try:
         parts = urlsplit(mail.uri)
         port = parts.port

@@ -34,8 +34,11 @@ _TIMEOUT_SECONDS = 30
 # Ceiling on a whole send, so a slow server cannot outlive a job lease and be
 # requeued while still being delivered to. A socket timeout alone cannot enforce
 # it: every read restarts the timeout, so a server dripping its reply a byte at a
-# time never trips one. A watchdog shuts the socket down when it expires.
+# time never trips one. A watchdog shuts the socket down when it expires, and
+# keeps doing so until the send ends: the socket may not exist yet at the
+# deadline (a slow connect), and a single shutdown would then be missed.
 _DEADLINE_SECONDS = 90
+_WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
 
 
@@ -157,15 +160,37 @@ class SmtpMail:
             sock.settimeout(min(_TIMEOUT_SECONDS, remaining))
 
     @staticmethod
-    def _expire(connection: smtplib.SMTP, expired: threading.Event) -> None:
-        """Watchdog: flag the deadline and unblock whatever read is in progress."""
+    def _watch(connection: smtplib.SMTP, expired: threading.Event, finished: threading.Event) -> None:
+        """Watchdog: at the deadline, flag it and keep unblocking reads until done."""
+        if finished.wait(_DEADLINE_SECONDS):
+            return
         expired.set()
-        sock = getattr(connection, "sock", None)
-        if sock is not None:
-            # The plain-socket method, on purpose: ``SSLSocket.shutdown`` also
-            # tears down TLS state the blocked thread is still using.
-            with contextlib.suppress(OSError):
-                socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        while not finished.is_set():
+            sock = getattr(connection, "sock", None)
+            if sock is not None:
+                # The plain-socket method, on purpose: ``SSLSocket.shutdown`` also
+                # tears down TLS state the blocked thread is still using.
+                with contextlib.suppress(OSError):
+                    socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            finished.wait(_WATCH_INTERVAL_SECONDS)
+
+    def _connect_host(self) -> str:
+        """The host to dial: the configured name, or for cleartext a vetted address.
+
+        Cleartext is allowed only to a private relay, and the name was checked
+        once at startup. DNS can change since, so it is resolved and checked again
+        for each send, and the connection goes to the address that was checked
+        rather than to the name, so it cannot be re-resolved in between.
+
+        Raises:
+            MailError: When the host no longer resolves to private addresses.
+        """
+        if self._tls:
+            return self._host
+        addresses, reason = network.resolve_private_addresses(self._host)
+        if reason is not None or not addresses:
+            raise MailError("SMTP relay no longer resolves to a private address; cleartext refused")
+        return addresses[0]
 
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
         """Connect, secure, authenticate and send; returns refused recipients."""
@@ -181,12 +206,12 @@ class SmtpMail:
         else:
             connection = smtplib.SMTP(local_hostname=self._local_hostname, timeout=_TIMEOUT_SECONDS)
         expired = threading.Event()
-        watchdog = threading.Timer(_DEADLINE_SECONDS, self._expire, (connection, expired))
-        watchdog.daemon = True
+        finished = threading.Event()
+        watchdog = threading.Thread(target=self._watch, args=(connection, expired, finished), daemon=True)
         watchdog.start()
         try:
             try:
-                code, reply = connection.connect(self._host, self._port)
+                code, reply = connection.connect(self._connect_host(), self._port)
                 if code != 220:
                     raise smtplib.SMTPConnectError(code, reply)
                 if self._tls and not self._implicit_tls:
@@ -214,7 +239,7 @@ class SmtpMail:
             # would then send it twice). Still under the watchdog, so QUIT is bounded.
             with contextlib.suppress(smtplib.SMTPException, OSError):
                 connection.quit()
-            watchdog.cancel()
+            finished.set()
             connection.close()
 
     @staticmethod

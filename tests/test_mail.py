@@ -409,12 +409,32 @@ class TestSmtpTransport:
         assert email.utils.parseaddr(smtp.sent["From"])[1] == "support@example.com"
         assert smtp.envelope_sender == "support@example.com"
 
-    def test_cleartext_skips_starttls_and_refuses_credentials(self):
+    def test_cleartext_skips_starttls_and_refuses_credentials(self, monkeypatch):
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["10.0.0.5"], None))
         _smtp(tls=False).send(_message())
 
         assert "starttls" not in FakeSMTP.instances[0].calls
+        assert FakeSMTP.instances[0].host == "10.0.0.5"  # pinned to the vetted address
         with pytest.raises(ValueError, match="never sent"):
             _smtp(tls=False, username="u", password="p")
+
+    def test_cleartext_is_refused_when_the_relay_stops_resolving_privately(self, monkeypatch):
+        monkeypatch.setattr(
+            mail_smtp.network, "resolve_private_addresses", lambda host: ([], "resolves to a public address")
+        )
+
+        with pytest.raises(MailError, match="cleartext refused"):
+            _smtp(tls=False).send(_message())
+
+        assert "connect" not in FakeSMTP.instances[0].calls
+
+    def test_a_message_is_hashable_with_a_list_of_recipients(self):
+        assert hash(_message()) == hash(_message())
+
+    @pytest.mark.parametrize("value", ["Name <a@b.com", "a@b.com>"])
+    def test_an_unbalanced_angle_bracket_is_refused(self, value):
+        with pytest.raises(ValueError, match="valid email"):
+            build_mime(_message(to=[value]), sender=SENDER, now=NOW)
 
     def test_a_send_past_its_deadline_is_aborted(self, monkeypatch):
         ticks = iter([0.0, 0.0, 1000.0, 1000.0, 1000.0])
@@ -471,6 +491,45 @@ class TestSmtpRobustness:
         _smtp().send(_message())
 
         assert FakeSMTP.instances[0].local_hostname == "localhost"
+
+    def test_a_slow_connect_cannot_outlive_the_deadline_either(self, monkeypatch):
+        """The watchdog fires before any socket exists; it must keep trying."""
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp, "_DEADLINE_SECONDS", 0.3)
+        monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                with conn:
+                    for _ in range(40):  # a multi-line greeting dripped over 4s
+                        conn.sendall(b"220-x\r\n")
+                        time.sleep(0.1)
+            except OSError:
+                pass
+
+        real_get_socket = REAL_SMTP._get_socket
+
+        def slow_get_socket(self, *args):
+            time.sleep(0.6)  # slow DNS / first address unreachable
+            return real_get_socket(self, *args)
+
+        monkeypatch.setattr(REAL_SMTP, "_get_socket", slow_get_socket)
+        threading.Thread(target=serve, daemon=True).start()
+        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["127.0.0.1"], None))
+        mail = SmtpMail(
+            "127.0.0.1", server.getsockname()[1], implicit_tls=False, tls=False, from_address=SENDER, clock=_Clock()
+        )
+
+        started = time.monotonic()
+        with pytest.raises(MailError, match="deadline"):
+            mail.send(_message())
+
+        assert time.monotonic() - started < 2.5
+        server.close()
 
     @pytest.mark.parametrize("slow", ["greeting", "MAIL"])
     def test_a_server_dripping_its_reply_cannot_outlive_the_deadline(self, monkeypatch, slow):

@@ -65,6 +65,9 @@ def parse_address(value: str, *, role: str) -> Address:
     invalid = ValueError(f"The {role} address is not a single valid email address")
     if not isinstance(value, str) or _has_control_character(value):
         raise invalid
+    # ``getaddresses`` accepts ``Name <addr`` (no closing bracket) and repairs it.
+    if value.count("<") != value.count(">"):
+        raise invalid
     parsed = getaddresses([value])
     if len(parsed) != 1:
         raise invalid

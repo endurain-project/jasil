@@ -141,33 +141,46 @@ def _address_rejection_reason(
     return None
 
 
-def non_public_rejection_reason(hostname: str) -> str | None:
-    """Return why ``hostname`` is not a purely private destination, or None.
+def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
+    """Resolve ``hostname`` and require every address to be private.
 
-    The inverse of :func:`host_rejection_reason`, for traffic that must *stay*
-    inside the network (cleartext mail to a local relay). Every address the name
-    resolves to must be private, loopback or link-local; one public answer, or a
-    name that does not resolve, refuses it. Like the SSRF guard this is a
-    time-of-check test.
+    For traffic that must *stay* inside the network (cleartext mail to a local
+    relay). Every address the name resolves to must be private, loopback or
+    link-local; one public answer, or a name that does not resolve, refuses it.
+    Returning the addresses lets a caller connect to the one it validated, which
+    closes the gap between this check and the connection (DNS rebinding).
 
     Args:
         hostname: A DNS name or IP literal, without a port.
 
     Returns:
-        A short reason, or ``None`` when every address is non-public.
+        ``(addresses, None)`` when all are non-public, else ``([], reason)``.
     """
     try:
         infos = socket.getaddrinfo(hostname, None)
     except (socket.gaierror, UnicodeError):
-        return _UNRESOLVABLE
+        return [], _UNRESOLVABLE
+    addresses: list[str] = []
     for info in infos:
+        text = str(info[4][0]).split("%", 1)[0]
         try:
-            addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+            addr = ipaddress.ip_address(text)
         except ValueError:
-            return _UNPARSEABLE
+            return [], _UNPARSEABLE
         if not (addr.is_private or addr.is_loopback or addr.is_link_local) or addr.is_multicast:
-            return "resolves to a public address"
-    return None
+            return [], "resolves to a public address"
+        if text not in addresses:
+            addresses.append(text)
+    return addresses, None
+
+
+def non_public_rejection_reason(hostname: str) -> str | None:
+    """Return why ``hostname`` is not a purely private destination, or None.
+
+    See :func:`resolve_private_addresses`; this is the check-only form used when
+    the platform is built.
+    """
+    return resolve_private_addresses(hostname)[1]
 
 
 def host_rejection_reason(

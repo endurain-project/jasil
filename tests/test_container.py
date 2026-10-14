@@ -294,6 +294,37 @@ class TestDeploymentConsistencyGate:
 class TestMailResolution:
     """A mail misconfiguration fails the build; an unset one never drops silently."""
 
+    @pytest.mark.parametrize("uri", ["memory:", " memory://", "memory://\n"])
+    def test_a_non_literal_memory_uri_is_refused(self, uri):
+        with pytest.raises(ValueError, match="not a valid URI"):
+            container._build_mail(_settings(mail=settings.MailSettings(uri=uri)), SystemClock())
+
+    def test_a_multi_process_memory_uri_variant_cannot_slip_past_the_gate(self):
+        for uri in ("memory:", "Memory://"):
+            s = _settings(web_workers=4, mail=settings.MailSettings(uri=uri))
+            try:
+                container.build_platform(s)
+            except ValueError:
+                continue
+            raise AssertionError(f"{uri!r} built in a multi-process deployment")
+
+    def test_a_platform_built_by_hand_defaults_geocoding_and_mail(self):
+        from jasil.backends.geocoding_http import NullGeocoding
+
+        base = container.build_platform(_settings())
+        bare = container.Platform(
+            profile=base.profile,
+            state=base.state,
+            storage=base.storage,
+            events=base.events,
+            lock=base.lock,
+            clock=base.clock,
+        )
+
+        assert isinstance(bare.mail, NullMail)
+        assert isinstance(bare.geocoding, NullGeocoding)
+        assert bare.recorder is None
+
     @staticmethod
     def _build(**mail):
         return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())

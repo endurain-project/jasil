@@ -136,8 +136,8 @@ class MailSettings:
             for the SMTP schemes. Independent of ``username``.
         secure: ``True`` (the default) requires verified TLS. ``False`` sends
             over a cleartext connection and is accepted only for ``smtp://``,
-            only when the host resolves exclusively to private or loopback
-            addresses, and never together with ``username`` / ``password``.
+            only when the host resolves exclusively to private, loopback or
+            link-local addresses (re-checked on every send), and never together with ``username`` / ``password``.
             That check resolves the host while the platform is built, so it
             needs a working resolver at startup.
         username: SMTP login, when the server requires authentication.

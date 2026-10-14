@@ -415,6 +415,11 @@ class MailMessage:
     html: str | None = None
     reply_to: str | None = None
 
+    def __hash__(self) -> int:
+        # ``to`` is usually a list, which the generated hash cannot digest.
+        recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
+        return hash((recipients, self.subject, self.text, self.html, self.reply_to))
+
 
 class MailError(RuntimeError):
     """A message could not be handed to the mail server.

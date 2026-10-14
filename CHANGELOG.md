@@ -8,12 +8,9 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
-### Breaking
-
-- `Platform` gains a required `mail` field. Hosts that construct `Platform` directly must pass a `MailProvider`; `build_platform` supplies one automatically.
-
 ### Added
 
+- `Platform.mail`, defaulting to a `NullMail` that raises `MailNotConfiguredError`. `Platform.geocoding` and `Platform.recorder` now default to `NullGeocoding()` and `None`, so a `Platform` built by hand need not supply them.
 - `build_platform(..., clock=...)`, so a test helper can supply the clock the backends stamp time with. `install_test_platform` now defaults an unset or empty `mail.uri` to `memory://`, except in a multi-process deployment that enforces consistency.
 - `MailProvider` capability: `send(MailMessage) -> str` returns the `Message-ID`. Delivery failures raise `MailError` (`MailNotConfiguredError` when unconfigured); an invalid message raises `ValueError`.
 - `MailSettings` and `JasilSettings.mail`, with URI-selected backends: unset (disabled), `memory://` (records to `outbox`), `smtp://` (STARTTLS) and `smtps://` (implicit TLS). TLS is verified by default; `MailSettings.secure = False` permits cleartext `smtp://` only to a private/loopback relay and never with credentials. `MailSettings.ehlo_hostname` overrides the name announced in `EHLO`. Standard library only — no new dependency.
