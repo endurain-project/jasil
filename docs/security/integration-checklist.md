@@ -13,6 +13,10 @@ through.
 - [ ] Set `web_workers` to the number of worker processes you actually run. Four
       workers under the `local` profile are still four processes, and
       process-local state cannot be shared between them.
+- [ ] Set `job_worker_mode=standalone` in **every** process — API and workers —
+      when durable jobs run in dedicated worker processes. A worker is a process
+      too: without the declaration the checks cannot see it, and a handler sends
+      mail or touches state through a backend its API never shares.
 - [ ] Leave `enforce_deployment_consistency` on. It refuses to build a platform
       whose wiring contradicts its topology. Turning it off downgrades those to
       warnings — reasonable on a development machine, not in production.
@@ -94,9 +98,11 @@ through.
 - [ ] Assign queue names at subscriber registration. Keep them lowercase ASCII,
       stable, and domain-neutral from JASIL's point of view; renaming a queue
       while old rows remain requires workers for both names during the drain.
-- [ ] For SQLite, run exactly one API process and one in-process worker. For
-      PostgreSQL, do not start handlers in API replicas; run standalone workers
-      with explicit non-empty allowlists and size each queue's process group.
+- [ ] For SQLite, run exactly one API process and one in-process worker
+      (`job_worker_mode=in_process`, the default). For PostgreSQL, do not start
+      handlers in API replicas; set `job_worker_mode=standalone` and run
+      standalone workers with explicit non-empty allowlists, sizing each queue's
+      process group.
 - [ ] Remember that durable jobs do not require Redis. Do not introduce a second
       queue as a source of truth beside `processing_jobs`.
 - [ ] Set `lease_seconds` above the longest handler duration. Heartbeats remain

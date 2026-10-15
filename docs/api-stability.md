@@ -22,12 +22,12 @@ modules:
 | `jasil.providers` | The capability protocols and their method signatures. |
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
-| `jasil.profile` | `DeploymentProfile`, `parse_profile`, `classify_state_uri`, topology helpers. |
+| `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
 | `jasil.settings` | The settings dataclasses and `configure` / `get_settings`. |
 | `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `Base`. |
 | `jasil.correlation` | `configure_provider`, `get_correlation_id`, `set_correlation_id`. |
 | `jasil.container` | `Platform`, `build_platform`. |
-| `jasil.capabilities` | `check_deployment_consistency` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
+| `jasil.capabilities` | `check_deployment_consistency`, `topology_of` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
 | `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |

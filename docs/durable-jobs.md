@@ -176,9 +176,11 @@ jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APSchedule
 
 This worker consumes all named queues serially and rotates the starting queue
 between batches for process-lifetime fairness. SQLite supports exactly this
-topology: one API process and one in-process consumer. JASIL refuses
-an in-process SQLite worker when `web_workers != 1`, and refuses a standalone
-SQLite worker because it has enough information to know those shapes are unsafe.
+topology: one process and one in-process consumer. JASIL refuses to start a
+consumer on SQLite when the configured deployment is multi-process — several
+`web_workers`, `profile=distributed`, or `job_worker_mode=standalone` — because it
+has enough information to know those shapes are unsafe. `start_job_worker()`
+requires `job_worker_mode=in_process`, which is the default.
 
 ### Distributed: API plumbing and PostgreSQL workers
 
@@ -189,8 +191,13 @@ consumer:
 jobs_service.schedule_job_maintenance(scheduler)
 ```
 
-Standalone worker processes use the supported blocking entry point. It must run
-in a dedicated worker process, never on an API request or event-loop thread:
+Declare the shape with `job_worker_mode=standalone`, and load it in the API
+processes as well as the workers: a worker is one more process reaching state,
+events, the lock and mail, and the API's own startup checks can only refuse a
+wiring the workers cannot share if it knows they exist. Standalone worker
+processes then use the supported blocking entry point, which requires that mode.
+It must run in a dedicated worker process, never on an API request or event-loop
+thread:
 
 ```python
 import signal
@@ -266,12 +273,13 @@ failure.
   jobs. The isolation comes from a dedicated worker group calling
   `run_job_worker(queues=("mail",))`: the single local consumer still runs mail
   serially with everything else.
-- **Configure the worker processes with a real relay.** In the distributed
-  shape the handler runs in the worker process, so that process's `mail.uri`
-  is the one that sends. `memory://` there records every message in that
-  process's memory and completes the job, with nothing delivered. The
-  [consistency checks](deployment-profiles.md#consistency-checks) count only
-  `web_workers`, so they cannot see a standalone worker to refuse it.
+- **Mail needs a real relay once workers are standalone.** The handler runs in
+  the worker process, so that process's `mail.uri` is the one that sends.
+  `memory://` there would record every message in that process's memory and
+  complete the job with nothing delivered. With
+  [`job_worker_mode=standalone`](deployment-profiles.md#job-workers-are-processes-too)
+  declared, the consistency checks refuse that wiring at startup, in the API and
+  in the workers.
 - **An unconfigured mail backend is retried too.** `MailNotConfiguredError` is a
   `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
   budget before dead-lettering. Catch it in the handler if that is not wanted.

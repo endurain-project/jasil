@@ -30,7 +30,8 @@ Valid for a single process. A multi-worker `local` deployment is a different
 matter — see below.
 
 With durable jobs enabled, the complete local shape is SQLite, one API process,
-and `start_job_worker()`. That one background consumer drains every named queue
+and `start_job_worker()` (`job_worker_mode` stays `in_process`, its default). That
+one background consumer drains every named queue
 serially and rotates queues fairly between batches for the lifetime of the
 process. It needs neither PostgreSQL nor Redis.
 
@@ -68,16 +69,12 @@ jasil_settings.configure(
 Durable jobs have a separate database topology from the capability URIs above.
 In a distributed deployment, use PostgreSQL for the outbox, jobs, and worker
 registry. API replicas schedule relay/reaping but do not call
-`start_job_worker()`; standalone processes call `run_job_worker(queues=...)`.
-Queue-specific process counts provide independent concurrency, while several
-processes selecting the same queue compete through `SKIP LOCKED`. Redis may
-back state or the event bus, but durable jobs themselves do not use it.
-
-A standalone worker is still a process, and its handlers use its own platform.
-The [consistency checks](#consistency-checks) count only `web_workers`, so they
-do not see worker processes. Give workers the same shared capabilities as the
-API, and in particular a real mail relay: `memory://` mail in a worker records
-every message in that process and delivers none.
+`start_job_worker()`; standalone processes call `run_job_worker(queues=...)`
+and the deployment declares that with
+[`job_worker_mode`](#job-workers-are-processes-too). Queue-specific process
+counts provide independent concurrency, while several processes selecting the
+same queue compete through `SKIP LOCKED`. Redis may back state or the event bus,
+but durable jobs themselves do not use it.
 
 ## custom
 
@@ -88,38 +85,91 @@ each writes only its own scratch data.
 ## Consistency checks
 
 Beyond the URI defaults, `build_platform()` validates the *combination* before it
-constructs a single backend, and refuses inconsistent wiring:
+constructs a single backend, and refuses inconsistent wiring. Every rule asks the
+same question of the deployment's shape: **can two processes reach this
+capability, or two machines?** A deployment is *multi-process* when any of these
+holds, and *multi-node* only for the first:
+
+| Input | Multi-process | Multi-node |
+|---|---|---|
+| `profile=distributed` | yes | yes |
+| `web_workers > 1` | yes | |
+| `job_worker_mode=standalone` | yes | |
 
 **Cross-process state.** Ephemeral state and the event bus must not resolve to
-process-local memory when the topology requires shared state — the `distributed`
-profile, or more than one web worker. Both stores would diverge silently across
-processes.
+process-local memory when the deployment is multi-process. Both stores would
+diverge silently across processes.
 
 **Cross-node storage.** Blob storage must not resolve to the local filesystem
-under `distributed`, where replicas run on separate nodes with no shared disk. A
-multi-worker `local` deployment shares one host disk, so local storage stays
-valid there.
+when the deployment is multi-node, where replicas run on separate nodes with no
+shared disk. Several processes of a `local` deployment share one host disk, so
+local storage stays valid there.
 
 **Coordination lock.** The lock must not resolve to the in-process `noop` lock
 when more than one process could run the same scheduled job.
 
-**Mail.** `mail.uri` must not be `memory://` when the deployment runs more than
-one process: each would record messages in its own memory and none would ever be
-delivered. Leaving mail unset is not flagged, because every send then raises.
+**Mail.** `mail.uri` must not be `memory://` when the deployment is
+multi-process: each process would record messages in its own memory and none
+would ever be delivered. Leaving mail unset is not flagged, because every send
+then raises.
 
-Note that **worker count matters as much as profile**. A `local` deployment with
+**Job workers.** `job_worker_mode=standalone` requires `jobs.enabled`: standalone
+workers consume durable jobs, so declaring them while the pipeline is dormant is
+a contradiction, not a shape.
+
+What each shape requires:
+
+| Capability | Local, one process | Local + standalone workers | Distributed |
+|---|---|---|---|
+| `job_worker_mode` | `in_process` | `standalone` | `standalone`, or `in_process` per replica |
+| State, events | memory | Redis | Redis |
+| Lock | `noop` or `postgres-advisory` | `postgres-advisory` | `postgres-advisory` |
+| Mail | `memory`, or SMTP | SMTP | SMTP |
+| Storage | `local` | `local` on a shared volume, or S3 | S3 |
+| Jobs database | SQLite or a server database | PostgreSQL, MySQL 8.0.1+ or MariaDB 10.6+ | the same |
+
+The middle column needs Redis whenever state or events are used. That is not a
+choice JASIL makes: two processes cannot share memory.
+
+Note that **the shape matters as much as the profile**. A `local` deployment with
 four web workers is four processes, and process-local memory cannot be shared
 between them, so tell JASIL how many you run:
 
 ```python
 jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
 # ValueError: JASIL's deployment wiring is inconsistent:
-#   - state_uri resolves to process-local memory, but profile=local with
-#     web_workers=4 requires a backend shared across processes. ...
+#   - state_uri resolves to process-local memory, but this deployment runs
+#     multiple processes (web_workers=4 runs several API processes) that need a
+#     backend shared across them. ...
 ```
 
 The `custom` profile opts out of the state, lock and mail rules: it promises no
 defaults, so there is nothing for a setting to contradict.
+
+### Job workers are processes too
+
+A standalone worker runs your handlers in its own process, with its own platform:
+one more process that reaches state, the event bus, the lock and mail. Counting
+web workers alone cannot see it, so the deployment declares how its job workers
+run:
+
+```python
+jasil_settings.JasilSettings(
+    job_worker_mode=jasil.JobWorkerMode.STANDALONE,  # or parse_job_worker_mode(env)
+    jobs=jasil_settings.JobSettings(enabled=True),
+    ...
+)
+```
+
+It is a fact about the shape, not a count, so it does not change when you scale
+workers. **Load the same value in every process of the deployment**, API replicas
+and workers alike: the API process must know that workers exist for its own
+`build_platform()` to refuse a `memory://` bus that those workers cannot share.
+
+The entry points enforce the declaration. `start_job_worker()` requires
+`in_process` and `run_job_worker()` requires `standalone`; starting the wrong one
+raises `RuntimeError` even with `enforce_deployment_consistency=False`, because
+it is the entry point's contract rather than capability wiring.
 
 On a development machine you may knowingly want an inconsistent setup — the
 distributed profile without Redis, say. Set
@@ -145,7 +195,7 @@ for issue in check_deployment_consistency(settings):
 
 ```
 JASIL platform capabilities:
-Deployment profile: local (web_workers=1, requires_shared_state=False)
+Deployment profile: local (web_workers=1, job_worker_mode=in_process, multi_process=False, multi_node=False)
   state   -> memory  (source: profile default)
   storage -> local   (source: profile default)
   events  -> memory  (source: profile default)
@@ -165,7 +215,8 @@ you want it somewhere other than the log.
 1. Stand up Redis, object storage, and Postgres.
 2. Set the four URIs and switch the profile.
 3. Run the [migrations](observability.md#migrations).
-4. Stop starting the in-process worker in the API; keep relay/reaper scheduling.
+4. Set `job_worker_mode=standalone` in the API and the workers alike, stop
+    starting the in-process worker in the API, and keep relay/reaper scheduling.
 5. Start standalone PostgreSQL workers with their queue allowlists and desired
     process counts.
 

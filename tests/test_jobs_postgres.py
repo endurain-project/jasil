@@ -24,6 +24,7 @@ from jasil.events import new_event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
+from jasil.profile import JobWorkerMode
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -194,7 +195,16 @@ def test_public_standalone_worker_selects_queues_and_records_its_lifecycle(
     tmp_path,
     monkeypatch,
 ):
-    platform = container.build_platform(settings.JasilSettings(data_dir=str(tmp_path)))
+    # One process stands in for the API and the worker, so the shape is declared
+    # and the memory backends it would normally refuse are knowingly accepted.
+    declared = settings.JasilSettings(
+        data_dir=str(tmp_path),
+        job_worker_mode=JobWorkerMode.STANDALONE,
+        jobs=settings.JobSettings(enabled=True),
+        enforce_deployment_consistency=False,
+    )
+    settings.configure(declared)
+    platform = container.build_platform(declared)
     monkeypatch.setattr(platform_runtime, "_active_platform", platform)
     stop = threading.Event()
     seen: list[int] = []

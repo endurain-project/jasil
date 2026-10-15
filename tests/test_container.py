@@ -24,7 +24,7 @@ from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 
 @pytest.fixture(autouse=True)
@@ -282,6 +282,48 @@ class TestDeploymentConsistencyGate:
 
         assert isinstance(platform.state, MemoryState)
         assert "Inconsistent deployment wiring" in caplog.text
+
+    def test_standalone_job_workers_stop_the_build_on_in_memory_wiring(self, tmp_path):
+        """One API process, one worker process, the default ``local`` profile: two processes."""
+        with pytest.raises(ValueError, match="job_worker_mode=standalone") as failure:
+            container.build_platform(
+                _settings(
+                    data_dir=str(tmp_path),
+                    job_worker_mode=JobWorkerMode.STANDALONE,
+                    jobs=settings.JobSettings(enabled=True),
+                    mail=settings.MailSettings(uri="memory://"),
+                )
+            )
+
+        for name in ("state_uri", "events_uri", "lock_uri", "mail.uri"):
+            assert name in str(failure.value)
+
+    def test_standalone_job_workers_build_on_shared_wiring(self, tmp_path):
+        platform = container.build_platform(
+            _settings(
+                data_dir=str(tmp_path),
+                job_worker_mode=JobWorkerMode.STANDALONE,
+                jobs=settings.JobSettings(enabled=True),
+                state_uri="redis://cache:6379/0",
+                events_uri="redis://cache:6379/1",
+                lock_uri="postgres-advisory://",
+                mail=settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c"),
+            )
+        )
+
+        assert isinstance(platform.mail, SmtpMail)
+
+    def test_standalone_job_workers_without_jobs_stop_the_build(self, tmp_path):
+        with pytest.raises(ValueError, match=r"jobs\.enabled is false"):
+            container.build_platform(
+                _settings(
+                    data_dir=str(tmp_path),
+                    job_worker_mode=JobWorkerMode.STANDALONE,
+                    state_uri="redis://cache:6379/0",
+                    events_uri="redis://cache:6379/1",
+                    lock_uri="postgres-advisory://",
+                )
+            )
 
     def test_a_consistent_deployment_logs_the_capability_report(self, tmp_path, caplog):
         with caplog.at_level("INFO"):

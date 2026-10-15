@@ -20,6 +20,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil.capabilities import topology_of
+from jasil.profile import JobWorkerMode
 from jasil.settings import get_settings
 
 # The runner, the worker, the relay and the job CRUD all reach a model bound to
@@ -83,13 +85,27 @@ def start_job_worker(
     label: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Start the in-process job worker (idempotent)."""
+    """Start the in-process job worker (idempotent).
+
+    Belongs to ``job_worker_mode=in_process``, the default: each API process runs
+    its own consumer. A deployment with dedicated worker processes declares
+    ``standalone`` and uses :func:`run_job_worker` instead.
+
+    Args:
+        role: Optional host-supplied worker role.
+        label: Optional host-supplied operator label.
+        metadata: Optional host-supplied neutral metadata.
+
+    Raises:
+        RuntimeError: When ``job_worker_mode`` is not ``in_process``, or when the
+            configured database is SQLite and the topology is multi-process.
+    """
     global _worker
     if _worker is not None:
         if _worker.is_alive:
             return
         _worker = None
-    _ensure_in_process_topology()
+    _ensure_job_topology(JobWorkerMode.IN_PROCESS, entry_point="start_job_worker", other="run_job_worker")
     from jasil.jobs.worker import BackgroundWorker
 
     # The loop logs its own start and stop, from the thread that actually runs it.
@@ -125,12 +141,13 @@ def run_job_worker(
         stop: Event ending the loop; a new unset event is used when omitted.
 
     Raises:
-        RuntimeError: When the configured database is SQLite, which supports
-            only JASIL's one in-process consumer topology.
+        RuntimeError: When ``job_worker_mode`` is not ``standalone``, or when the
+            configured database is SQLite, which supports only a single-process
+            topology.
         ValueError: When an explicit queue allowlist is empty or invalid.
     """
+    _ensure_job_topology(JobWorkerMode.STANDALONE, entry_point="run_job_worker", other="start_job_worker")
     runner = build_runner(queues=queues)
-    _ensure_standalone_topology()
     from jasil.jobs.worker import run_worker
 
     jobs = get_settings().jobs
@@ -174,19 +191,34 @@ def stop_job_worker() -> None:
         _worker = None
 
 
-def _ensure_in_process_topology() -> None:
-    if jasil_orm.get_engine().dialect.name == "sqlite" and get_settings().web_workers != 1:
+def _ensure_job_topology(expected: JobWorkerMode, *, entry_point: str, other: str) -> None:
+    """Refuse to start a consumer the deployment's declared shape does not have.
+
+    Two rules, both about whether this process is what the settings say it is:
+
+    * **The role must match ``job_worker_mode``.** ``start_job_worker`` belongs to
+      ``in_process`` and ``run_job_worker`` to ``standalone``. Every process of a
+      deployment loads the same settings, and the consistency checks reason from
+      that mode, so a consumer started the other way would be a process they
+      never counted. This is the entry point's contract rather than capability
+      wiring, so ``enforce_deployment_consistency=False`` does not relax it.
+    * **SQLite needs a single-process topology.** One file cannot be shared by
+      competing consumers, and a multi-process topology (several API processes,
+      standalone workers, or replicas on separate nodes) has more than one.
+    """
+    settings = get_settings()
+    if settings.job_worker_mode is not expected:
         raise RuntimeError(
-            "SQLite durable jobs support exactly one API process with one in-process consumer; "
-            "configure web_workers=1 or use PostgreSQL workers"
+            f"{entry_point}() requires job_worker_mode={expected.value!r}, but the configured mode is "
+            f"{settings.job_worker_mode.value!r}; set job_worker_mode in every process of the deployment, "
+            f"or use {other}() for this mode"
         )
-
-
-def _ensure_standalone_topology() -> None:
-    if jasil_orm.get_engine().dialect.name == "sqlite":
+    topology = topology_of(settings)
+    if topology.multi_process and jasil_orm.get_engine().dialect.name == "sqlite":
         raise RuntimeError(
-            "SQLite durable jobs support only one in-process consumer; "
-            "use start_job_worker() or configure PostgreSQL for standalone workers"
+            "SQLite durable jobs support exactly one process with one in-process consumer; "
+            f"the configured topology runs several ({'; '.join(topology.multi_process_causes)}). "
+            "Use a database that supports concurrent consumers, such as PostgreSQL"
         )
 
 

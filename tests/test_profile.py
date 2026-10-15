@@ -6,17 +6,33 @@ from jasil.capabilities import (
     StateSource,
     build_capability_report,
     check_deployment_consistency,
+    check_job_worker_consistency,
+    check_lock_consistency,
     check_mail_consistency,
+    check_state_consistency,
+    check_storage_consistency,
+    topology_of,
 )
 from jasil.profile import (
     DeploymentProfile,
-    DeploymentTopology,
+    JobWorkerMode,
     StateBackendKind,
     classify_state_uri,
+    parse_job_worker_mode,
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import JasilSettings, MailSettings
+from jasil.settings import JasilSettings, JobSettings, MailSettings
+
+LOCAL = DeploymentProfile.LOCAL
+DISTRIBUTED = DeploymentProfile.DISTRIBUTED
+CUSTOM = DeploymentProfile.CUSTOM
+IN_PROCESS = JobWorkerMode.IN_PROCESS
+STANDALONE = JobWorkerMode.STANDALONE
+
+
+def _topology(profile=LOCAL, web_workers=1, job_worker_mode=IN_PROCESS):
+    return resolve_topology(profile=profile, web_workers=web_workers, job_worker_mode=job_worker_mode)
 
 
 class TestParseProfile:
@@ -68,26 +84,83 @@ class TestClassifyStateUri:
         assert classify_state_uri(uri) is expected
 
 
-class TestTopology:
-    def test_worker_count_is_clamped_to_at_least_one(self):
-        assert resolve_topology(DeploymentProfile.LOCAL, 0).web_workers == 1
-        assert resolve_topology(DeploymentProfile.LOCAL, -3).web_workers == 1
-
+class TestParseJobWorkerMode:
     @pytest.mark.parametrize(
-        ("profile", "workers", "expected"),
+        ("value", "expected"),
         [
-            pytest.param(DeploymentProfile.LOCAL, 1, False, id="single-process-local"),
-            pytest.param(DeploymentProfile.LOCAL, 4, True, id="multi-worker-local"),
-            pytest.param(DeploymentProfile.DISTRIBUTED, 1, True, id="distributed-single-worker"),
-            pytest.param(DeploymentProfile.CUSTOM, 1, False, id="custom-single-worker"),
+            ("in_process", IN_PROCESS),
+            ("standalone", STANDALONE),
+            ("  STANDALONE  ", STANDALONE),
         ],
     )
-    def test_shared_state_requirement(self, profile, workers, expected):
-        """Process-local memory cannot be shared, so more than one process — by
-        replica *or* by worker — requires a shared backend."""
-        topology = DeploymentTopology(profile=profile, web_workers=workers)
+    def test_a_recognised_name_parses(self, value, expected):
+        assert parse_job_worker_mode(value) is expected
 
-        assert topology.requires_shared_state is expected
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_an_unset_value_defaults_to_in_process(self, value):
+        assert parse_job_worker_mode(value) is IN_PROCESS
+
+    def test_an_existing_mode_passes_through(self):
+        assert parse_job_worker_mode(STANDALONE) is STANDALONE
+
+    def test_a_typo_raises_rather_than_defaulting(self):
+        """Defaulting a typo to ``in_process`` would hide every worker process
+        from the consistency checks."""
+        with pytest.raises(ValueError, match="Invalid job worker mode 'standalon'"):
+            parse_job_worker_mode("standalon")
+
+    def test_the_error_lists_the_valid_values(self):
+        with pytest.raises(ValueError, match="in_process, standalone"):
+            parse_job_worker_mode("nonsense")
+
+
+class TestTopology:
+    def test_worker_count_is_clamped_to_at_least_one(self):
+        assert _topology(web_workers=0).web_workers == 1
+        assert _topology(web_workers=-3).web_workers == 1
+
+    @pytest.mark.parametrize(
+        ("profile", "workers", "mode", "multi_process", "multi_node"),
+        [
+            pytest.param(LOCAL, 1, IN_PROCESS, False, False, id="single-process-local"),
+            pytest.param(LOCAL, 4, IN_PROCESS, True, False, id="multi-worker-local"),
+            pytest.param(LOCAL, 1, STANDALONE, True, False, id="standalone-workers-local"),
+            pytest.param(LOCAL, 4, STANDALONE, True, False, id="multi-worker-and-standalone"),
+            pytest.param(DISTRIBUTED, 1, IN_PROCESS, True, True, id="distributed-single-worker"),
+            pytest.param(DISTRIBUTED, 1, STANDALONE, True, True, id="distributed-standalone"),
+            pytest.param(CUSTOM, 1, IN_PROCESS, False, False, id="custom-single-worker"),
+            pytest.param(CUSTOM, 1, STANDALONE, True, False, id="custom-standalone"),
+        ],
+    )
+    def test_what_the_shape_implies(self, profile, workers, mode, multi_process, multi_node):
+        """Process-local memory cannot be shared by more than one process — whether
+        it is a replica, a web worker or a job worker — and a disk cannot be shared
+        by more than one machine."""
+        topology = _topology(profile, workers, mode)
+
+        assert topology.multi_process is multi_process
+        assert topology.multi_node is multi_node
+
+    def test_a_single_process_has_no_causes(self):
+        assert _topology().multi_process_causes == ()
+
+    def test_every_input_that_makes_it_multi_process_is_named(self):
+        causes = _topology(DISTRIBUTED, 3, STANDALONE).multi_process_causes
+
+        assert len(causes) == 3
+        assert any("profile=distributed" in cause for cause in causes)
+        assert any("web_workers=3" in cause for cause in causes)
+        assert any("job_worker_mode=standalone" in cause for cause in causes)
+
+    def test_the_settings_resolve_to_a_topology(self):
+        settings = JasilSettings(profile=DISTRIBUTED, web_workers=2, job_worker_mode=STANDALONE)
+
+        topology = topology_of(settings)
+
+        assert (topology.profile, topology.web_workers, topology.job_worker_mode) == (DISTRIBUTED, 2, STANDALONE)
+
+    def test_the_default_mode_is_in_process(self):
+        assert JasilSettings().job_worker_mode is IN_PROCESS
 
 
 class TestStateSource:
@@ -168,7 +241,17 @@ class TestCapabilityReport:
 
         assert "Deployment profile: local" in rendered
         assert "web_workers=1" in rendered
-        assert "requires_shared_state=False" in rendered
+        assert "job_worker_mode=in_process" in rendered
+        assert "multi_process=False" in rendered
+        assert "multi_node=False" in rendered
+
+    def test_rendering_shows_standalone_workers(self):
+        rendered = build_capability_report(
+            JasilSettings(job_worker_mode=STANDALONE, jobs=JobSettings(enabled=True))
+        ).render()
+
+        assert "job_worker_mode=standalone" in rendered
+        assert "multi_process=True" in rendered
 
     def test_rendering_lists_every_row(self, report):
         rendered = report.render()
@@ -208,24 +291,24 @@ class TestDeploymentConsistency:
         assert any("mail.uri resolves to the in-memory mail recorder" in issue for issue in issues)
 
     def test_the_distributed_profile_on_memory_mail_is_refused(self):
-        issues = check_mail_consistency(
-            profile=DeploymentProfile.DISTRIBUTED, web_workers=1, mail_uri="MEMORY://", mail_label="mail.uri"
-        )
+        issues = check_mail_consistency(topology=_topology(DISTRIBUTED), mail_uri="MEMORY://", mail_label="mail.uri")
 
         assert len(issues) == 1 and "profile=distributed" in issues[0]
 
     @pytest.mark.parametrize(
         ("profile", "web_workers", "uri"),
         [
-            pytest.param(DeploymentProfile.LOCAL, 1, "memory://", id="single-process"),
-            pytest.param(DeploymentProfile.CUSTOM, 4, "memory://", id="custom"),
-            pytest.param(DeploymentProfile.LOCAL, 4, "smtp://relay.test", id="relay"),
-            pytest.param(DeploymentProfile.LOCAL, 4, None, id="unset"),
-            pytest.param(DeploymentProfile.LOCAL, 4, "", id="empty"),
+            pytest.param(LOCAL, 1, "memory://", id="single-process"),
+            pytest.param(CUSTOM, 4, "memory://", id="custom"),
+            pytest.param(LOCAL, 4, "smtp://relay.test", id="relay"),
+            pytest.param(LOCAL, 4, None, id="unset"),
+            pytest.param(LOCAL, 4, "", id="empty"),
         ],
     )
     def test_mail_that_cannot_silently_go_nowhere_is_accepted(self, profile, web_workers, uri):
-        assert check_mail_consistency(profile=profile, web_workers=web_workers, mail_uri=uri, mail_label="m") == []
+        topology = _topology(profile, web_workers)
+
+        assert check_mail_consistency(topology=topology, mail_uri=uri, mail_label="m") == []
 
     def test_multiple_workers_on_a_no_op_lock_are_refused(self):
         """Otherwise every worker runs every scheduled job."""
@@ -279,3 +362,149 @@ class TestDeploymentConsistency:
         )
 
         assert issues == []
+
+
+class TestStandaloneJobWorkers:
+    """A standalone worker is one more process reaching every capability.
+
+    The default ``local`` profile with one API process looks single-process to
+    every rule unless the deployment declares its workers; these are the wirings
+    that would otherwise start happily and lose data or work silently.
+    """
+
+    @pytest.fixture
+    def standalone(self):
+        return {"job_worker_mode": STANDALONE, "jobs": JobSettings(enabled=True)}
+
+    def test_memory_state_and_events_are_refused(self, standalone):
+        issues = check_deployment_consistency(JasilSettings(**standalone))
+
+        assert any(issue.startswith("state_uri resolves to process-local memory") for issue in issues)
+        assert any(issue.startswith("events_uri resolves to process-local memory") for issue in issues)
+
+    def test_the_noop_lock_is_refused(self, standalone):
+        issues = check_deployment_consistency(JasilSettings(**standalone))
+
+        assert any(issue.startswith("lock_uri resolves to an in-process no-op lock") for issue in issues)
+
+    def test_memory_mail_is_refused(self, standalone):
+        """The handler would 'send' into the worker's memory and the job would complete."""
+        issues = check_deployment_consistency(JasilSettings(mail=MailSettings(uri="memory://"), **standalone))
+
+        assert any(issue.startswith("mail.uri resolves to the in-memory mail recorder") for issue in issues)
+
+    def test_the_refusal_names_the_cause(self, standalone):
+        issues = check_deployment_consistency(JasilSettings(**standalone))
+
+        assert all("job_worker_mode=standalone" in issue for issue in issues)
+
+    def test_local_disk_is_allowed_because_both_processes_share_a_host(self, standalone):
+        issues = check_deployment_consistency(JasilSettings(**standalone))
+
+        assert not any("storage_uri" in issue for issue in issues)
+
+    def test_a_fully_shared_local_deployment_is_consistent(self, standalone):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                lock_uri="postgres-advisory://",
+                mail=MailSettings(uri="smtp://relay.test", from_address="a@b.c"),
+                **standalone,
+            )
+        )
+
+        assert issues == []
+
+    def test_an_in_process_deployment_is_unchanged(self):
+        assert check_deployment_consistency(JasilSettings(jobs=JobSettings(enabled=True))) == []
+
+    def test_standalone_workers_with_jobs_disabled_are_refused(self):
+        issues = check_job_worker_consistency(topology=_topology(job_worker_mode=STANDALONE), jobs_enabled=False)
+
+        assert len(issues) == 1 and "jobs.enabled is false" in issues[0]
+
+    @pytest.mark.parametrize(
+        ("mode", "jobs_enabled"),
+        [(STANDALONE, True), (IN_PROCESS, True), (IN_PROCESS, False)],
+    )
+    def test_every_other_combination_is_accepted(self, mode, jobs_enabled):
+        topology = _topology(job_worker_mode=mode)
+
+        assert check_job_worker_consistency(topology=topology, jobs_enabled=jobs_enabled) == []
+
+    def test_the_contradiction_is_reported_by_the_aggregate_check(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                job_worker_mode=STANDALONE,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert len(issues) == 1 and "jobs.enabled is false" in issues[0]
+
+    def test_the_custom_profile_opts_out_of_wiring_rules_but_not_the_contradiction(self):
+        custom = _topology(CUSTOM, job_worker_mode=STANDALONE)
+        sources = (StateSource(label="state_uri", uri="memory://"),)
+
+        assert check_state_consistency(topology=custom, state_sources=sources) == []
+        assert check_lock_consistency(topology=custom, lock_uri="noop://", lock_label="l") == []
+        assert check_mail_consistency(topology=custom, mail_uri="memory://", mail_label="m") == []
+        assert len(check_job_worker_consistency(topology=custom, jobs_enabled=False)) == 1
+
+
+class TestRulesTakeATopology:
+    """Each rule reads the one fact it needs from the topology."""
+
+    def test_state_follows_multi_process(self):
+        sources = (StateSource(label="state_uri", uri="memory://"),)
+
+        assert check_state_consistency(topology=_topology(), state_sources=sources) == []
+        assert len(check_state_consistency(topology=_topology(web_workers=2), state_sources=sources)) == 1
+
+    def test_state_ignores_a_source_that_does_not_apply(self):
+        sources = (StateSource(label="events_uri", uri="memory://", applies=False),)
+
+        assert check_state_consistency(topology=_topology(DISTRIBUTED), state_sources=sources) == []
+
+    def test_state_flags_an_unrecognised_scheme(self):
+        sources = (StateSource(label="state_uri", uri="postgres://db"),)
+
+        issues = check_state_consistency(topology=_topology(DISTRIBUTED), state_sources=sources)
+
+        assert len(issues) == 1 and "unrecognized storage scheme" in issues[0]
+
+    @pytest.mark.parametrize(
+        ("topology", "refused"),
+        [
+            pytest.param(_topology(), False, id="single-process"),
+            pytest.param(_topology(web_workers=4), False, id="several-processes-share-a-disk"),
+            pytest.param(_topology(job_worker_mode=STANDALONE), False, id="standalone-workers-share-a-disk"),
+            pytest.param(_topology(DISTRIBUTED), True, id="separate-nodes"),
+        ],
+    )
+    def test_storage_follows_multi_node(self, topology, refused):
+        issues = check_storage_consistency(topology=topology, storage_uri="LOCAL://", storage_label="storage_uri")
+
+        assert bool(issues) is refused
+
+    @pytest.mark.parametrize(
+        ("topology", "refused"),
+        [
+            pytest.param(_topology(), False, id="single-process"),
+            pytest.param(_topology(web_workers=2), True, id="web-workers"),
+            pytest.param(_topology(job_worker_mode=STANDALONE), True, id="standalone-workers"),
+            pytest.param(_topology(CUSTOM, 4), False, id="custom"),
+        ],
+    )
+    def test_lock_follows_multi_process(self, topology, refused):
+        issues = check_lock_consistency(topology=topology, lock_uri=" NOOP:// ", lock_label="lock_uri")
+
+        assert bool(issues) is refused
+
+    def test_a_shared_lock_is_always_accepted(self):
+        topology = _topology(DISTRIBUTED, 4, STANDALONE)
+
+        assert check_lock_consistency(topology=topology, lock_uri="postgres-advisory://", lock_label="l") == []

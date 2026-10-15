@@ -37,6 +37,7 @@ fields.
 |---|---|---|
 | `profile` | `DeploymentProfile.LOCAL` | The deployment shape. Supplies capability-URI defaults. |
 | `web_workers` | `1` | How many web-server worker processes you run. Drives the [consistency checks](deployment-profiles.md#consistency-checks) as much as the profile does. |
+| `job_worker_mode` | `JobWorkerMode.IN_PROCESS` | Where durable-job consumers run: `in_process` (each API process calls `start_job_worker()`) or `standalone` (dedicated processes call `run_job_worker()`). A fact about the shape, not a count: **load the same value in every process.** Drives the [consistency checks](deployment-profiles.md#job-workers-are-processes-too); `standalone` requires `jobs.enabled`. Parse an environment value with `jasil.profile.parse_job_worker_mode`. |
 | `enforce_deployment_consistency` | `True` | Refuse to build a platform whose wiring contradicts its topology. `False` logs the issues as warnings instead. |
 | `data_dir` | `"data"` | Root directory for the local storage backend. |
 | `state_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |

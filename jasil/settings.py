@@ -32,7 +32,7 @@ raise, because a Redis host or bucket name cannot be inferred.
 from dataclasses import dataclass, field
 
 from jasil._core.registry import ConfigSlot
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 __all__ = [
     "EventLogSettings",
@@ -194,6 +194,13 @@ class JasilSettings:
             *count* matters: four workers under the ``local`` profile are still
             four processes, and process-local state cannot be shared between them,
             so this drives the consistency checks as much as the profile does.
+        job_worker_mode: Where durable-job consumers run: ``in_process`` (each API
+            process calls ``start_job_worker``) or ``standalone`` (dedicated
+            processes call ``run_job_worker``). Like ``web_workers`` it describes
+            the deployment's shape, and **every process of the deployment must
+            load the same value**: a standalone worker is one more process that
+            reaches every capability, and the consistency checks can only see it
+            if the API processes know about it too.
         enforce_deployment_consistency: Refuse to build a platform whose wiring
             contradicts its topology (see :mod:`jasil.capabilities`). Set False to
             log the issues as warnings instead — useful on a development machine
@@ -212,6 +219,7 @@ class JasilSettings:
 
     profile: DeploymentProfile = DeploymentProfile.LOCAL
     web_workers: int = 1
+    job_worker_mode: JobWorkerMode = JobWorkerMode.IN_PROCESS
     enforce_deployment_consistency: bool = True
     data_dir: str = "data"
     state_uri: str | None = None

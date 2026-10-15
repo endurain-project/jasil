@@ -25,6 +25,7 @@ import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import new_event
 from jasil.jobs.models import EventOutbox, ProcessingJob
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 WAIT_TIMEOUT = 5.0
 
@@ -153,21 +154,93 @@ class TestWorkerLifecycle:
             pytest.skip("SQLite-only topology guard")
         settings.configure(settings.JasilSettings(web_workers=2))
 
-        with pytest.raises(RuntimeError, match="exactly one API process"):
+        with pytest.raises(RuntimeError, match=r"web_workers=2 runs several API processes"):
+            jobs_service.start_job_worker()
+
+    def test_sqlite_refuses_a_distributed_deployment_even_with_one_web_worker(
+        self, platform, session_factory, db_engine
+    ):
+        """Replicas on separate nodes cannot share one SQLite file."""
+        if db_engine.dialect.name != "sqlite":
+            pytest.skip("SQLite-only topology guard")
+        settings.configure(settings.JasilSettings(profile=DeploymentProfile.DISTRIBUTED))
+
+        with pytest.raises(RuntimeError, match=r"profile=distributed"):
+            jobs_service.start_job_worker()
+
+    def test_it_refuses_a_deployment_declared_standalone(self, platform, session_factory):
+        """A consumer started the other way is a process the checks never counted."""
+        settings.configure(settings.JasilSettings(job_worker_mode=JobWorkerMode.STANDALONE))
+
+        with pytest.raises(RuntimeError, match=r"start_job_worker\(\) requires job_worker_mode='in_process'"):
+            jobs_service.start_job_worker()
+
+        assert jobs_service._worker is None
+
+    def test_the_mode_is_a_contract_that_consistency_enforcement_does_not_relax(self, platform, session_factory):
+        settings.configure(
+            settings.JasilSettings(
+                job_worker_mode=JobWorkerMode.STANDALONE,
+                enforce_deployment_consistency=False,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match=r"run_job_worker\(\)"):
             jobs_service.start_job_worker()
 
 
 class TestStandaloneWorker:
-    def test_sqlite_is_refused(self, platform, session_factory, db_engine):
+    @pytest.fixture
+    def standalone(self):
+        """Declare the deployment shape, as every process of a real one would."""
+        configured = settings.JasilSettings(
+            job_worker_mode=JobWorkerMode.STANDALONE,
+            jobs=settings.JobSettings(enabled=True),
+            # One process stands in for two here, so the memory backends the
+            # platform fixture built are knowingly inconsistent with the shape.
+            enforce_deployment_consistency=False,
+        )
+        settings.configure(configured)
+        return configured
+
+    def test_sqlite_is_refused(self, platform, session_factory, db_engine, standalone):
         if db_engine.dialect.name != "sqlite":
             pytest.skip("SQLite-only topology guard")
         stop = threading.Event()
         stop.set()
 
-        with pytest.raises(RuntimeError, match="only one in-process consumer"):
+        with pytest.raises(RuntimeError, match=r"job_worker_mode=standalone runs job workers"):
             jobs_service.run_job_worker(queues=("campaign",), stop=stop)
 
-    def test_an_empty_queue_allowlist_fails_before_the_loop(self, platform, session_factory):
+    def test_it_refuses_an_in_process_deployment(self, platform, session_factory):
+        """The default mode: nothing declared this process, so the checks cannot see it."""
+        stop = threading.Event()
+        stop.set()
+
+        with pytest.raises(RuntimeError, match=r"run_job_worker\(\) requires job_worker_mode='standalone'"):
+            jobs_service.run_job_worker(queues=("campaign",), stop=stop)
+
+    def test_the_mode_is_a_contract_that_consistency_enforcement_does_not_relax(self, platform, session_factory):
+        settings.configure(settings.JasilSettings(enforce_deployment_consistency=False))
+
+        with pytest.raises(RuntimeError, match=r"start_job_worker\(\)"):
+            jobs_service.run_job_worker(stop=threading.Event())
+
+    def test_a_refused_worker_builds_nothing(self, platform, session_factory, monkeypatch):
+        built = []
+        monkeypatch.setattr(jobs_service, "build_runner", lambda **kw: built.append(kw))
+
+        with pytest.raises(RuntimeError):
+            jobs_service.run_job_worker(stop=threading.Event())
+
+        assert built == []
+
+    def test_an_empty_queue_allowlist_fails_before_the_loop(self, platform, session_factory, db_engine, monkeypatch):
+        """On SQLite the topology refuses first; the allowlist is validated by the runner."""
+        if db_engine.dialect.name == "sqlite":
+            monkeypatch.setattr(jobs_service, "_ensure_job_topology", lambda *a, **k: None)
+        settings.configure(settings.JasilSettings(job_worker_mode=JobWorkerMode.STANDALONE))
+
         with pytest.raises(ValueError, match="queues"):
             jobs_service.run_job_worker(queues=(), stop=threading.Event())
 
@@ -175,6 +248,8 @@ class TestStandaloneWorker:
         self,
         platform,
         session_factory,
+        db_engine,
+        standalone,
         monkeypatch,
     ):
         stop = threading.Event()
@@ -188,7 +263,10 @@ class TestStandaloneWorker:
                 telemetry=telemetry,
             )
 
-        monkeypatch.setattr(jobs_service, "_ensure_standalone_topology", lambda: None)
+        if db_engine.dialect.name == "sqlite":
+            # The declared shape is knowingly unsupported on SQLite; this test is
+            # about the wiring that follows the guard, which has its own tests.
+            monkeypatch.setattr(jobs_service, "_ensure_job_topology", lambda *a, **k: None)
         monkeypatch.setattr(jobs_worker, "run_worker", record_run)
 
         jobs_service.run_job_worker(

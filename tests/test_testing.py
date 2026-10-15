@@ -18,7 +18,7 @@ import jasil.settings as jasil_settings
 import jasil.testing as jasil_testing
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.storage_local import LocalStorage
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 from jasil.providers import ClockProvider, ServeFile
 
 
@@ -75,6 +75,22 @@ class TestTestMail:
         monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
         monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
         configured = jasil_settings.JasilSettings(web_workers=4, enforce_deployment_consistency=enforce)
+
+        jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert built[0].mail.uri == expected
+
+    @pytest.mark.parametrize(("enforce", "expected"), [(True, None), (False, "memory://")])
+    def test_standalone_job_workers_count_as_a_multi_process_deployment(self, tmp_path, monkeypatch, enforce, expected):
+        """A worker process is one more process, so recorded mail would go nowhere there too."""
+        built = []
+        monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
+        monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
+        configured = jasil_settings.JasilSettings(
+            job_worker_mode=JobWorkerMode.STANDALONE,
+            jobs=jasil_settings.JobSettings(enabled=True),
+            enforce_deployment_consistency=enforce,
+        )
 
         jasil_testing.install_test_platform(tmp_path, settings=configured)
 

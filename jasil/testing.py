@@ -110,8 +110,7 @@ def install_test_platform(
         # Unconfigured mail would raise on every send; a test wants it recorded.
         recording = replace(configured, mail=replace(configured.mail, uri="memory://", secure=True))
         refused = capabilities.check_mail_consistency(
-            profile=recording.profile,
-            web_workers=recording.web_workers,
+            topology=capabilities.topology_of(recording),
             mail_uri=recording.mail.uri,
             mail_label="mail.uri",
         )

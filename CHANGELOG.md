@@ -24,6 +24,9 @@ What counts as a breaking change — and what does not — is defined in [API st
   - **Durable route:** the outbox row is staged on the session immediately, uncommitted, and commits or rolls back with the caller's domain rows. A staging failure raises.
   - **Best-effort route:** the event is minted at publish time (capturing the ambient request id) and dispatched on the bus only after the session's **outermost** transaction commits, in publish order. Events published in a rolled-back SAVEPOINT, or in a rolled-back or closed transaction, are never dispatched; events from a released SAVEPOINT wait for the outermost commit. Dispatch failures are logged and swallowed. Pending events live in `Session.info`, so sessions never see each other's, and a session that never publishes gets no listeners.
   - Publishing starts the session's transaction if none is active; an empty `publish_many_on_commit` is a no-op. Only synchronous `Session` objects are supported; anything else (an `AsyncSession`, a `scoped_session` proxy) raises `TypeError`.
+- `JasilSettings.job_worker_mode` (`JobWorkerMode.IN_PROCESS` by default, or `STANDALONE`), with `jasil.profile.parse_job_worker_mode` for an environment value, declares where durable-job consumers run. A standalone worker is one more process reaching state, the event bus, the lock and mail, so declaring it makes every consistency rule see it. Load the same value in every process of the deployment, API and workers alike.
+- `DeploymentTopology.multi_process`, `multi_node` and `multi_process_causes`, and `jasil.capabilities.topology_of(settings)`, the one place settings become a topology. Consistency refusals now say what made the deployment multi-process (`profile=distributed`, `web_workers=N`, `job_worker_mode=standalone`), and the startup capability report shows `job_worker_mode`, `multi_process` and `multi_node`.
+- A fifth deployment-consistency rule, `jasil.capabilities.check_job_worker_consistency`: `job_worker_mode=standalone` is refused while `jobs.enabled` is false, because standalone workers cannot exist without the jobs pipeline.
 
 `publish_committing` and `publish_many_committing` are unchanged; hosts can adopt the new functions incrementally.
 
@@ -31,11 +34,15 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 - Durable job leases now use the restart-unique worker instance UUID that also keys telemetry. SQLite is explicitly limited to one API process with one in-process all-queue consumer; standalone selective workers require a concurrency-capable database such as PostgreSQL.
 - The queue migration backfills existing rows and keeps a database-side `default` default so writers from the previous release remain compatible during rolling deployment. Selective workers adopt only their subscribers' legacy `default` rows, and selective `default` workers exclude subscribers assigned to named queues.
+- **Breaking (0.x):** every consistency rule takes the resolved topology instead of its raw inputs. `check_state_consistency`, `check_lock_consistency`, `check_storage_consistency` and `check_mail_consistency` take `topology=` in place of `profile=` and `web_workers=` (pass `topology_of(settings)`), and `resolve_topology` takes keyword-only `profile`, `web_workers` and `job_worker_mode`. `DeploymentTopology.requires_shared_state` is removed: use `multi_process` for state, the lock and mail, and `multi_node` for storage.
+- `start_job_worker()` now requires `job_worker_mode=in_process` (the default) and `run_job_worker()` requires `standalone`; starting the wrong one raises `RuntimeError` even with `enforce_deployment_consistency=False`. Existing deployments that call `run_job_worker()` must set `job_worker_mode=standalone` in every process.
+- The two SQLite guards on durable-job consumers are one rule: a consumer is refused on SQLite whenever the configured topology is multi-process, which now also covers `profile=distributed` with a single web worker.
 - Job completion and failure use the worker id plus attempt generation as a compare-and-set token, so a handler that outlives its lease cannot overwrite a replacement worker's newer claim.
 
 ### Fixed
 
 - `JobRunner` renews the lease of the remaining jobs of a batch as each one starts, so a late job in a batch is no longer requeued (and run twice) while still running.
+- Standalone job workers were invisible to the deployment-consistency rules, so the default `local` profile with one API process and one worker passed startup on `memory://` state, an in-process event bus, a `noop://` lock and `memory://` mail. A handler would then "send" mail into the worker's memory and complete the job with nothing delivered.
 - An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is now judged by its embedded IPv4 address in the outbound-host check, so a public address is no longer refused on Python 3.12.0-3.12.3.
 
 ## [0.5.1]
