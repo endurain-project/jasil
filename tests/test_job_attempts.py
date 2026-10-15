@@ -862,9 +862,13 @@ class TestRetention:
     OLD = T0
     CUTOFF = T0 + timedelta(days=1)
 
-    def _job(self, db, subscriber, status):
+    def _job(self, db, subscriber, status, completed_at=None):
         job = _enqueue(db, subscriber)
-        db.execute(update(ProcessingJob).where(ProcessingJob.id == job.id).values(status=status))
+        if completed_at is None and status == jobs_crud.STATUS_COMPLETED:
+            completed_at = self.OLD
+        db.execute(
+            update(ProcessingJob).where(ProcessingJob.id == job.id).values(status=status, completed_at=completed_at)
+        )
         db.commit()
         return job
 
@@ -884,6 +888,14 @@ class TestRetention:
         remaining = {row.id for row in db.execute(select(JobAttempt)).scalars()}
         assert deleted == 2
         assert remaining == {"a-waiting", "a-running", "a-dead", "recent"}
+
+    def test_a_recently_completed_job_keeps_its_whole_history(self, db):
+        job = self._job(db, "fresh", jobs_crud.STATUS_COMPLETED, completed_at=self.CUTOFF + timedelta(hours=1))
+        _insert_attempt(db, id="first", job_id=job.id, claimed_at=self.OLD)
+
+        deleted = job_attempts.delete_attempts_before(self.CUTOFF, db=db)
+
+        assert deleted == 0
 
     def test_it_deletes_in_bounded_batches(self, db):
         for index in range(7):

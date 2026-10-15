@@ -58,7 +58,7 @@ class ScriptedRunner:
         self._stop = stop
         self.calls = 0
 
-    def run_once(self) -> int:
+    def run_once(self, stop=None) -> int:
         self.calls += 1
         if not self._script:
             self._stop.set()
@@ -136,7 +136,7 @@ class SignallingRunner:
         self.ran = threading.Event()
         self.thread_name: str | None = None
 
-    def run_once(self) -> int:
+    def run_once(self, stop=None) -> int:
         self.thread_name = threading.current_thread().name
         self.ran.set()
         return 0
@@ -149,7 +149,7 @@ class BlockingRunner:
         self.started = threading.Event()
         self.release = threading.Event()
 
-    def run_once(self) -> int:
+    def run_once(self, stop=None) -> int:
         self.started.set()
         assert self.release.wait(timeout=WAIT_TIMEOUT)
         return 1

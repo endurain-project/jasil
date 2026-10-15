@@ -62,7 +62,7 @@ class IdleRunner:
     connection, which the main thread's ``dispose()`` cannot close.
     """
 
-    def run_once(self) -> int:
+    def run_once(self, stop=None) -> int:
         return 0
 
 
