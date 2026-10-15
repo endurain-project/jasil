@@ -26,7 +26,7 @@ from jasil.jobs._worker_metadata import MAX_WORKER_METADATA_BYTES
 from jasil.jobs.models import JobWorker
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
-from jasil.jobs.worker import BackgroundWorker, WorkerTelemetry, run_worker
+from jasil.jobs.worker import BackgroundWorker, WorkerHeartbeat, WorkerTelemetry, run_worker
 
 # Long enough that an unwanted poll would hang the test rather than pass slowly.
 NEVER = 3600.0
@@ -239,6 +239,9 @@ class StepClock:
             self._moment += timedelta(seconds=1)
             return moment
 
+    def monotonic(self) -> float:
+        return self.now().timestamp()
+
 
 class TestWorkerTelemetry:
     @pytest.fixture
@@ -282,20 +285,25 @@ class TestWorkerTelemetry:
             session_factory=worker_database,
             worker_id="00000000-0000-4000-8000-000000000001",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=1,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
             queues=("campaign",),
         )
-        telemetry = WorkerTelemetry(
-            instance_id=runner._worker_id,
-            clock=clock,
-            session_factory=worker_database,
-            heartbeat_interval_seconds=0.01,
-            queues=runner._queues,
-            role="processor",
-            label="campaign-1",
-            metadata={"zone": "test"},
+        heartbeat = WorkerHeartbeat(
+            leases=runner.leases,
+            interval_seconds=0.01,
+            telemetry=WorkerTelemetry(
+                instance_id=runner._worker_id,
+                clock=clock,
+                session_factory=worker_database,
+                queues=runner._queues,
+                role="processor",
+                label="campaign-1",
+                metadata={"zone": "test"},
+            ),
         )
         original = worker_registry.record_worker_heartbeat
 
@@ -308,7 +316,7 @@ class TestWorkerTelemetry:
         thread = threading.Thread(
             target=run_worker,
             args=(runner,),
-            kwargs={"poll_interval_seconds": NEVER, "stop": stop, "telemetry": telemetry},
+            kwargs={"poll_interval_seconds": NEVER, "stop": stop, "heartbeat": heartbeat},
         )
         thread.start()
         assert handler_started.wait(timeout=WAIT_TIMEOUT)
@@ -381,16 +389,21 @@ class TestWorkerTelemetry:
             session_factory=worker_database,
             worker_id="00000000-0000-4000-8000-000000000002",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=1,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
         )
-        telemetry = WorkerTelemetry(
-            instance_id=runner._worker_id,
-            clock=clock,
-            session_factory=worker_database,
-            heartbeat_interval_seconds=0.01,
-            queues=None,
+        heartbeat = WorkerHeartbeat(
+            leases=runner.leases,
+            interval_seconds=0.01,
+            telemetry=WorkerTelemetry(
+                instance_id=runner._worker_id,
+                clock=clock,
+                session_factory=worker_database,
+                queues=None,
+            ),
         )
 
         def fail_heartbeat(*args, **kwargs):
@@ -402,7 +415,7 @@ class TestWorkerTelemetry:
             thread = threading.Thread(
                 target=run_worker,
                 args=(runner,),
-                kwargs={"poll_interval_seconds": NEVER, "stop": stop, "telemetry": telemetry},
+                kwargs={"poll_interval_seconds": NEVER, "stop": stop, "heartbeat": heartbeat},
             )
             thread.start()
             assert heartbeat_attempted.wait(timeout=WAIT_TIMEOUT)
@@ -423,7 +436,6 @@ class TestWorkerTelemetry:
                 instance_id="00000000-0000-4000-8000-000000000003",
                 clock=StepClock(),
                 session_factory=worker_database,
-                heartbeat_interval_seconds=1,
                 queues=None,
                 **kwargs,
             )
@@ -442,7 +454,6 @@ class TestWorkerTelemetry:
                 instance_id="00000000-0000-4000-8000-000000000003",
                 clock=StepClock(),
                 session_factory=worker_database,
-                heartbeat_interval_seconds=1,
                 queues=None,
                 metadata=metadata,
             )
@@ -453,7 +464,6 @@ class TestWorkerTelemetry:
             instance_id="00000000-0000-4000-8000-000000000003",
             clock=StepClock(),
             session_factory=worker_database,
-            heartbeat_interval_seconds=1,
             queues=None,
             metadata=metadata,
         )

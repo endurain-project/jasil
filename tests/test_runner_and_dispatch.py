@@ -43,6 +43,9 @@ class FixedClock:
     def now(self) -> datetime:
         return self._now
 
+    def monotonic(self) -> float:
+        return self._now.timestamp()
+
     def advance(self, seconds: float) -> None:
         self._now += timedelta(seconds=seconds)
 
@@ -64,6 +67,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="worker-1",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=10,
             backoff_base_seconds=10,
             backoff_max_seconds=100,
@@ -205,6 +210,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="w",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=2,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -224,6 +231,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="w",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=1,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -244,6 +253,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="w",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=10,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -275,6 +286,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="campaign-worker",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=10,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -286,6 +299,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="default-worker",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=10,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -312,6 +327,8 @@ class TestJobRunner:
             session_factory=session_factory,
             worker_id="default-worker",
             lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
             batch_size=10,
             backoff_base_seconds=1,
             backoff_max_seconds=2,
@@ -331,6 +348,8 @@ class TestJobRunner:
                 session_factory=session_factory,
                 worker_id="w",
                 lease_seconds=60,
+                max_runtime_seconds=600,
+                heartbeat_interval_seconds=15,
                 batch_size=10,
                 backoff_base_seconds=1,
                 backoff_max_seconds=2,

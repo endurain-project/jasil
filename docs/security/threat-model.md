@@ -185,8 +185,12 @@ a replay.
 
 **Mitigations.** `(event_id, subscriber_id)` uniqueness makes the fan-out
 idempotent; the claim is a compare-and-set so two workers cannot take the same
-row; and a worker's identity carries a digest when a long hostname forces
-truncation, so two machines never collapse onto one lease holder.
+row; a running worker's heartbeat renews its leases, so a slow healthy handler is
+not requeued and run a second time; and a handler whose lease is lost is
+signalled (`jasil.jobs.lease_lost`) and its result discarded by the claim's
+worker-id and attempt guard. What remains is a database partition, a handler
+that ignores the signal mid-side-effect, and a handler abandoned past
+`jobs.max_runtime_seconds`.
 
 **Yours.** Subscriber handlers must be idempotent. If running one twice would
 double-charge, double-send, or double-count, that is a correctness bug in the

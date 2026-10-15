@@ -116,6 +116,11 @@ A worker that dies holds its lease until it expires. The reaper returns those
 jobs to `pending` — or dead-letters them if they have no attempts left — so work
 is never stranded by a crash.
 
+A *running* worker does not lose its leases. Its heartbeat renews every lease it
+holds, the running job's and the waiting jobs' of its batch, on each beat, so
+`lease_seconds` is how long a worker may go **silent**, not how long a handler may
+run. See [Long-running handlers](#long-running-handlers).
+
 ## Idempotency
 
 `(event_id, subscriber_id)` is **unique in the database**. A repeated enqueue is a
@@ -285,16 +290,19 @@ failure.
   budget before dead-lettering. Catch it in the handler if that is not wanted.
 - **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
   message twice.
-- **Size `jobs.lease_seconds` for the whole handler, not one send.** One SMTP
-  send can take up to 90 seconds, and the DNS lookups before it are not counted
-  against that deadline. A handler that sends N messages can take N times that.
-  The runner renews a job's lease when its turn in a batch begins, but a lease
-  shorter than the handler lets the reaper requeue a job that is still being
-  delivered: it is then sent twice, and the late worker's result is discarded.
-  The claiming worker stamps the lease, so a dedicated mail worker group can run
-  with a longer `jobs.lease_seconds` without slowing crash recovery for other
-  queues. Give it a small `jobs.batch_size` too, so that one process does not hold
-  claimed messages while the rest of the group sits idle.
+- **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
+  SMTP send can take up to 90 seconds, and the DNS lookups before it are not
+  counted against that deadline. A handler that sends N messages can take N times
+  that. The worker's heartbeat keeps the job's lease alive while it runs, so the
+  lease itself no longer needs to be that long; the cap is
+  `max_runtime_seconds` (default 30 minutes). Past it the job is abandoned and a
+  retry may deliver the same message again.
+- **A lost lease stops the send.** The mail backends check
+  [`jasil.jobs.lease_lost()`](#long-running-handlers) before connecting, so a
+  handler that loops over recipients does not keep sending after its job has moved
+  to another worker. Give a dedicated mail worker group a small `jobs.batch_size`,
+  so one process does not hold claimed messages while the rest of the group sits
+  idle.
 - **Do not put secrets or rendered bodies in the event payload.** Payloads are
   stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
   build the message inside the handler.
@@ -304,17 +312,63 @@ failure.
 | Setting | Raise it when | Lower it when |
 |---|---|---|
 | `batch_size` | Throughput is the bottleneck | Individual jobs are slow or heavy |
-| `lease_seconds` | Jobs legitimately run long | Crashed workers strand work too long |
+| `lease_seconds` | Heartbeats are slow or the database is flaky | Crashed workers strand work too long |
+| `max_runtime_seconds` | Handlers legitimately run for a long time | A hung handler should be abandoned sooner |
 | `max_attempts` | Failures are usually transient | Failures are usually permanent |
 | `backoff_base_seconds` | The dependency needs time to recover | Retries should be prompt |
 | `poll_interval_seconds` | The queue is usually empty | Latency matters |
-| `heartbeat_interval_seconds` | Telemetry write volume matters | Faster stale detection matters |
+| `heartbeat_interval_seconds` | Heartbeat write volume matters | Faster stale detection, or a shorter lease, matters |
 
-`lease_seconds` must exceed the slowest realistic job duration. If a lease
-expires while a job is still running, the reaper requeues it and it runs twice
-concurrently — which your handler must tolerate anyway, but is wasteful. A late
-worker finalizes with its worker id and attempt generation, so it cannot overwrite
-the replacement worker's newer claim.
+`lease_seconds` is how long a worker may go silent. One heartbeat renews leases
+and proves the worker alive, so it must be at least **three**
+`heartbeat_interval_seconds` (two missed beats must not expire a lease), and
+`max_runtime_seconds` must not be below it; `build_runner` refuses anything else
+at startup. A worker is therefore reported stale no later than its leases start
+expiring.
+
+A late worker finalizes with its worker id and attempt generation, so even a
+handler that outlives its lease cannot overwrite the replacement worker's newer
+claim.
+
+### Long-running handlers
+
+A handler may run far longer than `lease_seconds`. While it does, the worker's
+heartbeat renews the job's lease, so the reaper leaves it alone and it is not run
+twice. Three things bound that:
+
+- **`max_runtime_seconds`.** Past it the job is **abandoned**: it is no longer
+  renewed, the handler is signalled, an `ERROR` is logged, and the rest of the
+  worker's batch is released back to the queue (no attempt is spent on jobs that
+  never started) instead of waiting behind a worker that is stuck. Python cannot
+  kill a thread, so a truly hung handler still occupies its worker; the log is the
+  operator's signal.
+- **Self-fencing.** If renewals fail for almost a whole lease (the database is
+  unreachable), the handler is signalled *before* another worker can have
+  reclaimed the job.
+- **A stolen lease.** If the job is found to belong to another worker, the handler
+  is signalled and its result is discarded.
+
+The signal is cooperative. A handler that loops, or does several side effects,
+should check it between units of work and return early:
+
+```python
+import jasil.jobs
+
+
+def send_digest(event):
+    for recipient in recipients_of(event):
+        if jasil.jobs.lease_lost():
+            return  # another worker owns this job now
+        platform.mail.send(build_message(recipient))
+```
+
+`lease_lost()` is `False` outside a durable job. The mail backends check it
+themselves. A `ContextVar` does not follow work a handler hands to its own
+threads unless it copies the context (`contextvars.copy_context()`).
+
+Delivery remains at-least-once: a handler that ignores the signal mid-send, or a
+database partition, can still produce a duplicate side effect, so handlers must
+stay idempotent.
 
 Queue rotation is intentionally in-memory and resets when a worker process
 restarts. It prevents starvation across batches in a healthy process; it is not

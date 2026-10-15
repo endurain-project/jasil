@@ -55,12 +55,13 @@ fields.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `False` | Route events through the outbox instead of the bus. |
-| `lease_seconds` | `300` | How long a claimed job is leased before the reaper may reclaim it. |
+| `lease_seconds` | `300` | How long a worker may go **silent** before the reaper may reclaim the jobs it holds. A running worker renews its leases on every heartbeat, so this is not a cap on handler runtime. At least three `heartbeat_interval_seconds`. |
+| `max_runtime_seconds` | `1800` | The longest a single handler is kept leased. Past it the job is abandoned to the reaper, the handler is signalled (`jasil.jobs.lease_lost`), and the rest of the batch is released. Not below `lease_seconds`. |
 | `batch_size` | `20` | Maximum rows claimed or relayed per pass. |
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
-| `heartbeat_interval_seconds` | `15.0` | Bounded interval between worker-registry writes. The default stale threshold is three intervals. |
+| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
 | `max_attempts` | `5` | Attempts before a job is dead-lettered. |
 | `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, and stopped/stale worker rows are pruned. `<= 0` disables. |
 

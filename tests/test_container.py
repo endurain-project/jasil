@@ -371,7 +371,29 @@ class TestMailResolution:
     def _build(**mail):
         return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())
 
-    def test_a_lease_not_above_the_smtp_deadline_warns(self, caplog):
+    def test_a_runtime_cap_not_above_the_smtp_deadline_warns(self, caplog):
+        """A running job keeps its lease only up to ``max_runtime_seconds``."""
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=60)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "max_runtime_seconds" in caplog.text
+
+    def test_a_longer_runtime_cap_does_not_warn(self, caplog):
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=1800)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "max_runtime_seconds" not in caplog.text
+
+    def test_a_short_lease_alone_does_not_warn(self, caplog):
+        """The lease is renewed while a handler runs, so it is no cap on one send."""
         jobs = settings.JobSettings(enabled=True, lease_seconds=60)
         cfg = _settings(
             mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
@@ -379,17 +401,7 @@ class TestMailResolution:
         with caplog.at_level("WARNING"):
             container._build_mail(cfg, SystemClock())
 
-        assert "lease_seconds" in caplog.text
-
-    def test_a_longer_lease_does_not_warn(self, caplog):
-        jobs = settings.JobSettings(enabled=True, lease_seconds=300)
-        cfg = _settings(
-            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
-        )
-        with caplog.at_level("WARNING"):
-            container._build_mail(cfg, SystemClock())
-
-        assert "lease_seconds" not in caplog.text
+        assert "jobs." not in caplog.text
 
     def test_unset_selects_the_disabled_backend(self):
         assert isinstance(self._build(), NullMail)

@@ -7,14 +7,17 @@ with backoff, or dead-letters it once the attempt ceiling is reached.
 """
 
 import logging
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
+from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector
 from jasil.providers import ClockProvider
@@ -65,6 +68,8 @@ class JobRunner:
         session_factory: Callable[[], Session],
         worker_id: str,
         lease_seconds: int,
+        max_runtime_seconds: float,
+        heartbeat_interval_seconds: float,
         batch_size: int,
         backoff_base_seconds: float,
         backoff_max_seconds: float,
@@ -89,6 +94,25 @@ class JobRunner:
                 sorted(registry.subscriber_ids().difference(selected_subscribers))
             )
         self._queue_cursor: str | None = None
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._leases = LeaseKeeper(
+            session_factory=session_factory,
+            clock=clock,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            interval_seconds=heartbeat_interval_seconds,
+        )
+
+    @property
+    def leases(self) -> LeaseKeeper:
+        """The record of what this worker holds, renewed by the worker heartbeat."""
+        return self._leases
+
+    @property
+    def heartbeat_interval_seconds(self) -> float:
+        """How often the worker heartbeat renews leases and refreshes telemetry."""
+        return self._heartbeat_interval_seconds
 
     @property
     def worker_id(self) -> str:
@@ -126,54 +150,56 @@ class JobRunner:
                 excluded_default_queue_subscribers=self._excluded_default_queue_subscribers,
             )
             snapshots = [self._snapshot(job) for job in claimed]
-        if snapshots:
-            self._queue_cursor = snapshots[-1].queue
-            logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
-        for index, snapshot in enumerate(snapshots):
-            # A DB error finishing one job must not abort the rest of the batch;
-            # its lease simply expires and the reaper requeues it.
-            try:
-                if index:
-                    try:
-                        held = self._still_held(snapshot, snapshots[index:])
-                    except Exception as error:
-                        # Not run: the lease is unknown, and the reaper requeues it.
-                        logger.error(
-                            "Durable job lease could not be renewed; skipping",
-                            exc_info=error,
-                            extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
-                        )
+        if not snapshots:
+            return 0
+        self._queue_cursor = snapshots[-1].queue
+        logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
+        self._leases.hold({snapshot.id: snapshot.attempts for snapshot in snapshots})
+        try:
+            for index, snapshot in enumerate(snapshots):
+                # A DB error finishing one job must not abort the rest of the batch;
+                # its lease simply expires and the reaper requeues it.
+                try:
+                    # The first job's lease was taken a moment ago; every later one
+                    # has been waiting, so it is renewed (and confirmed held) first.
+                    if index and not self._still_held(snapshot):
                         continue
-                    if not held:
-                        continue
-                self._run_job(snapshot)
-            except Exception as error:
-                logger.error(
-                    "Durable job could not be finalized",
-                    exc_info=error,
-                    extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
-                )
+                    if self._run_job(snapshot):
+                        # This worker lost its claim or overran its cap: it is in
+                        # trouble, so the rest of the batch goes back to the queue
+                        # for a worker that is not.
+                        self._leases.release_waiting()
+                        break
+                except Exception as error:
+                    logger.error(
+                        "Durable job could not be finalized",
+                        exc_info=error,
+                        extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
+                    )
+        finally:
+            self._leases.clear()
         return len(snapshots)
 
-    def _still_held(self, job: ClaimedJob, remaining: list[ClaimedJob]) -> bool:
-        """Renew the leases of the rest of the batch; False when ``job`` was lost.
+    def _still_held(self, job: ClaimedJob) -> bool:
+        """Renew the held leases; False when ``job`` is no longer this worker's.
 
-        The batch was claimed under one lease, but jobs run in turn: each one gets
-        a full lease from the start of its turn. A job the reaper already requeued
-        belongs to another worker now and must not be run here as well.
-
-        Renewing the whole remainder before each job is quadratic in the batch
-        size (one UPDATE per job at most ``batch_size`` rows); deliberate, as it
-        keeps every waiting job's lease alive while an earlier one runs.
+        The batch was claimed under one lease, but jobs run in turn. A job the
+        reaper already requeued belongs to another worker now and must not be run
+        here as well. The same renewal routine runs on the worker heartbeat, so a
+        waiting job normally has a fresh lease already; this is the confirmation
+        that it is still held.
         """
-        with self._session_factory() as db:
-            renewed = jobs_crud.renew_leases(
-                {item.id: item.attempts for item in remaining},
-                worker_id=self._worker_id,
-                lease_seconds=self._lease_seconds,
-                now=self._clock.now(),
-                db=db,
+        try:
+            renewed = self._leases.renew()
+        except Exception as error:
+            # Not run: the lease is unknown, and the reaper requeues it.
+            logger.error(
+                "Durable job lease could not be renewed; skipping",
+                exc_info=error,
+                extra={"job_id": job.id, "subscriber": job.subscriber_id},
             )
+            self._leases.drop(job.id)
+            return False
         if job.id in renewed:
             return True
         logger.warning(
@@ -193,13 +219,30 @@ class JobRunner:
         with self._session_factory() as db:
             return jobs_crud.reclaim_expired_leases(now=now, db=db)
 
-    def _run_job(self, job: ClaimedJob) -> None:
+    def _run_job(self, job: ClaimedJob) -> bool:
+        """Run one job and record its outcome.
+
+        Returns:
+            True when the job's lease was lost while it ran, abandoned past
+            ``max_runtime_seconds`` or fenced after failed renewals.
+        """
+        lost = self._leases.begin(job.id)
+        try:
+            self._execute(job, lost)
+        finally:
+            # After the outcome is written, so the heartbeat keeps renewing the
+            # lease through the completion write.
+            self._leases.finish(job.id)
+        return lost.is_set()
+
+    def _execute(self, job: ClaimedJob, lost: threading.Event) -> None:
         handler = self._registry.get(job.subscriber_id)
         event = self._event_from(job)
         try:
             if handler is None:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
-            handler(event)
+            with job_lease(lost):
+                handler(event)
         except Exception as error:
             self._fail(job, error)
             return

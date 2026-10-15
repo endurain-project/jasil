@@ -68,7 +68,11 @@ class IdleRunner:
 
 class TestBuildRunner:
     def test_it_wires_the_runner_from_settings_and_the_platform(self, platform, session_factory):
-        settings.configure(settings.JasilSettings(jobs=settings.JobSettings(lease_seconds=17, batch_size=3)))
+        settings.configure(
+            settings.JasilSettings(
+                jobs=settings.JobSettings(lease_seconds=17, batch_size=3, heartbeat_interval_seconds=5)
+            )
+        )
 
         runner = jobs_service.build_runner()
 
@@ -76,6 +80,52 @@ class TestBuildRunner:
         assert runner._batch_size == 3
         assert runner._clock is platform.clock
         assert runner._registry is jobs_registry.registry
+
+    def test_it_wires_the_lease_timing_from_settings(self, platform, session_factory):
+        settings.configure(
+            settings.JasilSettings(
+                jobs=settings.JobSettings(lease_seconds=90, max_runtime_seconds=500, heartbeat_interval_seconds=7)
+            )
+        )
+
+        runner = jobs_service.build_runner()
+
+        assert runner.heartbeat_interval_seconds == 7
+        assert runner.leases._max_runtime_seconds == 500
+        assert runner.leases._lease_seconds == 90
+
+    @pytest.mark.parametrize(
+        ("jobs", "message"),
+        [
+            pytest.param(
+                {"lease_seconds": 44, "heartbeat_interval_seconds": 15},
+                r"at least three heartbeat intervals \(45 s",
+                id="lease-below-three-beats",
+            ),
+            pytest.param(
+                {"max_runtime_seconds": 299},
+                r"max_runtime_seconds \(299\) must not be below jobs.lease_seconds \(300\)",
+                id="cap-below-lease",
+            ),
+            pytest.param(
+                {"heartbeat_interval_seconds": 0},
+                r"heartbeat_interval_seconds must be greater than zero",
+                id="no-interval",
+            ),
+        ],
+    )
+    def test_timings_that_cannot_keep_a_lease_alive_are_refused(self, platform, session_factory, jobs, message):
+        settings.configure(settings.JasilSettings(jobs=settings.JobSettings(**jobs)))
+
+        with pytest.raises(ValueError, match=message):
+            jobs_service.build_runner()
+
+    def test_a_lease_of_exactly_three_beats_is_accepted(self, platform, session_factory):
+        settings.configure(
+            settings.JasilSettings(jobs=settings.JobSettings(lease_seconds=45, heartbeat_interval_seconds=15))
+        )
+
+        assert jobs_service.build_runner().heartbeat_interval_seconds == 15
 
     def test_it_passes_a_queue_allowlist_to_the_runner(self, platform, session_factory):
         runner = jobs_service.build_runner(queues=("campaign", "maintenance"))
@@ -99,7 +149,7 @@ class TestWorkerLifecycle:
     @pytest.fixture(autouse=True)
     def idle_runner(self, platform, session_factory, monkeypatch):
         monkeypatch.setattr(jobs_service, "build_runner", IdleRunner)
-        monkeypatch.setattr(jobs_service, "_build_worker_telemetry", lambda *args, **kwargs: None)
+        monkeypatch.setattr(jobs_service, "_build_heartbeat", lambda *args, **kwargs: None)
 
     def test_starting_installs_a_worker(self):
         jobs_service.start_job_worker()
@@ -255,12 +305,12 @@ class TestStandaloneWorker:
         stop = threading.Event()
         captured = {}
 
-        def record_run(runner, *, poll_interval_seconds, stop, telemetry):
+        def record_run(runner, *, poll_interval_seconds, stop, heartbeat):
             captured.update(
                 runner=runner,
                 poll_interval_seconds=poll_interval_seconds,
                 stop=stop,
-                telemetry=telemetry,
+                heartbeat=heartbeat,
             )
 
         if db_engine.dialect.name == "sqlite":
@@ -277,9 +327,12 @@ class TestStandaloneWorker:
             stop=stop,
         )
 
+        heartbeat = captured["heartbeat"]
         assert captured["runner"].queues == ("campaign",)
-        assert captured["telemetry"]._queues == ("campaign",)
-        assert captured["telemetry"]._role == "domain-worker"
+        assert heartbeat._telemetry._queues == ("campaign",)
+        assert heartbeat._telemetry._role == "domain-worker"
+        assert heartbeat._leases is captured["runner"].leases
+        assert heartbeat._interval_seconds == captured["runner"].heartbeat_interval_seconds
         assert captured["stop"] is stop
 
 

@@ -92,8 +92,9 @@ through.
       or a documented exemption — and hold the registry to it with
       `assert_nets_complete` in a test. Delivery is at-least-once but not
       guaranteed.
-- [ ] Alert on `dead_letter` job count, and on the `Reaped N expired job lease(s)`
-      warning: a lease only expires because a worker died or overran.
+- [ ] Alert on `dead_letter` job count, on the `Reaped N expired job lease(s)`
+      warning (a lease only expires because a worker died or went silent), and on
+      `exceeded its maximum runtime` errors (a handler is hung or too slow).
 - [ ] Alert on the oldest pending job age from `jasil.admin.get_jobs_summary()`.
 - [ ] Assign queue names at subscriber registration. Keep them lowercase ASCII,
       stable, and domain-neutral from JASIL's point of view; renaming a queue
@@ -105,10 +106,15 @@ through.
       process group.
 - [ ] Remember that durable jobs do not require Redis. Do not introduce a second
       queue as a source of truth beside `processing_jobs`.
-- [ ] Set `lease_seconds` above the longest handler duration. Heartbeats remain
-      live during a long handler, but they do not extend the job lease. A stale
-      worker cannot finalize over a replacement claim, but both handlers may
-      already have performed external side effects, so idempotency still matters.
+- [ ] Set `max_runtime_seconds` above the longest handler you expect, and keep
+      `lease_seconds` at least three `heartbeat_interval_seconds`. The heartbeat
+      renews a running job's lease, so `lease_seconds` bounds how long a worker may
+      go silent, not how long a handler may run. A handler past
+      `max_runtime_seconds` is abandoned and may be run again, and a stale worker
+      cannot finalize over a replacement claim, but both may already have
+      performed external side effects, so idempotency still matters.
+- [ ] In handlers that loop or perform several side effects, check
+      `jasil.jobs.lease_lost()` between units of work and return early.
 
 ## The admin surface
 

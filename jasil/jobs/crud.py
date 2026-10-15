@@ -271,16 +271,7 @@ def renew_leases(
     """
     if not job_attempts:
         return set()
-    held = [
-        or_(
-            *(
-                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
-                for job_id, attempts in job_attempts.items()
-            )
-        ),
-        ProcessingJob.status == STATUS_CLAIMED,
-        ProcessingJob.locked_by == worker_id,
-    ]
+    held = _held_claims(job_attempts, worker_id=worker_id)
     db.execute(
         update(ProcessingJob)
         .where(*held)
@@ -291,6 +282,70 @@ def renew_leases(
     ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
     db.commit()
     return ids
+
+
+def release_leases(
+    job_attempts: dict[str, int],
+    *,
+    worker_id: str,
+    now: datetime,
+    db: Session,
+) -> int:
+    """
+    Return claimed jobs this worker will not run to ``pending``, at no attempt cost.
+
+    A batch is claimed up front, and a worker that stops early (a job lost its
+    lease, or ran past ``max_runtime_seconds``) would otherwise leave the rest
+    waiting out a lease it keeps renewing, or expiring into a requeue that counts
+    as an attempt for work that never started. Releasing returns each row to
+    ``pending``, immediately available, with the attempt this claim took refunded.
+    Only rows still ``claimed`` by ``worker_id`` at the given attempt are touched,
+    so a job already requeued and claimed again elsewhere is left alone.
+
+    Args:
+        job_attempts: The jobs to release, as ``{job_id: attempt number of the
+            claim being released}``.
+        worker_id: The lease holder.
+        now: Current instant; the jobs are available again from here.
+        db: Active database session.
+
+    Returns:
+        The number of jobs released.
+    """
+    if not job_attempts:
+        return 0
+    released = cast(
+        CursorResult[Any],
+        db.execute(
+            update(ProcessingJob)
+            .where(*_held_claims(job_attempts, worker_id=worker_id))
+            .values(
+                status=STATUS_PENDING,
+                attempts=ProcessingJob.attempts - 1,
+                available_at=now,
+                updated_at=now,
+                locked_by=None,
+                locked_at=None,
+                lease_expires_at=None,
+            )
+        ),
+    )
+    db.commit()
+    return released.rowcount
+
+
+def _held_claims(job_attempts: dict[str, int], *, worker_id: str) -> list[Any]:
+    """Match the claims ``worker_id`` still holds, each at the attempt it took."""
+    return [
+        or_(
+            *(
+                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
+                for job_id, attempts in job_attempts.items()
+            )
+        ),
+        ProcessingJob.status == STATUS_CLAIMED,
+        ProcessingJob.locked_by == worker_id,
+    ]
 
 
 def mark_job_completed(
@@ -448,9 +503,11 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     if not job_ids:
         db.commit()
         return 0
-    # Both updates re-assert ``status = 'claimed'``: without SKIP LOCKED two
-    # reapers can select the same rows, and the loser must not overwrite the
-    # requeue the winner already performed.
+    # Both updates re-assert ``status = 'claimed'`` *and* the expiry. Without SKIP
+    # LOCKED two reapers can select the same rows, and the loser must not
+    # overwrite the requeue the winner already performed; and a worker's heartbeat
+    # can renew a lease between this select and these updates, which must keep
+    # the job rather than requeue a lease that is no longer expired.
     dead_lettered = cast(
         CursorResult[Any],
         db.execute(
@@ -458,6 +515,7 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
             .where(
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
+                ProcessingJob.lease_expires_at < now,
                 ProcessingJob.attempts >= ProcessingJob.max_attempts,
             )
             .values(
@@ -468,6 +526,10 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
                 locked_by=None,
                 lease_expires_at=None,
             )
+            # ``fetch`` rather than the default in-Python evaluation: the criteria now
+            # compare a datetime, which the evaluator would run against any job the
+            # session already holds, and a loaded value may be naive (SQLite, MySQL).
+            .execution_options(synchronize_session="fetch")
         ),
     )
     requeued = cast(
@@ -477,6 +539,7 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
             .where(
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
+                ProcessingJob.lease_expires_at < now,
                 ProcessingJob.attempts < ProcessingJob.max_attempts,
             )
             .values(
@@ -488,6 +551,7 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
                 locked_at=None,
                 lease_expires_at=None,
             )
+            .execution_options(synchronize_session="fetch")
         ),
     )
     db.commit()

@@ -63,9 +63,13 @@ gets a UUIDv4 instance id on startup and records:
 Public summaries derive active claim counts directly from `processing_jobs`, so
 reaping a crashed worker cannot leave phantom load on the dashboard.
 
-A dedicated heartbeat thread writes at `heartbeat_interval_seconds`, not on
-every empty poll, and keeps running while a handler is blocked. Heartbeat writes
-are best-effort: a database error is logged and job execution continues.
+A dedicated heartbeat thread beats every `heartbeat_interval_seconds`, not on
+every empty poll, and keeps running while a handler is blocked. Each beat does two
+independent things: it renews the leases of the jobs the worker holds, and it
+refreshes the worker's registry row. One signal therefore means both "this worker
+is alive" and "this worker still holds these jobs", so a worker reported `stale`
+is one whose leases are about to expire. The registry write is best-effort: a
+database error is logged and job execution continues.
 
 ```python
 import jasil.admin as jasil_admin

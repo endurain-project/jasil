@@ -55,13 +55,21 @@ class JobSettings:
     Attributes:
         enabled: Route events through the transactional outbox instead of the
             event bus. When false the whole jobs layer stays dormant.
-        lease_seconds: How long a claimed job is leased to a worker before the
-            reaper may reclaim it.
+        lease_seconds: How long a worker may go silent before the reaper may
+            reclaim the jobs it holds. A running worker renews its leases on every
+            heartbeat, so this is *not* a cap on handler runtime (see
+            ``max_runtime_seconds``). Must be at least three
+            ``heartbeat_interval_seconds``.
         batch_size: Maximum rows claimed or relayed per pass.
         backoff_base_seconds: First retry delay; doubles per attempt.
         backoff_max_seconds: Ceiling for the exponential backoff.
         poll_interval_seconds: Idle wait between empty polls.
-        heartbeat_interval_seconds: Interval between worker-registry writes.
+        max_runtime_seconds: The longest a single handler is kept leased. Past it
+            the job is abandoned to the reaper, the handler is told to stop
+            (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
+            released to run elsewhere. Must not be below ``lease_seconds``.
+        heartbeat_interval_seconds: Interval between worker heartbeats, each of
+            which renews held leases and refreshes the worker-registry row.
         max_attempts: Attempts before a job is dead-lettered.
         retention_days: Age at which relayed outbox rows, completed jobs, and
             stopped and stale worker rows are pruned. ``<= 0`` disables pruning.
@@ -69,6 +77,7 @@ class JobSettings:
 
     enabled: bool = False
     lease_seconds: int = 300
+    max_runtime_seconds: int = 1800
     batch_size: int = 20
     backoff_base_seconds: int = 60
     backoff_max_seconds: int = 3600

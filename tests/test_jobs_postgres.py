@@ -50,6 +50,9 @@ class FixedClock:
     def now(self) -> datetime:
         return self._moment
 
+    def monotonic(self) -> float:
+        return self._moment.timestamp()
+
 
 def _runner(registry, session_factory, worker_id, *, queues, batch_size=10, clock=None):
     return JobRunner(
@@ -58,6 +61,8 @@ def _runner(registry, session_factory, worker_id, *, queues, batch_size=10, cloc
         session_factory=session_factory,
         worker_id=worker_id,
         lease_seconds=60,
+        max_runtime_seconds=600,
+        heartbeat_interval_seconds=15,
         batch_size=batch_size,
         backoff_base_seconds=1,
         backoff_max_seconds=2,
