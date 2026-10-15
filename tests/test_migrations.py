@@ -217,6 +217,21 @@ class TestDowngrade:
 
         assert "job_workers" in inspect(engine).get_table_names()
 
+    def test_the_attempt_history_can_downgrade_and_upgrade_again(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0003")
+
+        assert "job_attempts" not in inspect(engine).get_table_names()
+        assert "job_workers" in inspect(engine).get_table_names(), "only the history table is removed"
+
+        migrations.upgrade(engine)
+
+        columns = {column["name"] for column in inspect(engine).get_columns("job_attempts")}
+        assert {"job_id", "worker_id", "attempt", "outcome", "duration_ms", "claimed_at"} <= columns
+        indexes = {index["name"] for index in inspect(engine).get_indexes("job_attempts")}
+        assert {"idx_job_attempts_job", "idx_job_attempts_worker", "idx_job_attempts_event"} <= indexes
+
 
 class TestAdoptExistingSchema:
     def test_an_empty_database_is_not_stamped_and_can_be_upgraded(self, engine):

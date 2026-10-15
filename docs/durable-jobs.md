@@ -254,7 +254,10 @@ jasil_admin.replay_dead_letter_job(job_id)
 which returns the job to `pending` with a fresh attempt budget.
 
 `jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
-throughput, backlog age, and the dead-letter list for an operations dashboard.
+throughput, backlog age, handler durations, and the dead-letter list (each with
+the worker that ran its last attempt) for an operations dashboard.
+`jasil_admin.get_job(job_id)` returns a dead letter's whole history: which worker
+ran each attempt, how long it took, and why it failed.
 `jasil_admin.get_workers_summary()` reports running, stale, and gracefully
 stopped worker instances one bounded page at a time; pass its `next_cursor` into
 the next call. See [Observability](observability.md#worker-registry).

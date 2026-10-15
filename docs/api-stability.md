@@ -31,7 +31,7 @@ modules:
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
 | `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
-| `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `get_workers_summary`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
+| `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `get_workers_summary`, `get_job`, `get_event_jobs`, `get_worker_attempts`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`, `publish_on_commit`, `publish_many_on_commit`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, and the order they resolve a platform in. |

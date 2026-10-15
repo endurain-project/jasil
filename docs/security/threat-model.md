@@ -144,6 +144,12 @@ JASIL does not sanitise the values it logs. It bounds the *length* of the
 identifiers it persists (`event_type`, `source`, `subscriber_id`), which are
 developer-authored, but a `metadata` dict is yours and reaches the log intact.
 
+The same holds for failure text. A handler's exception message is stored,
+truncated to 4000 characters, in `processing_jobs.last_error` and, one row per
+attempt, in `job_attempts.error`, and `jasil.admin.get_job` returns it. Do not
+put a secret in an exception message, and keep `jasil.admin` behind the host's own
+authorization.
+
 ## SQL injection (CWE-89)
 
 **Not a surface.** Every query is SQLAlchemy Core or ORM with bound parameters.

@@ -1,8 +1,5 @@
 """Internal persistence for durable-worker lifecycle telemetry."""
 
-import base64
-import binascii
-import json
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -10,17 +7,17 @@ from typing import Any, cast
 from sqlalchemy import CursorResult, and_, case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
+from jasil._core.cursors import decode_cursor, encode_cursor
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
-from jasil._core.timestamps import age_seconds, as_utc
+from jasil._core.timestamps import age_seconds
 from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.crud import STATUS_CLAIMED
-from jasil.jobs.models import JobWorker, ProcessingJob
+from jasil.jobs.models import JobAttempt, JobWorker, ProcessingJob
 from jasil.jobs.registry import normalize_queue_selector
 from jasil.jobs.schema import WorkerInfo, WorkersSummary, WorkerStatus
 
 DEFAULT_WORKER_PAGE_SIZE = 100
 MAX_WORKER_PAGE_SIZE = 500
-_MAX_CURSOR_LENGTH = 512
 
 
 def record_worker_start(
@@ -97,8 +94,14 @@ def get_workers_summary(
     db: Session,
     limit: int = DEFAULT_WORKER_PAGE_SIZE,
     cursor: str | None = None,
+    hours: int = 24,
+    record_attempts: bool = True,
 ) -> WorkersSummary:
-    """Read one bounded page of workers and derive global operator totals."""
+    """Read one bounded page of workers and derive global operator totals.
+
+    ``hours`` windows the per-worker attempt counts (attempts that *ended* in it).
+    With ``record_attempts`` false those counts are ``None``, not ``0``.
+    """
     if stale_after_seconds <= 0:
         raise ValueError("stale_after_seconds must be greater than zero")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WORKER_PAGE_SIZE:
@@ -128,6 +131,21 @@ def get_workers_summary(
             ),
         )
     ).one()
+    # Jobs held by a worker that has stopped beating and never said goodbye: they
+    # wait out their lease for the reaper, which is the number an operator
+    # watching a crash wants. Active claims of *running* workers are not stuck.
+    claimed_by_stale = int(
+        db.execute(
+            select(func.count())
+            .select_from(ProcessingJob)
+            .join(JobWorker, JobWorker.instance_id == ProcessingJob.locked_by)
+            .where(
+                ProcessingJob.status == STATUS_CLAIMED,
+                JobWorker.stopped_at.is_(None),
+                JobWorker.last_heartbeat_at < stale_before,
+            )
+        ).scalar_one()
+    )
     statement = select(JobWorker)
     if cursor is not None:
         cursor_started_at, cursor_instance_id = _decode_cursor(cursor)
@@ -157,6 +175,18 @@ def get_workers_summary(
     active_claims: dict[str, int] = {
         instance_id: int(count) for instance_id, count in claim_rows if instance_id is not None
     }
+    window_start = now - timedelta(hours=hours)
+    outcomes: dict[str, dict[str, int]] = {}
+    last_finished: dict[str, datetime] = {}
+    if record_attempts and instance_ids:
+        for worker_id, outcome, count, finished in db.execute(
+            select(JobAttempt.worker_id, JobAttempt.outcome, func.count(), func.max(JobAttempt.finished_at))
+            .where(JobAttempt.worker_id.in_(instance_ids), JobAttempt.finished_at >= window_start)
+            .group_by(JobAttempt.worker_id, JobAttempt.outcome)
+        ).all():
+            outcomes.setdefault(worker_id, {})[outcome] = int(count)
+            if finished is not None and (worker_id not in last_finished or finished > last_finished[worker_id]):
+                last_finished[worker_id] = finished
     workers: list[WorkerInfo] = []
     for row in rows:
         status: WorkerStatus
@@ -181,10 +211,14 @@ def get_workers_summary(
                 # worker does not retain phantom claims after the reaper runs.
                 active_claimed_jobs=int(active_claims.get(row.instance_id, 0)),
                 status=status,
+                **_outcome_counts(outcomes.get(row.instance_id, {}), record_attempts),
+                last_finished_at=last_finished.get(row.instance_id),
             )
         )
     return WorkersSummary(
         stale_after_seconds=stale_after_seconds,
+        window_hours=hours,
+        claimed_by_stale_workers=claimed_by_stale,
         total_workers=int(total_workers),
         running=int(running),
         stale=int(stale),
@@ -194,26 +228,25 @@ def get_workers_summary(
     )
 
 
+def _outcome_counts(counts: dict[str, int], record_attempts: bool) -> dict[str, int | None]:
+    """A worker's per-outcome attempt counts; ``None`` when attempts are not recorded."""
+    if not record_attempts:
+        return {key: None for key in ("completed", "failed", "dead_lettered", "lease_expired", "superseded")}
+    return {
+        "completed": counts.get("completed", 0),
+        "failed": counts.get("failed", 0),
+        "dead_lettered": counts.get("dead_letter", 0),
+        "lease_expired": counts.get("lease_expired", 0),
+        "superseded": counts.get("superseded", 0),
+    }
+
+
 def _encode_cursor(worker: JobWorker) -> str:
-    payload = json.dumps([as_utc(worker.started_at).isoformat(), worker.instance_id], separators=(",", ":"))
-    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+    return encode_cursor(worker.started_at, worker.instance_id)
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, str]:
-    try:
-        if not cursor or len(cursor) > _MAX_CURSOR_LENGTH:
-            raise ValueError
-        padding = "=" * (-len(cursor) % 4)
-        decoded = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
-        values = json.loads(decoded)
-        if not isinstance(values, list) or len(values) != 2 or not all(isinstance(value, str) for value in values):
-            raise ValueError
-        started_at = datetime.fromisoformat(values[0])
-        if started_at.tzinfo is None or not values[1]:
-            raise ValueError
-        return started_at, values[1]
-    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as error:
-        raise ValueError("invalid worker summary cursor") from error
+    return decode_cursor(cursor, name="worker summary")
 
 
 def prune_worker_records_before(cutoff: datetime, *, db: Session, batch_size: int = PRUNE_BATCH_SIZE) -> int:

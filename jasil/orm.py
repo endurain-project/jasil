@@ -1,7 +1,8 @@
 """JASIL's SQLAlchemy registry plumbing and session-factory helpers.
 
 **Option B (the host owns the ``Base``).** JASIL's companion tables —
-``event_log``, ``processing_jobs``, ``event_outbox``, and ``job_workers`` — must
+``event_log``, ``processing_jobs``, ``event_outbox``, ``job_workers``, and
+``job_attempts`` — must
 live in the same declarative registry as the host's own models so that one
 ``create_all`` / migration run and one metadata object cover the whole schema.
 The host owns that registry; JASIL maps its models **into** it.
@@ -94,7 +95,9 @@ _MODEL_MODULES: tuple[str, ...] = (
 
 #: Tables JASIL owns. The migrations scope every operation to these, so a host
 #: sharing the registry never has its own tables added, dropped, or diffed.
-_TABLE_NAMES: frozenset[str] = frozenset({"event_log", "processing_jobs", "event_outbox", "job_workers"})
+_TABLE_NAMES: frozenset[str] = frozenset(
+    {"event_log", "processing_jobs", "event_outbox", "job_workers", "job_attempts"}
+)
 
 
 def jasil_table_names() -> frozenset[str]:

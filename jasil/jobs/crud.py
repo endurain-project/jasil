@@ -25,7 +25,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, and_, case, func, or_, select, update
+from sqlalchemy import CursorResult, and_, case, func, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -39,7 +39,17 @@ from jasil._core.limits import MAX_STORED_ERROR_LENGTH, fit_length
 from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.events import Event
-from jasil.jobs.models import ProcessingJob
+from jasil.jobs._attempts import (
+    OUTCOME_COMPLETED,
+    OUTCOME_DEAD_LETTER,
+    OUTCOME_FAILED,
+    OUTCOME_LEASE_EXPIRED,
+    OUTCOME_RELEASED,
+    OUTCOME_SUPERSEDED,
+    attempt_stats,
+    last_worker_ids,
+)
+from jasil.jobs.models import JobAttempt, ProcessingJob
 from jasil.jobs.registry import DEFAULT_QUEUE, normalize_queue_selector, validate_queue_name
 
 STATUS_PENDING = "pending"
@@ -122,6 +132,7 @@ def claim_jobs(
     queue_cursor: str | None = None,
     default_queue_subscribers: Iterable[str] | None = None,
     excluded_default_queue_subscribers: Iterable[str] | None = None,
+    record_attempts: bool = True,
 ) -> list[ProcessingJob]:
     """
     Atomically claim up to ``limit`` due jobs, taking a time-bounded lease.
@@ -150,6 +161,9 @@ def claim_jobs(
         excluded_default_queue_subscribers: Registered subscribers assigned to
             unselected queues. When ``default`` is selected, their legacy rows
             must remain available to the worker for their assigned queue.
+        record_attempts: Open one ``job_attempts`` row per claimed job, in the
+            claim's own transaction, so the history can never disagree with the
+            claim.
 
     Returns:
         The jobs this call actually claimed, oldest-available first.
@@ -204,6 +218,8 @@ def claim_jobs(
             updated_at=now,
         )
     )
+    if record_attempts:
+        _open_attempts(job_ids, worker_id=worker_id, now=now, db=db)
     db.commit()
     claimed = (
         db.execute(
@@ -228,6 +244,166 @@ def claim_jobs(
         .all()
     )
     return list(claimed)
+
+
+def _open_attempts(job_ids: list[str], *, worker_id: str, now: datetime, db: Session) -> None:
+    """Open one attempt row for each job this worker just claimed.
+
+    Reads the claimed rows back *before* the claim commits, so the history rows
+    join the claim's transaction, but selects plain columns rather than entities:
+    entities loaded here would be expired by that commit and reloaded one by one.
+    The predicate is the one the claim's own read-back uses.
+    """
+    rows = db.execute(
+        select(
+            ProcessingJob.id,
+            ProcessingJob.event_id,
+            ProcessingJob.event_type,
+            ProcessingJob.subscriber_id,
+            ProcessingJob.queue,
+            ProcessingJob.attempts,
+        ).where(
+            ProcessingJob.id.in_(job_ids),
+            ProcessingJob.status == STATUS_CLAIMED,
+            ProcessingJob.locked_by == worker_id,
+        )
+    ).all()
+    if not rows:
+        return
+    db.execute(
+        insert(JobAttempt),
+        [
+            {
+                "id": str(uuid.uuid4()),
+                "job_id": job_id,
+                "event_id": event_id,
+                "event_type": event_type,
+                "subscriber_id": subscriber_id,
+                "queue": queue,
+                "attempt": attempt,
+                "worker_id": worker_id,
+                "claimed_at": now,
+            }
+            for job_id, event_id, event_type, subscriber_id, queue, attempt in rows
+        ],
+    )
+
+
+def _finish_attempt(
+    db: Session,
+    *,
+    job_id: str,
+    worker_id: str,
+    attempt: int,
+    now: datetime,
+    outcome: str,
+    duration_ms: int | None = None,
+    error: str | None = None,
+    owned: bool,
+) -> None:
+    """Close the attempt row of one claim, in the caller's transaction.
+
+    A worker that still owned the claim closes its open row with ``outcome``. One
+    that did not (the lease expired and the job was taken) finished *late*: its
+    row is either still open or was closed ``lease_expired`` by the reaper, and
+    becomes ``superseded``, keeping the late duration and error: it is the only
+    durable record that the handler ran twice. A row closed ``abandoned`` stays so.
+    """
+    claim = [
+        JobAttempt.job_id == job_id,
+        JobAttempt.worker_id == worker_id,
+        JobAttempt.attempt == attempt,
+    ]
+    if owned:
+        claim.append(JobAttempt.finished_at.is_(None))
+    else:
+        outcome = OUTCOME_SUPERSEDED
+        claim.append(or_(JobAttempt.finished_at.is_(None), JobAttempt.outcome == OUTCOME_LEASE_EXPIRED))
+    db.execute(
+        update(JobAttempt)
+        .where(*claim)
+        .values(outcome=outcome, finished_at=now, duration_ms=duration_ms, error=error)
+        # Attempt rows are never read back through this session, so skip the sync.
+        .execution_options(synchronize_session=False)
+    )
+
+
+def close_attempts(
+    job_attempts: dict[str, int],
+    *,
+    worker_id: str,
+    outcome: str,
+    now: datetime,
+    db: Session,
+) -> int:
+    """
+    Close the open attempt rows of claims this worker will not finish.
+
+    Used for jobs that are released unstarted and for a job abandoned past its
+    maximum runtime; each is matched by job, worker and the attempt it took.
+    Commits.
+
+    Args:
+        job_attempts: ``{job_id: attempt number of the claim}``.
+        worker_id: The worker that holds the claims.
+        outcome: One of :data:`OUTCOMES`.
+        now: The instant the attempts ended.
+        db: Active database session.
+
+    Returns:
+        The number of attempt rows closed.
+    """
+    closed = _close_open(job_attempts, worker_id=worker_id, outcome=outcome, now=now, db=db)
+    db.commit()
+    return closed
+
+
+def _close_open(job_attempts: dict[str, int], *, worker_id: str, outcome: str, now: datetime, db: Session) -> int:
+    if not job_attempts:
+        return 0
+    result = cast(
+        CursorResult[Any],
+        db.execute(
+            update(JobAttempt)
+            .where(
+                or_(
+                    *(
+                        and_(JobAttempt.job_id == job_id, JobAttempt.attempt == attempt)
+                        for job_id, attempt in job_attempts.items()
+                    )
+                ),
+                JobAttempt.worker_id == worker_id,
+                JobAttempt.finished_at.is_(None),
+            )
+            .values(outcome=outcome, finished_at=now)
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    return result.rowcount
+
+
+def mark_attempt_started(job_id: str, *, worker_id: str, attempt: int, now: datetime, db: Session) -> None:
+    """Stamp the moment a claim's handler began. Commits.
+
+    Args:
+        job_id: The job being run.
+        worker_id: The worker running it.
+        attempt: The attempt number of the claim.
+        now: When the handler began.
+        db: Active database session.
+    """
+    db.execute(
+        update(JobAttempt)
+        .where(
+            JobAttempt.job_id == job_id,
+            JobAttempt.worker_id == worker_id,
+            JobAttempt.attempt == attempt,
+            JobAttempt.finished_at.is_(None),
+        )
+        .values(started_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
 
 
 def _queue_order(queue_cursor: str | None) -> tuple[Any, ...]:
@@ -290,6 +466,7 @@ def release_leases(
     worker_id: str,
     now: datetime,
     db: Session,
+    record_attempts: bool = True,
 ) -> int:
     """
     Return claimed jobs this worker will not run to ``pending``, at no attempt cost.
@@ -308,6 +485,7 @@ def release_leases(
         worker_id: The lease holder.
         now: Current instant; the jobs are available again from here.
         db: Active database session.
+        record_attempts: Close the released claims' attempt rows as ``released``.
 
     Returns:
         The number of jobs released.
@@ -330,6 +508,8 @@ def release_leases(
             )
         ),
     )
+    if record_attempts and released.rowcount:
+        _close_open(job_attempts, worker_id=worker_id, outcome=OUTCOME_RELEASED, now=now, db=db)
     db.commit()
     return released.rowcount
 
@@ -355,9 +535,15 @@ def mark_job_completed(
     attempt: int,
     now: datetime,
     db: Session,
+    duration_ms: int | None = None,
+    record_attempt: bool = True,
 ) -> bool:
     """
     Mark a claimed job ``completed`` and release its lease.
+
+    The attempt row is closed in the same transaction: ``completed`` when this
+    exact claim was completed, ``superseded`` when the handler finished after its
+    job had been taken from it (it ran twice).
 
     Args:
         job_id: The job to complete.
@@ -365,6 +551,8 @@ def mark_job_completed(
         attempt: Claim generation being completed.
         now: Current instant.
         db: Active database session.
+        duration_ms: Handler wall time, recorded on the attempt.
+        record_attempt: Close the claim's ``job_attempts`` row.
 
     Returns:
         True when this exact claim was completed; False when ownership was lost.
@@ -385,8 +573,20 @@ def mark_job_completed(
             )
         ),
     )
+    owned = completed.rowcount == 1
+    if record_attempt:
+        _finish_attempt(
+            db,
+            job_id=job_id,
+            worker_id=worker_id,
+            attempt=attempt,
+            now=now,
+            outcome=OUTCOME_COMPLETED,
+            duration_ms=duration_ms,
+            owned=owned,
+        )
     db.commit()
-    return completed.rowcount == 1
+    return owned
 
 
 def _owned_claim(job_id: str, *, worker_id: str, attempt: int) -> tuple[Any, ...]:
@@ -409,9 +609,15 @@ def mark_job_failed(
     max_seconds: float,
     now: datetime,
     db: Session,
+    duration_ms: int | None = None,
+    record_attempt: bool = True,
 ) -> str:
     """
     Record a failed attempt if the caller still owns that exact claim.
+
+    The attempt row is closed in the same transaction: ``failed`` or
+    ``dead_letter`` for the job's new state, or ``superseded`` when the handler
+    failed after its job had been taken from it.
 
     Args:
         job_id: The job that failed.
@@ -422,6 +628,8 @@ def mark_job_failed(
         max_seconds: Backoff ceiling.
         now: Current instant.
         db: Active database session.
+        duration_ms: Handler wall time, recorded on the attempt.
+        record_attempt: Close the claim's ``job_attempts`` row.
 
     Returns:
         The job's new status (``pending`` when rescheduled, ``dead_letter`` when
@@ -429,52 +637,52 @@ def mark_job_failed(
         lost or the job was not found.
     """
     ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
+    truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
+    status = ""
     attempt_state = db.execute(
         select(ProcessingJob.attempts, ProcessingJob.max_attempts).where(*ownership)
     ).one_or_none()
-    if attempt_state is None:
-        db.commit()
-        return ""
-    attempts, max_attempts = attempt_state
-    truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
-    if attempts >= max_attempts:
+    if attempt_state is not None:
+        attempts, max_attempts = attempt_state
+        if attempts >= max_attempts:
+            new_status = STATUS_DEAD_LETTER
+            values: dict[str, Any] = {"completed_at": now}
+        else:
+            delay = jobs_backoff.backoff_seconds(attempts, base_seconds=base_seconds, max_seconds=max_seconds)
+            new_status = STATUS_PENDING
+            values = {"available_at": now + timedelta(seconds=delay)}
         failed = cast(
             CursorResult[Any],
             db.execute(
                 update(ProcessingJob)
                 .where(*ownership)
                 .values(
-                    status=STATUS_DEAD_LETTER,
+                    status=new_status,
                     last_error=truncated,
-                    completed_at=now,
                     updated_at=now,
                     locked_by=None,
                     locked_at=None,
                     lease_expires_at=None,
+                    **values,
                 )
             ),
         )
-        db.commit()
-        return STATUS_DEAD_LETTER if failed.rowcount == 1 else ""
-    delay = jobs_backoff.backoff_seconds(attempts, base_seconds=base_seconds, max_seconds=max_seconds)
-    failed = cast(
-        CursorResult[Any],
-        db.execute(
-            update(ProcessingJob)
-            .where(*ownership)
-            .values(
-                status=STATUS_PENDING,
-                last_error=truncated,
-                available_at=now + timedelta(seconds=delay),
-                updated_at=now,
-                locked_by=None,
-                locked_at=None,
-                lease_expires_at=None,
-            )
-        ),
-    )
+        if failed.rowcount == 1:
+            status = new_status
+    if record_attempt:
+        _finish_attempt(
+            db,
+            job_id=job_id,
+            worker_id=worker_id,
+            attempt=attempt,
+            now=now,
+            outcome=OUTCOME_DEAD_LETTER if status == STATUS_DEAD_LETTER else OUTCOME_FAILED,
+            duration_ms=duration_ms,
+            error=truncated,
+            owned=bool(status),
+        )
     db.commit()
-    return STATUS_PENDING if failed.rowcount == 1 else ""
+    return status
 
 
 def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> int:
@@ -554,8 +762,52 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
             .execution_options(synchronize_session="fetch")
         ),
     )
+    # Close the attempt rows of exactly the jobs reclaimed: one renewed between the
+    # select and the updates is still ``claimed`` and keeps its open attempt. Same
+    # transaction, so no worker can claim a reclaimed row (and open a new attempt)
+    # before this runs. Unconditional: it is what closes rows left open by a worker
+    # that has since had ``record_attempts`` switched off.
+    db.execute(
+        update(JobAttempt)
+        .where(
+            JobAttempt.finished_at.is_(None),
+            JobAttempt.job_id.in_(
+                select(ProcessingJob.id).where(ProcessingJob.id.in_(job_ids), ProcessingJob.status != STATUS_CLAIMED)
+            ),
+        )
+        .values(outcome=OUTCOME_LEASE_EXPIRED, finished_at=now)
+        .execution_options(synchronize_session=False)
+    )
     db.commit()
     return dead_lettered.rowcount + requeued.rowcount
+
+
+def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
+    """
+    Count the jobs whose lease has expired, by the worker that held them.
+
+    Read before :func:`reclaim_expired_leases`, which clears the holder, so a
+    reaper's log can say which workers went silent. Informational: it is not the
+    set the reaper will reclaim, only the picture a moment earlier.
+
+    Args:
+        now: Current instant.
+        db: Active database session.
+
+    Returns:
+        ``{worker instance id: number of expired leases}``.
+    """
+    rows = db.execute(
+        select(ProcessingJob.locked_by, func.count())
+        .where(
+            ProcessingJob.status == STATUS_CLAIMED,
+            ProcessingJob.lease_expires_at < now,
+            ProcessingJob.locked_by.is_not(None),
+        )
+        .group_by(ProcessingJob.locked_by)
+    ).all()
+    db.rollback()
+    return {str(worker): int(count) for worker, count in rows}
 
 
 def get_job(job_id: str, db: Session) -> ProcessingJob | None:
@@ -572,7 +824,13 @@ def get_job(job_id: str, db: Session) -> ProcessingJob | None:
     return db.get(ProcessingJob, job_id)
 
 
-def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 50) -> jobs_schema.JobsSummary:
+def get_jobs_summary(
+    db: Session,
+    *,
+    hours: int = 24,
+    dead_letter_limit: int = 50,
+    record_attempts: bool = True,
+) -> jobs_schema.JobsSummary:
     """
     Aggregate ``processing_jobs`` into the admin-dashboard payload.
 
@@ -580,6 +838,10 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         db: Active database session.
         hours: Look-back window for the status/subscriber counts.
         dead_letter_limit: Maximum dead-letter jobs to return for inspection.
+        record_attempts: Whether attempts are being recorded. When ``False`` the
+            attempt-derived fields (durations, double runs, last worker) are
+            ``None`` rather than ``0``, so "not recorded" is never read as
+            "nothing happened".
 
     Returns:
         The durable-jobs summary — window counts, per-subscriber breakdown,
@@ -597,6 +859,12 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
     for subscriber_id, event_type, status, count in rows:
         counts[(subscriber_id, event_type)][status] += count
         totals[status] += count
+    subscriber_attempts = (
+        attempt_stats(db, JobAttempt.subscriber_id, JobAttempt.event_type, window_start=window_start)
+        if record_attempts
+        else {}
+    )
+    queue_attempts = attempt_stats(db, JobAttempt.queue, window_start=window_start) if record_attempts else {}
     by_subscriber = [
         jobs_schema.JobSubscriberStats(
             subscriber_id=subscriber_id,
@@ -606,6 +874,7 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
             claimed=status_counts.get(STATUS_CLAIMED, 0),
             completed=status_counts.get(STATUS_COMPLETED, 0),
             dead_letter=status_counts.get(STATUS_DEAD_LETTER, 0),
+            **_attempt_fields(subscriber_attempts.get((subscriber_id, event_type)), record_attempts),
         )
         for (subscriber_id, event_type), status_counts in sorted(counts.items())
     ]
@@ -635,6 +904,7 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
             completed=status_counts.get(STATUS_COMPLETED, 0),
             dead_letter=status_counts.get(STATUS_DEAD_LETTER, 0),
             oldest_pending_seconds=age_seconds(queue_oldest.get(queue), now),
+            **_attempt_fields(queue_attempts.get((queue,)), record_attempts),
         )
         for queue in sorted(queue_names)
         for status_counts in (queue_counts[queue],)
@@ -652,6 +922,7 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         .scalars()
         .all()
     )
+    last_workers = last_worker_ids(db, [job.id for job in dead_letter_jobs]) if record_attempts else {}
     return jobs_schema.JobsSummary(
         window_hours=hours,
         total_jobs=sum(totals.values()),
@@ -662,8 +933,32 @@ def get_jobs_summary(db: Session, *, hours: int = 24, dead_letter_limit: int = 5
         oldest_pending_seconds=age_seconds(oldest_pending, now),
         by_subscriber=by_subscriber,
         by_queue=by_queue,
-        recent_dead_letter=[jobs_schema.DeadLetterJob.model_validate(job) for job in dead_letter_jobs],
+        recent_dead_letter=[
+            jobs_schema.DeadLetterJob.model_validate(job).model_copy(
+                update={"last_worker_id": last_workers.get(job.id)}
+            )
+            for job in dead_letter_jobs
+        ],
     )
+
+
+def _attempt_fields(stats: Any, record_attempts: bool) -> dict[str, Any]:
+    """The attempt-derived summary fields: ``None`` when not recorded, zeros when quiet."""
+    if not record_attempts:
+        return {"avg_duration_ms": None, "max_duration_ms": None, "duration_buckets": None, "superseded": None}
+    if stats is None:
+        return {
+            "avg_duration_ms": None,
+            "max_duration_ms": None,
+            "duration_buckets": jobs_schema.DurationBuckets(),
+            "superseded": 0,
+        }
+    return {
+        "avg_duration_ms": stats.avg_duration_ms,
+        "max_duration_ms": stats.max_duration_ms,
+        "duration_buckets": stats.buckets,
+        "superseded": stats.superseded,
+    }
 
 
 def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:

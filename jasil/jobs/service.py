@@ -85,6 +85,7 @@ def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
         backoff_base_seconds=jobs.backoff_base_seconds,
         backoff_max_seconds=jobs.backoff_max_seconds,
         queues=queues,
+        record_attempts=jobs.record_attempts,
     )
 
 
@@ -299,12 +300,20 @@ def reap_expired_jobs_scheduled() -> None:
     import jasil.jobs.crud as jobs_crud
 
     platform = platform_runtime.get_active_platform()
+    now = platform.clock.now()
     with jasil_orm.get_sessionmaker()() as db:
-        reclaimed = jobs_crud.reclaim_expired_leases(now=platform.clock.now(), db=db)
+        # Read before reclaiming, which clears the holder: a crash should name the
+        # worker, not just say that one happened.
+        holders = jobs_crud.expired_lease_holders(now=now, db=db)
+        reclaimed = jobs_crud.reclaim_expired_leases(now=now, db=db)
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
-        # it died or overran, so this is the symptom of something else going wrong.
-        logger.warning("Reaped %d expired job lease(s); a worker died mid-job or overran its lease", reclaimed)
+        # it died or went silent, so this is the symptom of something else going wrong.
+        logger.warning(
+            "Reaped %d expired job lease(s); a worker died mid-job or went silent",
+            reclaimed,
+            extra={"workers": holders},
+        )
 
 
 def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:

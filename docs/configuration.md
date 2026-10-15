@@ -61,9 +61,10 @@ fields.
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
+| `record_attempts` | `True` | Write one `job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
 | `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
 | `max_attempts` | `5` | Attempts before a job is dead-lettered. |
-| `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, and stopped/stale worker rows are pruned. `<= 0` disables. |
+| `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. Jobs that are pending, claimed or dead-lettered keep their history. `<= 0` disables. |
 
 ### `EventLogSettings`
 

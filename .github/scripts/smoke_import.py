@@ -37,8 +37,13 @@ from jasil.container import build_platform
 OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler")
 
 # The tables JASIL maps into the host's registry.
-EXPECTED_TABLES = {"event_log", "processing_jobs", "event_outbox", "job_workers"}
-EXPECTED_REVISIONS = {"rev0001_initial.py", "rev0002_named_job_queues.py", "rev0003_worker_registry.py"}
+EXPECTED_TABLES = {"event_log", "processing_jobs", "event_outbox", "job_workers", "job_attempts"}
+EXPECTED_REVISIONS = {
+    "rev0001_initial.py",
+    "rev0002_named_job_queues.py",
+    "rev0003_worker_registry.py",
+    "rev0004_job_attempts.py",
+}
 
 
 class Base(DeclarativeBase):

@@ -74,7 +74,9 @@ class JobRunner:
         backoff_base_seconds: float,
         backoff_max_seconds: float,
         queues: Iterable[str] | None = None,
+        record_attempts: bool = True,
     ) -> None:
+        self._record_attempts = record_attempts
         self._registry = registry
         self._clock = clock
         self._session_factory = session_factory
@@ -102,6 +104,7 @@ class JobRunner:
             lease_seconds=lease_seconds,
             max_runtime_seconds=max_runtime_seconds,
             interval_seconds=heartbeat_interval_seconds,
+            record_attempts=record_attempts,
         )
 
     @property
@@ -148,6 +151,7 @@ class JobRunner:
                 queue_cursor=self._queue_cursor,
                 default_queue_subscribers=self._default_queue_subscribers,
                 excluded_default_queue_subscribers=self._excluded_default_queue_subscribers,
+                record_attempts=self._record_attempts,
             )
             snapshots = [self._snapshot(job) for job in claimed]
         if not snapshots:
@@ -196,7 +200,7 @@ class JobRunner:
             logger.error(
                 "Durable job lease could not be renewed; skipping",
                 exc_info=error,
-                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+                extra=self._context(job),
             )
             self._leases.drop(job.id)
             return False
@@ -204,7 +208,7 @@ class JobRunner:
             return True
         logger.warning(
             "Durable job lease was lost before its turn; skipping",
-            extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            extra=self._context(job),
         )
         return False
 
@@ -228,6 +232,7 @@ class JobRunner:
         """
         lost = self._leases.begin(job.id)
         try:
+            self._mark_started(job)
             self._execute(job, lost)
         finally:
             # After the outcome is written, so the heartbeat keeps renewing the
@@ -235,17 +240,31 @@ class JobRunner:
             self._leases.finish(job.id)
         return lost.is_set()
 
+    def _mark_started(self, job: ClaimedJob) -> None:
+        """Stamp when the handler began. Best-effort: history must not stop the job."""
+        if not self._record_attempts:
+            return
+        try:
+            with self._session_factory() as db:
+                jobs_crud.mark_attempt_started(
+                    job.id, worker_id=self._worker_id, attempt=job.attempts, now=self._clock.now(), db=db
+                )
+        except Exception as error:
+            logger.warning("Durable job start could not be recorded", exc_info=error, extra=self._context(job))
+
     def _execute(self, job: ClaimedJob, lost: threading.Event) -> None:
         handler = self._registry.get(job.subscriber_id)
         event = self._event_from(job)
+        began = self._clock.monotonic()
         try:
             if handler is None:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
             with job_lease(lost):
                 handler(event)
         except Exception as error:
-            self._fail(job, error)
+            self._fail(job, error, duration_ms=self._elapsed_ms(began))
             return
+        duration_ms = self._elapsed_ms(began)
         now = self._clock.now()
         with self._session_factory() as db:
             completed = jobs_crud.mark_job_completed(
@@ -254,14 +273,29 @@ class JobRunner:
                 attempt=job.attempts,
                 now=now,
                 db=db,
+                duration_ms=duration_ms,
+                record_attempt=self._record_attempts,
             )
         if not completed:
             logger.warning(
                 "Durable job completion skipped because claim ownership was lost",
-                extra={"job_id": job.id, "subscriber": job.subscriber_id, "attempts": job.attempts},
+                extra={**self._context(job), "duration_ms": duration_ms},
             )
 
-    def _fail(self, job: ClaimedJob, error: Exception) -> None:
+    def _elapsed_ms(self, began: float) -> int:
+        return max(0, round((self._clock.monotonic() - began) * 1000))
+
+    def _context(self, job: ClaimedJob) -> dict[str, object]:
+        """The structured fields every job-outcome log record carries."""
+        return {
+            "job_id": job.id,
+            "subscriber": job.subscriber_id,
+            "queue": job.queue,
+            "attempts": job.attempts,
+            "worker_id": self._worker_id,
+        }
+
+    def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> None:
         now = self._clock.now()
         with self._session_factory() as db:
             status = jobs_crud.mark_job_failed(
@@ -273,12 +307,14 @@ class JobRunner:
                 max_seconds=self._backoff_max_seconds,
                 now=now,
                 db=db,
+                duration_ms=duration_ms,
+                record_attempt=self._record_attempts,
             )
         if not status:
             logger.warning(
                 "Durable job failure skipped because claim ownership was lost",
                 exc_info=error,
-                extra={"job_id": job.id, "subscriber": job.subscriber_id, "attempts": job.attempts},
+                extra={**self._context(job), "duration_ms": duration_ms},
             )
             return
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
@@ -287,11 +323,10 @@ class JobRunner:
             "Durable job failed",
             exc_info=error,
             extra={
-                "job_id": job.id,
-                "subscriber": job.subscriber_id,
+                **self._context(job),
                 "event_type": job.event_type,
-                "attempts": job.attempts,
                 "job_status": status,
+                "duration_ms": duration_ms,
             },
         )
 

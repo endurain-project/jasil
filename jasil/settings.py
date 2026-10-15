@@ -68,16 +68,23 @@ class JobSettings:
             the job is abandoned to the reaper, the handler is told to stop
             (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
             released to run elsewhere. Must not be below ``lease_seconds``.
+        record_attempts: Write one ``job_attempts`` row per attempt to run a job:
+            which worker ran it, when, for how long, and how it ended. On by
+            default; ``False`` skips every attempt write (job processing is
+            unaffected) and the attempt-derived admin fields read ``None``.
         heartbeat_interval_seconds: Interval between worker heartbeats, each of
             which renews held leases and refreshes the worker-registry row.
         max_attempts: Attempts before a job is dead-lettered.
-        retention_days: Age at which relayed outbox rows, completed jobs, and
-            stopped and stale worker rows are pruned. ``<= 0`` disables pruning.
+        retention_days: Age at which relayed outbox rows, completed jobs, their
+            attempt history, and stopped and stale worker rows are pruned. A job
+            that is pending, claimed or dead-lettered keeps its whole history.
+            ``<= 0`` disables pruning.
     """
 
     enabled: bool = False
     lease_seconds: int = 300
     max_runtime_seconds: int = 1800
+    record_attempts: bool = True
     batch_size: int = 20
     backoff_base_seconds: int = 60
     backoff_max_seconds: int = 3600

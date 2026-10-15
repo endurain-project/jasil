@@ -29,7 +29,7 @@ how long it took, and why it failed:
 | Status | Meaning |
 |---|---|
 | `published` | Written, dispatch not finished. |
-| `queued` | Handed to the durable job queue (terminal here; execution is tracked in `processing_jobs`). |
+| `queued` | Handed to the durable job queue (terminal here; execution is tracked in `processing_jobs` and `job_attempts`). |
 | `processing` | A consumer picked it up. |
 | `completed` | Handlers succeeded. |
 | `failed` | A handler raised. |
@@ -43,6 +43,14 @@ how long it took, and why it failed:
 Because the durable route bypasses the bus, an event handed to the outbox is
 recorded `queued` explicitly. Otherwise the dashboard would go dark exactly when
 durable jobs are switched on.
+
+!!! note "A durable event stays `queued`"
+    The event log is a publication log: one row per event, written when it is
+    published. A durable event fans out to one job per subscriber, on different
+    queues and workers, so there is no single status its row could honestly hold,
+    and every job finishing would update the same row. Its outcome is the state
+    of those jobs: call `jasil.admin.get_event_jobs(event_id)` to see, for each
+    subscriber, which worker ran it and how it ended.
 
 `jasil.admin.get_event_log_summary()` gives counts by type and status,
 recent failures, and throughput over a window. It is the counterpart of
@@ -102,6 +110,81 @@ retained worker, while `workers` is a cursor-paginated page of 100 by default an
 authentication, authorization, UI, alerts, and whether any worker state affects
 a container health endpoint. JASIL ships no route or UI and never changes host
 health automatically.
+
+## Job attempts
+
+`processing_jobs` says where a job is *now*. `job_attempts` keeps what happened:
+one row for every attempt to run it. A worker opens the row in the transaction
+that claims the job, and whichever path ends that claim closes it in the same
+transaction as the job's own state change, so the history can never disagree with
+the job.
+
+| Outcome | Meaning |
+|---|---|
+| `completed` | The handler succeeded and this claim recorded it. |
+| `failed` | The handler raised; the job was rescheduled with backoff. |
+| `dead_letter` | The handler raised on the last attempt. |
+| `lease_expired` | The lease ran out with no result: the worker died or went silent. |
+| `superseded` | The handler finished **after** its job had been taken: it ran twice. |
+| `released` | Claimed but never run; returned to `pending` with the attempt refunded. |
+| `abandoned` | Exceeded `max_runtime_seconds`; signalled and left to the reaper. |
+
+`superseded` is the one to alert on. It is the only durable record that a side
+effect (an email) may have happened twice, and it keeps the late handler's
+duration and error. Each row records the job, event, subscriber and queue (copied,
+so statistics survive the job being pruned), the attempt number, the worker
+instance, and when it was claimed, started and finished. `duration_ms` is the
+handler's own time, from the monotonic clock. A replayed dead letter starts again
+at attempt 1; order history by claim time.
+
+```python
+import jasil.admin as jasil_admin
+
+job = jasil_admin.get_job(job_id)  # the job and its attempts, newest first
+for attempt in job.history:
+    print(attempt.attempt, attempt.worker_id, attempt.outcome, attempt.duration_ms, attempt.error)
+
+event = jasil_admin.get_event_jobs(event_id)  # every subscriber's job for one event
+page = jasil_admin.get_worker_attempts(instance_id, limit=100)  # what one worker has done
+more = jasil_admin.get_worker_attempts(instance_id, cursor=page.next_cursor)
+```
+
+The summaries carry it too. `get_jobs_summary()` adds, per subscriber and queue,
+`avg_duration_ms`, `max_duration_ms`, `duration_buckets` and `superseded` (over
+the window), and each dead letter's `last_worker_id`. `get_workers_summary()`
+adds each worker's `completed`, `failed`, `dead_lettered`, `lease_expired` and
+`superseded` counts, `last_finished_at`, and `claimed_by_stale_workers`: jobs
+waiting out a lease behind a worker that stopped beating, which is the number to
+watch during a crash.
+
+**Duration buckets.** An average hides a slow tail and a maximum shows only that
+it exists, so completed attempts are also counted in six fixed ranges:
+
+| Field | Range |
+|---|---|
+| `under_100ms` | below 100 ms |
+| `under_1s` | 100 ms up to 1 s |
+| `under_10s` | 1 s up to 10 s |
+| `under_1m` | 10 s up to 1 min |
+| `under_5m` | 1 min up to 5 min |
+| `over_5m` | 5 min and over |
+
+The boundaries are fixed, so two deployments' dashboards are comparable, and they
+sit near the 90-second SMTP deadline and the default 5-minute lease. There are no
+percentiles: they are not portable SQL across SQLite, PostgreSQL and MySQL/MariaDB.
+A host that needs them computes them from the `duration_ms` log field.
+
+**Turning it off.** `jobs.record_attempts` (on by default) can be set to `False`
+for a very high-volume deployment. Nothing is written then and job processing is
+unaffected, and the reads say so: attempt-derived summary fields are `None`
+rather than `0`, and `attempts_recorded` is `False`, so "not recorded" is never
+mistaken for "nothing happened". The reaper still closes any attempt left open
+from before the switch.
+
+**Metrics.** JASIL exports none. The admin reads are bounded and importable
+anywhere, so a host maps them into its own metrics system (for example
+`superseded` and `claimed_by_stale_workers` as alerts) from a scheduled job or a
+metrics route.
 
 ## Migrations
 
@@ -200,6 +283,7 @@ The two windows are independent, and `<= 0` disables either.
 | Relayed `event_outbox` rows | `pending` / `claimed` jobs — in flight |
 | `completed` jobs | `dead_letter` jobs — human-actionable |
 | Stopped or stale worker rows past job retention | Recent/running worker rows |
+| `job_attempts` past the window, and orphans of pruned jobs | Attempts of `pending`, `claimed` and `dead_letter` jobs |
 
 Every `event_log` row is prunable regardless of status: it is a safe-to-lose
 observability trail, and nothing in it is a source of truth. The job tables are
@@ -223,6 +307,13 @@ fields arrive via `extra`:
 ```python
 {"event_type": ..., "event_id": ..., "subscriber": ..., "event_metadata": {...}}
 ```
+
+Every job-outcome record from `jasil.jobs.runner` also carries `job_id`,
+`worker_id`, `queue`, `attempts` and, once the handler has run, `duration_ms`,
+so a log line names the worker that ran the job. The reaper's "Reaped N expired
+job lease(s)" warning carries `workers`, a `{instance id: count}` breakdown, so a
+crash names the worker that went silent. The keys are not covered by SemVer, but
+alerts are built on them, so they are listed here.
 
 Loggers are named after their module (`jasil.publisher`, `jasil.jobs.runner`,
 `jasil._core.network`, …), so you can raise or lower verbosity per subsystem.

@@ -96,6 +96,10 @@ through.
       warning (a lease only expires because a worker died or went silent), and on
       `exceeded its maximum runtime` errors (a handler is hung or too slow).
 - [ ] Alert on the oldest pending job age from `jasil.admin.get_jobs_summary()`.
+- [ ] Alert on `superseded` attempts (a handler finished after its job was taken:
+      it ran twice) and on `claimed_by_stale_workers` from
+      `jasil.admin.get_workers_summary()` (jobs waiting out a lease behind a
+      silent worker). Read a job's whole history with `jasil.admin.get_job`.
 - [ ] Assign queue names at subscriber registration. Keep them lowercase ASCII,
       stable, and domain-neutral from JASIL's point of view; renaming a queue
       while old rows remain requires workers for both names during the drain.

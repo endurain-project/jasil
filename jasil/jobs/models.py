@@ -192,6 +192,124 @@ class ProcessingJob(Base):
     )
 
 
+class JobAttempt(Base):
+    """
+    One row per attempt to run a durable job: who ran it, when, and how it ended.
+
+    Written in the same transaction as the job state change it describes, so the
+    history can never disagree with ``processing_jobs``. A row is opened when a
+    worker claims the job and closed by whichever path ends that claim: the
+    worker's own result, the reaper, a release, or the max-runtime cap.
+
+    There is deliberately no foreign key to ``processing_jobs``: a job may be
+    pruned before its history, SQLite does not enforce foreign keys by default,
+    and retention removes orphans explicitly. Event type, subscriber and queue are
+    copied onto the row so statistics and history survive the job's pruning.
+
+    Attributes:
+        id: Attempt identifier (UUIDv4 string).
+        job_id: The ``processing_jobs.id`` this attempt ran.
+        event_id: The originating envelope ``event_id``; links every subscriber's
+            job for one event.
+        event_type: The domain-event channel.
+        subscriber_id: The durable subscriber that ran.
+        queue: The named queue the job was claimed from.
+        attempt: ``processing_jobs.attempts`` at claim; restarts at 1 after a
+            dead-letter replay.
+        worker_id: The worker instance (``job_workers.instance_id``) that claimed it.
+        claimed_at: When the worker took the lease.
+        started_at: When the handler began; ``NULL`` if it never ran.
+        finished_at: When the attempt ended; ``NULL`` while open.
+        outcome: How it ended (see the outcome table in the observability
+            guide); ``NULL`` while open.
+        duration_ms: Handler wall time, from the monotonic clock.
+        error: The failure reason (truncated for storage), if it failed.
+    """
+
+    __tablename__ = "job_attempts"
+    __table_args__ = (
+        # One job's history, and closing the open attempt of a claim.
+        Index("idx_job_attempts_job", "job_id", "claimed_at"),
+        # One worker's history.
+        Index("idx_job_attempts_worker", "worker_id", "claimed_at"),
+        # Every subscriber's job for one event.
+        Index("idx_job_attempts_event", "event_id"),
+        # Statistics windows and retention.
+        Index("idx_job_attempts_claimed", "claimed_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        comment="Attempt identifier (UUIDv4)",
+    )
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        comment="The processing_jobs.id this attempt ran (no foreign key; pruned independently)",
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(MAX_EVENT_ID_LENGTH),
+        nullable=False,
+        comment="The originating envelope event_id",
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(MAX_EVENT_TYPE_LENGTH),
+        nullable=False,
+        comment="The domain-event channel",
+    )
+    subscriber_id: Mapped[str] = mapped_column(
+        String(MAX_SUBSCRIBER_ID_LENGTH),
+        nullable=False,
+        comment="The durable subscriber that ran",
+    )
+    queue: Mapped[str] = mapped_column(
+        String(MAX_QUEUE_NAME_LENGTH),
+        nullable=False,
+        comment="The named queue the job was claimed from",
+    )
+    attempt: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Attempt number at claim; restarts at 1 after a dead-letter replay",
+    )
+    worker_id: Mapped[str] = mapped_column(
+        String(MAX_WORKER_ID_LENGTH),
+        nullable=False,
+        comment="The worker instance that claimed the job",
+    )
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When the worker took the lease",
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the handler began; NULL if it never ran",
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the attempt ended; NULL while open",
+    )
+    outcome: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="How the attempt ended; NULL while open",
+    )
+    duration_ms: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Handler wall time in milliseconds",
+    )
+    error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Failure reason (truncated for storage)",
+    )
+
+
 class JobWorker(Base):
     """One restart-unique durable worker instance and its latest heartbeat."""
 

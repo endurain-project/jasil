@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil.jobs._attempts import OUTCOME_ABANDONED
 from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
@@ -58,7 +59,9 @@ class LeaseKeeper:
         lease_seconds: int,
         max_runtime_seconds: float,
         interval_seconds: float,
+        record_attempts: bool = True,
     ) -> None:
+        self._record_attempts = record_attempts
         self._session_factory = session_factory
         self._clock = clock
         self._worker_id = worker_id
@@ -164,7 +167,7 @@ class LeaseKeeper:
     def _abandon(self, running: _Running) -> None:
         running.abandoned = True
         running.lost.set()
-        self._held.pop(running.job_id, None)
+        attempt = self._held.pop(running.job_id, None)
         logger.error(
             "Durable job exceeded its maximum runtime; abandoned to the reaper",
             extra={
@@ -173,9 +176,25 @@ class LeaseKeeper:
                 "max_runtime_seconds": self._max_runtime_seconds,
             },
         )
+        if self._record_attempts and attempt is not None:
+            self._close_attempt(running.job_id, attempt)
         # Python cannot kill the handler's thread, and a worker stuck in one job
         # must not hold the rest of its batch hostage behind leases it keeps renewing.
         self._release_waiting()
+
+    def _close_attempt(self, job_id: str, attempt: int) -> None:
+        """Record the abandoned attempt; best-effort, the log line already says it."""
+        try:
+            with self._session_factory() as db:
+                jobs_crud.close_attempts(
+                    {job_id: attempt},
+                    worker_id=self._worker_id,
+                    outcome=OUTCOME_ABANDONED,
+                    now=self._clock.now(),
+                    db=db,
+                )
+        except Exception as error:
+            logger.warning("Abandoned durable job attempt could not be recorded", exc_info=error)
 
     def _fence_if_silent(self, running: _Running | None) -> None:
         silent = self._clock.monotonic() - self._last_renewed
