@@ -48,9 +48,10 @@ class LeaseKeeper:
 
     Held jobs are the running job plus the jobs of the batch still waiting for
     their turn. All state changes and every renewal are serialised by one lock,
-    held across the database round-trip, so the heartbeat thread and the runner's
-    own before-turn renewal can never interleave; the runner's calls wait at most
-    one round-trip.
+    held across the renewal's database round-trip, so the heartbeat thread and the
+    runner's own before-turn renewal can never interleave; the runner's calls wait
+    at most one round-trip. The bookkeeping writes of an abandonment or a release
+    happen outside the lock, after the state change that decided them.
     """
 
     def __init__(
@@ -139,15 +140,9 @@ class LeaseKeeper:
                 unknown lease means; the failure has already been counted toward
                 self-fencing.
         """
+        self._abandon_if_overdue()
         with self._lock:
             running = self._running
-            if (
-                running is not None
-                and not running.abandoned
-                and not running.finalizing
-                and self._clock.monotonic() - running.started >= self._max_runtime_seconds
-            ):
-                self._abandon(running)
             if not self._held:
                 return set()
             attempts = dict(self._held)
@@ -177,9 +172,35 @@ class LeaseKeeper:
     def release_waiting(self) -> None:
         """Return the jobs still waiting for their turn to ``pending``."""
         with self._lock:
-            self._release_waiting()
+            waiting = self._take_waiting()
+        self._release(waiting)
 
-    def _abandon(self, running: _Running) -> None:
+    def _abandon_if_overdue(self) -> None:
+        """Abandon the running job once it exceeds ``max_runtime_seconds``.
+
+        The decision and the state change are made under the lock; the attempt
+        close and the release of the waiting jobs are database writes, so they
+        run after it is dropped.
+        """
+        with self._lock:
+            running = self._running
+            if (
+                running is None
+                or running.abandoned
+                or running.finalizing
+                or self._clock.monotonic() - running.started < self._max_runtime_seconds
+            ):
+                return
+            attempt = self._abandon(running)
+            waiting = self._take_waiting()
+        if self._record_attempts and attempt is not None:
+            self._close_attempt(running.job_id, attempt)
+        # Python cannot kill the handler's thread, and a worker stuck in one job
+        # must not hold the rest of its batch hostage behind leases it keeps renewing.
+        self._release(waiting)
+
+    def _abandon(self, running: _Running) -> int | None:
+        """Mark ``running`` abandoned; returns the attempt it held, if any. Under the lock."""
         running.abandoned = True
         running.lost.set()
         attempt = self._held.pop(running.job_id, None)
@@ -191,11 +212,7 @@ class LeaseKeeper:
                 "max_runtime_seconds": self._max_runtime_seconds,
             },
         )
-        if self._record_attempts and attempt is not None:
-            self._close_attempt(running.job_id, attempt)
-        # Python cannot kill the handler's thread, and a worker stuck in one job
-        # must not hold the rest of its batch hostage behind leases it keeps renewing.
-        self._release_waiting()
+        return attempt
 
     def _close_attempt(self, job_id: str, attempt: int) -> None:
         """Record the abandoned attempt; best-effort, the log line already says it."""
@@ -229,9 +246,16 @@ class LeaseKeeper:
             extra={"job_id": running.job_id, "worker_id": self._worker_id},
         )
 
-    def _release_waiting(self) -> None:
+    def _take_waiting(self) -> dict[str, int]:
+        """Stop tracking, and return, the held jobs that have not started. Under the lock."""
         running_id = self._running.job_id if self._running is not None else None
         waiting = {job_id: attempt for job_id, attempt in self._held.items() if job_id != running_id}
+        for job_id in waiting:
+            self._held.pop(job_id, None)
+        return waiting
+
+    def _release(self, waiting: dict[str, int]) -> None:
+        """Return ``waiting`` to ``pending``. Best-effort; takes no lock."""
         if not waiting:
             return
         try:
@@ -252,5 +276,3 @@ class LeaseKeeper:
             # They stop being renewed either way; the reaper requeues them once
             # their leases expire, which costs an attempt but loses no work.
             logger.warning("Durable jobs could not be released; leaving them to the reaper", exc_info=error)
-        for job_id in waiting:
-            self._held.pop(job_id, None)

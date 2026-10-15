@@ -201,11 +201,6 @@ def topology_of(settings: JasilSettings) -> DeploymentTopology:
     )
 
 
-def _shape_reason(topology: DeploymentTopology) -> str:
-    """Say what makes ``topology`` multi-process, so a refusal names its cause."""
-    return "; ".join(topology.multi_process_causes)
-
-
 def check_deployment_consistency(settings: JasilSettings) -> list[str]:
     """Return every fatal wiring inconsistency in ``settings`` (empty when sound).
 
@@ -286,7 +281,7 @@ def check_state_consistency(
         )
         issues.append(
             f"{source.label} resolves to {reason}, but this deployment runs multiple processes "
-            f"({_shape_reason(topology)}) that need a backend shared across them. Point it at "
+            f"({topology.multi_process_reason}) that need a backend shared across them. Point it at "
             f"Redis (redis://...) or run a single process under the local profile."
         )
     return issues
@@ -356,7 +351,7 @@ def check_lock_consistency(
         return []
     return [
         f"{lock_label} resolves to an in-process no-op lock, but this deployment runs multiple "
-        f"processes ({_shape_reason(topology)}) that would each run scheduled jobs. Point it at "
+        f"processes ({topology.multi_process_reason}) that would each run scheduled jobs. Point it at "
         f"the shared database lock (postgres-advisory://)."
     ]
 
@@ -392,7 +387,7 @@ def check_mail_consistency(
         return []
     return [
         f"{mail_label} resolves to the in-memory mail recorder, but this deployment runs multiple "
-        f"processes ({_shape_reason(topology)}), and no message would ever be delivered. Point it "
+        f"processes ({topology.multi_process_reason}), and no message would ever be delivered. Point it "
         f"at a relay (smtp:// or smtps://), or leave it unset."
     ]
 

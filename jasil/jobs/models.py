@@ -71,8 +71,9 @@ class ProcessingJob(Base):
         UniqueConstraint("event_id", "subscriber_id", name="uq_processing_jobs_event_subscriber"),
         # Unselected workers discover due work across every queue with this index.
         Index("idx_processing_jobs_claim", "status", "available_at"),
-        # Selective and fair claims order/filter by queue before lifecycle state.
-        Index("idx_processing_jobs_queue_claim", "queue", "status", "available_at"),
+        # Selective and fair claims pin ``status = 'pending'`` first so the range scan
+        # over queues never walks retained completed or dead-letter rows.
+        Index("idx_processing_jobs_queue_claim", "status", "queue", "available_at"),
         # The reaper scans claimed rows whose lease has expired.
         Index("idx_processing_jobs_lease", "status", "lease_expires_at"),
         # Heartbeats and worker summaries count active leases by worker.

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from jasil._core.cursors import decode_cursor, encode_cursor
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil._core.timestamps import age_seconds
+from jasil.jobs._attempts import check_limit
 from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.crud import STATUS_CLAIMED
 from jasil.jobs.models import JobAttempt, JobWorker, ProcessingJob
@@ -104,8 +105,7 @@ def get_workers_summary(
     """
     if stale_after_seconds <= 0:
         raise ValueError("stale_after_seconds must be greater than zero")
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_WORKER_PAGE_SIZE:
-        raise ValueError(f"limit must be an integer between 1 and {MAX_WORKER_PAGE_SIZE}")
+    check_limit(limit, maximum=MAX_WORKER_PAGE_SIZE, name="limit")
     stale_before = now - timedelta(seconds=stale_after_seconds)
     total_workers, stopped, stale, running = db.execute(
         select(

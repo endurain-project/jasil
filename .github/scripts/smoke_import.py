@@ -40,9 +40,7 @@ OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "
 EXPECTED_TABLES = {"event_log", "processing_jobs", "event_outbox", "job_workers", "job_attempts"}
 EXPECTED_REVISIONS = {
     "rev0001_initial.py",
-    "rev0002_named_job_queues.py",
-    "rev0003_worker_registry.py",
-    "rev0004_job_attempts.py",
+    "rev0002_durable_job_queues.py",
 }
 
 

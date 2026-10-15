@@ -19,7 +19,7 @@ from jasil._core.timestamps import as_utc
 from jasil.events import Event
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
-from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector
+from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
 from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
@@ -86,15 +86,7 @@ class JobRunner:
         self._backoff_base_seconds = backoff_base_seconds
         self._backoff_max_seconds = backoff_max_seconds
         self._queues = normalize_queue_selector(queues)
-        if self._queues is None:
-            self._default_queue_subscribers = None
-            self._excluded_default_queue_subscribers = None
-        else:
-            selected_subscribers = registry.subscriber_ids_for_queues(self._queues)
-            self._default_queue_subscribers = selected_subscribers
-            self._excluded_default_queue_subscribers = tuple(
-                sorted(registry.subscriber_ids().difference(selected_subscribers))
-            )
+        self._legacy_queues_backfilled = False
         self._queue_cursor: str | None = None
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._leases = LeaseKeeper(
@@ -145,6 +137,8 @@ class JobRunner:
             The number of jobs processed in this batch (0 when none were due).
         """
         now = self._clock.now()
+        self._backfill_legacy_queues()
+        default_subscribers, excluded_subscribers = self._legacy_routing()
         with self._session_factory() as db:
             claimed = jobs_crud.claim_jobs(
                 worker_id=self._worker_id,
@@ -154,14 +148,14 @@ class JobRunner:
                 db=db,
                 queues=self._queues,
                 queue_cursor=self._queue_cursor,
-                default_queue_subscribers=self._default_queue_subscribers,
-                excluded_default_queue_subscribers=self._excluded_default_queue_subscribers,
+                default_queue_subscribers=default_subscribers,
+                excluded_default_queue_subscribers=excluded_subscribers,
                 record_attempts=self._record_attempts,
             )
             snapshots = [self._snapshot(job) for job in claimed]
         if not snapshots:
             return 0
-        self._queue_cursor = snapshots[-1].queue
+        self._queue_cursor = self._cursor_for(snapshots[-1].queue)
         logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
         self._leases.hold({snapshot.id: snapshot.attempts for snapshot in snapshots})
         try:
@@ -191,6 +185,48 @@ class JobRunner:
         finally:
             self._leases.clear()
         return len(snapshots)
+
+    @staticmethod
+    def _cursor_for(queue: str) -> str | None:
+        """The rotation cursor for a claimed row's queue, or None when unusable.
+
+        The name comes from the database, which may hold a row written by a host
+        or an older tool. A name that is not a valid queue must restart the
+        rotation rather than fail every later claim.
+        """
+        try:
+            return validate_queue_name(queue)
+        except ValueError:
+            logger.warning("Durable job has a non-conforming queue name; restarting queue rotation")
+            return None
+
+    def _legacy_routing(self) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
+        """Subscribers whose ``default``-queue rows this worker adopts or leaves.
+
+        Read from the registry on every claim, so a subscriber registered after
+        the runner was built is routed like the rest.
+        """
+        if self._queues is None:
+            return None, None
+        selected = self._registry.subscriber_ids_for_queues(self._queues)
+        return selected, tuple(sorted(self._registry.subscriber_ids().difference(selected)))
+
+    def _backfill_legacy_queues(self) -> None:
+        """Retag pending ``default`` rows to their subscribers' queues, once.
+
+        Best-effort: a failure is retried on the next batch and never stops a claim.
+        """
+        if self._legacy_queues_backfilled:
+            return
+        try:
+            with self._session_factory() as db:
+                moved = jobs_crud.backfill_legacy_queues(self._registry.queue_assignments(), db=db)
+        except Exception as error:
+            logger.warning("Durable job queue backfill failed; will retry", exc_info=error)
+            return
+        self._legacy_queues_backfilled = True
+        if moved:
+            logger.info("Moved %d pending durable job(s) to their subscribers' queues", moved)
 
     def _still_held(self, job: ClaimedJob) -> bool:
         """Renew the held leases; False when ``job`` is no longer this worker's.

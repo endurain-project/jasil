@@ -284,6 +284,11 @@ class BackgroundWorker:
             thread remains attached so another worker cannot overlap it.
         """
         thread = self._thread
+        # The worker thread joins its heartbeat thread on the way out, which can
+        # take a full join timeout; waiting no longer than that here would report
+        # a clean shutdown as a failure.
+        if self._heartbeat is not None:
+            timeout += STOP_JOIN_TIMEOUT_SECONDS
         stopped = signal_and_join(thread, self._stop, timeout=timeout)
         if stopped and self._thread is thread:
             self._thread = None

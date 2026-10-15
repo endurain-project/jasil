@@ -185,6 +185,11 @@ class DeploymentTopology:
         return tuple(causes)
 
     @property
+    def multi_process_reason(self) -> str:
+        """:attr:`multi_process_causes` joined into one phrase for a refusal message."""
+        return "; ".join(self.multi_process_causes)
+
+    @property
     def multi_process(self) -> bool:
         """Whether two or more processes can reach the same capability.
 

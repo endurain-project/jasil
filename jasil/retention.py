@@ -103,11 +103,13 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
     if jobs_days > 0:
         cutoff = now - timedelta(days=jobs_days)
         with jasil_orm.get_sessionmaker()() as db:
-            attempts = job_attempts.delete_attempts_before(cutoff, db=db)
-        with jasil_orm.get_sessionmaker()() as db:
             outbox = jobs_outbox.delete_relayed_before(cutoff, db=db)
+        # Jobs first: a failure here leaves jobs with their full history, never
+        # a surviving job with its history gone.
         with jasil_orm.get_sessionmaker()() as db:
             jobs = jobs_crud.delete_completed_jobs_before(cutoff, db=db)
+        with jasil_orm.get_sessionmaker()() as db:
+            attempts = job_attempts.delete_attempts_before(cutoff, db=db)
         with jasil_orm.get_sessionmaker()() as db:
             workers = worker_registry.prune_worker_records_before(cutoff, db=db)
 

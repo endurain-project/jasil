@@ -312,6 +312,51 @@ class TestJobRunner:
         assert campaign_runner.run_once() == 1
         assert seen == [2, 1]
 
+    def test_a_legacy_default_row_is_retagged_to_its_subscribers_queue(self, registry, clock, session_factory, db):
+        registry.register("activity.created", "campaign-handler", lambda _event: None, queue="campaign")
+        self._enqueue(db, subscriber="campaign-handler")
+        runner = self._selective_runner(registry, clock, session_factory, ("campaign",))
+
+        assert runner.run_once() == 1
+
+        assert stored_job(db).queue == "campaign"
+
+    def test_a_subscriber_registered_after_the_runner_was_built_is_routed(self, registry, clock, session_factory, db):
+        runner = self._selective_runner(registry, clock, session_factory, ("campaign",))
+        assert runner.run_once() == 0  # the backfill has already run against an empty registry
+        seen = []
+        registry.register("activity.created", "late-handler", seen.append, queue="campaign")
+        self._enqueue(db, subscriber="late-handler")
+
+        assert runner.run_once() == 1
+        assert len(seen) == 1
+
+    def test_a_stored_queue_name_that_is_not_valid_does_not_wedge_the_runner(self, runner, registry, db, caplog):
+        registry.register("activity.created", "s", lambda _event: None)
+        bad = self._enqueue(db)
+        db.execute(update(ProcessingJob).where(ProcessingJob.id == bad.id).values(queue="Not Valid"))
+        db.commit()
+
+        assert runner.run_once() == 1
+        self._enqueue(db, payload={"id": 2})
+
+        assert runner.run_once() == 1
+
+    def _selective_runner(self, registry, clock, session_factory, queues):
+        return JobRunner(
+            registry=registry,
+            clock=clock,
+            session_factory=session_factory,
+            worker_id="selective-worker",
+            lease_seconds=60,
+            max_runtime_seconds=600,
+            heartbeat_interval_seconds=15,
+            batch_size=10,
+            backoff_base_seconds=1,
+            backoff_max_seconds=2,
+            queues=queues,
+        )
+
     def test_a_selective_default_runner_still_dead_letters_an_unknown_subscriber(
         self,
         registry,

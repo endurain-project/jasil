@@ -195,42 +195,30 @@ class TestDowngrade:
 
         assert not set(inspect(engine).get_table_names()) & jasil_table_names()
 
-    def test_named_queues_can_downgrade_and_upgrade_again(self, engine):
+    def test_the_durable_job_additions_can_downgrade_and_upgrade_again(self, engine):
         migrations.upgrade(engine)
 
         migrations.downgrade(engine, "rev0001")
 
+        tables = set(inspect(engine).get_table_names())
         assert "queue" not in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
+        assert not tables & {"job_workers", "job_attempts"}
 
         migrations.upgrade(engine)
 
+        tables = set(inspect(engine).get_table_names())
         assert "queue" in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
-
-    def test_worker_registry_can_downgrade_and_upgrade_again(self, engine):
-        migrations.upgrade(engine)
-
-        migrations.downgrade(engine, "rev0002")
-
-        assert "job_workers" not in inspect(engine).get_table_names()
-
-        migrations.upgrade(engine)
-
-        assert "job_workers" in inspect(engine).get_table_names()
-
-    def test_the_attempt_history_can_downgrade_and_upgrade_again(self, engine):
-        migrations.upgrade(engine)
-
-        migrations.downgrade(engine, "rev0003")
-
-        assert "job_attempts" not in inspect(engine).get_table_names()
-        assert "job_workers" in inspect(engine).get_table_names(), "only the history table is removed"
-
-        migrations.upgrade(engine)
-
+        assert {"job_workers", "job_attempts"} <= tables
         columns = {column["name"] for column in inspect(engine).get_columns("job_attempts")}
         assert {"job_id", "worker_id", "attempt", "outcome", "duration_ms", "claimed_at"} <= columns
         indexes = {index["name"] for index in inspect(engine).get_indexes("job_attempts")}
         assert {"idx_job_attempts_job", "idx_job_attempts_worker", "idx_job_attempts_event"} <= indexes
+        claim = next(
+            index
+            for index in inspect(engine).get_indexes("processing_jobs")
+            if index["name"] == "idx_processing_jobs_queue_claim"
+        )
+        assert claim["column_names"] == ["status", "queue", "available_at"]
 
 
 class TestAdoptExistingSchema:

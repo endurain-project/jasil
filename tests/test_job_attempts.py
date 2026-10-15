@@ -305,6 +305,22 @@ class TestAHandlerThatOutlivesItsLease:
         stored = _job(db)
         assert (stored.status, stored.locked_by) == (jobs_crud.STATUS_CLAIMED, "other")
 
+    def test_a_late_finish_nobody_took_over_is_not_called_superseded(self, runner, registry, clock, db):
+        """Reaped but never claimed again: the handler ran once, so it did not run twice."""
+
+        def handle(_event):
+            clock.advance(150)
+            runner.reap_once()
+
+        registry.register("activity.created", "s", handle)
+        job = _enqueue(db)
+
+        runner.run_once()
+
+        (row,) = _attempts(db, job.id)
+        assert (row.outcome, row.duration_ms) == ("lease_expired", 150_000)
+        assert row.finished_at is not None
+
     def test_the_reaper_closes_the_attempt_of_a_worker_that_died(self, db):
         job = _enqueue(db)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=LEASE, now=T0, db=db)
@@ -920,6 +936,27 @@ class TestRetention:
         db.rollback()
         assert db.execute(select(JobAttempt)).first() is None
         assert "1 job attempt" in caplog.text
+
+
+class TestPruneOrder:
+    def test_jobs_go_before_their_history_so_a_failed_job_delete_keeps_both(self, db, tmp_path, monkeypatch):
+        import jasil.retention as retention
+
+        built = container.build_platform(settings.JasilSettings(data_dir=str(tmp_path)))
+        monkeypatch.setattr(platform_runtime, "_active_platform", built)
+        job = _enqueue(db)
+        jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=LEASE, now=T0, db=db)
+        jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("lock timeout")
+
+        monkeypatch.setattr(jobs_crud, "delete_completed_jobs_before", boom)
+
+        with pytest.raises(RuntimeError):
+            retention._run_prune(T0 + timedelta(days=90), event_log_days=0, jobs_days=30)
+
+        assert len(_attempts(db, job.id)) == 1
 
 
 class TestLogsNameTheWorker:

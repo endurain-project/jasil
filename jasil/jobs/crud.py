@@ -244,6 +244,45 @@ def claim_jobs(
     return sorted(claimed, key=lambda job: position[job.id])
 
 
+def backfill_legacy_queues(assignments: dict[str, str], *, db: Session) -> int:
+    """Move pending ``default`` rows to the queue their subscriber is assigned to.
+
+    Rows written before named queues existed (or by an older writer) carry the
+    database default. Retagging them once, from the registry, lets claims filter
+    on ``queue`` alone instead of patching those rows in the hot path. Only
+    ``pending`` rows move: a claimed row already has an attempt history that names
+    its queue. Commits.
+
+    Args:
+        assignments: ``{subscriber_id: queue}`` of the registered subscribers.
+        db: Active database session.
+
+    Returns:
+        The number of rows retagged.
+    """
+    by_queue: dict[str, list[str]] = defaultdict(list)
+    for subscriber_id, queue in assignments.items():
+        if queue != DEFAULT_QUEUE:
+            by_queue[queue].append(subscriber_id)
+    moved = 0
+    for queue, subscriber_ids in by_queue.items():
+        result = cast(
+            CursorResult[Any],
+            db.execute(
+                update(ProcessingJob)
+                .where(
+                    ProcessingJob.status == STATUS_PENDING,
+                    ProcessingJob.queue == DEFAULT_QUEUE,
+                    ProcessingJob.subscriber_id.in_(subscriber_ids),
+                )
+                .values(queue=queue)
+            ),
+        )
+        moved += result.rowcount
+    db.commit()
+    return moved
+
+
 def _open_attempts(job_ids: list[str], *, worker_id: str, now: datetime, db: Session) -> None:
     """Open one attempt row for each job this worker just claimed.
 
@@ -313,12 +352,23 @@ def _finish_attempt(
     taken meanwhile the row becomes ``superseded``, so an overrun handler that
     ran twice is counted like any other.
 
+    ``superseded`` means the job really was claimed again. A handler that outlasted
+    its lease while the job sat requeued or dead-lettered, with no later claim, ran
+    only once: its row keeps the reaper's ``lease_expired`` outcome and just gains
+    the late duration and error.
+
     A dead-letter replay restarts ``attempts``, so one worker can hold two rows
     for the same ``(job, attempt)``; the newest matching row is the one settled.
     """
     settleable = or_(JobAttempt.finished_at.is_(None), JobAttempt.outcome == OUTCOME_ABANDONED)
+    finished_at: Any = now
     if not owned:
-        outcome = OUTCOME_SUPERSEDED
+        latest_attempt = db.execute(select(ProcessingJob.attempts).where(ProcessingJob.id == job_id)).scalar()
+        if latest_attempt is not None and latest_attempt > attempt:
+            outcome = OUTCOME_SUPERSEDED
+        else:
+            outcome = OUTCOME_LEASE_EXPIRED
+            finished_at = func.coalesce(JobAttempt.finished_at, now)
         settleable = or_(settleable, JobAttempt.outcome == OUTCOME_LEASE_EXPIRED)
     target = db.execute(
         select(JobAttempt.id)
@@ -336,7 +386,7 @@ def _finish_attempt(
     db.execute(
         update(JobAttempt)
         .where(JobAttempt.id == target)
-        .values(outcome=outcome, finished_at=now, duration_ms=duration_ms, error=error)
+        .values(outcome=outcome, finished_at=finished_at, duration_ms=duration_ms, error=error)
         # Attempt rows are never read back through this session, so skip the sync.
         .execution_options(synchronize_session=False)
     )
@@ -432,7 +482,7 @@ def _select_due_ids(
 
     Two range scans rather than one ``ORDER BY CASE ...``: an expression cannot be
     served by an index, so a single ordered query would sort every due row on
-    each poll. Each scan is ``queue, available_at`` ordered and so rides
+    each poll. Each scan is ``queue, available_at`` ordered within ``status = 'pending'`` and so rides
     ``idx_processing_jobs_queue_claim``; the second wraps around to the queues at
     or before the cursor only when the first did not fill the batch.
     """
@@ -952,9 +1002,7 @@ def get_jobs_summary(
         for queue in sorted(queue_names)
         for status_counts in (queue_counts[queue],)
     ]
-    oldest_pending = db.execute(
-        select(func.min(ProcessingJob.created_at)).where(ProcessingJob.status.in_((STATUS_PENDING, STATUS_CLAIMED)))
-    ).scalar()
+    oldest_pending = min(queue_oldest.values(), default=None)
     dead_letter_jobs = (
         db.execute(
             select(ProcessingJob)

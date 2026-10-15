@@ -151,7 +151,7 @@ def _history(db: Session, job_id: str, limit: int) -> list[JobAttemptInfo]:
     return [JobAttemptInfo.model_validate(attempt) for attempt in attempts]
 
 
-def _check_limit(limit: int, *, maximum: int, name: str) -> None:
+def check_limit(limit: int, *, maximum: int, name: str) -> None:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
 
@@ -164,7 +164,7 @@ def get_job_detail(
     record_attempts: bool = True,
 ) -> JobDetail | None:
     """Return one job with its attempts, newest first; ``None`` when it does not exist."""
-    _check_limit(attempt_limit, maximum=MAX_ATTEMPT_LIMIT, name="attempt_limit")
+    check_limit(attempt_limit, maximum=MAX_ATTEMPT_LIMIT, name="attempt_limit")
     job = db.get(ProcessingJob, job_id)
     if job is None:
         return None
@@ -182,7 +182,7 @@ def get_event_jobs(
     record_attempts: bool = True,
 ) -> EventJobs:
     """Return every subscriber's job for ``event_id``, each with its newest attempts."""
-    _check_limit(attempt_limit, maximum=MAX_ATTEMPT_LIMIT, name="attempt_limit")
+    check_limit(attempt_limit, maximum=MAX_ATTEMPT_LIMIT, name="attempt_limit")
     jobs = (
         db.execute(
             select(ProcessingJob)
@@ -211,7 +211,7 @@ def get_worker_attempts(
     record_attempts: bool = True,
 ) -> WorkerAttempts:
     """Return one page of a worker instance's attempts, newest first."""
-    _check_limit(limit, maximum=MAX_WORKER_ATTEMPT_PAGE_SIZE, name="limit")
+    check_limit(limit, maximum=MAX_WORKER_ATTEMPT_PAGE_SIZE, name="limit")
     statement = select(JobAttempt).where(JobAttempt.worker_id == instance_id)
     if cursor is not None:
         claimed_at, attempt_id = decode_cursor(cursor, name="worker attempts")

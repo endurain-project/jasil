@@ -258,7 +258,7 @@ def _ensure_job_topology(expected: JobWorkerMode, *, entry_point: str, other: st
     if topology.multi_process and jasil_orm.get_engine().dialect.name == "sqlite":
         raise RuntimeError(
             "SQLite durable jobs support exactly one process with one in-process consumer; "
-            f"the configured topology runs several ({'; '.join(topology.multi_process_causes)}). "
+            f"the configured topology runs several ({topology.multi_process_reason}). "
             "Use a database that supports concurrent consumers, such as PostgreSQL"
         )
 

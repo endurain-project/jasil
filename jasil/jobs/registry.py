@@ -163,6 +163,10 @@ class JobHandlerRegistry:
         selected_set = frozenset(selected)
         return tuple(subscriber_id for subscriber_id, queue in self._queues.items() if queue in selected_set)
 
+    def queue_assignments(self) -> dict[str, str]:
+        """Return a copy of the ``{subscriber_id: queue}`` assignments."""
+        return dict(self._queues)
+
     def clear(self) -> None:
         """Remove every registration (used to reset state between tests)."""
         self._handlers.clear()

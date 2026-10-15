@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 
 import jasil.jobs._worker_registry as worker_registry
 import jasil.jobs.crud as jobs_crud
-from jasil._core.threads import signal_and_join
+from jasil._core.threads import STOP_JOIN_TIMEOUT_SECONDS, signal_and_join
 from jasil.events import new_event
 from jasil.jobs._worker_metadata import MAX_WORKER_METADATA_BYTES
 from jasil.jobs.models import JobWorker
@@ -191,6 +191,28 @@ class TestBackgroundWorker:
 
         assert worker._thread is None
         assert not thread.is_alive()
+
+    def test_stop_allows_the_worker_thread_time_to_join_its_heartbeat(self, monkeypatch):
+        """The outer join must outlast the heartbeat join the worker thread does on exit."""
+        joined = []
+
+        class Heartbeat:
+            def start(self):
+                pass
+
+            def stop(self):
+                return True
+
+        def record_join(thread, stop, *, timeout):
+            joined.append(timeout)
+            return True
+
+        monkeypatch.setattr("jasil.jobs.worker.signal_and_join", record_join)
+        worker = BackgroundWorker(SignallingRunner(), poll_interval_seconds=0.01, heartbeat=Heartbeat())
+
+        worker.stop(timeout=1.0)
+
+        assert joined == [1.0 + STOP_JOIN_TIMEOUT_SECONDS]
 
     def test_stopping_a_worker_that_never_started_is_a_no_op(self, worker):
         worker.stop()
