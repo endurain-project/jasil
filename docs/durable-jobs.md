@@ -247,10 +247,10 @@ Both rules are decided from the registrations of the worker process that makes
 the claim, so **every worker process must register every durable subscriber**,
 even those it will not consume, before it starts. A worker that has not
 registered a subscriber cannot tell that a legacy `default` row belongs to
-another queue, and will claim it, find no handler, and dead-letter it. The set is
-read once when the worker is built: subscribers registered afterwards are not
-seen by that worker. Alternatively, let the `default` queue drain before rolling
-out.
+another queue, and will claim it, find no handler, and dead-letter it. Routing
+reads the registrations on every claim, but the one-time retag of legacy rows
+runs on the worker's first batch, so register subscribers before starting the
+worker. Alternatively, let the `default` queue drain before rolling out.
 
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock

@@ -888,7 +888,7 @@ class TestRetention:
         db.commit()
         return job
 
-    def test_finished_history_goes_and_live_and_dead_lettered_history_stays(self, db):
+    def test_only_the_history_of_jobs_that_no_longer_exist_goes(self, db):
         done = self._job(db, "done", jobs_crud.STATUS_COMPLETED)
         waiting = self._job(db, "waiting", jobs_crud.STATUS_PENDING)
         running = self._job(db, "running", jobs_crud.STATUS_CLAIMED)
@@ -902,8 +902,16 @@ class TestRetention:
 
         db.rollback()
         remaining = {row.id for row in db.execute(select(JobAttempt)).scalars()}
-        assert deleted == 2
-        assert remaining == {"a-waiting", "a-running", "a-dead", "recent"}
+        assert deleted == 1
+        assert remaining == {"a-done", "a-waiting", "a-running", "a-dead", "recent"}
+
+    def test_a_completed_jobs_history_goes_once_the_job_itself_is_pruned(self, db):
+        done = self._job(db, "done", jobs_crud.STATUS_COMPLETED)
+        _insert_attempt(db, id="a-done", job_id=done.id, claimed_at=self.OLD)
+
+        assert job_attempts.delete_attempts_before(self.CUTOFF, db=db) == 0
+        assert jobs_crud.delete_completed_jobs_before(self.CUTOFF, db=db) == 1
+        assert job_attempts.delete_attempts_before(self.CUTOFF, db=db) == 1
 
     def test_a_recently_completed_job_keeps_its_whole_history(self, db):
         job = self._job(db, "fresh", jobs_crud.STATUS_COMPLETED, completed_at=self.CUTOFF + timedelta(hours=1))

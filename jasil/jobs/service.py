@@ -140,7 +140,8 @@ def run_job_worker(
     host configures JASIL, registers its durable subscribers, and calls this
     function without importing runner or CRUD internals. Register every durable
     subscriber first, including those on queues this worker does not select: the
-    worker reads the registry once, when it is built. Signal handling remains
+    worker re-reads the registry on every claim, but retags legacy ``default`` rows
+    from it once, on its first batch. Signal handling remains
     host-owned: pass an event that the host sets during graceful shutdown. This
     function blocks until that event is set; run it only as a dedicated worker
     process entrypoint, never on an API request or event-loop thread.

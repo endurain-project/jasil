@@ -239,12 +239,13 @@ def get_worker_attempts(
 def delete_attempts_before(cutoff: datetime, *, db: Session, batch_size: int = PRUNE_BATCH_SIZE) -> int:
     """Delete attempts claimed before ``cutoff``, in bounded batches.
 
-    A live job (``pending``, ``claimed``) and a dead-lettered one keep their whole
-    history, matching the rule that dead letters are kept for operator review. A
-    ``completed`` job's history goes only once the job itself is past the cutoff
-    (by ``completed_at``), so a job that still exists is never left with part of
-    its history. Attempts whose job is gone (pruned, or never existed) are
-    orphans and go.
+    Every job that still exists keeps its whole history: live (``pending``,
+    ``claimed``) and dead-lettered jobs by the rule that dead letters are kept for
+    operator review, and a ``completed`` job until the job row itself is pruned
+    (which is bounded per pass, so an old completed job can outlive the cutoff for
+    a pass or two). Only attempts whose job is gone (pruned, or never existed) are
+    orphans and go, so a job that still exists is never left with part of its
+    history.
 
     Args:
         cutoff: Delete attempts whose ``claimed_at`` is strictly before this.
@@ -254,15 +255,8 @@ def delete_attempts_before(cutoff: datetime, *, db: Session, batch_size: int = P
     Returns:
         The total number of rows deleted.
     """
-    # A job that is still being kept, or completed too recently to be pruned.
-    kept = exists().where(
-        ProcessingJob.id == JobAttempt.job_id,
-        or_(
-            ProcessingJob.status != "completed",
-            ProcessingJob.completed_at.is_(None),
-            ProcessingJob.completed_at >= cutoff,
-        ),
-    )
+    # Any job row that still exists, whatever its state or age.
+    kept = exists().where(ProcessingJob.id == JobAttempt.job_id)
     total = 0
     for _ in range(PRUNE_MAX_BATCHES):
         ids = list(
