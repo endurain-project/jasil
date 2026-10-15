@@ -25,7 +25,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, and_, case, func, insert, or_, select, update
+from sqlalchemy import CursorResult, and_, func, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -40,6 +40,7 @@ from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.events import Event
 from jasil.jobs._attempts import (
+    OUTCOME_ABANDONED,
     OUTCOME_COMPLETED,
     OUTCOME_DEAD_LETTER,
     OUTCOME_FAILED,
@@ -166,7 +167,8 @@ def claim_jobs(
             claim.
 
     Returns:
-        The jobs this call actually claimed, oldest-available first.
+        The jobs this call actually claimed, in rotation order: queues after
+        ``queue_cursor`` first, wrapping, and oldest-available first within a queue.
     """
     selected_queues = normalize_queue_selector(queues)
     if queue_cursor is not None:
@@ -193,11 +195,8 @@ def claim_jobs(
                 ),
             )
         filters.append(queue_filter)
-    ordering = _queue_order(queue_cursor)
-    id_stmt = select(ProcessingJob.id).where(*filters).order_by(*ordering).limit(limit)
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
-        id_stmt = id_stmt.with_for_update(skip_locked=True)
-    job_ids = list(db.execute(id_stmt).scalars().all())
+    skip_locked = supports_skip_locked(db.bind)
+    job_ids = _select_due_ids(filters, queue_cursor=queue_cursor, limit=limit, skip_locked=skip_locked, db=db)
     if not job_ids:
         db.commit()  # end the transaction so FOR UPDATE locks are released
         return []
@@ -223,8 +222,7 @@ def claim_jobs(
     db.commit()
     claimed = (
         db.execute(
-            select(ProcessingJob)
-            .where(
+            select(ProcessingJob).where(
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
                 # The lease we just took. ``job_ids`` were all ``pending`` at
@@ -238,12 +236,12 @@ def claim_jobs(
                 # nothing and the worker claimed batches it then never ran.
                 ProcessingJob.locked_by == worker_id,
             )
-            .order_by(*ordering)
         )
         .scalars()
         .all()
     )
-    return list(claimed)
+    position = {job_id: index for index, job_id in enumerate(job_ids)}
+    return sorted(claimed, key=lambda job: position[job.id])
 
 
 def _open_attempts(job_ids: list[str], *, worker_id: str, now: datetime, db: Session) -> None:
@@ -303,25 +301,41 @@ def _finish_attempt(
 ) -> None:
     """Close the attempt row of one claim, in the caller's transaction.
 
-    A worker that still owned the claim closes its open row with ``outcome``. One
-    that did not (the lease expired and the job was taken) finished *late*: its
-    row is either still open or was closed ``lease_expired`` by the reaper, and
-    becomes ``superseded``, keeping the late duration and error: it is the only
-    durable record that the handler ran twice. A row closed ``abandoned`` stays so.
+    A worker that still owned the claim closes its row with ``outcome``. One that
+    did not (the lease expired and the job was taken) finished *late*: its row is
+    either still open or was closed ``lease_expired`` by the reaper, and becomes
+    ``superseded``, keeping the late duration and error: it is the only durable
+    record that the handler ran twice.
+
+    A row closed ``abandoned`` (the handler overran ``max_runtime_seconds``) is
+    settled by whichever happens to the job next: if the worker still owns the
+    claim the handler's own result replaces ``abandoned``, and if the job was
+    taken meanwhile the row becomes ``superseded``, so an overrun handler that
+    ran twice is counted like any other.
+
+    A dead-letter replay restarts ``attempts``, so one worker can hold two rows
+    for the same ``(job, attempt)``; the newest matching row is the one settled.
     """
-    claim = [
-        JobAttempt.job_id == job_id,
-        JobAttempt.worker_id == worker_id,
-        JobAttempt.attempt == attempt,
-    ]
-    if owned:
-        claim.append(JobAttempt.finished_at.is_(None))
-    else:
+    settleable = or_(JobAttempt.finished_at.is_(None), JobAttempt.outcome == OUTCOME_ABANDONED)
+    if not owned:
         outcome = OUTCOME_SUPERSEDED
-        claim.append(or_(JobAttempt.finished_at.is_(None), JobAttempt.outcome == OUTCOME_LEASE_EXPIRED))
+        settleable = or_(settleable, JobAttempt.outcome == OUTCOME_LEASE_EXPIRED)
+    target = db.execute(
+        select(JobAttempt.id)
+        .where(
+            JobAttempt.job_id == job_id,
+            JobAttempt.worker_id == worker_id,
+            JobAttempt.attempt == attempt,
+            settleable,
+        )
+        .order_by(JobAttempt.claimed_at.desc(), JobAttempt.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if target is None:
+        return
     db.execute(
         update(JobAttempt)
-        .where(*claim)
+        .where(JobAttempt.id == target)
         .values(outcome=outcome, finished_at=now, duration_ms=duration_ms, error=error)
         # Attempt rows are never read back through this session, so skip the sync.
         .execution_options(synchronize_session=False)
@@ -406,13 +420,40 @@ def mark_attempt_started(job_id: str, *, worker_id: str, attempt: int, now: date
     db.commit()
 
 
-def _queue_order(queue_cursor: str | None) -> tuple[Any, ...]:
-    """Order queues after the previous cursor, wrapping at the end."""
-    ordering: list[Any] = []
+def _select_due_ids(
+    filters: list[Any],
+    *,
+    queue_cursor: str | None,
+    limit: int,
+    skip_locked: bool,
+    db: Session,
+) -> list[str]:
+    """Select up to ``limit`` due job ids, queues rotating after ``queue_cursor``.
+
+    Two range scans rather than one ``ORDER BY CASE ...``: an expression cannot be
+    served by an index, so a single ordered query would sort every due row on
+    each poll. Each scan is ``queue, available_at`` ordered and so rides
+    ``idx_processing_jobs_queue_claim``; the second wraps around to the queues at
+    or before the cursor only when the first did not fill the batch.
+    """
+    ranges: list[list[Any]] = [[]]
     if queue_cursor is not None:
-        ordering.append(case((ProcessingJob.queue > queue_cursor, 0), else_=1))
-    ordering.extend((ProcessingJob.queue, ProcessingJob.available_at, ProcessingJob.created_at, ProcessingJob.id))
-    return tuple(ordering)
+        ranges = [[ProcessingJob.queue > queue_cursor], [ProcessingJob.queue <= queue_cursor]]
+    job_ids: list[str] = []
+    for bounds in ranges:
+        remaining = limit - len(job_ids)
+        if remaining <= 0:
+            break
+        statement = (
+            select(ProcessingJob.id)
+            .where(*filters, *bounds)
+            .order_by(ProcessingJob.queue, ProcessingJob.available_at, ProcessingJob.created_at, ProcessingJob.id)
+            .limit(remaining)
+        )
+        if skip_locked:  # pragma: no cover - server-side locking, not exercised on SQLite
+            statement = statement.with_for_update(skip_locked=True)
+        job_ids.extend(db.execute(statement).scalars().all())
+    return job_ids
 
 
 def renew_leases(
@@ -806,7 +847,6 @@ def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
         )
         .group_by(ProcessingJob.locked_by)
     ).all()
-    db.rollback()
     return {str(worker): int(count) for worker, count in rows}
 
 

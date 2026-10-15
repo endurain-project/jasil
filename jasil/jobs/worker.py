@@ -160,7 +160,10 @@ class WorkerHeartbeat:
         self._thread.start()
 
     def stop(self) -> bool:
-        """Stop beating and record a graceful shutdown.
+        """Stop beating and, if the thread really stopped, record a graceful shutdown.
+
+        A thread that outlived the join is still beating, so no stop is recorded:
+        the registry keeps reporting what is true of it.
 
         Returns:
             True when the thread stopped; False when it had to be abandoned.
@@ -169,7 +172,7 @@ class WorkerHeartbeat:
         stopped = signal_and_join(thread, self._stop)
         if stopped and self._thread is thread:
             self._thread = None
-        if self._telemetry is not None:
+        if stopped and self._telemetry is not None:
             self._telemetry.record_stop()
         return stopped
 

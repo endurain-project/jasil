@@ -457,7 +457,25 @@ class TestTheRunnerRecordsTheRun:
         runner.run_once()
 
         (row,) = _attempts(db, job.id)
-        assert row.outcome == "abandoned", "a late success does not overwrite the cap"
+        assert row.outcome == "completed", "the claim was still held, so the handler's own result settles it"
+
+    def test_an_abandoned_handler_that_finishes_after_the_job_was_taken_is_superseded(
+        self, runner, registry, clock, db
+    ):
+        def handle(_event):
+            clock.advance(601)
+            runner.leases.renew()  # past the cap: abandoned, no longer renewed
+            runner.reap_once()
+            jobs_crud.claim_jobs(worker_id="other", limit=10, lease_seconds=LEASE, now=clock.now(), db=db)
+
+        registry.register("activity.created", "s", handle)
+        job = _enqueue(db)
+
+        runner.run_once()
+
+        first, second = _attempts(db, job.id)
+        assert (first.worker_id, first.outcome) == ("worker-1", "superseded")
+        assert (second.worker_id, second.outcome) == ("other", None)
 
     def test_an_abandon_that_cannot_be_recorded_is_logged_and_the_job_carries_on(
         self, runner, registry, clock, db, monkeypatch, caplog
