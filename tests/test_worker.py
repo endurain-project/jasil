@@ -386,6 +386,7 @@ class TestWorkerTelemetry:
 
     def test_a_heartbeat_failure_does_not_kill_job_execution(self, worker_database, monkeypatch, caplog):
         heartbeat_attempted = threading.Event()
+        handler_started = threading.Event()
         release_handler = threading.Event()
         handled = threading.Event()
         stop = threading.Event()
@@ -393,6 +394,7 @@ class TestWorkerTelemetry:
         registry = JobHandlerRegistry()
 
         def handle(_event):
+            handler_started.set()
             assert release_handler.wait(timeout=WAIT_TIMEOUT)
             handled.set()
 
@@ -441,6 +443,9 @@ class TestWorkerTelemetry:
             )
             thread.start()
             assert heartbeat_attempted.wait(timeout=WAIT_TIMEOUT)
+            # Only stop once the job is running: the heartbeat can fail before the
+            # worker has claimed anything, and a stopped worker never claims.
+            assert handler_started.wait(timeout=WAIT_TIMEOUT)
             stop.set()
             release_handler.set()
             thread.join(timeout=WAIT_TIMEOUT)
