@@ -24,7 +24,7 @@ from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 
 @pytest.fixture(autouse=True)
@@ -283,6 +283,48 @@ class TestDeploymentConsistencyGate:
         assert isinstance(platform.state, MemoryState)
         assert "Inconsistent deployment wiring" in caplog.text
 
+    def test_standalone_job_workers_stop_the_build_on_in_memory_wiring(self, tmp_path):
+        """One API process, one worker process, the default ``local`` profile: two processes."""
+        with pytest.raises(ValueError, match="job_worker_mode=standalone") as failure:
+            container.build_platform(
+                _settings(
+                    data_dir=str(tmp_path),
+                    job_worker_mode=JobWorkerMode.STANDALONE,
+                    jobs=settings.JobSettings(enabled=True),
+                    mail=settings.MailSettings(uri="memory://"),
+                )
+            )
+
+        for name in ("state_uri", "events_uri", "lock_uri", "mail.uri"):
+            assert name in str(failure.value)
+
+    def test_standalone_job_workers_build_on_shared_wiring(self, tmp_path):
+        platform = container.build_platform(
+            _settings(
+                data_dir=str(tmp_path),
+                job_worker_mode=JobWorkerMode.STANDALONE,
+                jobs=settings.JobSettings(enabled=True),
+                state_uri="redis://cache:6379/0",
+                events_uri="redis://cache:6379/1",
+                lock_uri="postgres-advisory://",
+                mail=settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c"),
+            )
+        )
+
+        assert isinstance(platform.mail, SmtpMail)
+
+    def test_standalone_job_workers_without_jobs_stop_the_build(self, tmp_path):
+        with pytest.raises(ValueError, match=r"jobs\.enabled is false"):
+            container.build_platform(
+                _settings(
+                    data_dir=str(tmp_path),
+                    job_worker_mode=JobWorkerMode.STANDALONE,
+                    state_uri="redis://cache:6379/0",
+                    events_uri="redis://cache:6379/1",
+                    lock_uri="postgres-advisory://",
+                )
+            )
+
     def test_a_consistent_deployment_logs_the_capability_report(self, tmp_path, caplog):
         with caplog.at_level("INFO"):
             container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -329,7 +371,29 @@ class TestMailResolution:
     def _build(**mail):
         return container._build_mail(_settings(mail=settings.MailSettings(**mail)), SystemClock())
 
-    def test_a_lease_not_above_the_smtp_deadline_warns(self, caplog):
+    def test_a_runtime_cap_not_above_the_smtp_deadline_warns(self, caplog):
+        """A running job keeps its lease only up to ``max_runtime_seconds``."""
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=60)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "max_runtime_seconds" in caplog.text
+
+    def test_a_longer_runtime_cap_does_not_warn(self, caplog):
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=1800)
+        cfg = _settings(
+            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
+        )
+        with caplog.at_level("WARNING"):
+            container._build_mail(cfg, SystemClock())
+
+        assert "max_runtime_seconds" not in caplog.text
+
+    def test_a_short_lease_alone_does_not_warn(self, caplog):
+        """The lease is renewed while a handler runs, so it is no cap on one send."""
         jobs = settings.JobSettings(enabled=True, lease_seconds=60)
         cfg = _settings(
             mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
@@ -337,17 +401,7 @@ class TestMailResolution:
         with caplog.at_level("WARNING"):
             container._build_mail(cfg, SystemClock())
 
-        assert "lease_seconds" in caplog.text
-
-    def test_a_longer_lease_does_not_warn(self, caplog):
-        jobs = settings.JobSettings(enabled=True, lease_seconds=300)
-        cfg = _settings(
-            mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
-        )
-        with caplog.at_level("WARNING"):
-            container._build_mail(cfg, SystemClock())
-
-        assert "lease_seconds" not in caplog.text
+        assert "jobs." not in caplog.text
 
     def test_unset_selects_the_disabled_backend(self):
         assert isinstance(self._build(), NullMail)

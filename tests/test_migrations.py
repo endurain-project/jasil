@@ -10,7 +10,7 @@ is the guard for that.
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect
+from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect, text
 
 from jasil import migrations
 from jasil.orm import jasil_table_names
@@ -89,6 +89,51 @@ class TestUpgrade:
 
         assert migrations.db_revision(engine) == migrations.head_revision()
 
+    def test_existing_jobs_become_default_queue_jobs(self, engine):
+        migrations.upgrade(engine, "rev0001")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO processing_jobs (
+                        id, event_id, event_type, subscriber_id, source, payload,
+                        max_attempts, available_at, created_at, updated_at
+                    ) VALUES (
+                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
+                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )"""
+                )
+            )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT queue FROM processing_jobs WHERE id = 'job-1'")).scalar_one()
+                == "default"
+            )
+
+    def test_old_writers_receive_the_database_default_queue(self, engine):
+        migrations.upgrade(engine)
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO processing_jobs (
+                        id, event_id, event_type, subscriber_id, source, payload,
+                        max_attempts, available_at, created_at, updated_at
+                    ) VALUES (
+                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
+                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )"""
+                )
+            )
+
+        with engine.connect() as connection:
+            assert (
+                connection.execute(text("SELECT queue FROM processing_jobs WHERE id = 'job-1'")).scalar_one()
+                == "default"
+            )
+
 
 class TestNoDrift:
     # The migration adds one index the ORM cannot declare: a PostgreSQL-only GIN
@@ -149,6 +194,31 @@ class TestDowngrade:
         migrations.downgrade(engine, "base")
 
         assert not set(inspect(engine).get_table_names()) & jasil_table_names()
+
+    def test_the_durable_job_additions_can_downgrade_and_upgrade_again(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0001")
+
+        tables = set(inspect(engine).get_table_names())
+        assert "queue" not in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
+        assert not tables & {"job_workers", "job_attempts"}
+
+        migrations.upgrade(engine)
+
+        tables = set(inspect(engine).get_table_names())
+        assert "queue" in {column["name"] for column in inspect(engine).get_columns("processing_jobs")}
+        assert {"job_workers", "job_attempts"} <= tables
+        columns = {column["name"] for column in inspect(engine).get_columns("job_attempts")}
+        assert {"job_id", "worker_id", "attempt", "outcome", "duration_ms", "claimed_at"} <= columns
+        indexes = {index["name"] for index in inspect(engine).get_indexes("job_attempts")}
+        assert {"idx_job_attempts_job", "idx_job_attempts_worker", "idx_job_attempts_event"} <= indexes
+        claim = next(
+            index
+            for index in inspect(engine).get_indexes("processing_jobs")
+            if index["name"] == "idx_processing_jobs_queue_claim"
+        )
+        assert claim["column_names"] == ["status", "queue", "available_at"]
 
 
 class TestAdoptExistingSchema:

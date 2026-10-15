@@ -7,16 +7,19 @@ with backoff, or dead-letters it once the attempt ceiling is reached.
 """
 
 import logging
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
+from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
-from jasil.jobs.registry import JobHandlerRegistry
+from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
 from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,7 @@ class ClaimedJob:
         timestamp: ISO-8601 enqueue time, used to rebuild the event envelope.
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
+        queue: Named queue from which the job was claimed.
     """
 
     id: str
@@ -50,6 +54,7 @@ class ClaimedJob:
     attempts: int
     timestamp: str
     schema_version: int
+    queue: str
 
 
 class JobRunner:
@@ -63,10 +68,15 @@ class JobRunner:
         session_factory: Callable[[], Session],
         worker_id: str,
         lease_seconds: int,
+        max_runtime_seconds: float,
+        heartbeat_interval_seconds: float,
         batch_size: int,
         backoff_base_seconds: float,
         backoff_max_seconds: float,
+        queues: Iterable[str] | None = None,
+        record_attempts: bool = True,
     ) -> None:
+        self._record_attempts = record_attempts
         self._registry = registry
         self._clock = clock
         self._session_factory = session_factory
@@ -75,15 +85,60 @@ class JobRunner:
         self._batch_size = batch_size
         self._backoff_base_seconds = backoff_base_seconds
         self._backoff_max_seconds = backoff_max_seconds
+        self._queues = normalize_queue_selector(queues)
+        self._legacy_queues_backfilled = False
+        self._queue_cursor: str | None = None
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._leases = LeaseKeeper(
+            session_factory=session_factory,
+            clock=clock,
+            worker_id=worker_id,
+            lease_seconds=lease_seconds,
+            max_runtime_seconds=max_runtime_seconds,
+            interval_seconds=heartbeat_interval_seconds,
+            record_attempts=record_attempts,
+        )
 
-    def run_once(self) -> int:
+    @property
+    def leases(self) -> LeaseKeeper:
+        """The record of what this worker holds, renewed by the worker heartbeat."""
+        return self._leases
+
+    @property
+    def heartbeat_interval_seconds(self) -> float:
+        """How often the worker heartbeat renews leases and refreshes telemetry."""
+        return self._heartbeat_interval_seconds
+
+    @property
+    def worker_id(self) -> str:
+        """Restart-unique worker and lease-holder identity."""
+        return self._worker_id
+
+    @property
+    def clock(self) -> ClockProvider:
+        """Clock shared by claims and worker telemetry."""
+        return self._clock
+
+    @property
+    def queues(self) -> tuple[str, ...] | None:
+        """Normalized queue allowlist, or None when all queues are selected."""
+        return self._queues
+
+    def run_once(self, stop: threading.Event | None = None) -> int:
         """
         Claim and process one batch of due jobs.
+
+        Args:
+            stop: When set between jobs, the jobs not yet started are released
+                back to the queue instead of being run, so a graceful shutdown
+                does not hold them for the rest of the batch.
 
         Returns:
             The number of jobs processed in this batch (0 when none were due).
         """
         now = self._clock.now()
+        self._backfill_legacy_queues()
+        default_subscribers, excluded_subscribers = self._legacy_routing()
         with self._session_factory() as db:
             claimed = jobs_crud.claim_jobs(
                 worker_id=self._worker_id,
@@ -91,60 +146,113 @@ class JobRunner:
                 lease_seconds=self._lease_seconds,
                 now=now,
                 db=db,
+                queues=self._queues,
+                queue_cursor=self._queue_cursor,
+                default_queue_subscribers=default_subscribers,
+                excluded_default_queue_subscribers=excluded_subscribers,
+                record_attempts=self._record_attempts,
             )
             snapshots = [self._snapshot(job) for job in claimed]
-        if snapshots:
-            logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
-        for index, snapshot in enumerate(snapshots):
-            # A DB error finishing one job must not abort the rest of the batch;
-            # its lease simply expires and the reaper requeues it.
-            try:
-                if index:
-                    try:
-                        held = self._still_held(snapshot, snapshots[index:])
-                    except Exception as error:
-                        # Not run: the lease is unknown, and the reaper requeues it.
-                        logger.error(
-                            "Durable job lease could not be renewed; skipping",
-                            exc_info=error,
-                            extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
-                        )
+        if not snapshots:
+            return 0
+        self._queue_cursor = self._cursor_for(snapshots[-1].queue)
+        logger.debug("Claimed %d durable job(s) as %s", len(snapshots), self._worker_id)
+        self._leases.hold({snapshot.id: snapshot.attempts for snapshot in snapshots})
+        try:
+            for index, snapshot in enumerate(snapshots):
+                # A DB error finishing one job must not abort the rest of the batch;
+                # its lease simply expires and the reaper requeues it.
+                if stop is not None and stop.is_set():
+                    self._leases.release_waiting()
+                    break
+                try:
+                    # The first job's lease was taken a moment ago; every later one
+                    # has been waiting, so it is renewed (and confirmed held) first.
+                    if index and not self._still_held(snapshot):
                         continue
-                    if not held:
-                        continue
-                self._run_job(snapshot)
-            except Exception as error:
-                logger.error(
-                    "Durable job could not be finalized",
-                    exc_info=error,
-                    extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
-                )
+                    if self._run_job(snapshot):
+                        # This worker lost its claim or overran its cap: it is in
+                        # trouble, so the rest of the batch goes back to the queue
+                        # for a worker that is not.
+                        self._leases.release_waiting()
+                        break
+                except Exception as error:
+                    logger.error(
+                        "Durable job could not be finalized",
+                        exc_info=error,
+                        extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
+                    )
+        finally:
+            self._leases.clear()
         return len(snapshots)
 
-    def _still_held(self, job: ClaimedJob, remaining: list[ClaimedJob]) -> bool:
-        """Renew the leases of the rest of the batch; False when ``job`` was lost.
+    @staticmethod
+    def _cursor_for(queue: str) -> str | None:
+        """The rotation cursor for a claimed row's queue, or None when unusable.
 
-        The batch was claimed under one lease, but jobs run in turn: each one gets
-        a full lease from the start of its turn. A job the reaper already requeued
-        belongs to another worker now and must not be run here as well.
-
-        Renewing the whole remainder before each job is quadratic in the batch
-        size (one UPDATE per job at most ``batch_size`` rows); deliberate, as it
-        keeps every waiting job's lease alive while an earlier one runs.
+        The name comes from the database, which may hold a row written by a host
+        or an older tool. A name that is not a valid queue must restart the
+        rotation rather than fail every later claim.
         """
-        with self._session_factory() as db:
-            renewed = jobs_crud.renew_leases(
-                {item.id: item.attempts for item in remaining},
-                worker_id=self._worker_id,
-                lease_seconds=self._lease_seconds,
-                now=self._clock.now(),
-                db=db,
+        try:
+            return validate_queue_name(queue)
+        except ValueError:
+            logger.warning("Durable job has a non-conforming queue name; restarting queue rotation")
+            return None
+
+    def _legacy_routing(self) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None]:
+        """Subscribers whose ``default``-queue rows this worker adopts or leaves.
+
+        Read from the registry on every claim, so a subscriber registered after
+        the runner was built is routed like the rest.
+        """
+        if self._queues is None:
+            return None, None
+        selected = self._registry.subscriber_ids_for_queues(self._queues)
+        return selected, tuple(sorted(self._registry.subscriber_ids().difference(selected)))
+
+    def _backfill_legacy_queues(self) -> None:
+        """Retag pending ``default`` rows to their subscribers' queues, once.
+
+        Best-effort: a failure is retried on the next batch and never stops a claim.
+        """
+        if self._legacy_queues_backfilled:
+            return
+        try:
+            with self._session_factory() as db:
+                moved = jobs_crud.backfill_legacy_queues(self._registry.queue_assignments(), db=db)
+        except Exception as error:
+            logger.warning("Durable job queue backfill failed; will retry", exc_info=error)
+            return
+        self._legacy_queues_backfilled = True
+        if moved:
+            logger.info("Moved %d pending durable job(s) to their subscribers' queues", moved)
+
+    def _still_held(self, job: ClaimedJob) -> bool:
+        """Renew the held leases; False when ``job`` is no longer this worker's.
+
+        The batch was claimed under one lease, but jobs run in turn. A job the
+        reaper already requeued belongs to another worker now and must not be run
+        here as well. The same renewal routine runs on the worker heartbeat, so a
+        waiting job normally has a fresh lease already; this is the confirmation
+        that it is still held.
+        """
+        try:
+            renewed = self._leases.renew()
+        except Exception as error:
+            # Not run: the lease is unknown, and the reaper requeues it.
+            logger.error(
+                "Durable job lease could not be renewed; skipping",
+                exc_info=error,
+                extra=self._context(job),
             )
+            self._leases.drop(job.id)
+            return False
         if job.id in renewed:
             return True
         logger.warning(
             "Durable job lease was lost before its turn; skipping",
-            extra={"job_id": job.id, "subscriber": job.subscriber_id},
+            extra=self._context(job),
         )
         return False
 
@@ -159,62 +267,123 @@ class JobRunner:
         with self._session_factory() as db:
             return jobs_crud.reclaim_expired_leases(now=now, db=db)
 
-    def _run_job(self, job: ClaimedJob) -> None:
+    def _run_job(self, job: ClaimedJob) -> bool:
+        """Run one job and record its outcome.
+
+        Returns:
+            True when the job's lease was lost while it ran, abandoned past
+            ``max_runtime_seconds`` or fenced after failed renewals.
+        """
+        lost = self._leases.begin(job.id)
+        try:
+            self._mark_started(job)
+            lost_claim = self._execute(job, lost)
+        finally:
+            # After the outcome is written, so the heartbeat keeps renewing the
+            # lease through the completion write.
+            self._leases.finish(job.id)
+        return lost_claim or lost.is_set()
+
+    def _mark_started(self, job: ClaimedJob) -> None:
+        """Stamp when the handler began. Best-effort: history must not stop the job."""
+        if not self._record_attempts:
+            return
+        try:
+            with self._session_factory() as db:
+                jobs_crud.mark_attempt_started(
+                    job.id, worker_id=self._worker_id, attempt=job.attempts, now=self._clock.now(), db=db
+                )
+        except Exception as error:
+            logger.warning("Durable job start could not be recorded", exc_info=error, extra=self._context(job))
+
+    def _execute(self, job: ClaimedJob, lost: threading.Event) -> bool:
+        """Run the handler and write its outcome.
+
+        Returns:
+            True when the outcome write found the claim no longer owned. This, not
+            a renewal seeing the row finished, is what says the claim was lost once
+            the handler has returned.
+        """
         handler = self._registry.get(job.subscriber_id)
         event = self._event_from(job)
+        began = self._clock.monotonic()
         try:
             if handler is None:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
-            handler(event)
+            with job_lease(lost):
+                handler(event)
         except Exception as error:
-            self._fail(job, error)
-            return
+            self._leases.finalize(job.id)
+            return self._fail(job, error, duration_ms=self._elapsed_ms(began))
+        self._leases.finalize(job.id)
+        duration_ms = self._elapsed_ms(began)
         now = self._clock.now()
         with self._session_factory() as db:
             completed = jobs_crud.mark_job_completed(
-                job.id, worker_id=self._worker_id, attempts=job.attempts, now=now, db=db
+                job.id,
+                worker_id=self._worker_id,
+                attempt=job.attempts,
+                now=now,
+                db=db,
+                duration_ms=duration_ms,
+                record_attempt=self._record_attempts,
             )
         if not completed:
-            # The handler outran the lease: the job was requeued and may be running
-            # elsewhere, so its state belongs to that worker now.
             logger.warning(
-                "Durable job lease expired while it ran; its completion is not recorded",
-                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+                "Durable job completion skipped because claim ownership was lost",
+                extra={**self._context(job), "duration_ms": duration_ms},
             )
+        return not completed
 
-    def _fail(self, job: ClaimedJob, error: Exception) -> None:
+    def _elapsed_ms(self, began: float) -> int:
+        return max(0, round((self._clock.monotonic() - began) * 1000))
+
+    def _context(self, job: ClaimedJob) -> dict[str, object]:
+        """The structured fields every job-outcome log record carries."""
+        return {
+            "job_id": job.id,
+            "subscriber": job.subscriber_id,
+            "queue": job.queue,
+            "attempts": job.attempts,
+            "worker_id": self._worker_id,
+        }
+
+    def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> bool:
+        """Record a failure; True when the claim was no longer owned."""
         now = self._clock.now()
         with self._session_factory() as db:
             status = jobs_crud.mark_job_failed(
                 job.id,
                 str(error),
                 worker_id=self._worker_id,
-                attempts=job.attempts,
+                attempt=job.attempts,
                 base_seconds=self._backoff_base_seconds,
                 max_seconds=self._backoff_max_seconds,
                 now=now,
                 db=db,
+                duration_ms=duration_ms,
+                record_attempt=self._record_attempts,
             )
         if not status:
             logger.warning(
-                "Durable job lease expired while it ran; its failure is not recorded",
+                "Durable job failure skipped because claim ownership was lost",
                 exc_info=error,
-                extra={"job_id": job.id, "subscriber": job.subscriber_id},
+                extra={**self._context(job), "duration_ms": duration_ms},
             )
-            return
+            return True
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
             "Durable job failed",
             exc_info=error,
             extra={
-                "job_id": job.id,
-                "subscriber": job.subscriber_id,
+                **self._context(job),
                 "event_type": job.event_type,
-                "attempts": job.attempts,
                 "job_status": status,
+                "duration_ms": duration_ms,
             },
         )
+        return False
 
     def _event_from(self, job: ClaimedJob) -> Event:
         return Event(
@@ -240,4 +409,5 @@ class JobRunner:
             attempts=job.attempts,
             timestamp=as_utc(job.created_at).isoformat(),
             schema_version=job.schema_version,
+            queue=job.queue,
         )

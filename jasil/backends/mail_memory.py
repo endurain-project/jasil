@@ -10,8 +10,9 @@ import threading
 from dataclasses import replace
 from email.message import EmailMessage
 
+from jasil._core.job_context import lease_lost
 from jasil._core.mail_message import build_mime
-from jasil.providers import ClockProvider, MailMessage, MailNotConfiguredError
+from jasil.providers import ClockProvider, MailError, MailMessage, MailNotConfiguredError
 
 # Used only when ``memory://`` is configured without a ``from_address``.
 _DEFAULT_SENDER = "jasil@localhost"
@@ -61,7 +62,12 @@ class MemoryMail:
 
         Raises:
             ValueError: When the message is invalid.
+            MailError: When the durable job sending it has lost its lease, so a
+                worker that no longer owns the job records nothing, as
+                :class:`~jasil.backends.mail_smtp.SmtpMail` would send nothing.
         """
+        if lease_lost():
+            raise MailError("Job lease lost; send abandoned")
         mime = build_mime(message, sender=self._from_address, now=self._clock.now())
         # Recipients copied as sent: the caller's list may be reused or mutated
         # after ``send`` returns, which would rewrite what the test asserts on. A

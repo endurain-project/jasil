@@ -52,6 +52,8 @@ postgres = [
     "psycopg[binary]>=3.3.5",
 ]
 # Durable jobs: the outbox relay and lease-expiry schedules.
+# The tested floor remains above 3.10.1, whose package-scope ``pkg_resources``
+# import fails on Python 3.12+ environments without setuptools.
 jobs = [
     "apscheduler>=3.11.3",
 ]

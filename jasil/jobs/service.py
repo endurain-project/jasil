@@ -10,14 +10,18 @@ serialized. All of this is inert unless durable jobs are enabled.
 """
 
 import logging
-from typing import TYPE_CHECKING
+import threading
+import uuid
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-import jasil._core.identity as identity
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil.capabilities import topology_of
+from jasil.profile import JobWorkerMode
 from jasil.settings import get_settings
 
 # The runner, the worker, the relay and the job CRUD all reach a model bound to
@@ -26,7 +30,8 @@ from jasil.settings import get_settings
 # function imports what it needs instead.
 if TYPE_CHECKING:
     from jasil.jobs.runner import JobRunner
-    from jasil.jobs.worker import BackgroundWorker
+    from jasil.jobs.worker import BackgroundWorker, WorkerHeartbeat
+    from jasil.settings import JobSettings
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +48,30 @@ _worker: "BackgroundWorker | None" = None
 
 
 def _worker_id() -> str:
-    """Return a per-process worker identifier (host + pid)."""
-    return identity.process_identity()
+    """Return a restart-unique worker instance identifier."""
+    return str(uuid.uuid4())
 
 
-def build_runner() -> "JobRunner":
+def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
     """
     Build a :class:`JobRunner` from settings and the active platform.
 
     Returns:
         A runner wired to the durable-subscriber registry, the platform clock,
         and the main-database session factory.
+
+    Args:
+        queues: Optional non-empty queue allowlist. Omit it to consume all queues.
+
+    Raises:
+        ValueError: When ``jobs.heartbeat_interval_seconds``,
+            ``jobs.lease_seconds`` and ``jobs.max_runtime_seconds`` cannot keep a
+            lease alive (see :func:`_validate_job_timing`).
     """
     from jasil.jobs.runner import JobRunner
 
     jobs = get_settings().jobs
+    _validate_job_timing(jobs)
     platform = platform_runtime.get_active_platform()
     return JobRunner(
         registry=jobs_registry.registry,
@@ -65,31 +79,189 @@ def build_runner() -> "JobRunner":
         session_factory=jasil_orm.get_sessionmaker(),
         worker_id=_worker_id(),
         lease_seconds=jobs.lease_seconds,
+        max_runtime_seconds=jobs.max_runtime_seconds,
+        heartbeat_interval_seconds=jobs.heartbeat_interval_seconds,
         batch_size=jobs.batch_size,
         backoff_base_seconds=jobs.backoff_base_seconds,
         backoff_max_seconds=jobs.backoff_max_seconds,
+        queues=queues,
+        record_attempts=jobs.record_attempts,
     )
 
 
-def start_job_worker() -> None:
-    """Start the in-process job worker (idempotent)."""
+def start_job_worker(
+    *,
+    role: str | None = None,
+    label: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Start the in-process job worker (idempotent).
+
+    Belongs to ``job_worker_mode=in_process``, the default: each API process runs
+    its own consumer. A deployment with dedicated worker processes declares
+    ``standalone`` and uses :func:`run_job_worker` instead.
+
+    Args:
+        role: Optional host-supplied worker role.
+        label: Optional host-supplied operator label.
+        metadata: Optional host-supplied neutral metadata.
+
+    Raises:
+        RuntimeError: When ``job_worker_mode`` is not ``in_process``, or when the
+            configured database is SQLite and the topology is multi-process.
+    """
     global _worker
     if _worker is not None:
-        return
+        if _worker.is_alive:
+            return
+        _worker = None
+    _ensure_job_topology(JobWorkerMode.IN_PROCESS, entry_point="start_job_worker", other="run_job_worker")
     from jasil.jobs.worker import BackgroundWorker
 
     # The loop logs its own start and stop, from the thread that actually runs it.
-    _worker = BackgroundWorker(build_runner(), poll_interval_seconds=get_settings().jobs.poll_interval_seconds)
+    runner = build_runner()
+    jobs = get_settings().jobs
+    heartbeat = _build_heartbeat(runner, role=role, label=label, metadata=metadata)
+    _worker = BackgroundWorker(runner, poll_interval_seconds=jobs.poll_interval_seconds, heartbeat=heartbeat)
     _worker.start()
 
 
+def run_job_worker(
+    *,
+    queues: Iterable[str] | None = None,
+    role: str | None = None,
+    label: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    stop: threading.Event | None = None,
+) -> None:
+    """Run a blocking standalone durable-job worker.
+
+    This is the supported process entrypoint for distributed deployments. The
+    host configures JASIL, registers its durable subscribers, and calls this
+    function without importing runner or CRUD internals. Register every durable
+    subscriber first, including those on queues this worker does not select: the
+    worker re-reads the registry on every claim, but retags legacy ``default`` rows
+    from it once, on its first batch. Signal handling remains
+    host-owned: pass an event that the host sets during graceful shutdown. This
+    function blocks until that event is set; run it only as a dedicated worker
+    process entrypoint, never on an API request or event-loop thread.
+
+    Args:
+        queues: Optional non-empty queue allowlist. Omit it to consume all queues.
+        role: Optional host-supplied worker role.
+        label: Optional host-supplied operator label.
+        metadata: Optional host-supplied neutral metadata.
+        stop: Event ending the loop; a new unset event is used when omitted.
+
+    Raises:
+        RuntimeError: When ``job_worker_mode`` is not ``standalone``, or when the
+            configured database is SQLite, which supports only a single-process
+            topology.
+        ValueError: When an explicit queue allowlist is empty or invalid.
+    """
+    _ensure_job_topology(JobWorkerMode.STANDALONE, entry_point="run_job_worker", other="start_job_worker")
+    runner = build_runner(queues=queues)
+    from jasil.jobs.worker import run_worker
+
+    jobs = get_settings().jobs
+    heartbeat = _build_heartbeat(runner, role=role, label=label, metadata=metadata)
+    run_worker(
+        runner,
+        poll_interval_seconds=jobs.poll_interval_seconds,
+        stop=stop or threading.Event(),
+        heartbeat=heartbeat,
+    )
+
+
+def _build_heartbeat(
+    runner: "JobRunner",
+    *,
+    role: str | None,
+    label: str | None,
+    metadata: dict[str, Any] | None,
+) -> "WorkerHeartbeat":
+    from jasil.jobs.worker import WorkerHeartbeat, WorkerTelemetry
+
+    telemetry = WorkerTelemetry(
+        instance_id=runner.worker_id,
+        clock=runner.clock,
+        session_factory=jasil_orm.get_sessionmaker(),
+        queues=runner.queues,
+        role=role,
+        label=label,
+        metadata=metadata,
+    )
+    return WorkerHeartbeat(
+        leases=runner.leases,
+        interval_seconds=runner.heartbeat_interval_seconds,
+        telemetry=telemetry,
+    )
+
+
+def _validate_job_timing(jobs: "JobSettings") -> None:
+    """Refuse timings under which a lease cannot be kept alive.
+
+    One heartbeat renews leases and proves the worker alive, so the lease has to
+    outlast several missed beats, and a handler has to be allowed at least one
+    lease. ``lease_seconds >= 3 * heartbeat_interval_seconds`` is also the
+    threshold ``jasil.admin.get_workers_summary`` uses to call a worker stale, so
+    a worker is flagged stale no later than its leases start expiring.
+    """
+    if jobs.heartbeat_interval_seconds <= 0:
+        raise ValueError("jobs.heartbeat_interval_seconds must be greater than zero")
+    floor = 3 * jobs.heartbeat_interval_seconds
+    if jobs.lease_seconds < floor:
+        raise ValueError(
+            f"jobs.lease_seconds ({jobs.lease_seconds}) must be at least three heartbeat intervals "
+            f"({floor:g} s, from jobs.heartbeat_interval_seconds={jobs.heartbeat_interval_seconds:g}): "
+            "a worker is renewed on its heartbeat, and two missed beats must not expire a lease"
+        )
+    if jobs.max_runtime_seconds < jobs.lease_seconds:
+        raise ValueError(
+            f"jobs.max_runtime_seconds ({jobs.max_runtime_seconds}) must not be below "
+            f"jobs.lease_seconds ({jobs.lease_seconds})"
+        )
+
+
 def stop_job_worker() -> None:
-    """Stop the in-process job worker if it is running."""
+    """Stop the in-process worker from synchronous shutdown code."""
     global _worker
     if _worker is None:
         return
-    _worker.stop()
-    _worker = None
+    worker = _worker
+    if worker.stop() and _worker is worker:
+        _worker = None
+
+
+def _ensure_job_topology(expected: JobWorkerMode, *, entry_point: str, other: str) -> None:
+    """Refuse to start a consumer the deployment's declared shape does not have.
+
+    Two rules, both about whether this process is what the settings say it is:
+
+    * **The role must match ``job_worker_mode``.** ``start_job_worker`` belongs to
+      ``in_process`` and ``run_job_worker`` to ``standalone``. Every process of a
+      deployment loads the same settings, and the consistency checks reason from
+      that mode, so a consumer started the other way would be a process they
+      never counted. This is the entry point's contract rather than capability
+      wiring, so ``enforce_deployment_consistency=False`` does not relax it.
+    * **SQLite needs a single-process topology.** One file cannot be shared by
+      competing consumers, and a multi-process topology (several API processes,
+      standalone workers, or replicas on separate nodes) has more than one.
+    """
+    settings = get_settings()
+    if settings.job_worker_mode is not expected:
+        raise RuntimeError(
+            f"{entry_point}() requires job_worker_mode={expected.value!r}, but the configured mode is "
+            f"{settings.job_worker_mode.value!r}; set job_worker_mode in every process of the deployment, "
+            f"or use {other}() for this mode"
+        )
+    topology = topology_of(settings)
+    if topology.multi_process and jasil_orm.get_engine().dialect.name == "sqlite":
+        raise RuntimeError(
+            "SQLite durable jobs support exactly one process with one in-process consumer; "
+            f"the configured topology runs several ({topology.multi_process_reason}). "
+            "Use a database that supports concurrent consumers, such as PostgreSQL"
+        )
 
 
 def relay_outbox_scheduled() -> None:
@@ -131,12 +303,20 @@ def reap_expired_jobs_scheduled() -> None:
     import jasil.jobs.crud as jobs_crud
 
     platform = platform_runtime.get_active_platform()
+    now = platform.clock.now()
     with jasil_orm.get_sessionmaker()() as db:
-        reclaimed = jobs_crud.reclaim_expired_leases(now=platform.clock.now(), db=db)
+        # Read before reclaiming, which clears the holder: a crash should name the
+        # worker, not just say that one happened.
+        holders = jobs_crud.expired_lease_holders(now=now, db=db)
+        reclaimed = jobs_crud.reclaim_expired_leases(now=now, db=db)
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
-        # it died or overran, so this is the symptom of something else going wrong.
-        logger.warning("Reaped %d expired job lease(s); a worker died mid-job or overran its lease", reclaimed)
+        # it died or went silent, so this is the symptom of something else going wrong.
+        logger.warning(
+            "Reaped %d expired job lease(s); a worker died mid-job or went silent",
+            reclaimed,
+            extra={"workers": holders},
+        )
 
 
 def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:

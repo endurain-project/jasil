@@ -400,14 +400,15 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         if reason is not None:
             raise ValueError(f"mail.secure=False requires a private or loopback relay; the host {reason}")
         logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
-    if settings.jobs.enabled and settings.jobs.lease_seconds <= SMTP_SEND_DEADLINE_SECONDS:
-        # One send can take up to the SMTP deadline; a shorter lease lets the reaper
-        # requeue a job that is still being delivered, so it is sent twice. Only the
-        # floor is checkable here: a handler sending N messages needs N times this.
+    if settings.jobs.enabled and settings.jobs.max_runtime_seconds <= SMTP_SEND_DEADLINE_SECONDS:
+        # A running job keeps its lease, but only up to ``max_runtime_seconds``: past
+        # it the job is abandoned and a send in flight is delivered by a worker that
+        # no longer owns the job. Only the floor is checkable here: a handler
+        # sending N messages needs N times one send.
         logger.warning(
-            "jobs.lease_seconds (%d) is not above the SMTP send deadline (%d s, per "
-            "message); a slow send can be requeued and delivered twice",
-            settings.jobs.lease_seconds,
+            "jobs.max_runtime_seconds (%d) is not above the SMTP send deadline (%d s, per "
+            "message); a slow send can be abandoned mid-delivery and sent again by a retry",
+            settings.jobs.max_runtime_seconds,
             SMTP_SEND_DEADLINE_SECONDS,
         )
     resolved_port = port or _SMTP_PORTS[scheme]

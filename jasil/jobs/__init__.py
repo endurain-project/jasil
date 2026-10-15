@@ -8,3 +8,7 @@ stream entry — is the truth, retries are naturally per-subscriber and the
 ``(event_id, subscriber_id)`` uniqueness doubles as the idempotent-consumer
 marker (enqueuing the same work twice is a no-op).
 """
+
+from jasil._core.job_context import lease_lost
+
+__all__ = ["lease_lost"]

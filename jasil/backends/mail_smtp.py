@@ -25,6 +25,7 @@ import time
 from email.message import EmailMessage
 
 import jasil._core.network as network
+from jasil._core.job_context import lease_lost
 from jasil._core.mail_message import build_mime, parse_address
 from jasil.providers import ClockProvider, MailError, MailMessage
 
@@ -182,10 +183,14 @@ class SmtpMail:
         Raises:
             ValueError: When the message is invalid.
             MailError: When the server could not be reached or refused the
-                message. If only *some* recipients are refused the send succeeds
-                and a warning records the count, since failing would make a
-                retry re-send to recipients that already got it.
+                message, or when the durable job sending it has lost its lease
+                (nothing is sent: another worker owns the job now). If only
+                *some* recipients are refused the send succeeds and a warning
+                records the count, since failing would make a retry re-send to
+                recipients that already got it.
         """
+        if lease_lost():
+            raise MailError("Job lease lost; send abandoned")
         mime = build_mime(message, sender=self._from_address, now=self._clock.now())
         message_id = str(mime["Message-ID"])
         try:

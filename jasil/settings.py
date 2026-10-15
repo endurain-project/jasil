@@ -32,7 +32,7 @@ raise, because a Redis host or bucket name cannot be inferred.
 from dataclasses import dataclass, field
 
 from jasil._core.registry import ConfigSlot
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 __all__ = [
     "EventLogSettings",
@@ -55,23 +55,41 @@ class JobSettings:
     Attributes:
         enabled: Route events through the transactional outbox instead of the
             event bus. When false the whole jobs layer stays dormant.
-        lease_seconds: How long a claimed job is leased to a worker before the
-            reaper may reclaim it.
+        lease_seconds: How long a worker may go silent before the reaper may
+            reclaim the jobs it holds. A running worker renews its leases on every
+            heartbeat, so this is *not* a cap on handler runtime (see
+            ``max_runtime_seconds``). Must be at least three
+            ``heartbeat_interval_seconds``.
         batch_size: Maximum rows claimed or relayed per pass.
         backoff_base_seconds: First retry delay; doubles per attempt.
         backoff_max_seconds: Ceiling for the exponential backoff.
         poll_interval_seconds: Idle wait between empty polls.
+        max_runtime_seconds: The longest a single handler is kept leased. Past it
+            the job is abandoned to the reaper, the handler is told to stop
+            (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
+            released to run elsewhere. Must not be below ``lease_seconds``.
+        record_attempts: Write one ``job_attempts`` row per attempt to run a job:
+            which worker ran it, when, for how long, and how it ended. On by
+            default; ``False`` skips every attempt write (job processing is
+            unaffected) and the attempt-derived admin fields read ``None``.
+        heartbeat_interval_seconds: Interval between worker heartbeats, each of
+            which renews held leases and refreshes the worker-registry row.
         max_attempts: Attempts before a job is dead-lettered.
-        retention_days: Age at which relayed outbox rows and completed jobs are
-            pruned. ``<= 0`` disables pruning.
+        retention_days: Age at which relayed outbox rows, completed jobs, their
+            attempt history, and stopped and stale worker rows are pruned. A job
+            that is pending, claimed or dead-lettered keeps its whole history.
+            ``<= 0`` disables pruning.
     """
 
     enabled: bool = False
     lease_seconds: int = 300
+    max_runtime_seconds: int = 1800
+    record_attempts: bool = True
     batch_size: int = 20
     backoff_base_seconds: int = 60
     backoff_max_seconds: int = 3600
     poll_interval_seconds: float = 5.0
+    heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
     retention_days: int = 30
 
@@ -192,6 +210,13 @@ class JasilSettings:
             *count* matters: four workers under the ``local`` profile are still
             four processes, and process-local state cannot be shared between them,
             so this drives the consistency checks as much as the profile does.
+        job_worker_mode: Where durable-job consumers run: ``in_process`` (each API
+            process calls ``start_job_worker``) or ``standalone`` (dedicated
+            processes call ``run_job_worker``). Like ``web_workers`` it describes
+            the deployment's shape, and **every process of the deployment must
+            load the same value**: a standalone worker is one more process that
+            reaches every capability, and the consistency checks can only see it
+            if the API processes know about it too.
         enforce_deployment_consistency: Refuse to build a platform whose wiring
             contradicts its topology (see :mod:`jasil.capabilities`). Set False to
             log the issues as warnings instead — useful on a development machine
@@ -210,6 +235,7 @@ class JasilSettings:
 
     profile: DeploymentProfile = DeploymentProfile.LOCAL
     web_workers: int = 1
+    job_worker_mode: JobWorkerMode = JobWorkerMode.IN_PROCESS
     enforce_deployment_consistency: bool = True
     data_dir: str = "data"
     state_uri: str | None = None

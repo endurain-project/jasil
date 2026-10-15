@@ -144,6 +144,12 @@ JASIL does not sanitise the values it logs. It bounds the *length* of the
 identifiers it persists (`event_type`, `source`, `subscriber_id`), which are
 developer-authored, but a `metadata` dict is yours and reaches the log intact.
 
+The same holds for failure text. A handler's exception message is stored,
+truncated to 4000 characters, in `processing_jobs.last_error` and, one row per
+attempt, in `job_attempts.error`, and `jasil.admin.get_job` returns it. Do not
+put a secret in an exception message, and keep `jasil.admin` behind the host's own
+authorization.
+
 ## SQL injection (CWE-89)
 
 **Not a surface.** Every query is SQLAlchemy Core or ORM with bound parameters.
@@ -185,8 +191,12 @@ a replay.
 
 **Mitigations.** `(event_id, subscriber_id)` uniqueness makes the fan-out
 idempotent; the claim is a compare-and-set so two workers cannot take the same
-row; and a worker's identity carries a digest when a long hostname forces
-truncation, so two machines never collapse onto one lease holder.
+row; a running worker's heartbeat renews its leases, so a slow healthy handler is
+not requeued and run a second time; and a handler whose lease is lost is
+signalled (`jasil.jobs.lease_lost`) and its result discarded by the claim's
+worker-id and attempt guard. What remains is a database partition, a handler
+that ignores the signal mid-side-effect, and a handler abandoned past
+`jobs.max_runtime_seconds`.
 
 **Yours.** Subscriber handlers must be idempotent. If running one twice would
 double-charge, double-send, or double-count, that is a correctness bug in the

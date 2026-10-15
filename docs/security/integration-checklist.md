@@ -13,6 +13,10 @@ through.
 - [ ] Set `web_workers` to the number of worker processes you actually run. Four
       workers under the `local` profile are still four processes, and
       process-local state cannot be shared between them.
+- [ ] Set `job_worker_mode=standalone` in **every** process — API and workers —
+      when durable jobs run in dedicated worker processes. A worker is a process
+      too: without the declaration the checks cannot see it, and a handler sends
+      mail or touches state through a backend its API never shares.
 - [ ] Leave `enforce_deployment_consistency` on. It refuses to build a platform
       whose wiring contradicts its topology. Turning it off downgrades those to
       warnings — reasonable on a development machine, not in production.
@@ -28,6 +32,12 @@ through.
       uses its own `jasil_alembic_version` table and never touches yours.
 - [ ] On MySQL, note that `DATETIME` stores whole seconds and rounds. Do not
       compare a timestamp JASIL persisted for equality with the value you passed.
+- [ ] Upgrade through JASIL's packaged revisions before rolling out queue-aware
+      code. The queue column is non-null and has a database-side `default`
+      default so previous-release writers remain valid during the rollout.
+      Selective new workers adopt legacy `default` rows only for subscribers
+      assigned to their queues, and a selective `default` worker excludes
+      subscribers assigned to named queues.
 
 ## Secrets and event payloads
 
@@ -35,6 +45,8 @@ through.
       verbatim in three tables, serialized onto the Redis stream, and `metadata`
       is logged in full when a best-effort subscriber fails. Carry identifiers.
 - [ ] Never put a token, password, key, or personal data in either.
+- [ ] Apply the same rule to worker metadata. It appears in operator summaries
+      and is capped at 16 KiB of serialized JSON.
 - [ ] Remember that a dead-lettered job keeps its payload indefinitely — those
       rows are deliberately never pruned.
 
@@ -80,9 +92,33 @@ through.
       or a documented exemption — and hold the registry to it with
       `assert_nets_complete` in a test. Delivery is at-least-once but not
       guaranteed.
-- [ ] Alert on `dead_letter` job count, and on the `Reaped N expired job lease(s)`
-      warning: a lease only expires because a worker died or overran.
+- [ ] Alert on `dead_letter` job count, on the `Reaped N expired job lease(s)`
+      warning (a lease only expires because a worker died or went silent), and on
+      `exceeded its maximum runtime` errors (a handler is hung or too slow).
 - [ ] Alert on the oldest pending job age from `jasil.admin.get_jobs_summary()`.
+- [ ] Alert on `superseded` attempts (a handler finished after its job was taken:
+      it ran twice) and on `claimed_by_stale_workers` from
+      `jasil.admin.get_workers_summary()` (jobs waiting out a lease behind a
+      silent worker). Read a job's whole history with `jasil.admin.get_job`.
+- [ ] Assign queue names at subscriber registration. Keep them lowercase ASCII,
+      stable, and domain-neutral from JASIL's point of view; renaming a queue
+      while old rows remain requires workers for both names during the drain.
+- [ ] For SQLite, run exactly one API process and one in-process worker
+      (`job_worker_mode=in_process`, the default). For PostgreSQL, do not start
+      handlers in API replicas; set `job_worker_mode=standalone` and run
+      standalone workers with explicit non-empty allowlists, sizing each queue's
+      process group.
+- [ ] Remember that durable jobs do not require Redis. Do not introduce a second
+      queue as a source of truth beside `processing_jobs`.
+- [ ] Set `max_runtime_seconds` above the longest handler you expect, and keep
+      `lease_seconds` at least three `heartbeat_interval_seconds`. The heartbeat
+      renews a running job's lease, so `lease_seconds` bounds how long a worker may
+      go silent, not how long a handler may run. A handler past
+      `max_runtime_seconds` is abandoned and may be run again, and a stale worker
+      cannot finalize over a replacement claim, but both may already have
+      performed external side effects, so idempotency still matters.
+- [ ] In handlers that loop or perform several side effects, check
+      `jasil.jobs.lease_lost()` between units of work and return early.
 
 ## The admin surface
 
@@ -91,6 +127,11 @@ through.
       JASIL has no notion of who is calling.
 - [ ] Do not reflect the summaries to end users. `recent_failures` carries error
       messages and `event_metadata`.
+- [ ] Expose worker and queue summaries through host-owned authenticated routes.
+      JASIL supplies typed reads, not FastAPI routes or UI.
+- [ ] Treat running/stale/stopped as operator telemetry. Decide alert and
+      container-health policy in the host rather than mapping status to health
+      automatically.
 
 ## Logging
 
@@ -107,6 +148,8 @@ through.
 
 - [ ] Call `jasil.lifecycle.shutdown()` on the way down. It stops the durable-job
       worker before releasing the bus its subscribers publish through.
+- [ ] Standalone workers must pass a stop event and set it from their signal
+      handler so JASIL can record a graceful stop.
 - [ ] Stop your own scheduler and dispose your own engine — JASIL created neither
       and does not touch them.
 

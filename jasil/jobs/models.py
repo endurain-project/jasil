@@ -16,9 +16,13 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
-from jasil._core.limits import MAX_WORKER_ID_LENGTH
+from jasil._core.limits import (
+    MAX_WORKER_ID_LENGTH,
+    MAX_WORKER_LABEL_LENGTH,
+    MAX_WORKER_ROLE_LENGTH,
+)
 from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
-from jasil.jobs.registry import MAX_SUBSCRIBER_ID_LENGTH
+from jasil.jobs.registry import DEFAULT_QUEUE, MAX_QUEUE_NAME_LENGTH, MAX_SUBSCRIBER_ID_LENGTH
 from jasil.orm import get_active_base
 
 # Binds to the host-owned declarative base at map_models() time.
@@ -38,6 +42,7 @@ class ProcessingJob(Base):
 
     Attributes:
         id: Job identifier (UUIDv4 string).
+        queue: Named queue used to select which workers may claim the job.
         event_id: The originating envelope ``event_id`` — correlation and, with
             ``subscriber_id``, the idempotent-consumer dedup key.
         event_type: The domain-event channel, e.g. ``order.created``.
@@ -64,17 +69,28 @@ class ProcessingJob(Base):
     __tablename__ = "processing_jobs"
     __table_args__ = (
         UniqueConstraint("event_id", "subscriber_id", name="uq_processing_jobs_event_subscriber"),
-        # The claim query filters ``status = 'pending' AND available_at <= now``
-        # and orders by ``available_at``; this composite index serves both.
+        # Unselected workers discover due work across every queue with this index.
         Index("idx_processing_jobs_claim", "status", "available_at"),
+        # Selective and fair claims pin ``status = 'pending'`` first so the range scan
+        # over queues never walks retained completed or dead-letter rows.
+        Index("idx_processing_jobs_queue_claim", "status", "queue", "available_at"),
         # The reaper scans claimed rows whose lease has expired.
         Index("idx_processing_jobs_lease", "status", "lease_expires_at"),
+        # Heartbeats and worker summaries count active leases by worker.
+        Index("idx_processing_jobs_worker_claim", "status", "locked_by"),
     )
 
     id: Mapped[str] = mapped_column(
         String(36),
         primary_key=True,
         comment="Job identifier (UUIDv4)",
+    )
+    queue: Mapped[str] = mapped_column(
+        String(MAX_QUEUE_NAME_LENGTH),
+        nullable=False,
+        default=DEFAULT_QUEUE,
+        server_default=DEFAULT_QUEUE,
+        comment="Named queue used to select which workers may claim the job",
     )
     event_id: Mapped[str] = mapped_column(
         String(MAX_EVENT_ID_LENGTH),
@@ -174,6 +190,177 @@ class ProcessingJob(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="When the job reached a terminal state (completed/dead_letter)",
+    )
+
+
+class JobAttempt(Base):
+    """
+    One row per attempt to run a durable job: who ran it, when, and how it ended.
+
+    Written in the same transaction as the job state change it describes, so the
+    history can never disagree with ``processing_jobs``. A row is opened when a
+    worker claims the job and closed by whichever path ends that claim: the
+    worker's own result, the reaper, a release, or the max-runtime cap.
+
+    There is deliberately no foreign key to ``processing_jobs``: a job may be
+    pruned before its history, SQLite does not enforce foreign keys by default,
+    and retention removes orphans explicitly. Event type, subscriber and queue are
+    copied onto the row so statistics and history survive the job's pruning.
+
+    Attributes:
+        id: Attempt identifier (UUIDv4 string).
+        job_id: The ``processing_jobs.id`` this attempt ran.
+        event_id: The originating envelope ``event_id``; links every subscriber's
+            job for one event.
+        event_type: The domain-event channel.
+        subscriber_id: The durable subscriber that ran.
+        queue: The named queue the job was claimed from.
+        attempt: ``processing_jobs.attempts`` at claim; restarts at 1 after a
+            dead-letter replay.
+        worker_id: The worker instance (``job_workers.instance_id``) that claimed it.
+        claimed_at: When the worker took the lease.
+        started_at: When the handler began; ``NULL`` if it never ran.
+        finished_at: When the attempt ended; ``NULL`` while open.
+        outcome: How it ended (see the outcome table in the observability
+            guide); ``NULL`` while open.
+        duration_ms: Handler wall time, from the monotonic clock.
+        error: The failure reason (truncated for storage), if it failed.
+    """
+
+    __tablename__ = "job_attempts"
+    __table_args__ = (
+        # One job's history, and closing the open attempt of a claim.
+        Index("idx_job_attempts_job", "job_id", "claimed_at"),
+        # One worker's history.
+        Index("idx_job_attempts_worker", "worker_id", "claimed_at"),
+        # Every subscriber's job for one event.
+        Index("idx_job_attempts_event", "event_id"),
+        # Retention, and the windows of attempts that were claimed in them.
+        Index("idx_job_attempts_claimed", "claimed_at"),
+        # Statistics windows: attempts that *ended* since a cutoff.
+        Index("idx_job_attempts_finished", "finished_at"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        comment="Attempt identifier (UUIDv4)",
+    )
+    job_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        comment="The processing_jobs.id this attempt ran (no foreign key; pruned independently)",
+    )
+    event_id: Mapped[str] = mapped_column(
+        String(MAX_EVENT_ID_LENGTH),
+        nullable=False,
+        comment="The originating envelope event_id",
+    )
+    event_type: Mapped[str] = mapped_column(
+        String(MAX_EVENT_TYPE_LENGTH),
+        nullable=False,
+        comment="The domain-event channel",
+    )
+    subscriber_id: Mapped[str] = mapped_column(
+        String(MAX_SUBSCRIBER_ID_LENGTH),
+        nullable=False,
+        comment="The durable subscriber that ran",
+    )
+    queue: Mapped[str] = mapped_column(
+        String(MAX_QUEUE_NAME_LENGTH),
+        nullable=False,
+        comment="The named queue the job was claimed from",
+    )
+    attempt: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        comment="Attempt number at claim; restarts at 1 after a dead-letter replay",
+    )
+    worker_id: Mapped[str] = mapped_column(
+        String(MAX_WORKER_ID_LENGTH),
+        nullable=False,
+        comment="The worker instance that claimed the job",
+    )
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When the worker took the lease",
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the handler began; NULL if it never ran",
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the attempt ended; NULL while open",
+    )
+    outcome: Mapped[str | None] = mapped_column(
+        String(16),
+        nullable=True,
+        comment="How the attempt ended; NULL while open",
+    )
+    duration_ms: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Handler wall time in milliseconds",
+    )
+    error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Failure reason (truncated for storage)",
+    )
+
+
+class JobWorker(Base):
+    """One restart-unique durable worker instance and its latest heartbeat."""
+
+    __tablename__ = "job_workers"
+    __table_args__ = (
+        Index("idx_job_workers_heartbeat", "last_heartbeat_at"),
+        Index("idx_job_workers_stopped", "stopped_at"),
+    )
+
+    instance_id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        comment="Restart-unique worker instance UUID",
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="When this worker instance started",
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Most recent successful worker heartbeat",
+    )
+    stopped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When this worker stopped gracefully; NULL after a crash",
+    )
+    queues: Mapped[list[str] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+        comment="Selected queue allowlist; NULL means all queues",
+    )
+    role: Mapped[str | None] = mapped_column(
+        String(MAX_WORKER_ROLE_LENGTH),
+        nullable=True,
+        comment="Optional host-supplied worker role",
+    )
+    label: Mapped[str | None] = mapped_column(
+        String(MAX_WORKER_LABEL_LENGTH),
+        nullable=True,
+        comment="Optional host-supplied operator label",
+    )
+    worker_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+        comment="Optional host-supplied neutral metadata",
     )
 
 

@@ -37,6 +37,7 @@ fields.
 |---|---|---|
 | `profile` | `DeploymentProfile.LOCAL` | The deployment shape. Supplies capability-URI defaults. |
 | `web_workers` | `1` | How many web-server worker processes you run. Drives the [consistency checks](deployment-profiles.md#consistency-checks) as much as the profile does. |
+| `job_worker_mode` | `JobWorkerMode.IN_PROCESS` | Where durable-job consumers run: `in_process` (each API process calls `start_job_worker()`) or `standalone` (dedicated processes call `run_job_worker()`). A fact about the shape, not a count: **load the same value in every process.** Drives the [consistency checks](deployment-profiles.md#job-workers-are-processes-too); `standalone` requires `jobs.enabled`. Parse an environment value with `jasil.profile.parse_job_worker_mode`. |
 | `enforce_deployment_consistency` | `True` | Refuse to build a platform whose wiring contradicts its topology. `False` logs the issues as warnings instead. |
 | `data_dir` | `"data"` | Root directory for the local storage backend. |
 | `state_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
@@ -54,13 +55,16 @@ fields.
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `False` | Route events through the outbox instead of the bus. |
-| `lease_seconds` | `300` | How long a claimed job is leased before the reaper may reclaim it. |
+| `lease_seconds` | `300` | How long a worker may go **silent** before the reaper may reclaim the jobs it holds. A running worker renews its leases on every heartbeat, so this is not a cap on handler runtime. At least three `heartbeat_interval_seconds`. |
+| `max_runtime_seconds` | `1800` | The longest a single handler is kept leased. Past it the job is abandoned to the reaper, the handler is signalled (`jasil.jobs.lease_lost`), and the rest of the batch is released. Not below `lease_seconds`. |
 | `batch_size` | `20` | Maximum rows claimed or relayed per pass. |
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
+| `record_attempts` | `True` | Write one `job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
+| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
 | `max_attempts` | `5` | Attempts before a job is dead-lettered. |
-| `retention_days` | `30` | Age at which relayed outbox rows and completed jobs are pruned. `<= 0` disables. |
+| `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. A job's history goes after the job row itself is pruned; pending, claimed and dead-lettered jobs keep theirs. `<= 0` disables. |
 
 ### `EventLogSettings`
 

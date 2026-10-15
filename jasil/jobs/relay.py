@@ -68,7 +68,15 @@ def relay_outbox_once(
         for snapshot in snapshots:
             event = _event_from(snapshot)
             for subscriber_id in registry.subscribers_for(event.event_type):
-                jobs_crud.enqueue_job(event, subscriber_id, max_attempts=max_attempts, now=now, db=db, commit=False)
+                jobs_crud.enqueue_job(
+                    event,
+                    subscriber_id,
+                    queue=registry.queue_for(subscriber_id),
+                    max_attempts=max_attempts,
+                    now=now,
+                    db=db,
+                    commit=False,
+                )
             jobs_outbox.mark_relayed(snapshot.id, now=now, db=db, commit=False)
         db.commit()
     return len(snapshots)

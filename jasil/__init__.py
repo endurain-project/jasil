@@ -1,7 +1,7 @@
 """Platform substrate: deployment profile, event envelope, and providers.
 
 Public (pure) surface — safe to import anywhere; pulls in no backends:
-    - ``DeploymentProfile`` — the deployment shape.
+    - ``DeploymentProfile`` / ``JobWorkerMode`` — the deployment shape.
     - ``Event`` / ``new_event`` — the event envelope.
         - Narrow storage protocols plus ``StorageProvider`` as their complete
             aggregate.
@@ -19,7 +19,7 @@ from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _version
 
 from jasil.events import Event, new_event
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 from jasil.providers import (
     ClockProvider,
     EventBusProvider,
@@ -61,6 +61,7 @@ __all__ = [
     "DeploymentProfile",
     "Event",
     "EventBusProvider",
+    "JobWorkerMode",
     "LockProvider",
     "MailError",
     "MailMessage",

@@ -1,9 +1,8 @@
 """Process identity for competing-consumer coordination.
 
-A single helper so the durable-job worker and the Redis Streams consumer derive
-their identifier the same way. The value distinguishes competing consumers
-across replicas in logs, lease holders (``processing_jobs.locked_by``), and
-Redis pending-entry lists.
+The Redis Streams backend needs one stable consumer name per process. The value
+distinguishes replicas in logs and Redis pending-entry lists and fits the event
+log's fixed-width worker column.
 """
 
 import hashlib
@@ -14,13 +13,13 @@ from jasil._core.limits import MAX_WORKER_ID_LENGTH
 
 
 def process_identity() -> str:
-    """Return a stable per-process identifier that fits the lease column.
+    """Return a stable per-process identifier that fits persisted worker fields.
 
-    Uniqueness is the point: this value is what ``claim_jobs`` compares against
-    to decide whether *this* worker won a row, so two live processes sharing one
-    identity would run the same job twice. A long hostname therefore cannot
-    simply be clipped — the truncated form carries a digest of the full identity
-    instead, which stays distinct where a shared prefix would not.
+    Uniqueness is the point: two Redis consumers sharing one identity would
+    collide in the consumer group's pending-entry state. A long hostname
+    therefore cannot simply be clipped — the truncated form carries a digest of
+    the full identity instead, which stays distinct where a shared prefix would
+    not.
 
     Returns:
         ``"{hostname}-{pid}"`` — unique per process, stable for its lifetime — or

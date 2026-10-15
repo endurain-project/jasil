@@ -43,6 +43,23 @@ queued work.
 
 The handler must **raise** on failure. That is what drives retry.
 
+Every registration has a named queue. Existing calls use `default`; select one
+when the subscriber is registered when independent worker capacity matters:
+
+```python
+jobs_registry.registry.register(
+    "order.created",
+    "invoice.render",
+    render_invoice,
+    queue="campaign",
+)
+```
+
+Queue ownership belongs to the subscriber rather than the event. One event can
+fan out to several subscribers on different queues, and the relay stamps each
+subscriber's queue on its own job. Names are 1–100 lowercase ASCII characters:
+letters, digits, `.`, `_`, and `-`; an invalid name raises before persistence.
+
 ## The job state machine
 
 ```
@@ -68,6 +85,22 @@ A worker claims a batch of due jobs, taking a time-bounded lease. On PostgreSQL
 the claim uses `FOR UPDATE SKIP LOCKED`, so concurrent workers take disjoint
 batches with no coordinating lock.
 
+A worker can select a non-empty queue allowlist. Omitting it consumes every
+queue, preserving the original behavior. A selective claim includes the queue
+predicate in the locked query, so it cannot lease work from another queue.
+Workers consuming several queues rotate their queue cursor between batches; a
+permanently busy queue cannot starve another one indefinitely.
+Rotation considers only the worker's allowlist. Queues outside it are never
+claimed by that worker and need another matching worker.
+
+!!! warning "Moving a subscriber to another queue"
+    A job keeps the queue it was enqueued on. Only rows carrying the database
+    default `default` queue follow their subscriber to its currently assigned
+    queue. If a subscriber moves from queue `a` to `b` and no worker still selects
+    `a`, its pending rows on `a` wait forever. Keep a worker on the old queue until
+    it drains, or reassign the rows once:
+    `UPDATE processing_jobs SET queue = 'b' WHERE queue = 'a' AND subscriber_id = '<id>' AND status = 'pending'`.
+
 !!! note "The attempt is counted at claim time"
     Not at completion. A worker that crashes mid-run still consumes an attempt,
     which is what bounds a crash loop — otherwise a job that reliably kills its
@@ -90,6 +123,11 @@ Once `attempts` reaches `max_attempts`, the job becomes `dead_letter`.
 A worker that dies holds its lease until it expires. The reaper returns those
 jobs to `pending` — or dead-letters them if they have no attempts left — so work
 is never stranded by a crash.
+
+A *running* worker does not lose its leases. Its heartbeat renews every lease it
+holds, the running job's and the waiting jobs' of its batch, on each beat, so
+`lease_seconds` is how long a worker may go **silent**, not how long a handler may
+run. See [Long-running handlers](#long-running-handlers).
 
 ## Idempotency
 
@@ -140,6 +178,8 @@ when you want to report the gap rather than fail on it.
 
 ## Running the workers
 
+### Local: one process and SQLite
+
 ```python
 import jasil.jobs.service as jobs_service
 
@@ -147,8 +187,75 @@ jobs_service.start_job_worker()  # in-process worker thread
 jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
 ```
 
-The relay and the reaper run on **every** replica. Both use `SKIP LOCKED`, and
-the fan-out is idempotent, so no single-runner lock is needed.
+This worker consumes all named queues serially and rotates the starting queue
+between batches for process-lifetime fairness. SQLite supports exactly this
+topology: one process and one in-process consumer. JASIL refuses to start a
+consumer on SQLite when the configured deployment is multi-process — several
+`web_workers`, `profile=distributed`, or `job_worker_mode=standalone` — because it
+has enough information to know those shapes are unsafe. `start_job_worker()`
+requires `job_worker_mode=in_process`, which is the default.
+
+### Distributed: API plumbing and PostgreSQL workers
+
+The API process schedules the relay and reaper but does not start a domain-job
+consumer:
+
+```python
+jobs_service.schedule_job_maintenance(scheduler)
+```
+
+Declare the shape with `job_worker_mode=standalone`, and load it in the API
+processes as well as the workers: a worker is one more process reaching state,
+events, the lock and mail, and the API's own startup checks can only refuse a
+wiring the workers cannot share if it knows they exist. Standalone worker
+processes then use the supported blocking entry point, which requires that mode.
+It must run in a dedicated worker process, never on an API request or event-loop
+thread:
+
+```python
+import signal
+import threading
+
+import jasil.jobs.service as jobs_service
+
+stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+jobs_service.run_job_worker(
+    queues=("campaign", "intake"),
+    role="domain-worker",
+    label="campaign-intake-1",
+    metadata={"zone": "eu-1"},
+    stop=stop,
+)
+```
+
+Pass one queue per process group when each queue needs independent concurrency.
+Run several processes with the same queue to get competing consumers; PostgreSQL
+claims remain `FOR UPDATE SKIP LOCKED`, so each job is processed once per claim.
+Omit `queues` to consume all queues, and never pass an empty allowlist.
+
+During a rolling upgrade, an old relay can still write the database-side
+`default` queue. A selective new worker also adopts those legacy rows when the
+subscriber is now registered to one of its selected queues. It does not adopt
+rows belonging to a subscriber that is genuinely registered to `default`, so
+queue isolation remains intact while old writers drain. Conversely, a selective
+`default` worker excludes legacy rows for subscribers now assigned to a named
+queue; the two workers cannot race for the same compatibility row.
+
+Both rules are decided from the registrations of the worker process that makes
+the claim, so **every worker process must register every durable subscriber**,
+even those it will not consume, before it starts. A worker that has not
+registered a subscriber cannot tell that a legacy `default` row belongs to
+another queue, and will claim it, find no handler, and dead-letter it. Routing
+reads the registrations on every claim, but the one-time retag of legacy rows
+runs on the worker's first batch, so register subscribers before starting the
+worker. Alternatively, let the `default` queue drain before rolling out.
+
+The relay and reaper may run on every API replica. Their locking and the
+idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
+unnecessary. Durable jobs use the database only; Redis is not a job-queue
+dependency.
 
 ## Dead letters
 
@@ -163,8 +270,14 @@ jasil_admin.replay_dead_letter_job(job_id)
 
 which returns the job to `pending` with a fresh attempt budget.
 
-`jasil_admin.get_jobs_summary()` gives counts by status, recent throughput, and
-the dead-letter list, for an operations dashboard.
+`jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
+throughput, backlog age, handler durations, and the dead-letter list (each with
+the worker that ran its last attempt) for an operations dashboard.
+`jasil_admin.get_job(job_id)` returns a dead letter's whole history: which worker
+ran each attempt, how long it took, and why it failed.
+`jasil_admin.get_workers_summary()` reports running, stale, and gracefully
+stopped worker instances one bounded page at a time; pass its `next_cursor` into
+the next call. See [Observability](observability.md#worker-registry).
 
 !!! note "Why `jasil.admin` and not `jasil.jobs.crud`"
     The CRUD layer is where these queries live, but it is the wrong thing to wire
@@ -175,21 +288,41 @@ the dead-letter list, for an operations dashboard.
 
 ## Sending mail
 
-There is no mail queue: durable jobs are the queue. Publish an event, and have a
-durable subscriber call `platform.mail.send(...)`. A raised `MailError` gets
-backoff, retries and the dead-letter queue like any other failure.
+There is no separate mail queue: durable jobs are the queue. Publish an event,
+and have a durable subscriber call `platform.mail.send(...)`. A raised
+`MailError` gets backoff, retries and the dead-letter queue like any other
+failure.
 
+- **Give mail its own named queue.** Register the mail subscriber with
+  `queue="mail"` (or similar), so a slow relay cannot hold up other subscribers'
+  jobs. The isolation comes from a dedicated worker group calling
+  `run_job_worker(queues=("mail",))`: the single local consumer still runs mail
+  serially with everything else.
+- **Mail needs a real relay once workers are standalone.** The handler runs in
+  the worker process, so that process's `mail.uri` is the one that sends.
+  `memory://` there would record every message in that process's memory and
+  complete the job with nothing delivered. With
+  [`job_worker_mode=standalone`](deployment-profiles.md#job-workers-are-processes-too)
+  declared, the consistency checks refuse that wiring at startup, in the API and
+  in the workers.
 - **An unconfigured mail backend is retried too.** `MailNotConfiguredError` is a
   `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
   budget before dead-lettering. Catch it in the handler if that is not wanted.
 - **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
   message twice.
-- **Size `jobs.lease_seconds` for the whole handler, not one send.** One SMTP
-  send can take up to 90 seconds, and the DNS lookups before it are not counted
-  against that deadline. A handler that sends N messages can take N times that.
-  The runner renews a job's lease when its turn in a batch begins, but a lease
-  shorter than the handler lets the reaper requeue a job that is still being
-  delivered: it is then sent twice, and the late worker's result is discarded.
+- **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
+  SMTP send can take up to 90 seconds, and the DNS lookups before it are not
+  counted against that deadline. A handler that sends N messages can take N times
+  that. The worker's heartbeat keeps the job's lease alive while it runs, so the
+  lease itself no longer needs to be that long; the cap is
+  `max_runtime_seconds` (default 30 minutes). Past it the job is abandoned and a
+  retry may deliver the same message again.
+- **A lost lease stops the send.** The mail backends check
+  [`jasil.jobs.lease_lost()`](#long-running-handlers) before connecting, so a
+  handler that loops over recipients does not keep sending after its job has moved
+  to another worker. Give a dedicated mail worker group a small `jobs.batch_size`,
+  so one process does not hold claimed messages while the rest of the group sits
+  idle.
 - **Do not put secrets or rendered bodies in the event payload.** Payloads are
   stored verbatim and dead-lettered rows are never pruned. Carry identifiers and
   build the message inside the handler.
@@ -199,11 +332,69 @@ backoff, retries and the dead-letter queue like any other failure.
 | Setting | Raise it when | Lower it when |
 |---|---|---|
 | `batch_size` | Throughput is the bottleneck | Individual jobs are slow or heavy |
-| `lease_seconds` | Jobs legitimately run long | Crashed workers strand work too long |
+| `lease_seconds` | Heartbeats are slow or the database is flaky | Crashed workers strand work too long |
+| `max_runtime_seconds` | Handlers legitimately run for a long time | A hung handler should be abandoned sooner |
 | `max_attempts` | Failures are usually transient | Failures are usually permanent |
 | `backoff_base_seconds` | The dependency needs time to recover | Retries should be prompt |
 | `poll_interval_seconds` | The queue is usually empty | Latency matters |
+| `heartbeat_interval_seconds` | Heartbeat write volume matters | Faster stale detection, or a shorter lease, matters |
 
-`lease_seconds` must exceed the slowest realistic job duration. If a lease
-expires while a job is still running, the reaper requeues it and it runs twice
-concurrently — which your handler must tolerate anyway, but is wasteful.
+`lease_seconds` is how long a worker may go silent. One heartbeat renews leases
+and proves the worker alive, so it must be at least **three**
+`heartbeat_interval_seconds` (two missed beats must not expire a lease), and
+`max_runtime_seconds` must not be below it; `build_runner` refuses anything else
+at startup. A worker is therefore reported stale no later than its leases start
+expiring.
+
+A late worker finalizes with its worker id and attempt generation, so even a
+handler that outlives its lease cannot overwrite the replacement worker's newer
+claim.
+
+### Long-running handlers
+
+A handler may run far longer than `lease_seconds`. While it does, the worker's
+heartbeat renews the job's lease, so the reaper leaves it alone and it is not run
+twice. Three things bound that:
+
+- **`max_runtime_seconds`.** Past it the job is **abandoned**: it is no longer
+  renewed, the handler is signalled, an `ERROR` is logged, and the rest of the
+  worker's batch is released back to the queue (no attempt is spent on jobs that
+  never started) instead of waiting behind a worker that is stuck. Python cannot
+  kill a thread, so a truly hung handler still occupies its worker; the log is the
+  operator's signal.
+- **Self-fencing.** If renewals fail for almost a whole lease (the database is
+  unreachable), the handler is signalled *before* another worker can have
+  reclaimed the job.
+- **A stolen lease.** If the job is found to belong to another worker, the handler
+  is signalled and its result is discarded.
+
+An abandoned job is signalled but not fenced: if the handler returns while this
+worker still holds the claim, its result is recorded as usual (a mail send made
+after the signal raises `MailError`, so that job is retried with backoff).
+
+The signal is cooperative. A handler that loops, or does several side effects,
+should check it between units of work and return early:
+
+```python
+import jasil.jobs
+
+
+def send_digest(event):
+    for recipient in recipients_of(event):
+        if jasil.jobs.lease_lost():
+            return  # another worker owns this job now
+        platform.mail.send(build_message(recipient))
+```
+
+`lease_lost()` is `False` outside a durable job. The mail backends check it
+themselves. A `ContextVar` does not follow work a handler hands to its own
+threads unless it copies the context (`contextvars.copy_context()`).
+
+Delivery remains at-least-once: a handler that ignores the signal mid-send, or a
+database partition, can still produce a duplicate side effect, so handlers must
+stay idempotent.
+
+Queue rotation is intentionally in-memory and resets when a worker process
+restarts. It prevents starvation across batches in a healthy process; it is not
+a global scheduling guarantee across repeated crashes or deployments. Use
+queue-specific process groups when queues require independent capacity.
