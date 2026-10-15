@@ -90,7 +90,7 @@ class JobRunner:
             self._default_queue_subscribers = None
             self._excluded_default_queue_subscribers = None
         else:
-            selected_subscribers = registry._subscriber_ids_for_queues(self._queues)
+            selected_subscribers = registry.subscriber_ids_for_queues(self._queues)
             self._default_queue_subscribers = selected_subscribers
             self._excluded_default_queue_subscribers = tuple(
                 sorted(registry.subscriber_ids().difference(selected_subscribers))
@@ -233,12 +233,12 @@ class JobRunner:
         lost = self._leases.begin(job.id)
         try:
             self._mark_started(job)
-            self._execute(job, lost)
+            lost_claim = self._execute(job, lost)
         finally:
             # After the outcome is written, so the heartbeat keeps renewing the
             # lease through the completion write.
             self._leases.finish(job.id)
-        return lost.is_set()
+        return lost_claim or lost.is_set()
 
     def _mark_started(self, job: ClaimedJob) -> None:
         """Stamp when the handler began. Best-effort: history must not stop the job."""
@@ -252,7 +252,14 @@ class JobRunner:
         except Exception as error:
             logger.warning("Durable job start could not be recorded", exc_info=error, extra=self._context(job))
 
-    def _execute(self, job: ClaimedJob, lost: threading.Event) -> None:
+    def _execute(self, job: ClaimedJob, lost: threading.Event) -> bool:
+        """Run the handler and write its outcome.
+
+        Returns:
+            True when the outcome write found the claim no longer owned. This, not
+            a renewal seeing the row finished, is what says the claim was lost once
+            the handler has returned.
+        """
         handler = self._registry.get(job.subscriber_id)
         event = self._event_from(job)
         began = self._clock.monotonic()
@@ -262,8 +269,9 @@ class JobRunner:
             with job_lease(lost):
                 handler(event)
         except Exception as error:
-            self._fail(job, error, duration_ms=self._elapsed_ms(began))
-            return
+            self._leases.finalize(job.id)
+            return self._fail(job, error, duration_ms=self._elapsed_ms(began))
+        self._leases.finalize(job.id)
         duration_ms = self._elapsed_ms(began)
         now = self._clock.now()
         with self._session_factory() as db:
@@ -281,6 +289,7 @@ class JobRunner:
                 "Durable job completion skipped because claim ownership was lost",
                 extra={**self._context(job), "duration_ms": duration_ms},
             )
+        return not completed
 
     def _elapsed_ms(self, began: float) -> int:
         return max(0, round((self._clock.monotonic() - began) * 1000))
@@ -295,7 +304,8 @@ class JobRunner:
             "worker_id": self._worker_id,
         }
 
-    def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> None:
+    def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> bool:
+        """Record a failure; True when the claim was no longer owned."""
         now = self._clock.now()
         with self._session_factory() as db:
             status = jobs_crud.mark_job_failed(
@@ -316,7 +326,7 @@ class JobRunner:
                 exc_info=error,
                 extra={**self._context(job), "duration_ms": duration_ms},
             )
-            return
+            return True
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
@@ -329,6 +339,7 @@ class JobRunner:
                 "duration_ms": duration_ms,
             },
         )
+        return False
 
     def _event_from(self, job: ClaimedJob) -> Event:
         return Event(

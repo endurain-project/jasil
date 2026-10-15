@@ -549,6 +549,9 @@ def release_leases(
             )
         ),
     )
+    # Closes by (job, worker, attempt, still open), not by the rows just released:
+    # a claim this worker no longer holds had its attempt closed by whoever took
+    # it (the reaper, a late completion), so those rows are not matched again.
     if record_attempts and released.rowcount:
         _close_open(job_attempts, worker_id=worker_id, outcome=OUTCOME_RELEASED, now=now, db=db)
     db.commit()

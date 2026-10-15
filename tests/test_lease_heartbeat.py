@@ -147,6 +147,61 @@ class TestLeaseRenewal:
         assert runner.leases.renew() == set()
 
 
+class TestABeatDuringTheOutcomeWrite:
+    """A renewal that sees the row already finished is not a lost lease."""
+
+    def _beat_after(self, monkeypatch, runner, name):
+        original = getattr(jobs_crud, name)
+        fired = []
+
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                runner.leases.renew()  # lands after the commit, before finish()
+            return result
+
+        monkeypatch.setattr(jobs_crud, name, wrapped)
+
+    def test_a_completed_job_does_not_release_the_rest_of_the_batch(self, runner, registry, db, monkeypatch, caplog):
+        ran = []
+        for name in ("s", "t"):
+            registry.register("activity.created", name, lambda _e, n=name: ran.append(n))
+        _enqueue(db, "s")
+        _enqueue(db, "t")
+        self._beat_after(monkeypatch, runner, "mark_job_completed")
+
+        with caplog.at_level(logging.WARNING):
+            runner.run_once()
+
+        assert sorted(ran) == ["s", "t"]
+        assert _job(db, "s").status == "completed"
+        assert _job(db, "t").status == "completed"
+        assert "lease was lost" not in caplog.text
+
+    def test_a_failed_job_does_not_release_the_rest_of_the_batch(self, runner, registry, db, monkeypatch):
+        ran = []
+
+        def handler_for(name):
+            def handle(_event):
+                ran.append(name)
+                if len(ran) == 1:  # whichever is claimed first fails
+                    raise RuntimeError("boom")
+
+            return handle
+
+        _register_both(registry, handler_for)
+        _enqueue(db, "s")
+        _enqueue(db, "t")
+        self._beat_after(monkeypatch, runner, "mark_job_failed")
+
+        runner.run_once()
+
+        assert sorted(ran) == ["s", "t"]
+        assert _job(db, ran[0]).status == "pending"
+        assert _job(db, ran[1]).status == "completed"
+
+
 class TestALostLease:
     @staticmethod
     def _steal(db, subscriber):

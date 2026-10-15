@@ -38,6 +38,9 @@ class _Running:
     started: float
     lost: threading.Event
     abandoned: bool = False
+    #: The handler has returned and its outcome is being written. The write, not a
+    #: renewal, decides whether the claim was still owned.
+    finalizing: bool = False
 
 
 class LeaseKeeper:
@@ -88,6 +91,17 @@ class LeaseKeeper:
             self._running = _Running(job_id, self._clock.monotonic(), lost)
         return lost
 
+    def finalize(self, job_id: str) -> None:
+        """Mark ``job_id``'s handler as done and its outcome as being written.
+
+        From here a renewal that finds the row no longer ``claimed`` is not a lost
+        lease: it is the outcome write landing first. Whether the claim was really
+        still owned is the write's own result.
+        """
+        with self._lock:
+            if self._running is not None and self._running.job_id == job_id:
+                self._running.finalizing = True
+
     def finish(self, job_id: str) -> None:
         """Stop tracking ``job_id``: it completed, failed, or was abandoned."""
         with self._lock:
@@ -130,6 +144,7 @@ class LeaseKeeper:
             if (
                 running is not None
                 and not running.abandoned
+                and not running.finalizing
                 and self._clock.monotonic() - running.started >= self._max_runtime_seconds
             ):
                 self._abandon(running)
@@ -151,7 +166,7 @@ class LeaseKeeper:
             self._last_renewed = self._clock.monotonic()
             for job_id in attempts.keys() - renewed:
                 self._held.pop(job_id, None)
-                if running is not None and job_id == running.job_id:
+                if running is not None and job_id == running.job_id and not running.finalizing:
                     running.lost.set()
                     logger.warning(
                         "Durable job lease was lost while it ran; its result will be discarded",
@@ -198,7 +213,12 @@ class LeaseKeeper:
 
     def _fence_if_silent(self, running: _Running | None) -> None:
         silent = self._clock.monotonic() - self._last_renewed
-        if running is None or running.lost.is_set() or silent < self._lease_seconds - self._interval_seconds:
+        if (
+            running is None
+            or running.finalizing
+            or running.lost.is_set()
+            or silent < self._lease_seconds - self._interval_seconds
+        ):
             return
         # Another worker may have reclaimed the job already, or will before the
         # next beat: stop the handler's side effects now rather than after.

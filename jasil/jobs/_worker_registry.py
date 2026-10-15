@@ -78,7 +78,7 @@ def record_worker_heartbeat(
 
 
 def record_worker_stop(instance_id: str, *, now: datetime, db: Session) -> None:
-    """Stamp a graceful stop and the final active-claim count."""
+    """Stamp a graceful stop; active claims are derived from jobs at read time."""
     worker = db.get(JobWorker, instance_id)
     if worker is None:
         return

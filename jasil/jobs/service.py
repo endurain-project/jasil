@@ -30,7 +30,7 @@ from jasil.settings import get_settings
 # function imports what it needs instead.
 if TYPE_CHECKING:
     from jasil.jobs.runner import JobRunner
-    from jasil.jobs.worker import BackgroundWorker
+    from jasil.jobs.worker import BackgroundWorker, WorkerHeartbeat
     from jasil.settings import JobSettings
 
 logger = logging.getLogger(__name__)
@@ -178,7 +178,7 @@ def _build_heartbeat(
     role: str | None,
     label: str | None,
     metadata: dict[str, Any] | None,
-):
+) -> "WorkerHeartbeat":
     from jasil.jobs.worker import WorkerHeartbeat, WorkerTelemetry
 
     telemetry = WorkerTelemetry(
