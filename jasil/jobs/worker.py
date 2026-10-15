@@ -211,7 +211,7 @@ def run_worker(
     try:
         while not stop.is_set():
             try:
-                processed = runner.run_once()
+                processed = runner.run_once(stop)
             except Exception as error:
                 logger.error("Durable job worker iteration failed", exc_info=error)
                 processed = 0

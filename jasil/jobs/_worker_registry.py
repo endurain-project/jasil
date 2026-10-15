@@ -231,13 +231,18 @@ def get_workers_summary(
 def _outcome_counts(counts: dict[str, int], record_attempts: bool) -> dict[str, int | None]:
     """A worker's per-outcome attempt counts; ``None`` when attempts are not recorded."""
     if not record_attempts:
-        return {key: None for key in ("completed", "failed", "dead_lettered", "lease_expired", "superseded")}
+        return {
+            key: None
+            for key in ("completed", "failed", "dead_lettered", "lease_expired", "superseded", "released", "abandoned")
+        }
     return {
         "completed": counts.get("completed", 0),
         "failed": counts.get("failed", 0),
         "dead_lettered": counts.get("dead_letter", 0),
         "lease_expired": counts.get("lease_expired", 0),
         "superseded": counts.get("superseded", 0),
+        "released": counts.get("released", 0),
+        "abandoned": counts.get("abandoned", 0),
     }
 
 

@@ -29,8 +29,10 @@ def lease_lost() -> bool:
     """Whether the durable job running in this context has lost its lease.
 
     A handler that loops, or sends several messages, should check this between
-    units of work and return early: the result of a run that lost its lease is
-    discarded, but its side effects are not.
+    units of work and return early. The result of a run whose job was taken by
+    another worker is discarded, but its side effects are not. A job abandoned
+    past ``jobs.max_runtime_seconds`` is signalled too, yet its result is still
+    recorded if this worker holds the claim when the handler returns.
 
     Returns:
         True once the lease is gone. Always False outside a durable job.

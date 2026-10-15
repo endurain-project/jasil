@@ -276,7 +276,7 @@ class WorkerAttempts(BaseModel):
 class WorkerInfo(BaseModel):
     """Operator-facing state for one restart-unique worker instance.
 
-    The ``completed`` .. ``superseded`` counts are attempts that *ended* within
+    The ``completed`` .. ``abandoned`` counts are attempts that *ended* within
     the summary's window, and are ``None`` when attempts are not recorded.
     """
 
@@ -295,6 +295,8 @@ class WorkerInfo(BaseModel):
     dead_lettered: int | None = None
     lease_expired: int | None = None
     superseded: int | None = None
+    released: int | None = None
+    abandoned: int | None = None
     last_finished_at: datetime | None = None
 
 

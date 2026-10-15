@@ -234,8 +234,10 @@ class JobAttempt(Base):
         Index("idx_job_attempts_worker", "worker_id", "claimed_at"),
         # Every subscriber's job for one event.
         Index("idx_job_attempts_event", "event_id"),
-        # Statistics windows and retention.
+        # Retention, and the windows of attempts that were claimed in them.
         Index("idx_job_attempts_claimed", "claimed_at"),
+        # Statistics windows: attempts that *ended* since a cutoff.
+        Index("idx_job_attempts_finished", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(

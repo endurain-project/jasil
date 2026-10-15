@@ -152,8 +152,8 @@ more = jasil_admin.get_worker_attempts(instance_id, cursor=page.next_cursor)
 The summaries carry it too. `get_jobs_summary()` adds, per subscriber and queue,
 `avg_duration_ms`, `max_duration_ms`, `duration_buckets` and `superseded` (over
 the window), and each dead letter's `last_worker_id`. `get_workers_summary()`
-adds each worker's `completed`, `failed`, `dead_lettered`, `lease_expired` and
-`superseded` counts, `last_finished_at`, and `claimed_by_stale_workers`: jobs
+adds each worker's `completed`, `failed`, `dead_lettered`, `lease_expired`, `superseded`,
+`released` and `abandoned` counts, `last_finished_at`, and `claimed_by_stale_workers`: jobs
 waiting out a lease behind a worker that stopped beating, which is the number to
 watch during a crash.
 

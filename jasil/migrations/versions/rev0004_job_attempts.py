@@ -64,9 +64,11 @@ def upgrade() -> None:
     op.create_index("idx_job_attempts_worker", "job_attempts", ["worker_id", "claimed_at"])
     op.create_index("idx_job_attempts_event", "job_attempts", ["event_id"])
     op.create_index("idx_job_attempts_claimed", "job_attempts", ["claimed_at"])
+    op.create_index("idx_job_attempts_finished", "job_attempts", ["finished_at"])
 
 
 def downgrade() -> None:
+    op.drop_index("idx_job_attempts_finished", table_name="job_attempts")
     op.drop_index("idx_job_attempts_claimed", table_name="job_attempts")
     op.drop_index("idx_job_attempts_event", table_name="job_attempts")
     op.drop_index("idx_job_attempts_worker", table_name="job_attempts")

@@ -93,6 +93,14 @@ permanently busy queue cannot starve another one indefinitely.
 Rotation considers only the worker's allowlist. Queues outside it are never
 claimed by that worker and need another matching worker.
 
+!!! warning "Moving a subscriber to another queue"
+    A job keeps the queue it was enqueued on. Only rows carrying the database
+    default `default` queue follow their subscriber to its currently assigned
+    queue. If a subscriber moves from queue `a` to `b` and no worker still selects
+    `a`, its pending rows on `a` wait forever. Keep a worker on the old queue until
+    it drains, or reassign the rows once:
+    `UPDATE processing_jobs SET queue = 'b' WHERE queue = 'a' AND subscriber_id = '<id>' AND status = 'pending'`.
+
 !!! note "The attempt is counted at claim time"
     Not at completion. A worker that crashes mid-run still consumes an attempt,
     which is what bounds a crash loop — otherwise a job that reliably kills its
@@ -359,6 +367,10 @@ twice. Three things bound that:
   reclaimed the job.
 - **A stolen lease.** If the job is found to belong to another worker, the handler
   is signalled and its result is discarded.
+
+An abandoned job is signalled but not fenced: if the handler returns while this
+worker still holds the claim, its result is recorded as usual (a mail send made
+after the signal raises `MailError`, so that job is retried with backoff).
 
 The signal is cooperative. A handler that loops, or does several side effects,
 should check it between units of work and return early:

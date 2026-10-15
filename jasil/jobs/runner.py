@@ -132,9 +132,14 @@ class JobRunner:
         """Normalized queue allowlist, or None when all queues are selected."""
         return self._queues
 
-    def run_once(self) -> int:
+    def run_once(self, stop: threading.Event | None = None) -> int:
         """
         Claim and process one batch of due jobs.
+
+        Args:
+            stop: When set between jobs, the jobs not yet started are released
+                back to the queue instead of being run, so a graceful shutdown
+                does not hold them for the rest of the batch.
 
         Returns:
             The number of jobs processed in this batch (0 when none were due).
@@ -163,6 +168,9 @@ class JobRunner:
             for index, snapshot in enumerate(snapshots):
                 # A DB error finishing one job must not abort the rest of the batch;
                 # its lease simply expires and the reaper requeues it.
+                if stop is not None and stop.is_set():
+                    self._leases.release_waiting()
+                    break
                 try:
                     # The first job's lease was taken a moment ago; every later one
                     # has been waiting, so it is renewed (and confirmed held) first.

@@ -123,7 +123,13 @@ def last_worker_ids(db: Session, job_ids: list[str]) -> dict[str, str]:
     rows = db.execute(
         select(JobAttempt.job_id, JobAttempt.worker_id)
         .where(JobAttempt.job_id.in_(job_ids))
-        .order_by(JobAttempt.claimed_at.desc(), JobAttempt.id.desc())
+        # A released claim never ran, and shares its attempt number (and, on
+        # second-resolution MySQL, its timestamp) with the claim that did.
+        .order_by(
+            case((func.coalesce(JobAttempt.outcome, "") == OUTCOME_RELEASED, 1), else_=0),
+            JobAttempt.claimed_at.desc(),
+            JobAttempt.id.desc(),
+        )
     ).all()
     latest: dict[str, str] = {}
     for job_id, worker_id in rows:
@@ -234,8 +240,11 @@ def delete_attempts_before(cutoff: datetime, *, db: Session, batch_size: int = P
     """Delete attempts claimed before ``cutoff``, in bounded batches.
 
     A live job (``pending``, ``claimed``) and a dead-lettered one keep their whole
-    history, matching the rule that dead letters are kept for operator review.
-    Attempts whose job is gone (pruned, or never existed) are orphans and go.
+    history, matching the rule that dead letters are kept for operator review. A
+    ``completed`` job's history goes only once the job itself is past the cutoff
+    (by ``completed_at``), so a job that still exists is never left with part of
+    its history. Attempts whose job is gone (pruned, or never existed) are
+    orphans and go.
 
     Args:
         cutoff: Delete attempts whose ``claimed_at`` is strictly before this.
@@ -245,9 +254,14 @@ def delete_attempts_before(cutoff: datetime, *, db: Session, batch_size: int = P
     Returns:
         The total number of rows deleted.
     """
+    # A job that is still being kept, or completed too recently to be pruned.
     kept = exists().where(
         ProcessingJob.id == JobAttempt.job_id,
-        ProcessingJob.status.in_(("pending", "claimed", "dead_letter")),
+        or_(
+            ProcessingJob.status != "completed",
+            ProcessingJob.completed_at.is_(None),
+            ProcessingJob.completed_at >= cutoff,
+        ),
     )
     total = 0
     for _ in range(PRUNE_MAX_BATCHES):

@@ -236,7 +236,13 @@ class LeaseKeeper:
             return
         try:
             with self._session_factory() as db:
-                released = jobs_crud.release_leases(waiting, worker_id=self._worker_id, now=self._clock.now(), db=db)
+                released = jobs_crud.release_leases(
+                    waiting,
+                    worker_id=self._worker_id,
+                    now=self._clock.now(),
+                    db=db,
+                    record_attempts=self._record_attempts,
+                )
             logger.info(
                 "Released %d unstarted durable job(s) back to the queue",
                 released,
