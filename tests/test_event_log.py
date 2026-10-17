@@ -370,6 +370,36 @@ class TestRecorder:
 
         assert _row(db, event.event_id).status == "queued"
 
+    def test_a_session_staged_queueing_rolls_back_with_the_caller(self, recorder, db):
+        event = _event()
+        # A caller always has a domain write in flight; on SQLite the savepoint
+        # only joins the transaction once one has begun.
+        event_log_crud.record_queued(_event(), db, commit=False)
+
+        recorder.record_queued_in(event, db)
+        db.rollback()
+
+        assert db.get(EventLog, event.event_id) is None
+
+    def test_a_session_staged_queueing_commits_with_the_caller(self, recorder, db):
+        event = _event()
+
+        recorder.record_queued_in(event, db)
+        db.commit()
+
+        assert db.get(EventLog, event.event_id).status == "queued"
+
+    def test_a_failed_session_staged_write_leaves_the_caller_usable(self, recorder, db, caplog):
+        event = _event()
+        recorder.record_queued_in(event, db)
+        db.commit()
+
+        with caplog.at_level("WARNING"):
+            recorder.record_queued_in(event, db)  # duplicate primary key
+
+        assert "record_queued_in failed" in caplog.text
+        assert db.get(EventLog, event.event_id).status == "queued"
+
     def test_tracking_records_processing_then_completed(self, recorder, db):
         event = _event()
         recorder.record_published(event)

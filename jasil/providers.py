@@ -333,6 +333,12 @@ class EventRecorder(Protocol):
     where the intermediate state is never observed) and *completed* / *failed* on
     exit, re-raising any handler exception so the bus keeps its own error
     semantics (propagate in-process, leave pending on Redis Streams).
+
+    Implementations may additionally offer ``record_queued_in(event, db)``, which
+    stages the ``queued`` row on the caller's session so it commits or rolls back
+    with the outbox row. It is optional and deliberately not part of this
+    protocol (SemVer); the publisher uses it when present and otherwise falls
+    back to :meth:`record_queued`.
     """
 
     def record_published(self, event: Event) -> None: ...

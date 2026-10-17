@@ -47,6 +47,15 @@ class RecordingRecorder:
         self.queued.append(event)
 
 
+class SessionAwareRecorder(RecordingRecorder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.staged: list = []
+
+    def record_queued_in(self, event, db) -> None:
+        self.staged.append((event, db))
+
+
 class FixedClock:
     def now(self) -> datetime:
         return T0
@@ -125,6 +134,18 @@ class TestDurableRouting:
         publisher.publish("activity.created", {"id": 1}, source="test", db=db)
 
         assert len(recorder.queued) == 1
+
+    def test_a_session_aware_recorder_stages_on_the_callers_session(self, platform, db, monkeypatch):
+        """The queued row must ride the caller's transaction, not its own."""
+        recorder = SessionAwareRecorder()
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=recorder))
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+        publisher.publish("activity.created", {"id": 1}, source="test", db=db)
+
+        assert [staged_db for _event, staged_db in recorder.staged] == [db]
+        assert recorder.queued == []
 
     def test_durable_delivery_needs_a_session(self, platform, db):
         _enable_durable_jobs()
