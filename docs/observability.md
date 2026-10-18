@@ -204,7 +204,7 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 |---|---|
 | `upgrade(engine)` | Create or upgrade to head. Run at deploy time. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
-| `adopt_existing_schema(engine)` | Validate and adopt complete, unversioned JASIL tables. |
+| `adopt_existing_schema(engine)` | Validate and adopt unversioned JASIL tables at head or an earlier revision. |
 | `head_revision()` | The newest revision shipped in this package. |
 | `db_revision(engine)` | What the database currently records. |
 | `verify_schema_current(engine)` | Raise unless the database is at head. |
@@ -220,21 +220,39 @@ migrate" into a clear message at boot rather than a confusing query error later.
 
 ### Adopting existing tables
 
-`adopt_existing_schema()` is only for a database where all four JASIL-owned
-tables already exist but `jasil_alembic_version` does not record a revision. It
-compares their columns, types, nullability, primary keys, unique constraints,
-and required indexes with the schema expected by the
-installed JASIL migration head. PostgreSQL adoption also requires the metadata
-GIN index and its PostgreSQL-specific definition.
+`adopt_existing_schema()` is only for a database where JASIL's tables already
+exist but `jasil_alembic_version` does not record a revision. It compares their
+columns, types, nullability, primary keys, unique constraints, and required
+indexes with the schema of the installed migration head. If that does not match
+exactly, it tries each earlier revision's schema, newest first, and records the
+first exact match (the newest, if two describe the same schema). It returns
+`True` only when this call recorded a revision. PostgreSQL adoption also
+requires the metadata GIN index and its PostgreSQL-specific definition.
 
-An empty database is left unversioned for `upgrade()` to create. A partial or
-incompatible schema raises `SchemaCompatibilityError` without changing it or
-recording a revision. Unexpected columns are incompatible; additional ordinary
+Adopting an older revision leaves the database behind head, so always call
+`upgrade()` next: it applies the revisions after the recorded one. That is how a
+host whose own migrations created the tables at an earlier JASIL revision (for
+example `event_log`, `event_outbox` and `processing_jobs` in the `rev0001`
+shape) catches up without copying JASIL's DDL into its own history.
+
+An empty database is left unversioned for `upgrade()` to create. A schema that
+matches no revision raises `SchemaCompatibilityError` without changing it or
+recording a revision; the message names the closest revision and lists its
+differences. Unexpected tables and columns are incompatible; additional ordinary
 non-unique indexes are allowed because they do not change JASIL's write
 contract. JASIL never repairs an incompatible schema automatically.
 
+!!! note "Tables your host created itself"
+    Create them in exactly the shape of a revision JASIL ships (same columns,
+    types, nullability, primary keys, unique constraints and index names), at
+    that revision or at head. If your host evolved them differently, migrate
+    them to a shipped revision's shape in your own history first; adoption never
+    guesses and there is no public way to stamp an arbitrary revision. A host
+    that copied a later revision's DDL by hand can delete that copy: adoption
+    plus `upgrade()` now applies it.
+
 Do not guess or hardcode a JASIL revision identifier. The adoption API owns the
-installed head and all expected schema details. Calling it again after a
+shipped revisions and all expected schema details. Calling it again after a
 successful adoption is a no-op.
 
 ### Prefer one unified history?

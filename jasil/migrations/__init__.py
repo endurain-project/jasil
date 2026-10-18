@@ -13,7 +13,7 @@ never pulls this in; import it explicitly::
     from jasil import migrations
 
     jasil_orm.map_models(Base)                  # the metadata must exist first
-    migrations.adopt_existing_schema(engine)   # validate/stamp legacy tables, if any
+    migrations.adopt_existing_schema(engine)   # validate/record legacy tables, if any
     migrations.upgrade(engine)                  # create/upgrade JASIL's tables
     migrations.verify_schema_current(engine)   # fail fast if not migrated
 
@@ -200,24 +200,148 @@ def _postgres_gin_differences(connection: Any, inspector: Any) -> list[str]:
     return differences
 
 
+class _MetadataOps:
+    """Stand-in for ``alembic.op`` that applies a downgrade to a ``MetaData``.
+
+    Lets an older revision's schema be derived from the migration that removes
+    it, so nothing is maintained twice. Only the operations JASIL's downgrades
+    use are supported; anything else raises, so a new kind of operation cannot
+    silently yield a wrong schema.
+    """
+
+    def __init__(self, metadata: Any) -> None:
+        self._metadata = metadata
+
+    def drop_index(self, index_name: str, table_name: str | None = None, **kwargs: Any) -> None:
+        tables = [self._metadata.tables[table_name]] if table_name else list(self._metadata.tables.values())
+        for table in tables:
+            for index in list(table.indexes):
+                if index.name == index_name:
+                    table.indexes.discard(index)
+                    return
+        raise RuntimeError(f"downgrade drops unknown index {index_name!r}")
+
+    def drop_table(self, table_name: str, **kwargs: Any) -> None:
+        self._metadata.remove(self._metadata.tables[table_name])
+
+    def drop_column(self, table_name: str, column_name: str, **kwargs: Any) -> None:
+        table = self._metadata.tables[table_name]
+        table._columns.remove(table.c[column_name])
+
+    def __getattr__(self, name: str) -> Any:
+        raise NotImplementedError(
+            f"adoption cannot derive an older schema through op.{name}(); teach jasil.migrations._MetadataOps"
+        )
+
+
+def _copy_jasil_metadata(metadata: Any, only: frozenset[str] | None = None) -> Any:
+    from sqlalchemy import MetaData
+
+    from jasil.orm import jasil_table_names
+
+    copied = MetaData()
+    for table_name in sorted(
+        jasil_table_names() & set(metadata.tables) & (set(metadata.tables) if only is None else only)
+    ):
+        metadata.tables[table_name].to_metadata(copied)
+    return copied
+
+
+def _revision_schemas() -> list[tuple[str, Any]]:
+    """Return ``(revision, metadata)`` for every revision, newest first.
+
+    The head entry is a copy of the active metadata. Each older entry is derived
+    by running the newer revision's ``downgrade`` against a copy of the one
+    before it. The base state (no tables) is not a candidate.
+    """
+    from alembic.script import ScriptDirectory
+
+    from jasil.orm import get_active_base
+
+    current = _copy_jasil_metadata(get_active_base().metadata)
+    schemas: list[tuple[str, Any]] = []
+    for script in ScriptDirectory.from_config(_config()).walk_revisions():
+        schemas.append((script.revision, current))
+        if script.down_revision is None:
+            break
+        current = _copy_jasil_metadata(current)
+        module: Any = script.module
+        original_op = module.op
+        module.op = _MetadataOps(current)
+        try:
+            module.downgrade()
+        finally:
+            module.op = original_op
+    return schemas
+
+
+def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple[list[str], int]:
+    """Describe how the unversioned JASIL tables differ from ``metadata``.
+
+    Returns the readable differences and a count of individual discrepancies,
+    used to rank which revision came closest.
+    """
+    from alembic.autogenerate import compare_metadata
+    from alembic.runtime.migration import MigrationContext
+
+    from jasil.orm import jasil_table_names
+
+    expected_tables = frozenset(metadata.tables)
+    present_tables = frozenset(inspector.get_table_names()) & jasil_table_names()
+    missing = sorted(expected_tables - present_tables)
+    unexpected = sorted(present_tables - expected_tables)
+    differences = []
+    if missing:
+        differences.append("missing tables: " + ", ".join(missing))
+    if unexpected:
+        differences.append("unexpected tables: " + ", ".join(unexpected))
+    count = len(missing) + len(unexpected)
+
+    # Compare column-level detail only where both sides have the table.
+    common = expected_tables & present_tables
+    restricted = _copy_jasil_metadata(metadata, common)
+    comparison_context = MigrationContext.configure(
+        connection,
+        opts={
+            "compare_type": True,
+            "include_object": _adoption_include_object,
+        },
+    )
+    detailed = [
+        _format_difference(difference)
+        for difference in compare_metadata(comparison_context, restricted)
+        if difference[0] != "remove_table"
+    ]
+    detailed.extend(_primary_key_differences(inspector, restricted, common))
+    if "event_log" in common:
+        detailed.extend(_postgres_gin_differences(connection, inspector))
+    return differences + detailed, count + len(detailed)
+
+
 def adopt_existing_schema(engine: "Engine") -> bool:
     """Validate and adopt complete, unversioned JASIL tables.
 
-    Returns ``True`` only when this call records the installed head. An empty
-    database or one that already has a JASIL revision is left unchanged and
-    returns ``False``.
+    The tables are matched exactly against the head schema, then against each
+    earlier revision's schema, newest first. The first exact match is recorded
+    as the database's revision, so a following ``upgrade()`` applies whatever
+    revisions come after it. If two revisions describe the same schema, the
+    newest is recorded. An older revision's schema is derived from the
+    migrations' own ``downgrade`` functions, never maintained separately.
+
+    Returns ``True`` only when this call records a revision. An empty database
+    or one that already has a JASIL revision is left unchanged and returns
+    ``False``.
 
     Raises:
-        SchemaCompatibilityError: If only some JASIL tables exist, or their
-            physical schema is incompatible with the installed migration head.
+        SchemaCompatibilityError: If no revision matches exactly; the message
+            names the closest revision and lists its differences.
     """
     _require_alembic()
     from alembic import command
-    from alembic.autogenerate import compare_metadata
     from alembic.runtime.migration import MigrationContext
     from sqlalchemy import inspect
 
-    from jasil.orm import get_active_base, jasil_table_names
+    from jasil.orm import jasil_table_names
 
     with engine.connect() as connection:
         context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
@@ -225,36 +349,24 @@ def adopt_existing_schema(engine: "Engine") -> bool:
             return False
 
         inspector = inspect(connection)
-        expected_tables = jasil_table_names()
-        present_tables = set(inspector.get_table_names()) & expected_tables
-        if not present_tables:
+        if not set(inspector.get_table_names()) & jasil_table_names():
             return False
-        if present_tables != expected_tables:
-            missing = sorted(expected_tables - present_tables)
-            raise SchemaCompatibilityError("Cannot adopt a partial JASIL schema; missing tables: " + ", ".join(missing))
 
-        metadata = get_active_base().metadata
-        comparison_context = MigrationContext.configure(
-            connection,
-            opts={
-                "compare_type": True,
-                "include_object": _adoption_include_object,
-            },
-        )
-        raw_differences = compare_metadata(comparison_context, metadata)
-        differences = [_format_difference(difference) for difference in raw_differences]
-        differences.extend(_primary_key_differences(inspector, metadata, expected_tables))
-        differences.extend(_postgres_gin_differences(connection, inspector))
-        if differences:
-            raise SchemaCompatibilityError("Cannot adopt an incompatible JASIL schema: " + "; ".join(differences))
+        closest: tuple[str, list[str], int] | None = None
+        for revision, metadata in _revision_schemas():
+            differences, weight = _schema_differences(connection, inspector, metadata)
+            if not differences:
+                command.stamp(_config(connection), revision)
+                connection.commit()
+                return True
+            if closest is None or weight < closest[2]:
+                closest = (revision, differences, weight)
 
-        head = head_revision()
-        if head is None:
+        if closest is None:
             raise RuntimeError("JASIL has no packaged migration head")
-        config = _config(connection)
-        command.stamp(config, head)
-        connection.commit()
-        return True
+        raise SchemaCompatibilityError(
+            f"Cannot adopt an incompatible JASIL schema (closest revision {closest[0]}): " + "; ".join(closest[1])
+        )
 
 
 def verify_schema_current(engine: "Engine") -> None:

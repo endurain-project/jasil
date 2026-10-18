@@ -48,6 +48,28 @@ class EventLogRecorder:
         """
         self._safely("record_queued", lambda db: event_log_crud.record_queued(event, db))
 
+    def record_queued_in(self, event: Event, db: Session) -> None:
+        """
+        Stage the terminal ``queued`` row on the caller's session, uncommitted.
+
+        The row joins the caller's open transaction, so it commits or rolls back
+        with the outbox row staged beside it. The write runs in a savepoint so a
+        storage error is logged and swallowed without poisoning the caller's
+        transaction.
+
+        Args:
+            event: The event envelope staged for durable delivery.
+            db: The caller's active session.
+
+        Returns:
+            None.
+        """
+        try:
+            with db.begin_nested():
+                event_log_crud.record_queued(event, db, commit=False)
+        except Exception as error:  # observability must never break the producer
+            logger.warning("event_log record_queued_in failed: %r", error)
+
     @contextmanager
     def track(
         self,

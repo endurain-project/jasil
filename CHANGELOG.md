@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.6.1] - 2026-10-18
+
+### Changed
+
+- **`adopt_existing_schema` adopts an older-baseline schema.** Unversioned JASIL tables are matched against the head schema first, as before, then against each earlier revision's schema, newest first. The first exact match is recorded as the database's revision and `True` is returned, so the `upgrade()` that follows applies the later revisions. A database created at `rev0001` (no `queue` column, no `job_workers` or `job_attempts`) is now adopted at `rev0001` instead of being rejected as a partial schema. No match still raises `SchemaCompatibilityError`, now naming the closest revision and listing its differences. An empty database or one that already records a revision still returns `False`. Each older schema is derived from that migration's own `downgrade`, never maintained separately, and a migration using an operation the derivation does not understand fails loudly. There is no schema change.
+
+### Fixed
+
+- **The `queued` event-log row now commits with the outbox row.** `publish_on_commit` and `publish_many_on_commit` used to write the `queued` row on a separate session, so it could be committed when the caller's transaction rolled back, or be missing when it committed. The row is now staged on the caller's session, inside a savepoint, so it commits or rolls back with the outbox row beside it; a storage error is logged and swallowed without poisoning the caller's transaction. `EventLogRecorder.record_queued_in(event, db)` is the new session-aware method, and `event_log.crud.record_queued` takes a keyword-only `commit` (default `True`, unchanged). `EventRecorder` gains no required method: the publisher uses `record_queued_in` when a recorder offers it and otherwise falls back to `record_queued`, so third-party recorders keep working.
+
 ## [0.6.0] - 2026-09-15
 
 ### Upgrade notes

@@ -88,7 +88,14 @@ def _stage_in_outbox(
     import jasil.jobs.outbox as jobs_outbox
 
     if recorder is not None:
-        recorder.record_queued(event)
+        # Prefer the session-aware method so the queued row rides the caller's
+        # transaction; third-party recorders that lack it keep the legacy
+        # own-session write.
+        record_in = getattr(recorder, "record_queued_in", None)
+        if record_in is not None:
+            record_in(event, db)
+        else:
+            recorder.record_queued(event)
     jobs_outbox.add_to_outbox(event, now=now, db=db, commit=commit)
 
 

@@ -31,6 +31,7 @@ from jasil._core.limits import (
     MAX_WORKER_ID_LENGTH,
     fit_length,
 )
+from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds
 from jasil.event_log.models import EventLog
 from jasil.events import Event
@@ -68,7 +69,7 @@ def record_published(event: Event, db: Session) -> None:
     db.commit()
 
 
-def record_queued(event: Event, db: Session) -> None:
+def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
     """
     Insert a terminal ``queued`` row for an event handed to the durable job queue.
 
@@ -81,6 +82,9 @@ def record_queued(event: Event, db: Session) -> None:
     Args:
         event: The event envelope being staged for durable delivery.
         db: Active database session.
+        commit: When True (default), commit immediately. When False, flush only
+            so the row joins the caller's open transaction and commits or rolls
+            back with it.
 
     Returns:
         None.
@@ -96,7 +100,7 @@ def record_queued(event: Event, db: Session) -> None:
             retry_count=event.retry_count,
         )
     )
-    db.commit()
+    commit_or_flush(db, commit)
 
 
 def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
