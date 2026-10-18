@@ -359,8 +359,8 @@ class TestAdoptExistingSchema:
     def test_an_additional_non_unique_index_is_allowed(self, engine, mapped_base):
         migrations.upgrade(engine)
         _drop_version_table(engine)
-        table = mapped_base.metadata.tables["event_outbox"]
-        Index("idx_host_event_outbox_event_id", table.c.event_id).create(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE INDEX idx_host_event_outbox_event_id ON event_outbox (event_id)")
 
         assert migrations.adopt_existing_schema(engine) is True
         assert migrations.db_revision(engine) == migrations.head_revision()
@@ -384,6 +384,56 @@ class TestAdoptExistingSchema:
 
         assert migrations.adopt_existing_schema(engine) is False
         assert migrations.db_revision(engine) == "older_revision"
+
+    def test_a_baseline_schema_is_adopted_at_its_revision_then_upgraded(self, engine):
+        migrations.upgrade(engine, "rev0001")
+        _drop_version_table(engine)
+        assert "job_workers" not in inspect(engine).get_table_names()
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == "rev0001"
+        assert migrations.adopt_existing_schema(engine) is False
+
+        migrations.upgrade(engine)
+        assert migrations.db_revision(engine) == "rev0002"
+        migrations.verify_schema_current(engine)
+        assert _schema(engine)["processing_jobs"].keys() >= {"queue"}
+
+    def test_a_baseline_schema_with_a_wrong_column_type_fails_closed(self, engine, mapped_base):
+        migrations.upgrade(engine, "rev0001")
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE event_outbox")
+        metadata = _copied_jasil_metadata(mapped_base)
+        metadata.tables["event_outbox"].c.event_type.type = Integer()
+        metadata.tables["event_outbox"].create(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"closest revision rev0001.*event_type"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_baseline_schema_missing_a_table_fails_closed(self, engine):
+        migrations.upgrade(engine, "rev0001")
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TABLE event_outbox")
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"closest revision rev0001.*missing tables"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_baseline_schema_with_a_later_revisions_table_is_not_adopted_as_the_baseline(self, engine):
+        migrations.upgrade(engine, "rev0001")
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE job_workers (instance_id VARCHAR(36) PRIMARY KEY)")
+
+        with pytest.raises(migrations.SchemaCompatibilityError):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
 
     def test_postgres_requires_the_metadata_gin_index(self, engine):
         if engine.dialect.name != "postgresql":
@@ -426,3 +476,29 @@ class TestHostIsolation:
 
     def test_non_table_objects_are_always_included(self):
         assert migrations.jasil_include_object(None, "some_index", "index", True, None) is True
+
+
+class TestRevisionSchemas:
+    def test_every_derived_schema_matches_the_real_migration(self, engine, mapped_base):
+        """The downgrade-derived schema of each revision equals what upgrading to it builds."""
+        derived = migrations._revision_schemas()
+        assert derived[0][0] == migrations.head_revision()
+        for revision, metadata in derived:
+            _drop_everything(engine, mapped_base)
+            migrations.upgrade(engine, revision)
+            _drop_version_table(engine)
+            with engine.connect() as connection:
+                differences, _ = migrations._schema_differences(connection, inspect(connection), metadata)
+            assert differences == [], revision
+
+    def test_an_unsupported_downgrade_operation_is_refused(self, mapped_base):
+        ops = migrations._MetadataOps(_copied_jasil_metadata(mapped_base))
+
+        with pytest.raises(NotImplementedError, match=r"op\.alter_column"):
+            ops.alter_column("event_log", "status")
+
+    def test_the_metadata_ops_reject_an_unknown_index(self, mapped_base):
+        ops = migrations._MetadataOps(_copied_jasil_metadata(mapped_base))
+
+        with pytest.raises(RuntimeError, match="unknown index"):
+            ops.drop_index("idx_missing", table_name="event_log")
