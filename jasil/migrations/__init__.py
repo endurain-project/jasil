@@ -265,7 +265,7 @@ def _revision_schemas() -> list[tuple[str, Any]]:
         if script.down_revision is None:
             break
         current = _copy_jasil_metadata(current)
-        module = script.module
+        module: Any = script.module
         original_op = module.op
         module.op = _MetadataOps(current)
         try:
