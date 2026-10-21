@@ -96,9 +96,12 @@ holds, and *multi-node* only for the first:
 | `web_workers > 1` | yes | |
 | `job_worker_mode=standalone` | yes | |
 
-**Cross-process state.** Ephemeral state and the event bus must not resolve to
-process-local memory when the deployment is multi-process. Both stores would
-diverge silently across processes.
+**Cross-process state.** Ephemeral state, the event bus and the realtime hint
+channel must not resolve to process-local memory when the deployment is
+multi-process. The stores would diverge silently across processes, and a hint
+published by one process (another replica, a standalone job worker) would never
+reach the process holding the user's connection. An unset `realtime_uri` follows
+`events_uri`, so it is judged (and named in the refusal) as the event bus.
 
 **Cross-node storage.** Blob storage must not resolve to the local filesystem
 when the deployment is multi-node, where replicas run on separate nodes with no
@@ -122,7 +125,7 @@ What each shape requires:
 | Capability | Local, one process | Local + standalone workers | Distributed |
 |---|---|---|---|
 | `job_worker_mode` | `in_process` | `standalone` | `standalone`, or `in_process` per replica |
-| State, events | memory | Redis | Redis |
+| State, events, realtime | memory | Redis | Redis |
 | Lock | `noop` or `postgres-advisory` | `postgres-advisory` | `postgres-advisory` |
 | Mail | `memory`, or SMTP | SMTP | SMTP |
 | Storage | `local` | `local` on a shared volume, or S3 | S3 |

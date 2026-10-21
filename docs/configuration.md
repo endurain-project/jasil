@@ -44,6 +44,7 @@ fields.
 | `storage_uri` | `None` | `local://` or `s3://`. |
 | `events_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
+| `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |

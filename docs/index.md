@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.6.1"
+!!! warning "Status: 0.7.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -16,7 +16,7 @@ same code runs single-process on a laptop and multi-replica in production.
 
 | Layer | What it does |
 |---|---|
-| **Providers** | Narrow protocols domain services can depend on, plus complete aggregates such as `StorageProvider` for the assembled platform. Capabilities: state, storage, events, lock, clock, geocoding, mail. |
+| **Providers** | Narrow protocols domain services can depend on, plus complete aggregates such as `StorageProvider` for the assembled platform. Capabilities: state, storage, events, realtime hints, lock, clock, geocoding, mail. |
 | **Backends** | A working implementation of each, selected by URI. |
 | **Deployment profiles** | `local` needs no infrastructure at all. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload versioning that survives a rolling deploy. |

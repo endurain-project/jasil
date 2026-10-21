@@ -180,7 +180,7 @@ class TestCapabilityReport:
         names = [row.name for row in report.rows]
 
         assert sorted(names) == sorted(set(names))
-        assert {"state", "storage", "events", "lock", "mail", "clock"} == set(names)
+        assert {"state", "storage", "events", "realtime", "lock", "mail", "clock"} == set(names)
 
     def test_mail_reports_disabled_when_unset(self, report):
         row = next(row for row in report.rows if row.name == "mail")
@@ -228,6 +228,18 @@ class TestCapabilityReport:
         sources = {row.name: row.source for row in report.rows}
 
         assert sources["state"] == "profile default"
+
+    def test_realtime_is_reported_as_following_the_event_bus_when_unset(self, report):
+        row = next(row for row in report.rows if row.name == "realtime")
+
+        assert (row.backend, row.source) == ("memory", "follows events_uri")
+
+    def test_an_explicit_realtime_uri_is_reported(self):
+        settings = JasilSettings(realtime_uri="redis://hints:6379/0")
+
+        row = next(row for row in build_capability_report(settings).rows if row.name == "realtime")
+
+        assert (row.backend, row.source) == ("redis", "realtime_uri")
 
     def test_an_explicit_uri_is_attributed_to_its_setting(self):
         report = build_capability_report(JasilSettings(state_uri="memory://"))
@@ -283,6 +295,59 @@ class TestDeploymentConsistency:
         issues = check_deployment_consistency(JasilSettings(web_workers=4))
 
         assert any("events_uri resolves to process-local memory" in issue for issue in issues)
+
+    def test_multiple_workers_on_in_process_realtime_are_refused(self):
+        """A hint published by one process would never reach the one holding the connection."""
+        issues = check_deployment_consistency(
+            JasilSettings(
+                web_workers=4,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                lock_uri="postgres-advisory://",
+                realtime_uri="memory://",
+            )
+        )
+
+        assert len(issues) == 1
+        assert "realtime_uri resolves to process-local memory" in issues[0]
+
+    @pytest.mark.parametrize(
+        "topology_settings",
+        [
+            pytest.param({"profile": DeploymentProfile.DISTRIBUTED, "storage_uri": "s3://b"}, id="distributed"),
+            pytest.param({"web_workers": 4}, id="web-workers"),
+            pytest.param({"job_worker_mode": STANDALONE, "jobs": JobSettings(enabled=True)}, id="standalone"),
+        ],
+    )
+    def test_every_multi_process_topology_refuses_in_process_realtime(self, topology_settings):
+        settings = JasilSettings(
+            state_uri="redis://c:6379/0",
+            events_uri="redis://c:6379/1",
+            lock_uri="postgres-advisory://",
+            realtime_uri="memory://",
+            **topology_settings,
+        )
+
+        assert [issue for issue in check_deployment_consistency(settings) if "realtime_uri" in issue]
+
+    @pytest.mark.parametrize("uri", ["redis://c:6379/2", "rediss://c:6379/2", "unix:///run/redis.sock"])
+    def test_multiple_workers_on_redis_realtime_are_accepted(self, uri):
+        settings = JasilSettings(
+            web_workers=4,
+            state_uri="redis://c:6379/0",
+            events_uri="redis://c:6379/1",
+            lock_uri="postgres-advisory://",
+            realtime_uri=uri,
+        )
+
+        assert check_deployment_consistency(settings) == []
+
+    def test_an_unset_realtime_uri_is_judged_through_the_event_bus(self):
+        """It *is* the events URI, so the refusal names the setting the operator wrote."""
+        issues = check_deployment_consistency(JasilSettings(web_workers=4))
+
+        assert any("events_uri" in issue for issue in issues)
+        assert not any("realtime_uri" in issue for issue in issues)
 
     def test_multiple_workers_on_memory_mail_are_refused(self):
         """Each process would keep its own outbox and nothing would be delivered."""

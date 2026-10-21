@@ -8,6 +8,7 @@ Public (pure) surface — safe to import anywhere; pulls in no backends:
         - ``StateProvider`` / ``EventBusProvider`` / ``LockProvider`` /
             ``ClockProvider`` - the other capability providers.
         - ``MailProvider`` / ``MailMessage`` and its ``MailError`` family.
+        - ``RealtimeProvider`` - cross-process, best-effort per-user hints.
 
 The composition root (``Platform`` / ``build_platform``) lives in
 ``jasil.container`` and is imported explicitly where the platform is
@@ -30,6 +31,7 @@ from jasil.providers import (
     MailProvider,
     ObjectStat,
     PartRef,
+    RealtimeProvider,
     ResumableUploads,
     ServeFile,
     ServePlan,
@@ -69,6 +71,7 @@ __all__ = [
     "MailProvider",
     "ObjectStat",
     "PartRef",
+    "RealtimeProvider",
     "ResumableUploads",
     "ServeFile",
     "ServePlan",

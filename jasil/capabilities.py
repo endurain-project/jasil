@@ -1,6 +1,7 @@
 """Startup capability report and deployment-consistency checks.
 
-Renders how each infrastructure capability (state, storage, events, lock, mail, clock)
+Renders how each infrastructure capability (state, storage, events, realtime, lock,
+mail, clock)
 is wired for a human-readable startup log, and detects fatal inconsistencies — a
 deployment that *requires* a shared backend but resolves one to a process- or
 node-local implementation.
@@ -16,10 +17,12 @@ change here.
 Five consistency rules are enforced:
 
 - **Cross-process backends** — ephemeral *state* (rate limiting, throttling,
-  single-use tokens) and the *event* bus — must not resolve to process-local
-  memory when the topology is multi-process; the stores and the bus would
-  diverge silently across processes. Both share the ``memory://`` / ``redis://``
-  vocabulary and are validated by :func:`check_state_consistency`.
+  single-use tokens), the *event* bus and the *realtime* hint channel — must not
+  resolve to process-local memory when the topology is multi-process; the stores
+  and the bus would diverge silently across processes, and a hint published by
+  one process (a job worker, another replica) would never reach the process
+  holding the user's connection. All three share the ``memory://`` /
+  ``redis://`` vocabulary and are validated by :func:`check_state_consistency`.
 - **Cross-node storage** must not resolve to the local filesystem when the
   topology is multi-node (the ``distributed`` profile), where replicas run on
   separate nodes with no shared disk. Several processes of a *local* deployment
@@ -90,7 +93,7 @@ class CapabilityRow:
     """One line of the capability report.
 
     Attributes:
-        name: Capability name (state / storage / events / lock / mail / clock).
+        name: Capability name (state / storage / events / realtime / lock / mail / clock).
         backend: The resolved backend (e.g. ``memory``, ``local``, ``system``).
         source: Where the value came from (setting name or ``profile default``).
     """
@@ -171,6 +174,11 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
         CapabilityRow(
             "events", _scheme_of(settings.resolved_events_uri), _source_of(settings.events_uri, "events_uri")
         ),
+        CapabilityRow(
+            "realtime",
+            _scheme_of(settings.resolved_realtime_uri),
+            "realtime_uri" if settings.realtime_uri else "follows events_uri",
+        ),
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
         CapabilityRow(
             "mail",
@@ -224,6 +232,11 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
             state_sources=(
                 StateSource(label="state_uri", uri=settings.resolved_state_uri),
                 StateSource(label="events_uri", uri=settings.resolved_events_uri),
+                # Unset, it *is* the events URI, already checked above: flagging
+                # it again would name a setting the operator never wrote.
+                StateSource(
+                    label="realtime_uri", uri=settings.resolved_realtime_uri, applies=bool(settings.realtime_uri)
+                ),
             ),
         ),
         *check_storage_consistency(
@@ -258,13 +271,15 @@ def check_state_consistency(
     A multi-process deployment that resolves a cross-process backend to
     process-local memory is fatally misconfigured: ephemeral state (rate-limit
     counters, lockout gates, single-use tokens) and the in-process event bus
-    would silently diverge across processes. State stores and the event bus share
-    the ``memory://`` / ``redis://`` vocabulary, so both are validated here.
+    would silently diverge across processes, and in-process realtime hints would
+    never leave the process that published them. State stores, the event bus and
+    the realtime channel share the ``memory://`` / ``redis://`` vocabulary, so all
+    three are validated here.
 
     Args:
         topology: The deployment topology.
         state_sources: The active cross-process backends to validate (the
-            resolved state and event-bus URIs).
+            resolved state, event-bus and realtime URIs).
 
     Returns:
         Human-readable issue messages; empty when consistent. The ``custom``

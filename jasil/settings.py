@@ -23,10 +23,11 @@ Every component reads the installed settings through :func:`get_settings`.
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
 
-**Profile defaults.** The four capability URIs may be left unset, in which case
+**Profile defaults.** The capability URIs may be left unset, in which case
 the deployment profile supplies the default: ``local`` resolves to the
 single-process backends, while ``distributed`` and ``custom`` refuse to guess and
-raise, because a Redis host or bucket name cannot be inferred.
+raise, because a Redis host or bucket name cannot be inferred. The one exception
+is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 """
 
 from dataclasses import dataclass, field
@@ -226,6 +227,14 @@ class JasilSettings:
         storage_uri: ``local://`` or ``s3://``.
         events_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``.
         lock_uri: ``noop://`` or ``postgres-advisory://``.
+        realtime_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``
+            — the channel that carries per-user realtime hints to every process
+            (see :class:`~jasil.providers.RealtimeProvider`). Unset, it follows
+            the resolved ``events_uri`` in every profile — ``memory://`` under
+            the ``local`` defaults, the event bus's Redis otherwise — because
+            both need the same reach across processes, and a deployment
+            upgrading from a release without this setting must keep building.
+            Set it to put hints on a different Redis.
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
         geocoding: Reverse-geocoding backend configuration.
@@ -242,6 +251,7 @@ class JasilSettings:
     storage_uri: str | None = None
     events_uri: str | None = None
     lock_uri: str | None = None
+    realtime_uri: str | None = None
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
@@ -283,6 +293,15 @@ class JasilSettings:
     def resolved_lock_uri(self) -> str:
         """The effective lock-backend URI."""
         return self._resolve("lock_uri")
+
+    @property
+    def resolved_realtime_uri(self) -> str:
+        """The effective realtime-hint URI: ``realtime_uri``, else the resolved ``events_uri``.
+
+        Raises:
+            ValueError: When both are unset and the profile has no default.
+        """
+        return self.realtime_uri or self.resolved_events_uri
 
 
 _settings: ConfigSlot[JasilSettings] = ConfigSlot(default_factory=JasilSettings)

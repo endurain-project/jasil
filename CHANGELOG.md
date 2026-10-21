@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.7.0] - Unreleased
+
+### Added
+
+- **Realtime hint capability.** `RealtimeProvider` (`notify_user(user_id, hint)`, `subscribe(handler)`, `start()`, `stop()`) carries a small per-user "something changed, refetch" hint to every process of the deployment, so a host can push to a browser connection held by any replica, including from a standalone job worker that holds no connections. The host keeps the WebSocket/SSE endpoint, auth and connection registry. Delivery is best-effort, at-most-once and unordered: a hint is a latency optimisation, never the record. Transport failures never raise from `notify_user`; a hint that is not a JSON-serialisable `dict`, a non-`int` `user_id`, or an envelope over 4096 bytes raises `ValueError`. Exported from `jasil`.
+- **Realtime backends.** `InProcessRealtime` (`memory://`) delivers inline on the caller's thread. `RedisRealtime` (`redis://`, `rediss://`, `unix://`, the `redis` extra) uses Pub/Sub on one channel (`jasil:realtime`), not the event bus's consumer group, so every started process receives every hint. Its subscriber runs on a daemon thread with a dedicated connection, reconnects with capped exponential backoff and jitter, and PINGs an idle subscription to replace a silently dead one. The wire envelope is `{"v": 1, "user_id": ..., "hint": {...}}`; unknown versions and malformed payloads are logged and ignored. The Redis module is imported only when `realtime_uri` selects Redis.
+- **`JasilSettings.realtime_uri`** and `resolved_realtime_uri`. Unset, it follows the resolved `events_uri` in every profile (`memory://` under the `local` defaults), so no existing deployment needs a new setting.
+- **`Platform.realtime`**, defaulting to `InProcessRealtime()` so a hand-built `Platform` need not supply it. `Platform.close()` (and so `jasil.lifecycle.shutdown()`) stops it and never raises. `jasil.deps.get_realtime` exposes it to routes, and the startup capability report gains a `realtime` row.
+- **Testing helpers.** `jasil.testing.capture_hints(platform)` returns a list collecting every hint published afterwards. `install_test_platform` defaults an unset `realtime_uri` to `memory://` (unless that would fail an enforced multi-process build), and `reset_all` clears the handlers of the active in-process provider.
+
+### Changed
+
+- The cross-process consistency rule now also covers an explicit `realtime_uri`: `memory://` in a multi-process deployment (`profile=distributed`, `web_workers > 1`, or `job_worker_mode=standalone`) fails the build, or warns with `enforce_deployment_consistency=False`. An unset `realtime_uri` is judged as `events_uri`, which it follows.
+
 ## [0.6.1] - 2026-10-18
 
 ### Changed
@@ -228,6 +242,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.7.0]: https://github.com/endurain-project/jasil/releases/tag/v0.7.0
 [0.6.0]: https://github.com/endurain-project/jasil/releases/tag/v0.6.0
 [0.5.1]: https://github.com/endurain-project/jasil/releases/tag/v0.5.1
 [0.5.0]: https://github.com/endurain-project/jasil/releases/tag/v0.5.0

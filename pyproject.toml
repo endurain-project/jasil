@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.6.1"
+version = "0.7.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -38,7 +38,7 @@ Security = "https://github.com/endurain-project/jasil/blob/main/SECURITY.md"
 # root imports each backend lazily, so an unselected backend's dependency is
 # never loaded.
 [project.optional-dependencies]
-# Distributed state store and Redis-Streams event bus.
+# Distributed state store, Redis-Streams event bus and Pub/Sub realtime hints.
 redis = [
     "redis>=8.1.0",
 ]
