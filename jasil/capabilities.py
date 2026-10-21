@@ -177,7 +177,9 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
         CapabilityRow(
             "realtime",
             _scheme_of(settings.resolved_realtime_uri),
-            "realtime_uri" if settings.realtime_uri else "follows events_uri",
+            "realtime_uri"
+            if settings.realtime_uri
+            else f"follows events_uri ({_source_of(settings.events_uri, 'events_uri')})",
         ),
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
         CapabilityRow(

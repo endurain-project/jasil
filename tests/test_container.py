@@ -224,6 +224,23 @@ class TestRealtimeResolution:
 
         assert isinstance(platform.realtime, InProcessRealtime)
 
+    def test_the_configured_channel_reaches_the_redis_backend(self):
+        realtime = container._build_realtime(
+            _settings(realtime_uri="redis://c:6379/1", realtime_channel="tenant-a:realtime")
+        )
+
+        assert isinstance(realtime, RedisRealtime)
+        assert realtime._channel == "tenant-a:realtime"
+
+    def test_a_failed_build_releases_the_shared_clients(self, tmp_path, monkeypatch):
+        closed = []
+        monkeypatch.setattr(container.redis_clients, "close_shared_clients", lambda: closed.append(True))
+
+        with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
+            container.build_platform(_settings(data_dir=str(tmp_path), realtime_uri="nats://bus"))
+
+        assert closed == [True]
+
     def test_close_stops_the_provider(self, tmp_path, monkeypatch):
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
         stopped = []
@@ -232,19 +249,6 @@ class TestRealtimeResolution:
         platform.close()
 
         assert stopped == [True]
-
-    def test_close_survives_a_provider_that_fails_to_stop(self, tmp_path, caplog, monkeypatch):
-        platform = container.build_platform(_settings(data_dir=str(tmp_path)))
-
-        def broken():
-            raise RuntimeError("wedged")
-
-        monkeypatch.setattr(platform.realtime, "stop", broken)
-
-        with caplog.at_level(logging.WARNING):
-            platform.close()
-
-        assert "Failed to stop the realtime provider" in caplog.text
 
     def test_close_joins_a_started_redis_subscriber(self, tmp_path):
         server = fakeredis.FakeServer()

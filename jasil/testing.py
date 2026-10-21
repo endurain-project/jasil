@@ -82,6 +82,15 @@ class FixedClock:
         self.moment += timedelta(seconds=seconds)
 
 
+def _prefer_memory(
+    configured: jasil_settings.JasilSettings,
+    memory: jasil_settings.JasilSettings,
+    refused: object,
+) -> jasil_settings.JasilSettings:
+    """Pick the ``memory://`` variant, unless the consistency check refuses it under enforcement."""
+    return memory if not refused or not memory.enforce_deployment_consistency else configured
+
+
 def install_test_platform(
     data_dir: str | Path,
     *,
@@ -121,22 +130,26 @@ def install_test_platform(
         # An unset realtime URI follows the event bus, which may be (fake)
         # Redis; a test wants hints delivered inline and capturable instead.
         inline = replace(configured, realtime_uri="memory://")
-        refused = capabilities.check_state_consistency(
-            topology=capabilities.topology_of(inline),
-            state_sources=(capabilities.StateSource(label="realtime_uri", uri="memory://"),),
+        configured = _prefer_memory(
+            configured,
+            inline,
+            capabilities.check_state_consistency(
+                topology=capabilities.topology_of(inline),
+                state_sources=(capabilities.StateSource(label="realtime_uri", uri="memory://"),),
+            ),
         )
-        if not refused or not inline.enforce_deployment_consistency:
-            configured = inline
     if not configured.mail.uri:
         # Unconfigured mail would raise on every send; a test wants it recorded.
         recording = replace(configured, mail=replace(configured.mail, uri="memory://", secure=True))
-        refused = capabilities.check_mail_consistency(
-            topology=capabilities.topology_of(recording),
-            mail_uri=recording.mail.uri,
-            mail_label="mail.uri",
+        configured = _prefer_memory(
+            configured,
+            recording,
+            capabilities.check_mail_consistency(
+                topology=capabilities.topology_of(recording),
+                mail_uri=recording.mail.uri,
+                mail_label="mail.uri",
+            ),
         )
-        if not refused or not recording.enforce_deployment_consistency:
-            configured = recording
     jasil_settings.configure(configured)
     platform = build_platform(configured, clock=clock or FixedClock())
     platform_runtime.set_active_platform(platform)

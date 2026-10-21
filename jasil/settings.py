@@ -235,6 +235,10 @@ class JasilSettings:
             both need the same reach across processes, and a deployment
             upgrading from a release without this setting must keep building.
             Set it to put hints on a different Redis.
+        realtime_channel: The Redis Pub/Sub channel carrying realtime hints.
+            Pub/Sub channels are server-wide — the database number in the URI
+            does not separate them — so two deployments sharing one Redis server
+            must use different channels. Ignored for ``memory://``.
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
         geocoding: Reverse-geocoding backend configuration.
@@ -252,6 +256,7 @@ class JasilSettings:
     events_uri: str | None = None
     lock_uri: str | None = None
     realtime_uri: str | None = None
+    realtime_channel: str = "jasil:realtime"
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)

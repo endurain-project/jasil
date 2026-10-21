@@ -479,7 +479,7 @@ platform.realtime.notify_user(user.id, {"kind": "activity.imported", "id": activ
 | Backend | URI | Notes |
 |---|---|---|
 | `InProcessRealtime` | `memory://` | `notify_user` calls the handlers inline on the caller's thread. `start` / `stop` are no-ops. |
-| `RedisRealtime` | `redis://`, `rediss://`, `unix://` | Redis Pub/Sub on one channel (`jasil:realtime`). Every started process receives every hint. |
+| `RedisRealtime` | `redis://`, `rediss://`, `unix://` | Redis Pub/Sub on one channel (`realtime_channel`, default `jasil:realtime`; server-wide, so unique per deployment). Every started process receives every hint. |
 
 `realtime_uri` follows `events_uri` when unset, so an existing deployment needs
 no new setting.

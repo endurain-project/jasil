@@ -232,7 +232,7 @@ class TestCapabilityReport:
     def test_realtime_is_reported_as_following_the_event_bus_when_unset(self, report):
         row = next(row for row in report.rows if row.name == "realtime")
 
-        assert (row.backend, row.source) == ("memory", "follows events_uri")
+        assert (row.backend, row.source) == ("memory", "follows events_uri (profile default)")
 
     def test_an_explicit_realtime_uri_is_reported(self):
         settings = JasilSettings(realtime_uri="redis://hints:6379/0")

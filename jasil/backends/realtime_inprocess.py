@@ -1,8 +1,6 @@
 """In-process (synchronous) ``RealtimeProvider`` backend."""
 
-import json
 import logging
-import threading
 from collections.abc import Callable
 
 import jasil._core.realtime_envelope as realtime_envelope
@@ -27,8 +25,7 @@ class InProcessRealtime:
 
     def __init__(self, *, max_bytes: int = realtime_envelope.DEFAULT_MAX_ENVELOPE_BYTES) -> None:
         self._max_bytes = max_bytes
-        self._lock = threading.Lock()
-        self._handlers: tuple[Callable[[int, dict], None], ...] = ()
+        self._handlers = realtime_envelope.HintHandlers()
 
     def notify_user(self, user_id: int, hint: dict) -> None:
         """Validate the hint, then deliver it to every handler on this thread.
@@ -37,21 +34,16 @@ class InProcessRealtime:
             ValueError: When the hint is invalid (see
                 :class:`~jasil.providers.RealtimeProvider`).
         """
-        delivered = json.loads(realtime_envelope.encode(user_id, hint, max_bytes=self._max_bytes))["hint"]
-        for handler in self._handlers:
-            try:
-                handler(user_id, delivered)
-            except Exception as error:  # one handler must not stop the rest, nor the publisher
-                logger.error("Realtime hint handler %r failed", handler, exc_info=error)
+        decoded = realtime_envelope.decode(realtime_envelope.encode(user_id, hint, max_bytes=self._max_bytes))
+        if decoded is not None:
+            self._handlers.deliver(*decoded)
 
     def subscribe(self, handler: Callable[[int, dict], None]) -> None:
-        with self._lock:
-            self._handlers = (*self._handlers, handler)
+        self._handlers.add(handler)
 
     def clear(self) -> None:
         """Drop every registered handler (for test isolation)."""
-        with self._lock:
-            self._handlers = ()
+        self._handlers.clear()
 
     def start(self) -> None:
         """No-op — in-process delivery needs no subscriber."""

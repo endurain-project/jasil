@@ -93,11 +93,13 @@ class RedisRealtime:
         self._reconnect_max = reconnect_max_seconds
         self._keepalive = keepalive_seconds
         self._lock = threading.Lock()
-        self._handlers: tuple[Callable[[int, dict], None], ...] = ()
+        self._handlers = realtime_envelope.HintHandlers()
         self._thread: threading.Thread | None = None
+        # Replaced on every start(), so a thread stop() gave up on keeps its own
+        # signalled event instead of being revived by the next start().
         self._stop = threading.Event()
-        # Set while a SUBSCRIBE is live; start() waits on it so a hint published
-        # right after start() returns is not lost to the subscribe race.
+        # Set while a SUBSCRIBE is confirmed; start() waits on it so a hint
+        # published right after start() returns is not lost to the subscribe race.
         self._subscribed = threading.Event()
 
     @classmethod
@@ -112,7 +114,11 @@ class RedisRealtime:
         client = redis_clients.get_shared_client(uri, purpose="realtime hints")
         return cls(
             client,
-            subscriber_factory=lambda: redis_clients.create_redis_client(uri, "realtime hint subscriber"),
+            # Raw bytes: another publisher on the server-wide channel may send
+            # non-UTF-8 data, which ``decode`` must reject, not the Redis client.
+            subscriber_factory=lambda: redis_clients.create_redis_client(
+                uri, "realtime hint subscriber", decode_responses=False
+            ),
             channel=channel,
             max_bytes=max_bytes,
         )
@@ -131,8 +137,7 @@ class RedisRealtime:
             logger.warning("Dropped a realtime hint for user %s: publish failed: %r", user_id, error)
 
     def subscribe(self, handler: Callable[[int, dict], None]) -> None:
-        with self._lock:
-            self._handlers = (*self._handlers, handler)
+        self._handlers.add(handler)
 
     def start(self) -> None:
         """Start the subscriber thread (idempotent).
@@ -144,19 +149,26 @@ class RedisRealtime:
         with self._lock:
             if self._thread is not None:
                 return
-            self._stop.clear()
-            self._subscribed.clear()
-            self._thread = threading.Thread(target=self._run, name="realtime-subscriber", daemon=True)
+            stop, subscribed = self._stop, self._subscribed = threading.Event(), threading.Event()
+            self._thread = threading.Thread(
+                target=self._run, args=(stop, subscribed), name="realtime-subscriber", daemon=True
+            )
             self._thread.start()
-        if not self._subscribed.wait(timeout=_START_WAIT_SECONDS):
+        if not subscribed.wait(timeout=_START_WAIT_SECONDS):
             logger.warning("Realtime subscriber is not connected yet; it keeps retrying in the background")
 
     def stop(self) -> None:
         """Signal the subscriber thread and wait briefly for it to finish (idempotent, never raises)."""
         with self._lock:
             thread, self._thread = self._thread, None
+            stop = self._stop
         try:
-            signal_and_join(thread, self._stop)
+            if thread is threading.current_thread():
+                # Called from a handler: joining oneself raises. The loop sees
+                # the event after the handler returns.
+                stop.set()
+            else:
+                signal_and_join(thread, stop)
         except Exception as error:  # pragma: no cover - shutdown must not raise
             logger.warning("Failed to stop the realtime subscriber: %r", error)
 
@@ -165,36 +177,47 @@ class RedisRealtime:
         delay = min(self._reconnect_max, self._reconnect_base * 2 ** min(failures, 32))
         return delay * 0.5 + random.uniform(0.0, delay * 0.5)  # noqa: S311 - jitter, not security
 
-    def _run(self) -> None:
+    def _run(self, stop: threading.Event, subscribed: threading.Event) -> None:
         failures = 0
-        while not self._stop.is_set():
+        while not stop.is_set():
             subscriber = pubsub = None
             failure: Exception | None = None
             try:
                 subscriber = self._subscriber_factory()
-                pubsub = subscriber.pubsub(ignore_subscribe_messages=True)
+                pubsub = subscriber.pubsub(ignore_subscribe_messages=False)
                 pubsub.subscribe(self._channel)
-                self._subscribed.set()
+                self._await_subscribed(pubsub, stop)
+                subscribed.set()
                 if failures:
                     logger.info("Realtime subscriber reconnected after %d failed attempt(s)", failures)
                 failures = 0
-                self._listen(pubsub)
+                self._listen(pubsub, stop)
             except Exception as error:  # the thread must survive any connection failure
                 failure = error
             finally:
-                self._subscribed.clear()
+                subscribed.clear()
                 # Released before the backoff, not held open through it.
                 self._close(pubsub, subscriber)
             if failure is not None:
                 delay = self._reconnect_delay(failures)
                 failures += 1
                 logger.warning("Realtime subscriber disconnected (%r); reconnecting in %.1fs", failure, delay)
-                self._stop.wait(timeout=delay)
+                stop.wait(timeout=delay)
 
-    def _listen(self, pubsub: Any) -> None:
+    def _await_subscribed(self, pubsub: Any, stop: threading.Event) -> None:
+        """Block until Redis confirms the SUBSCRIBE, so no hint published afterwards is missed."""
+        deadline = time.monotonic() + _START_WAIT_SECONDS
+        while not stop.is_set():
+            message = pubsub.get_message(timeout=_POLL_TIMEOUT_SECONDS)
+            if message is not None and message.get("type") == "subscribe":
+                return
+            if time.monotonic() >= deadline:
+                raise ConnectionError("Redis did not confirm the realtime subscription")
+
+    def _listen(self, pubsub: Any, stop: threading.Event) -> None:
         """Read and deliver until stopped; raise when the connection fails or goes silent."""
         last_received = last_ping = time.monotonic()
-        while not self._stop.is_set():
+        while not stop.is_set():
             message = pubsub.get_message(timeout=_POLL_TIMEOUT_SECONDS)
             now = time.monotonic()
             if message is not None:
@@ -221,9 +244,4 @@ class RedisRealtime:
         decoded = realtime_envelope.decode(data)
         if decoded is None:
             return
-        user_id, hint = decoded
-        for handler in self._handlers:
-            try:
-                handler(user_id, hint)
-            except Exception as error:  # a handler must not kill the subscriber thread
-                logger.error("Realtime hint handler %r failed", handler, exc_info=error)
+        self._handlers.deliver(*decoded)

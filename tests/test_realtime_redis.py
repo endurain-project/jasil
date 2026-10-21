@@ -217,6 +217,54 @@ class TestReceive:
 
 
 class TestLifecycle:
+    def test_a_restart_does_not_revive_a_thread_stop_gave_up_on(self, make_realtime, monkeypatch):
+        realtime = make_realtime()
+        realtime.start()
+        old_thread, old_stop = realtime._thread, realtime._stop
+        monkeypatch.setattr(realtime_redis, "signal_and_join", lambda thread, stop: stop.set())
+        realtime.stop()
+        monkeypatch.undo()
+
+        realtime.start()
+
+        assert old_stop.is_set()
+        assert realtime._stop is not old_stop
+        old_thread.join(timeout=DEADLINE_SECONDS)
+        assert not old_thread.is_alive()
+
+    def test_stop_from_a_handler_does_not_join_itself(self, make_realtime, caplog):
+        realtime = make_realtime()
+        stopped = threading.Event()
+        realtime.subscribe(lambda user_id, hint: (realtime.stop(), stopped.set()))
+        realtime.start()
+
+        with caplog.at_level(logging.WARNING):
+            realtime.notify_user(7, {})
+            assert stopped.wait(timeout=DEADLINE_SECONDS)
+        assert "Failed to stop" not in caplog.text
+
+    def test_start_returns_only_once_redis_confirmed_the_subscription(self, server, make_realtime):
+        realtime = make_realtime()
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+
+        realtime.start()
+        _publish_raw(server, b'{"v":1,"user_id":1,"hint":{}}')
+
+        assert inbox.wait_for(1) == [(1, {})]
+
+    def test_a_non_utf8_payload_does_not_drop_the_subscription(self, server, make_realtime, caplog):
+        realtime = make_realtime(subscriber_factory=lambda: fakeredis.FakeStrictRedis(server=server))
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+        realtime.start()
+
+        with caplog.at_level(logging.WARNING):
+            _publish_raw(server, b"\xff\xfe")
+            realtime.notify_user(7, {"ok": True})
+            assert inbox.wait_for(1) == [(7, {"ok": True})]
+        assert "disconnected" not in caplog.text
+
     def test_start_is_idempotent(self, make_realtime):
         realtime = make_realtime()
         realtime.start()
@@ -298,13 +346,23 @@ class TestReconnect:
         assert "Realtime subscriber disconnected" in caplog.text
         assert "reconnected after" in caplog.text
 
-    def test_a_silent_connection_is_pinged_then_torn_down(self, make_realtime, caplog):
+    def test_a_silent_connection_is_pinged_then_torn_down(self, server, make_realtime, caplog):
         """A half-open connection delivers nothing, so silence itself must trigger a reconnect.
 
-        fakeredis does not answer a PING in Pub/Sub mode, which is exactly the
-        silence a dead connection produces.
+        The PING is swallowed here, which is exactly the silence a dead
+        connection produces; a live one answers with a PONG.
         """
-        realtime = make_realtime(keepalive_seconds=0.05)
+
+        class Silent(fakeredis.FakeStrictRedis):
+            def pubsub(self, **kwargs):
+                pubsub = super().pubsub(**kwargs)
+                pubsub.ping = lambda *args, **kw: None
+                return pubsub
+
+        realtime = make_realtime(
+            keepalive_seconds=0.05,
+            subscriber_factory=lambda: Silent(server=server, decode_responses=True),
+        )
         realtime.start()
 
         with caplog.at_level(logging.WARNING):
@@ -361,14 +419,15 @@ class TestFromUri:
         monkeypatch.setattr(
             redis_clients,
             "create_redis_client",
-            lambda uri, purpose, **kwargs: dedicated.append((uri, purpose)) or fakeredis.FakeStrictRedis(),
+            lambda uri, purpose, **kwargs: dedicated.append((uri, purpose, kwargs)) or fakeredis.FakeStrictRedis(),
         )
 
         realtime = RedisRealtime.from_uri("redis://cache:6379/0")
         client = realtime._subscriber_factory()
 
         assert client is not shared
-        assert dedicated == [("redis://cache:6379/0", "realtime hint subscriber")]
+        # Raw bytes, so a foreign payload on the server-wide channel cannot raise in the client.
+        assert dedicated == [("redis://cache:6379/0", "realtime hint subscriber", {"decode_responses": False})]
 
     def test_an_unreachable_server_fails_eagerly(self):
         redis_clients.reset_shared_clients()

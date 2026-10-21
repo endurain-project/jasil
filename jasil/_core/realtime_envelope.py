@@ -13,9 +13,11 @@ under this process's control.
 
 import json
 import logging
+import threading
+from collections.abc import Callable
 from typing import Any, TypeGuard
 
-__all__ = ["DEFAULT_MAX_ENVELOPE_BYTES", "ENVELOPE_VERSION", "decode", "encode"]
+__all__ = ["DEFAULT_MAX_ENVELOPE_BYTES", "ENVELOPE_VERSION", "HintHandlers", "decode", "encode"]
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +91,33 @@ def decode(raw: str | bytes) -> tuple[int, dict[str, Any]] | None:
         logger.warning("Ignoring a malformed realtime hint envelope")
         return None
     return user_id, hint
+
+
+class HintHandlers:
+    """The handler registry and fan-out both backends share.
+
+    Registration is copy-on-write under a lock, so :meth:`deliver` iterates a
+    stable snapshot without holding it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._handlers: tuple[Callable[[int, dict], None], ...] = ()
+
+    def add(self, handler: Callable[[int, dict], None]) -> None:
+        """Register ``handler``."""
+        with self._lock:
+            self._handlers = (*self._handlers, handler)
+
+    def clear(self) -> None:
+        """Drop every handler."""
+        with self._lock:
+            self._handlers = ()
+
+    def deliver(self, user_id: int, hint: dict) -> None:
+        """Call every handler; one that raises is logged and the rest still run."""
+        for handler in self._handlers:
+            try:
+                handler(user_id, hint)
+            except Exception as error:  # one handler must not stop the rest, nor the caller
+                logger.error("Realtime hint handler %r failed", handler, exc_info=error)

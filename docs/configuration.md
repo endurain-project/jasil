@@ -45,6 +45,7 @@ fields.
 | `events_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
 | `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
+| `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |

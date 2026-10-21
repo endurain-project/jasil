@@ -120,10 +120,7 @@ class Platform:
             self.events.stop()
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
-        try:
-            self.realtime.stop()
-        except Exception as error:
-            logger.warning("Failed to stop the realtime provider during shutdown: %r", error)
+        self.realtime.stop()  # the provider contract: never raises
         redis_clients.close_shared_clients()
 
 
@@ -160,18 +157,24 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_mail(settings, clock)
-    return Platform(
-        profile=profile,
-        state=_build_state(settings),
-        storage=_build_storage(settings),
-        events=_build_events(settings, recorder),
-        lock=_build_lock(settings),
-        clock=clock,
-        geocoding=_build_geocoding(settings),
-        mail=mail,
-        recorder=recorder,
-        realtime=_build_realtime(settings),
-    )
+    try:
+        return Platform(
+            profile=profile,
+            state=_build_state(settings),
+            storage=_build_storage(settings),
+            events=_build_events(settings, recorder),
+            lock=_build_lock(settings),
+            clock=clock,
+            geocoding=_build_geocoding(settings),
+            mail=mail,
+            recorder=recorder,
+            realtime=_build_realtime(settings),
+        )
+    except Exception:
+        # No Platform exists to close, so release the Redis clients a backend
+        # that did build has already opened.
+        redis_clients.close_shared_clients()
+        raise
 
 
 def _check_deployment_consistency(settings: JasilSettings) -> None:
@@ -241,7 +244,7 @@ def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
         # ``local`` deployment then never loads the module at all.
         from jasil.backends.realtime_redis import RedisRealtime
 
-        return RedisRealtime.from_uri(realtime_uri)
+        return RedisRealtime.from_uri(realtime_uri, channel=settings.realtime_channel)
     raise ValueError(f"Unsupported realtime_uri scheme: {scheme or realtime_uri!r}")
 
 
