@@ -120,9 +120,9 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
         logger.warning("Ignoring a realtime hint whose envelope is not an object")
         return None
     version = envelope.get("v")
-    if version == ENVELOPE_VERSION:
+    if type(version) is int and version == ENVELOPE_VERSION:
         key = envelope.get("key")
-    elif version == LEGACY_ENVELOPE_VERSION:
+    elif type(version) is int and version == LEGACY_ENVELOPE_VERSION:
         user_id = envelope.get("user_id")
         # ``bool`` is an ``int`` subclass; ``True`` was never a user id.
         key = str(user_id) if isinstance(user_id, int) and not isinstance(user_id, bool) else None

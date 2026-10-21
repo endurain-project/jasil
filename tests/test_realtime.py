@@ -155,9 +155,9 @@ class TestEnvelope:
     def test_the_key_cap_is_the_public_constant(self):
         assert realtime_envelope.MAX_KEY_LENGTH == MAX_REALTIME_KEY_LENGTH == 256
 
-    @pytest.mark.parametrize("version", [0, 3, "1", "2", None])
+    @pytest.mark.parametrize("version", [0, 3, "1", "2", None, True, False, 1.0, 2.0])
     def test_an_unknown_version_decodes_to_nothing(self, version, caplog):
-        raw = json.dumps({"v": version, "key": "7", "hint": {}})
+        raw = json.dumps({"v": version, "key": "7", "user_id": 7, "hint": {}})
 
         with caplog.at_level(logging.WARNING):
             assert realtime_envelope.decode(raw) is None
