@@ -91,6 +91,12 @@ class TestEnvelope:
             assert realtime_envelope.decode(b'{"v":2,"key":"k","hint":{"x":["\\ud800"]}}') is None
         assert "Ignoring" in caplog.text
 
+    @pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+    def test_a_non_finite_number_in_the_hint_decodes_to_nothing(self, value, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert realtime_envelope.decode(('{"v":2,"key":"k","hint":{"x":%s}}' % value).encode()) is None
+        assert "Ignoring" in caplog.text
+
     def test_the_key_cap_is_256_and_the_version_is_2(self):
         assert realtime_envelope.MAX_KEY_LENGTH == 256
         assert realtime_envelope.ENVELOPE_VERSION == 2

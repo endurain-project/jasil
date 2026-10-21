@@ -115,10 +115,11 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
 
 def _encodes(hint: dict) -> bool:
     # JSON can carry an escaped unpaired surrogate (``"\ud800"``) that ``encode``
-    # would refuse; drop it here so no handler sees a hint no backend could send.
+    # would refuse, and ``NaN`` / ``Infinity`` parse but ``encode`` rejects them;
+    # drop both here so no handler sees a hint no backend could send.
     try:
-        json.dumps(hint, ensure_ascii=False).encode()
-    except UnicodeEncodeError:
+        json.dumps(hint, ensure_ascii=False, allow_nan=False).encode()
+    except (UnicodeEncodeError, ValueError):
         return False
     return True
 
