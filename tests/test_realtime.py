@@ -73,6 +73,15 @@ class TestEnvelope:
         with pytest.raises(ValueError, match="256-character cap"):
             realtime_envelope.encode(at_cap + "k", {})
 
+    def test_a_key_with_an_unpaired_surrogate_is_refused(self):
+        with pytest.raises(ValueError, match="unpaired Unicode surrogate"):
+            realtime_envelope.encode("\ud800", {})
+
+    def test_an_escaped_surrogate_key_decodes_to_nothing(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert realtime_envelope.decode(b'{"v":2,"key":"\\ud800","hint":{}}') is None
+        assert "Ignoring" in caplog.text
+
     def test_the_key_cap_is_256_and_the_version_is_2(self):
         assert realtime_envelope.MAX_KEY_LENGTH == 256
         assert realtime_envelope.ENVELOPE_VERSION == 2

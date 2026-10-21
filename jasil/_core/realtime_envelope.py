@@ -44,6 +44,10 @@ def _key_problem(key: object) -> str | None:
         return "key must not be empty"
     if len(key) > MAX_KEY_LENGTH:
         return f"key is {len(key)} characters, over the {MAX_KEY_LENGTH}-character cap"
+    try:
+        key.encode("utf-8")
+    except UnicodeEncodeError:
+        return "key contains an unpaired Unicode surrogate"
     return None
 
 
