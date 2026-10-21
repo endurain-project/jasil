@@ -474,6 +474,11 @@ class MailProvider(Protocol):
     def send(self, message: MailMessage) -> str: ...
 
 
+#: Cap on the length of a :class:`RealtimeProvider` hint key, in characters
+#: (code points, not bytes).
+MAX_REALTIME_KEY_LENGTH = 256
+
+
 @runtime_checkable
 class RealtimeProvider(Protocol):
     """Cross-process "something changed, refetch" hints addressed by an opaque key.
@@ -497,7 +502,8 @@ class RealtimeProvider(Protocol):
       down is logged and the hint dropped, so a request or job never fails
       because a push could not be sent.
     - **Programmer errors do raise** ``ValueError``: a ``key`` that is not a
-      ``str``, an empty ``key``, a ``key`` over 256 characters (code points, not
+      ``str``, an empty ``key``, a ``key`` over
+      :data:`MAX_REALTIME_KEY_LENGTH` (256) characters (code points, not
       bytes), a ``key`` or ``hint`` holding an unpaired Unicode surrogate, a
       ``hint`` that is not a JSON-serialisable ``dict``, or an envelope over the
       backend's size cap (4096 bytes by default). Every backend validates the

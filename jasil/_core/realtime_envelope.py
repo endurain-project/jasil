@@ -8,7 +8,11 @@ nothing leaves the process — so a hint that is not JSON, or is too large, fail
 in a local test exactly as it would against Redis, and the handler receives the
 same decoded value (tuples as lists, keys as strings) either way.
 
-Only version 2 is read or written; any other version is logged and ignored.
+Only version 2 is written. Version 1 (``{"v": 1, "user_id": <int>, "hint":
+{...}}``, JASIL 0.7) is still read, its ``user_id`` arriving as the key
+``str(user_id)``, so hints from 0.7 replicas still arrive during a rolling
+upgrade (0.7 ignores version 2, so the reverse direction is lost until the
+rollout finishes). Any other version is logged and ignored.
 
 Validation failures are programmer errors and raise ``ValueError``;
 :func:`decode` never raises, because what arrives on a shared channel is not
@@ -21,15 +25,29 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-__all__ = ["DEFAULT_MAX_ENVELOPE_BYTES", "ENVELOPE_VERSION", "MAX_KEY_LENGTH", "HintHandlers", "decode", "encode"]
+from jasil.providers import MAX_REALTIME_KEY_LENGTH
+
+__all__ = [
+    "DEFAULT_MAX_ENVELOPE_BYTES",
+    "ENVELOPE_VERSION",
+    "LEGACY_ENVELOPE_VERSION",
+    "MAX_KEY_LENGTH",
+    "HintHandlers",
+    "decode",
+    "encode",
+]
 
 logger = logging.getLogger(__name__)
 
-#: The only envelope version this build reads or writes.
+#: The envelope version this build writes.
 ENVELOPE_VERSION = 2
 
+#: The previous envelope version, still read so a rolling upgrade from 0.7 loses
+#: no hints. Drop it once no supported release writes it.
+LEGACY_ENVELOPE_VERSION = 1
+
 #: Cap on the length of a hint key, in characters (code points, not bytes).
-MAX_KEY_LENGTH = 256
+MAX_KEY_LENGTH = MAX_REALTIME_KEY_LENGTH
 
 #: Default cap on the serialised envelope, in bytes. A hint says *what* changed,
 #: not the data itself; anything near this size belongs in a refetch.
@@ -103,10 +121,16 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
         logger.warning("Ignoring a realtime hint whose envelope is not an object")
         return None
     version = envelope.get("v")
-    if version != ENVELOPE_VERSION:
+    if version == ENVELOPE_VERSION:
+        key = envelope.get("key")
+    elif version == LEGACY_ENVELOPE_VERSION:
+        user_id = envelope.get("user_id")
+        # ``bool`` is an ``int`` subclass; ``True`` was never a user id.
+        key = str(user_id) if isinstance(user_id, int) and not isinstance(user_id, bool) else None
+    else:
         logger.warning("Ignoring a realtime hint with unsupported envelope version %r", version)
         return None
-    key, hint = envelope.get("key"), envelope.get("hint")
+    hint = envelope.get("hint")
     if not isinstance(key, str) or _key_problem(key) is not None or not isinstance(hint, dict) or not _encodes(hint):
         logger.warning("Ignoring a malformed realtime hint envelope")
         return None

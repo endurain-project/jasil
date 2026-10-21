@@ -470,7 +470,7 @@ registry; JASIL only moves the hint between processes.
 The `key` names the hint's audience and is an opaque string: a user id, a device
 id, an organisation, a cache name. Its meaning belongs entirely to the host, and
 JASIL does no routing or filtering on it. It must be a non-empty `str` of at most
-256 characters (code points, not bytes) with no unpaired Unicode surrogate. The
+256 characters (`MAX_REALTIME_KEY_LENGTH`; code points, not bytes) with no unpaired Unicode surrogate. The
 key appears in the warning logged when a hint is dropped, so do not put a secret
 (a token, a session id) in it.
 

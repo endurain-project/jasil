@@ -14,7 +14,7 @@ import pytest
 
 import jasil._core.realtime_envelope as realtime_envelope
 from jasil.backends.realtime_inprocess import InProcessRealtime
-from jasil.providers import RealtimeProvider
+from jasil.providers import MAX_REALTIME_KEY_LENGTH, RealtimeProvider
 
 
 @pytest.fixture
@@ -130,7 +130,32 @@ class TestEnvelope:
             assert realtime_envelope.decode(raw) is None
         assert "Ignoring" in caplog.text
 
-    @pytest.mark.parametrize("version", [0, 1, 3, "2", None])
+    @pytest.mark.parametrize("user_id", [7, 0, -3])
+    def test_a_version_1_envelope_decodes_with_the_user_id_as_the_key(self, user_id):
+        raw = json.dumps({"v": 1, "user_id": user_id, "hint": {"a": 1}})
+
+        assert realtime_envelope.decode(raw) == (str(user_id), {"a": 1})
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b'{"v": 1, "user_id": "7", "hint": {}}',
+            b'{"v": 1, "user_id": true, "hint": {}}',
+            b'{"v": 1, "user_id": 7.0, "hint": {}}',
+            b'{"v": 1, "key": "7", "hint": {}}',
+            b'{"v": 1, "user_id": 7, "hint": []}',
+            b'{"v": 1, "user_id": 7, "hint": {"x": NaN}}',
+        ],
+    )
+    def test_a_malformed_version_1_envelope_decodes_to_nothing(self, raw, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert realtime_envelope.decode(raw) is None
+        assert "Ignoring a malformed" in caplog.text
+
+    def test_the_key_cap_is_the_public_constant(self):
+        assert realtime_envelope.MAX_KEY_LENGTH == MAX_REALTIME_KEY_LENGTH == 256
+
+    @pytest.mark.parametrize("version", [0, 3, "1", "2", None])
     def test_an_unknown_version_decodes_to_nothing(self, version, caplog):
         raw = json.dumps({"v": version, "key": "7", "hint": {}})
 

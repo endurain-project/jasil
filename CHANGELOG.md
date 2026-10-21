@@ -8,13 +8,17 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [0.8.0] - 2026-10-21
 
+### Added
+
+- `jasil.providers.MAX_REALTIME_KEY_LENGTH` (256), the cap `notify` enforces on a key.
+
 ### Changed
 
 - **BREAKING: the realtime hint channel is addressed by an opaque string key, not a user id.** `RealtimeProvider.notify_user(user_id: int, hint)` is now `notify(key: str, hint)`, and `subscribe` handlers are called as `handler(key: str, hint)`. The `key` names the audience (a user id, device id, organisation, cache name, ...); its meaning belongs to the host and JASIL does no per-key routing. There is no deprecated `notify_user` alias. A host that used integer user ids passes `str(user_id)` and parses it back in its handler.
-- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, is over 256 characters (`MAX_KEY_LENGTH`, counted in code points), or holds an unpaired Unicode surrogate, in addition to the existing hint and envelope-size checks. Both backends validate identically.
+- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, is over 256 characters (`MAX_REALTIME_KEY_LENGTH`, counted in code points), or holds an unpaired Unicode surrogate, in addition to the existing hint and envelope-size checks. Both backends validate identically.
 - A received envelope whose `key` or `hint` holds an unpaired Unicode surrogate (sent JSON-escaped), or whose `hint` holds `NaN` / infinity, is logged and dropped instead of reaching the handlers, so a subscriber never sees a hint that `notify` would have refused.
 - The `key` appears in the warning logged when a publish fails; do not put a secret in it.
-- **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`.
+- **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`. Version 1 envelopes from 0.7.0 replicas are still read, with `str(user_id)` as the key, so a rolling upgrade loses no hints in that direction; 0.7.0 replicas ignore version 2, so hints published by already-upgraded processes do not reach not-yet-upgraded ones until the rollout finishes.
 - `jasil.testing.capture_hints` returns `list[tuple[str, dict]]` of `(key, hint)`.
 
 ## [0.7.0] - 2026-10-21
