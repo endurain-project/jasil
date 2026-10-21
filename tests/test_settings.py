@@ -65,6 +65,7 @@ class TestCapabilityUriResolution:
         assert resolved.resolved_storage_uri == "local://"
         assert resolved.resolved_events_uri == "memory://"
         assert resolved.resolved_lock_uri == "noop://"
+        assert resolved.resolved_realtime_uri == "memory://"
 
     def test_an_explicit_uri_wins_over_the_profile_default(self):
         resolved = settings.JasilSettings(profile=DeploymentProfile.LOCAL, state_uri="redis://cache:6379/0")
@@ -94,6 +95,25 @@ class TestCapabilityUriResolution:
         assert resolved.resolved_storage_uri == "s3://bucket"
         assert resolved.resolved_events_uri == "redis://cache:6379/1"
         assert resolved.resolved_lock_uri == "postgres-advisory://"
+
+    @pytest.mark.parametrize("profile", list(DeploymentProfile))
+    def test_an_unset_realtime_uri_follows_the_event_bus(self, profile):
+        """A deployment configured before ``realtime_uri`` existed must keep building."""
+        resolved = settings.JasilSettings(profile=profile, events_uri="redis://cache:6379/1")
+
+        assert resolved.resolved_realtime_uri == "redis://cache:6379/1"
+
+    @pytest.mark.parametrize("profile", [DeploymentProfile.DISTRIBUTED, DeploymentProfile.CUSTOM])
+    def test_the_realtime_fallback_still_refuses_to_guess_without_events(self, profile):
+        with pytest.raises(ValueError, match="events_uri must be set explicitly"):
+            _ = settings.JasilSettings(profile=profile).resolved_realtime_uri
+
+    def test_an_explicit_realtime_uri_wins_over_the_fallback(self):
+        resolved = settings.JasilSettings(
+            profile=DeploymentProfile.DISTRIBUTED, events_uri="redis://cache:6379/1", realtime_uri="redis://hints:6379"
+        )
+
+        assert resolved.resolved_realtime_uri == "redis://hints:6379"
 
 
 class TestSettingsInstallation:

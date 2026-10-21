@@ -21,6 +21,8 @@ from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
+from jasil.backends.realtime_inprocess import InProcessRealtime
+from jasil.backends.realtime_redis import RedisRealtime
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -38,6 +40,14 @@ def fake_redis(monkeypatch):
     redis_clients.reset_shared_clients()
     yield
     redis_clients.reset_shared_clients()
+
+
+#: Every cross-process capability on shared backends, so a test isolates one more.
+SHARED_WIRING = {
+    "state_uri": "redis://cache:6379/0",
+    "events_uri": "redis://cache:6379/1",
+    "lock_uri": "postgres-advisory://",
+}
 
 
 def _settings(**kwargs) -> settings.JasilSettings:
@@ -194,6 +204,73 @@ class TestGeocodingResolution:
         assert provider._min_interval == 0
 
 
+class TestRealtimeResolution:
+    def test_memory_uri_selects_the_in_process_backend(self):
+        assert isinstance(container._build_realtime(_settings(realtime_uri="memory://")), InProcessRealtime)
+
+    @pytest.mark.parametrize("uri", ["redis://c:6379/0", "rediss://c:6379/0", "unix:///run/redis.sock"])
+    def test_every_redis_scheme_selects_the_pub_sub_backend(self, uri):
+        assert isinstance(container._build_realtime(_settings(realtime_uri=uri)), RedisRealtime)
+
+    def test_an_unset_uri_follows_the_event_bus(self):
+        assert isinstance(container._build_realtime(_settings(events_uri="redis://c:6379/1")), RedisRealtime)
+
+    def test_an_unknown_scheme_is_refused(self):
+        with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
+            container._build_realtime(_settings(realtime_uri="nats://bus"))
+
+    def test_a_local_platform_carries_the_in_process_backend(self, tmp_path):
+        platform = container.build_platform(_settings(data_dir=str(tmp_path)))
+
+        assert isinstance(platform.realtime, InProcessRealtime)
+
+    def test_the_configured_channel_reaches_the_redis_backend(self):
+        realtime = container._build_realtime(
+            _settings(realtime_uri="redis://c:6379/1", realtime_channel="tenant-a:realtime")
+        )
+
+        assert isinstance(realtime, RedisRealtime)
+        assert realtime._channel == "tenant-a:realtime"
+
+    def test_a_failed_build_releases_the_shared_clients(self, tmp_path, monkeypatch):
+        closed = []
+        monkeypatch.setattr(container.redis_clients, "close_shared_clients", lambda: closed.append(True))
+
+        with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
+            container.build_platform(_settings(data_dir=str(tmp_path), realtime_uri="nats://bus"))
+
+        assert closed == [True]
+
+    def test_close_stops_the_provider(self, tmp_path, monkeypatch):
+        platform = container.build_platform(_settings(data_dir=str(tmp_path)))
+        stopped = []
+        monkeypatch.setattr(platform.realtime, "stop", lambda: stopped.append(True))
+
+        platform.close()
+
+        assert stopped == [True]
+
+    def test_close_joins_a_started_redis_subscriber(self, tmp_path):
+        server = fakeredis.FakeServer()
+        realtime = RedisRealtime(fakeredis.FakeStrictRedis(server=server, decode_responses=True))
+        base = container.build_platform(_settings(data_dir=str(tmp_path)))
+        platform = container.Platform(
+            profile=base.profile,
+            state=base.state,
+            storage=base.storage,
+            events=base.events,
+            lock=base.lock,
+            clock=base.clock,
+            realtime=realtime,
+        )
+        realtime.start()
+        thread = realtime._thread
+
+        platform.close()
+
+        assert not thread.is_alive()
+
+
 class TestBuildPlatform:
     def test_the_local_profile_assembles_single_process_backends(self, tmp_path):
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -248,6 +325,7 @@ class TestBuildPlatform:
 
         assert isinstance(platform.state, RedisState)
         assert isinstance(platform.events, RedisStreamEventBus)
+        assert isinstance(platform.realtime, RedisRealtime)
         assert isinstance(platform.lock, PgAdvisoryLock)
         assert platform.profile is DeploymentProfile.DISTRIBUTED
 
@@ -282,6 +360,34 @@ class TestDeploymentConsistencyGate:
 
         assert isinstance(platform.state, MemoryState)
         assert "Inconsistent deployment wiring" in caplog.text
+
+    def test_in_process_realtime_across_workers_stops_the_build(self, tmp_path):
+        with pytest.raises(ValueError, match="realtime_uri resolves to process-local memory"):
+            container.build_platform(
+                _settings(data_dir=str(tmp_path), web_workers=4, **SHARED_WIRING, realtime_uri="memory://")
+            )
+
+    def test_in_process_realtime_across_workers_can_be_downgraded_to_a_warning(self, tmp_path, caplog):
+        with caplog.at_level("WARNING"):
+            platform = container.build_platform(
+                _settings(
+                    data_dir=str(tmp_path),
+                    web_workers=4,
+                    **SHARED_WIRING,
+                    realtime_uri="memory://",
+                    enforce_deployment_consistency=False,
+                )
+            )
+
+        assert isinstance(platform.realtime, InProcessRealtime)
+        assert "realtime_uri resolves to process-local memory" in caplog.text
+
+    def test_redis_realtime_across_workers_builds(self, tmp_path):
+        platform = container.build_platform(
+            _settings(data_dir=str(tmp_path), web_workers=4, **SHARED_WIRING, realtime_uri="redis://cache:6379/2")
+        )
+
+        assert isinstance(platform.realtime, RedisRealtime)
 
     def test_standalone_job_workers_stop_the_build_on_in_memory_wiring(self, tmp_path):
         """One API process, one worker process, the default ``local`` profile: two processes."""
@@ -365,6 +471,7 @@ class TestMailResolution:
 
         assert isinstance(bare.mail, NullMail)
         assert isinstance(bare.geocoding, NullGeocoding)
+        assert isinstance(bare.realtime, InProcessRealtime)
         assert bare.recorder is None
 
     @staticmethod

@@ -64,6 +64,19 @@ def test_pure_module_imports_without_loading_an_optional_dependency(module: str)
     assert result.stdout.strip() == "", f"importing {module} loaded optional dependencies: {result.stdout.strip()}"
 
 
+def test_a_local_platform_never_loads_the_redis_realtime_backend():
+    """``local`` deployments must not even import the Pub/Sub backend module."""
+    result = _run("""
+        import sys
+        import jasil.container
+        jasil.container.build_platform()
+        print("jasil.backends.realtime_redis" in sys.modules)
+    """)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"
+
+
 def test_the_composition_root_imports_without_any_extra():
     """``jasil.container`` must be importable on a core install.
 
