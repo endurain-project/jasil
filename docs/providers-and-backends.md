@@ -470,7 +470,9 @@ registry; JASIL only moves the hint between processes.
 The `key` names the hint's audience and is an opaque string: a user id, a device
 id, an organisation, a cache name. Its meaning belongs entirely to the host, and
 JASIL does no routing or filtering on it. It must be a non-empty `str` of at most
-256 characters.
+256 characters (code points, not bytes) with no unpaired Unicode surrogate. The
+key appears in the warning logged when a hint is dropped, so do not put a secret
+(a token, a session id) in it.
 
 ```python
 # At startup, in every process that holds client connections:
@@ -497,9 +499,11 @@ no new setting.
     - **Transport failures never raise** out of `notify`: Redis being down
       is logged and the hint dropped, so a request or job never fails over a push.
     - **Programmer errors do raise** `ValueError`: a `key` that is not a
-      `str`, an empty `key`, a `key` over 256 characters, a `hint` that is not a
-      JSON-serialisable `dict`, or an envelope over 4096 bytes. Both backends validate identically, so the bug shows up in
-      a local test.
+      `str`, an empty `key`, a `key` over 256 characters, a `key` or `hint`
+      holding an unpaired Unicode surrogate, a `hint` that is not a
+      JSON-serialisable `dict`, or an envelope over 4096 bytes. Both backends
+      validate identically, so the bug shows up in a local test. A received
+      hint that breaks these rules is logged and dropped, never delivered.
     - **Every started process receives every hint**, its own included. Filter by
       your connection registry; there is no per-key routing, topic, ack or
       history.

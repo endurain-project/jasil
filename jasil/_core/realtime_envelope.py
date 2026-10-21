@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 #: The only envelope version this build reads or writes.
 ENVELOPE_VERSION = 2
 
-#: Cap on the length of a hint key, in characters.
+#: Cap on the length of a hint key, in characters (code points, not bytes).
 MAX_KEY_LENGTH = 256
 
 #: Default cap on the serialised envelope, in bytes. A hint says *what* changed,
@@ -64,8 +64,9 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
 
     Raises:
         ValueError: When ``key`` is not a non-empty ``str`` of at most
-            :data:`MAX_KEY_LENGTH` characters, ``hint`` is not a
-            ``dict`` or not JSON-serialisable (including NaN / infinity), or the
+            :data:`MAX_KEY_LENGTH` characters or holds an unpaired Unicode
+            surrogate, ``hint`` is not a ``dict`` or not JSON-serialisable as
+            UTF-8 (including NaN / infinity and unpaired surrogates), or the
             envelope exceeds ``max_bytes``.
     """
     problem = _key_problem(key)
@@ -106,10 +107,20 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
         logger.warning("Ignoring a realtime hint with unsupported envelope version %r", version)
         return None
     key, hint = envelope.get("key"), envelope.get("hint")
-    if not isinstance(key, str) or _key_problem(key) is not None or not isinstance(hint, dict):
+    if not isinstance(key, str) or _key_problem(key) is not None or not isinstance(hint, dict) or not _encodes(hint):
         logger.warning("Ignoring a malformed realtime hint envelope")
         return None
     return key, hint
+
+
+def _encodes(hint: dict) -> bool:
+    # JSON can carry an escaped unpaired surrogate (``"\ud800"``) that ``encode``
+    # would refuse; drop it here so no handler sees a hint no backend could send.
+    try:
+        json.dumps(hint, ensure_ascii=False).encode()
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 class HintHandlers:

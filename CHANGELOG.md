@@ -11,7 +11,9 @@ What counts as a breaking change — and what does not — is defined in [API st
 ### Changed
 
 - **BREAKING: the realtime hint channel is addressed by an opaque string key, not a user id.** `RealtimeProvider.notify_user(user_id: int, hint)` is now `notify(key: str, hint)`, and `subscribe` handlers are called as `handler(key: str, hint)`. The `key` names the audience (a user id, device id, organisation, cache name, ...); its meaning belongs to the host and JASIL does no per-key routing. There is no deprecated `notify_user` alias. A host that used integer user ids passes `str(user_id)` and parses it back in its handler.
-- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, or is over 256 characters (`MAX_KEY_LENGTH`), in addition to the existing hint and envelope-size checks. Both backends validate identically.
+- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, is over 256 characters (`MAX_KEY_LENGTH`, counted in code points), or holds an unpaired Unicode surrogate, in addition to the existing hint and envelope-size checks. Both backends validate identically.
+- A received envelope whose `key` or `hint` holds an unpaired Unicode surrogate (sent JSON-escaped) is logged and dropped instead of reaching the handlers, so a subscriber never sees a hint that `notify` would have refused.
+- The `key` appears in the warning logged when a publish fails; do not put a secret in it.
 - **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`.
 - `jasil.testing.capture_hints` returns `list[tuple[str, dict]]` of `(key, hint)`.
 

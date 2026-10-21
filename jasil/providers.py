@@ -497,10 +497,13 @@ class RealtimeProvider(Protocol):
       down is logged and the hint dropped, so a request or job never fails
       because a push could not be sent.
     - **Programmer errors do raise** ``ValueError``: a ``key`` that is not a
-      ``str``, an empty ``key``, a ``key`` over 256 characters, a ``hint`` that is
-      not a JSON-serialisable ``dict``, or an envelope over the backend's size cap
-      (4096 bytes by default). Every
-      backend validates the same way, so the bug surfaces in a local test.
+      ``str``, an empty ``key``, a ``key`` over 256 characters (code points, not
+      bytes), a ``key`` or ``hint`` holding an unpaired Unicode surrogate, a
+      ``hint`` that is not a JSON-serialisable ``dict``, or an envelope over the
+      backend's size cap (4096 bytes by default). Every backend validates the
+      same way, so the bug surfaces in a local test.
+    - The ``key`` appears in the warning logged when a hint is dropped, so do
+      not put a secret (a token, a session id) in it.
     - **Every started process receives every hint**, including the ones it
       published itself. There is no per-key routing, no topic, no
       acknowledgement and no history.

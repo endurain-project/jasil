@@ -82,6 +82,15 @@ class TestEnvelope:
             assert realtime_envelope.decode(b'{"v":2,"key":"\\ud800","hint":{}}') is None
         assert "Ignoring" in caplog.text
 
+    def test_a_hint_with_an_unpaired_surrogate_is_refused(self):
+        with pytest.raises(ValueError, match="not JSON-serialisable"):
+            realtime_envelope.encode("k", {"x": ["\ud800"]})
+
+    def test_an_escaped_surrogate_in_the_hint_decodes_to_nothing(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert realtime_envelope.decode(b'{"v":2,"key":"k","hint":{"x":["\\ud800"]}}') is None
+        assert "Ignoring" in caplog.text
+
     def test_the_key_cap_is_256_and_the_version_is_2(self):
         assert realtime_envelope.MAX_KEY_LENGTH == 256
         assert realtime_envelope.ENVELOPE_VERSION == 2
