@@ -30,14 +30,14 @@ class Inbox:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._arrived = threading.Condition(self._lock)
-        self.items: list[tuple[int, dict]] = []
+        self.items: list[tuple[str, dict]] = []
 
-    def __call__(self, user_id: int, hint: dict) -> None:
+    def __call__(self, key: str, hint: dict) -> None:
         with self._arrived:
-            self.items.append((user_id, hint))
+            self.items.append((key, hint))
             self._arrived.notify_all()
 
-    def wait_for(self, count: int) -> list[tuple[int, dict]]:
+    def wait_for(self, count: int) -> list[tuple[str, dict]]:
         with self._arrived:
             assert self._arrived.wait_for(lambda: len(self.items) >= count, timeout=DEADLINE_SECONDS), self.items
             return list(self.items)
@@ -92,27 +92,27 @@ class TestPublish:
         listener.subscribe(CHANNEL)
         listener.get_message(timeout=0.1)  # consume the subscribe confirmation
 
-        make_realtime().notify_user(7, {"kind": "activity"})
+        make_realtime().notify("7", {"kind": "activity"})
 
         message = listener.get_message(timeout=1.0)
-        assert json.loads(message["data"]) == {"v": 1, "user_id": 7, "hint": {"kind": "activity"}}
+        assert json.loads(message["data"]) == {"v": 2, "key": "7", "hint": {"kind": "activity"}}
 
     def test_an_oversized_hint_raises(self, make_realtime):
         with pytest.raises(ValueError, match="cap"):
-            make_realtime(max_bytes=64).notify_user(7, {"p": "x" * 64})
+            make_realtime(max_bytes=64).notify("7", {"p": "x" * 64})
 
     def test_a_hint_that_is_not_json_raises(self, make_realtime):
         with pytest.raises(ValueError, match="not JSON-serialisable"):
-            make_realtime().notify_user(7, {"when": object()})
+            make_realtime().notify("7", {"when": object()})
 
     def test_a_transport_failure_is_logged_and_dropped(self, server, make_realtime, caplog):
         realtime = make_realtime()
         server.connected = False
 
         with caplog.at_level(logging.WARNING):
-            realtime.notify_user(7, {"kind": "activity"})
+            realtime.notify("7", {"kind": "activity"})
 
-        assert "Dropped a realtime hint for user 7" in caplog.text
+        assert "Dropped a realtime hint for key '7'" in caplog.text
 
     def test_any_client_error_is_dropped(self, caplog):
         class Exploding:
@@ -120,9 +120,34 @@ class TestPublish:
                 raise OSError("socket closed")
 
         with caplog.at_level(logging.WARNING):
-            RedisRealtime(Exploding()).notify_user(7, {})
+            RedisRealtime(Exploding()).notify("7", {})
 
         assert "socket closed" in caplog.text
+
+
+class TestValidation:
+    """The Redis backend refuses what the in-process one refuses."""
+
+    @pytest.mark.parametrize("key", [7, None, b"7", True, "", "x" * 257])
+    def test_an_invalid_key_raises(self, make_realtime, key):
+        with pytest.raises(ValueError):
+            make_realtime().notify(key, {})
+
+    @pytest.mark.parametrize("hint", [[], "a", None, {"x": float("nan")}, {"x": float("inf")}, {"o": object()}])
+    def test_an_invalid_hint_raises(self, make_realtime, hint):
+        with pytest.raises(ValueError):
+            make_realtime().notify("k", hint)
+
+    def test_any_non_empty_str_key_reaches_the_handler_unchanged(self, make_realtime):
+        realtime = make_realtime()
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+        realtime.start()
+        key = "6f1c2a9e:é"
+
+        realtime.notify(key, {"a": 1})
+
+        assert inbox.wait_for(1) == [(key, {"a": 1})]
 
 
 class TestFanOut:
@@ -134,12 +159,12 @@ class TestFanOut:
         first.start()
         second.start()
 
-        first.notify_user(1, {"from": "first"})
-        second.notify_user(2, {"from": "second"})
+        first.notify("1", {"from": "first"})
+        second.notify("2", {"from": "second"})
 
-        expected = [(1, {"from": "first"}), (2, {"from": "second"})]
-        assert sorted(first_inbox.wait_for(2), key=lambda item: item[0]) == expected
-        assert sorted(second_inbox.wait_for(2), key=lambda item: item[0]) == expected
+        expected = [("1", {"from": "first"}), ("2", {"from": "second"})]
+        assert sorted(first_inbox.wait_for(2)) == expected
+        assert sorted(second_inbox.wait_for(2)) == expected
 
     def test_a_publish_only_instance_reaches_the_started_ones(self, make_realtime):
         """A dedicated job worker publishes without ever calling start()."""
@@ -148,9 +173,9 @@ class TestFanOut:
         replica.subscribe(inbox)
         replica.start()
 
-        worker.notify_user(7, {"kind": "import.done"})
+        worker.notify("7", {"kind": "import.done"})
 
-        assert inbox.wait_for(1) == [(7, {"kind": "import.done"})]
+        assert inbox.wait_for(1) == [("7", {"kind": "import.done"})]
 
     def test_every_handler_of_an_instance_runs(self, make_realtime):
         realtime = make_realtime()
@@ -159,15 +184,15 @@ class TestFanOut:
         realtime.subscribe(second)
         realtime.start()
 
-        realtime.notify_user(7, {})
+        realtime.notify("7", {})
 
-        assert first.wait_for(1) == second.wait_for(1) == [(7, {})]
+        assert first.wait_for(1) == second.wait_for(1) == [("7", {})]
 
     def test_a_failing_handler_does_not_kill_the_subscriber(self, make_realtime, caplog):
         realtime = make_realtime()
         inbox = Inbox()
 
-        def broken(user_id, hint):
+        def broken(key, hint):
             raise RuntimeError("boom")
 
         realtime.subscribe(broken)
@@ -175,9 +200,9 @@ class TestFanOut:
         realtime.start()
 
         with caplog.at_level(logging.ERROR):
-            realtime.notify_user(1, {})
-            realtime.notify_user(2, {})
-            assert inbox.wait_for(2) == [(1, {}), (2, {})]
+            realtime.notify("1", {})
+            realtime.notify("2", {})
+            assert inbox.wait_for(2) == [("1", {}), ("2", {})]
         assert "Realtime hint handler" in caplog.text
 
 
@@ -186,9 +211,9 @@ class TestReceive:
         "payload",
         [
             "not json",
-            json.dumps({"v": 2, "user_id": 7, "hint": {}}),
-            json.dumps({"v": 1, "user_id": "7", "hint": {}}),
-            json.dumps({"v": 1, "user_id": 7, "hint": "x"}),
+            json.dumps({"v": 3, "key": "7", "hint": {}}),
+            json.dumps({"v": 2, "key": 7, "hint": {}}),
+            json.dumps({"v": 2, "key": "7", "hint": "x"}),
             json.dumps([1, 2, 3]),
         ],
     )
@@ -200,8 +225,8 @@ class TestReceive:
 
         with caplog.at_level(logging.WARNING):
             _publish_raw(server, payload)
-            realtime.notify_user(7, {"ok": True})
-            assert inbox.wait_for(1) == [(7, {"ok": True})]
+            realtime.notify("7", {"ok": True})
+            assert inbox.wait_for(1) == [("7", {"ok": True})]
         assert "Ignoring" in caplog.text
 
     def test_a_bytes_payload_is_decoded(self, server, make_realtime):
@@ -211,9 +236,9 @@ class TestReceive:
         realtime.subscribe(inbox)
         realtime.start()
 
-        _publish_raw(server, b'{"v":1,"user_id":7,"hint":{"a":1}}')
+        _publish_raw(server, b'{"v":2,"key":"7","hint":{"a":1}}')
 
-        assert inbox.wait_for(1) == [(7, {"a": 1})]
+        assert inbox.wait_for(1) == [("7", {"a": 1})]
 
 
 class TestLifecycle:
@@ -235,11 +260,11 @@ class TestLifecycle:
     def test_stop_from_a_handler_does_not_join_itself(self, make_realtime, caplog):
         realtime = make_realtime()
         stopped = threading.Event()
-        realtime.subscribe(lambda user_id, hint: (realtime.stop(), stopped.set()))
+        realtime.subscribe(lambda key, hint: (realtime.stop(), stopped.set()))
         realtime.start()
 
         with caplog.at_level(logging.WARNING):
-            realtime.notify_user(7, {})
+            realtime.notify("7", {})
             assert stopped.wait(timeout=DEADLINE_SECONDS)
         assert "Failed to stop" not in caplog.text
 
@@ -249,9 +274,9 @@ class TestLifecycle:
         realtime.subscribe(inbox)
 
         realtime.start()
-        _publish_raw(server, b'{"v":1,"user_id":1,"hint":{}}')
+        _publish_raw(server, b'{"v":2,"key":"1","hint":{}}')
 
-        assert inbox.wait_for(1) == [(1, {})]
+        assert inbox.wait_for(1) == [("1", {})]
 
     def test_a_non_utf8_payload_does_not_drop_the_subscription(self, server, make_realtime, caplog):
         realtime = make_realtime(subscriber_factory=lambda: fakeredis.FakeStrictRedis(server=server))
@@ -261,8 +286,8 @@ class TestLifecycle:
 
         with caplog.at_level(logging.WARNING):
             _publish_raw(server, b"\xff\xfe")
-            realtime.notify_user(7, {"ok": True})
-            assert inbox.wait_for(1) == [(7, {"ok": True})]
+            realtime.notify("7", {"ok": True})
+            assert inbox.wait_for(1) == [("7", {"ok": True})]
         assert "disconnected" not in caplog.text
 
     def test_start_is_idempotent(self, make_realtime):
@@ -293,9 +318,9 @@ class TestLifecycle:
         realtime.stop()
 
         realtime.start()
-        realtime.notify_user(7, {})
+        realtime.notify("7", {})
 
-        assert inbox.wait_for(1) == [(7, {})]
+        assert inbox.wait_for(1) == [("7", {})]
 
     def test_a_stopped_instance_receives_nothing(self, make_realtime):
         listener, publisher = make_realtime(), make_realtime()
@@ -307,7 +332,7 @@ class TestLifecycle:
         other.subscribe(witness)
         other.start()
 
-        publisher.notify_user(7, {})
+        publisher.notify("7", {})
 
         witness.wait_for(1)
         assert inbox.items == []
@@ -340,8 +365,8 @@ class TestReconnect:
             server.connected = True
             assert realtime._subscribed.wait(timeout=DEADLINE_SECONDS)
 
-            realtime.notify_user(7, {"after": "reconnect"})
-            assert inbox.wait_for(1) == [(7, {"after": "reconnect"})]
+            realtime.notify("7", {"after": "reconnect"})
+            assert inbox.wait_for(1) == [("7", {"after": "reconnect"})]
 
         assert "Realtime subscriber disconnected" in caplog.text
         assert "reconnected after" in caplog.text
@@ -386,9 +411,9 @@ class TestReconnect:
         realtime.start()
         assert realtime._subscribed.wait(timeout=DEADLINE_SECONDS)
 
-        realtime.notify_user(7, {})
+        realtime.notify("7", {})
 
-        assert inbox.wait_for(1) == [(7, {})]
+        assert inbox.wait_for(1) == [("7", {})]
         assert len(attempts) == 3
 
     def test_the_backoff_is_capped_and_jittered(self):

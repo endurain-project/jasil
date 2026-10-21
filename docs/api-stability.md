@@ -50,8 +50,8 @@ default is additive.
 
 `RealtimeProvider`'s four methods and its contract are covered: best-effort,
 at-most-once, unordered delivery; transport failures never raise from
-`notify_user`; an invalid hint raises `ValueError`; every started process
-receives every hint. The realtime wire envelope (`{"v": 1, "user_id", "hint"}`)
+`notify`; an invalid hint raises `ValueError`; every started process
+receives every hint. The realtime wire envelope (`{"v": 2, "key", "hint"}`)
 is covered like the event envelope: a new version is added alongside, never in
 place of, the one a running replica reads. The default 4096-byte cap may grow
 but will not shrink within a minor series.

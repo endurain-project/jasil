@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class InProcessRealtime:
-    """``RealtimeProvider`` for a single process — ``notify_user`` calls the handlers inline.
+    """``RealtimeProvider`` for a single process — ``notify`` calls the handlers inline.
 
     The ``memory://`` backend and the ``local`` profile default. Each hint is
     validated and round-tripped through the same JSON envelope the Redis backend
@@ -27,18 +27,18 @@ class InProcessRealtime:
         self._max_bytes = max_bytes
         self._handlers = realtime_envelope.HintHandlers()
 
-    def notify_user(self, user_id: int, hint: dict) -> None:
+    def notify(self, key: str, hint: dict) -> None:
         """Validate the hint, then deliver it to every handler on this thread.
 
         Raises:
             ValueError: When the hint is invalid (see
                 :class:`~jasil.providers.RealtimeProvider`).
         """
-        decoded = realtime_envelope.decode(realtime_envelope.encode(user_id, hint, max_bytes=self._max_bytes))
+        decoded = realtime_envelope.decode(realtime_envelope.encode(key, hint, max_bytes=self._max_bytes))
         if decoded is not None:
             self._handlers.deliver(*decoded)
 
-    def subscribe(self, handler: Callable[[int, dict], None]) -> None:
+    def subscribe(self, handler: Callable[[str, dict], None]) -> None:
         self._handlers.add(handler)
 
     def clear(self) -> None:

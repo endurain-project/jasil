@@ -24,53 +24,80 @@ def realtime():
 
 class TestEnvelope:
     def test_a_hint_survives_the_round_trip(self):
-        encoded = realtime_envelope.encode(7, {"kind": "activity", "id": 3})
+        encoded = realtime_envelope.encode("7", {"kind": "activity", "id": 3})
 
-        assert realtime_envelope.decode(encoded) == (7, {"kind": "activity", "id": 3})
+        assert realtime_envelope.decode(encoded) == ("7", {"kind": "activity", "id": 3})
 
     def test_the_wire_format_is_versioned_compact_json(self):
-        assert realtime_envelope.encode(7, {"a": 1}) == b'{"v":1,"user_id":7,"hint":{"a":1}}'
+        assert realtime_envelope.encode("7", {"a": 1}) == b'{"v":2,"key":"7","hint":{"a":1}}'
 
     def test_an_envelope_at_the_cap_is_accepted(self):
-        empty = len(realtime_envelope.encode(1, {"p": ""}))
+        empty = len(realtime_envelope.encode("k", {"p": ""}))
         hint = {"p": "x" * (128 - empty)}
 
-        assert len(realtime_envelope.encode(1, hint, max_bytes=128)) == 128
+        assert len(realtime_envelope.encode("k", hint, max_bytes=128)) == 128
 
     def test_an_envelope_over_the_cap_is_refused(self):
         with pytest.raises(ValueError, match="over the 4096-byte cap"):
-            realtime_envelope.encode(1, {"p": "x" * 5000})
+            realtime_envelope.encode("k", {"p": "x" * 5000})
 
     def test_the_cap_counts_encoded_bytes_not_characters(self):
         hint = {"p": "é" * 30}  # 30 characters, 60 bytes
 
         with pytest.raises(ValueError, match="cap"):
-            realtime_envelope.encode(1, hint, max_bytes=80)
+            realtime_envelope.encode("k", hint, max_bytes=80)
 
     @pytest.mark.parametrize("hint", [{"when": object()}, {"x": float("nan")}, {"x": {1, 2}}])
     def test_a_hint_that_is_not_json_is_refused(self, hint):
         with pytest.raises(ValueError, match="not JSON-serialisable"):
-            realtime_envelope.encode(1, hint)
+            realtime_envelope.encode("k", hint)
 
     @pytest.mark.parametrize("hint", [["a"], "a", None])
     def test_a_hint_that_is_not_a_dict_is_refused(self, hint):
         with pytest.raises(ValueError, match="hint must be a dict"):
-            realtime_envelope.encode(1, hint)
+            realtime_envelope.encode("k", hint)
 
-    @pytest.mark.parametrize("user_id", ["7", 7.0, True, None])
-    def test_a_user_id_that_is_not_an_int_is_refused(self, user_id):
-        with pytest.raises(ValueError, match="user_id must be an int"):
-            realtime_envelope.encode(user_id, {})
+    @pytest.mark.parametrize("key", [7, 7.0, True, None, b"7"])
+    def test_a_key_that_is_not_a_str_is_refused(self, key):
+        with pytest.raises(ValueError, match="key must be a str"):
+            realtime_envelope.encode(key, {})
+
+    def test_an_empty_key_is_refused(self):
+        with pytest.raises(ValueError, match="must not be empty"):
+            realtime_envelope.encode("", {})
+
+    def test_a_key_at_the_cap_is_accepted_and_one_over_is_refused(self):
+        at_cap = "k" * realtime_envelope.MAX_KEY_LENGTH
+
+        assert realtime_envelope.decode(realtime_envelope.encode(at_cap, {})) == (at_cap, {})
+        with pytest.raises(ValueError, match="256-character cap"):
+            realtime_envelope.encode(at_cap + "k", {})
+
+    def test_the_key_cap_is_256_and_the_version_is_2(self):
+        assert realtime_envelope.MAX_KEY_LENGTH == 256
+        assert realtime_envelope.ENVELOPE_VERSION == 2
+
+    @pytest.mark.parametrize("key", ["7", "6f1c2a9e-0b7d-4c1e-9a55-3d2f8e7b1c40", "device:42:é", "日本語", "a b"])
+    def test_any_non_empty_str_key_round_trips_unchanged(self, key):
+        assert realtime_envelope.decode(realtime_envelope.encode(key, {"a": 1})) == (key, {"a": 1})
+
+    def test_nan_and_infinity_are_refused(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ValueError, match="not JSON-serialisable"):
+                realtime_envelope.encode("k", {"x": value})
 
     @pytest.mark.parametrize(
         "raw",
         [
             b"not json",
             b"[1, 2]",
-            b'{"v": 1, "user_id": "7", "hint": {}}',
-            b'{"v": 1, "user_id": true, "hint": {}}',
-            b'{"v": 1, "user_id": 7, "hint": []}',
-            b'{"v": 1, "hint": {}}',
+            b'{"v": 2, "key": 7, "hint": {}}',
+            b'{"v": 2, "key": true, "hint": {}}',
+            b'{"v": 2, "key": null, "hint": {}}',
+            b'{"v": 2, "key": "", "hint": {}}',
+            b'{"v": 2, "key": "' + b"k" * 257 + b'", "hint": {}}',
+            b'{"v": 2, "key": "7", "hint": []}',
+            b'{"v": 2, "hint": {}}',
             None,
         ],
     )
@@ -79,9 +106,9 @@ class TestEnvelope:
             assert realtime_envelope.decode(raw) is None
         assert "Ignoring" in caplog.text
 
-    @pytest.mark.parametrize("version", [0, 2, "1", None])
+    @pytest.mark.parametrize("version", [0, 1, 3, "2", None])
     def test_an_unknown_version_decodes_to_nothing(self, version, caplog):
-        raw = json.dumps({"v": version, "user_id": 7, "hint": {}})
+        raw = json.dumps({"v": version, "key": "7", "hint": {}})
 
         with caplog.at_level(logging.WARNING):
             assert realtime_envelope.decode(raw) is None
@@ -94,75 +121,94 @@ class TestInProcessRealtime:
 
     def test_a_handler_receives_the_user_and_the_hint(self, realtime):
         received = []
-        realtime.subscribe(lambda user_id, hint: received.append((user_id, hint)))
+        realtime.subscribe(lambda key, hint: received.append((key, hint)))
 
-        realtime.notify_user(7, {"kind": "activity"})
+        realtime.notify("7", {"kind": "activity"})
 
-        assert received == [(7, {"kind": "activity"})]
+        assert received == [("7", {"kind": "activity"})]
+
+    @pytest.mark.parametrize("key", ["6f1c2a9e-0b7d-4c1e-9a55-3d2f8e7b1c40", "org:42:room", "salle-é", "x" * 256])
+    def test_any_non_empty_str_key_reaches_the_handler_unchanged(self, realtime, key):
+        received = []
+        realtime.subscribe(lambda k, hint: received.append((k, hint)))
+
+        realtime.notify(key, {"kind": "x"})
+
+        assert received == [(key, {"kind": "x"})]
+
+    @pytest.mark.parametrize("key", [7, None, b"7", True, "", "x" * 257])
+    def test_an_invalid_key_raises(self, realtime, key):
+        with pytest.raises(ValueError):
+            realtime.notify(key, {})
+
+    @pytest.mark.parametrize("hint", [[], "a", None, {"x": float("nan")}, {"x": float("inf")}, {"o": object()}])
+    def test_an_invalid_hint_raises(self, realtime, hint):
+        with pytest.raises(ValueError):
+            realtime.notify("k", hint)
 
     def test_delivery_is_synchronous_on_the_callers_thread(self, realtime):
         threads = []
-        realtime.subscribe(lambda user_id, hint: threads.append(threading.current_thread()))
+        realtime.subscribe(lambda key, hint: threads.append(threading.current_thread()))
 
-        realtime.notify_user(1, {})
+        realtime.notify("1", {})
 
         assert threads == [threading.current_thread()]
 
     def test_every_handler_receives_every_hint(self, realtime):
         first, second = [], []
-        realtime.subscribe(lambda user_id, hint: first.append(user_id))
-        realtime.subscribe(lambda user_id, hint: second.append(user_id))
+        realtime.subscribe(lambda key, hint: first.append(key))
+        realtime.subscribe(lambda key, hint: second.append(key))
 
-        realtime.notify_user(1, {})
-        realtime.notify_user(2, {})
+        realtime.notify("1", {})
+        realtime.notify("2", {})
 
-        assert first == second == [1, 2]
+        assert first == second == ["1", "2"]
 
     def test_a_failing_handler_is_logged_and_the_next_still_runs(self, realtime, caplog):
         received = []
 
-        def broken(user_id, hint):
+        def broken(key, hint):
             raise RuntimeError("boom")
 
         realtime.subscribe(broken)
-        realtime.subscribe(lambda user_id, hint: received.append(user_id))
+        realtime.subscribe(lambda key, hint: received.append(key))
 
         with caplog.at_level(logging.ERROR):
-            realtime.notify_user(7, {})
+            realtime.notify("7", {})
 
-        assert received == [7]
+        assert received == ["7"]
         assert "Realtime hint handler" in caplog.text
         assert "boom" in caplog.text
 
     def test_notify_before_subscribe_is_a_no_op(self, realtime):
-        realtime.notify_user(7, {"kind": "activity"})
+        realtime.notify("7", {"kind": "activity"})
 
     def test_an_invalid_hint_raises_even_with_no_handler(self, realtime):
         """The programmer error surfaces whether or not anyone is listening."""
         with pytest.raises(ValueError):
-            realtime.notify_user(7, {"when": object()})
+            realtime.notify("7", {"when": object()})
 
     def test_an_oversized_hint_raises(self):
         realtime = InProcessRealtime(max_bytes=64)
 
         with pytest.raises(ValueError, match="cap"):
-            realtime.notify_user(7, {"p": "x" * 64})
+            realtime.notify("7", {"p": "x" * 64})
 
     def test_the_handler_sees_what_the_wire_would_carry(self, realtime):
         """Tuples arrive as lists and keys as strings, as they would through Redis."""
         received = []
-        realtime.subscribe(lambda user_id, hint: received.append(hint))
+        realtime.subscribe(lambda key, hint: received.append(hint))
 
-        realtime.notify_user(7, {"ids": (1, 2), 3: "three"})
+        realtime.notify("7", {"ids": (1, 2), 3: "three"})
 
         assert received == [{"ids": [1, 2], "3": "three"}]
 
     def test_the_handler_gets_a_copy_not_the_callers_dict(self, realtime):
         received = []
-        realtime.subscribe(lambda user_id, hint: received.append(hint))
+        realtime.subscribe(lambda key, hint: received.append(hint))
         hint = {"n": 1}
 
-        realtime.notify_user(7, hint)
+        realtime.notify("7", hint)
         hint["n"] = 2
 
         assert received == [{"n": 1}]
@@ -175,9 +221,9 @@ class TestInProcessRealtime:
 
     def test_clear_drops_every_handler(self, realtime):
         received = []
-        realtime.subscribe(lambda user_id, hint: received.append(user_id))
+        realtime.subscribe(lambda key, hint: received.append(key))
 
         realtime.clear()
-        realtime.notify_user(7, {})
+        realtime.notify("7", {})
 
         assert received == []

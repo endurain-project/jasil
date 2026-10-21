@@ -8,7 +8,7 @@ registered handlers.
 
 Pub/Sub, not Streams, on purpose: the event bus's consumer group gives each
 entry to *one* replica (competing consumers), whereas a hint must reach *every*
-replica, because any of them may hold the user's connection. Pub/Sub is
+replica, because any of them may hold the connection a hint is for. Pub/Sub is
 fire-and-forget fan-out with no backlog, which is exactly the contract: a
 subscriber that is reconnecting misses what was published meanwhile, and that
 is acceptable because a hint is never the record.
@@ -123,20 +123,20 @@ class RedisRealtime:
             max_bytes=max_bytes,
         )
 
-    def notify_user(self, user_id: int, hint: dict) -> None:
+    def notify(self, key: str, hint: dict) -> None:
         """Publish a hint to every started process; a transport failure is logged and dropped.
 
         Raises:
             ValueError: When the hint is invalid (see
                 :class:`~jasil.providers.RealtimeProvider`).
         """
-        payload = realtime_envelope.encode(user_id, hint, max_bytes=self._max_bytes)
+        payload = realtime_envelope.encode(key, hint, max_bytes=self._max_bytes)
         try:
             self._client.publish(self._channel, payload)
         except Exception as error:  # best-effort: never fail the caller over a hint
-            logger.warning("Dropped a realtime hint for user %s: publish failed: %r", user_id, error)
+            logger.warning("Dropped a realtime hint for key %r: publish failed: %r", key, error)
 
-    def subscribe(self, handler: Callable[[int, dict], None]) -> None:
+    def subscribe(self, handler: Callable[[str, dict], None]) -> None:
         self._handlers.add(handler)
 
     def start(self) -> None:

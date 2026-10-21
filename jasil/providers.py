@@ -476,13 +476,16 @@ class MailProvider(Protocol):
 
 @runtime_checkable
 class RealtimeProvider(Protocol):
-    """Cross-process "something changed, refetch" hints for one user.
+    """Cross-process "something changed, refetch" hints addressed by an opaque key.
 
     The host owns the live connections (a WebSocket or SSE endpoint, its auth and
     its connection registry); this provider only carries a small hint from
     whichever process noticed the change — an API replica, a dedicated job
-    worker — to *every* process that may hold that user's connection. Each
-    receiving process looks the user up in its own registry and pushes or drops.
+    worker — to *every* process that may hold the connection it is for. The
+    ``key`` names the audience of a hint; its meaning is entirely the host's (a
+    user id, a device id, a cache name, ...) and JASIL does no per-key routing or
+    filtering. Each receiving process looks the key up in its own registry and
+    pushes or drops.
 
     **The contract — a hint is a latency optimisation, never the record:**
 
@@ -490,23 +493,24 @@ class RealtimeProvider(Protocol):
       lost (a replica reconnecting to Redis, a restart, a full socket buffer)
       or arrive after a later one. The receiver must treat it as "go and look",
       never as the data itself, and must stay correct if it never arrives.
-    - **Transport failures never raise** out of :meth:`notify_user`: Redis being
+    - **Transport failures never raise** out of :meth:`notify`: Redis being
       down is logged and the hint dropped, so a request or job never fails
       because a push could not be sent.
-    - **Programmer errors do raise** ``ValueError``: a ``hint`` that is not a
-      JSON-serialisable ``dict``, a ``user_id`` that is not an ``int``, or an
-      envelope over the backend's size cap (4096 bytes by default). Every
+    - **Programmer errors do raise** ``ValueError``: a ``key`` that is not a
+      ``str``, an empty ``key``, a ``key`` over 256 characters, a ``hint`` that is
+      not a JSON-serialisable ``dict``, or an envelope over the backend's size cap
+      (4096 bytes by default). Every
       backend validates the same way, so the bug surfaces in a local test.
     - **Every started process receives every hint**, including the ones it
-      published itself. There is no per-user routing, no topic, no
+      published itself. There is no per-key routing, no topic, no
       acknowledgement and no history.
 
     Methods:
-        notify_user: Publish a hint. Synchronous and thread-safe; works in a
+        notify: Publish a hint. Synchronous and thread-safe; works in a
             process that never calls :meth:`start` (a job worker that only
             publishes).
         subscribe: Register a local delivery callback, called as
-            ``handler(user_id, hint)``. Register before :meth:`start`; several
+            ``handler(key, hint)``. Register before :meth:`start`; several
             handlers may be registered. Handlers run on the provider's
             subscriber thread (on the caller's thread for the in-process
             backend), so keep them short and hand anything slow to the host's
@@ -516,7 +520,7 @@ class RealtimeProvider(Protocol):
             Idempotent and never raises.
     """
 
-    def notify_user(self, user_id: int, hint: dict) -> None: ...
-    def subscribe(self, handler: Callable[[int, dict], None]) -> None: ...
+    def notify(self, key: str, hint: dict) -> None: ...
+    def subscribe(self, handler: Callable[[str, dict], None]) -> None: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...

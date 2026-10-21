@@ -188,13 +188,13 @@ class TestTestRealtime:
         platform = jasil_testing.install_test_platform(tmp_path)
         hints = jasil_testing.capture_hints(platform)
 
-        platform.realtime.notify_user(7, {"kind": "activity", "ids": (1, 2)})
+        platform.realtime.notify("7", {"kind": "activity", "ids": (1, 2)})
 
-        assert hints == [(7, {"kind": "activity", "ids": [1, 2]})]
+        assert hints == [("7", {"kind": "activity", "ids": [1, 2]})]
 
     def test_hints_before_capture_are_not_recorded(self, tmp_path):
         platform = jasil_testing.install_test_platform(tmp_path)
-        platform.realtime.notify_user(1, {})
+        platform.realtime.notify("1", {})
 
         hints = jasil_testing.capture_hints(platform)
 
@@ -205,7 +205,7 @@ class TestTestRealtime:
         platform = jasil_testing.install_test_platform(tmp_path)
 
         with pytest.raises(ValueError):
-            platform.realtime.notify_user(1, {"p": "x" * 5000})
+            platform.realtime.notify("1", {"p": "x" * 5000})
 
     def test_an_unset_uri_is_in_process_even_when_events_are_redis(self, tmp_path, monkeypatch):
         built = []
@@ -267,7 +267,7 @@ class TestResetAll:
         hints = jasil_testing.capture_hints(platform)
 
         jasil_testing.reset_all()
-        platform.realtime.notify_user(7, {})
+        platform.realtime.notify("7", {})
         fresh = jasil_testing.install_test_platform(tmp_path)
 
         assert hints == []

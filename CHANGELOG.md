@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.8.0] - 2026-10-21
+
+### Changed
+
+- **BREAKING: the realtime hint channel is addressed by an opaque string key, not a user id.** `RealtimeProvider.notify_user(user_id: int, hint)` is now `notify(key: str, hint)`, and `subscribe` handlers are called as `handler(key: str, hint)`. The `key` names the audience (a user id, device id, organisation, cache name, ...); its meaning belongs to the host and JASIL does no per-key routing. There is no deprecated `notify_user` alias. A host that used integer user ids passes `str(user_id)` and parses it back in its handler.
+- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, or is over 256 characters (`MAX_KEY_LENGTH`), in addition to the existing hint and envelope-size checks. Both backends validate identically.
+- **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`.
+- `jasil.testing.capture_hints` returns `list[tuple[str, dict]]` of `(key, hint)`.
+
 ## [0.7.0] - 2026-10-21
 
 ### Added
@@ -248,6 +257,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.8.0]: https://github.com/endurain-project/jasil/releases/tag/v0.8.0
 [0.7.0]: https://github.com/endurain-project/jasil/releases/tag/v0.7.0
 [0.6.0]: https://github.com/endurain-project/jasil/releases/tag/v0.6.0
 [0.5.1]: https://github.com/endurain-project/jasil/releases/tag/v0.5.1
