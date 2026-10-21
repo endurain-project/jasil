@@ -18,7 +18,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Changed
 
+- Refreshed the Python dependency minimums and the locked dependency graph to the newest releases allowed by the supply-chain cooldown. Runtime floors rise to `sqlalchemy>=2.0.54`, `boto3>=1.43.98` (the `s3` extra) and `psycopg[binary]>=3.3.6` (the `postgres` extra).
 - The cross-process consistency rule now also covers an explicit `realtime_uri`: `memory://` in a multi-process deployment (`profile=distributed`, `web_workers > 1`, or `job_worker_mode=standalone`) fails the build, or warns with `enforce_deployment_consistency=False`. An unset `realtime_uri` is judged as `events_uri`, which it follows.
+
+### Security
+
+- `certifi` is locked at 2026.10.19, which fixes PYSEC-2026-4320. It is a runtime transitive dependency of `requests` and `botocore`, so the fix is exempt from the cooldown until it ages out of the window. The cooldown exemptions for `cryptography`, `urllib3` and `virtualenv` are removed now that their fixes are older than the window.
 
 ## [0.6.1] - 2026-10-18
 

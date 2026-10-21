@@ -21,7 +21,7 @@ classifiers = [
 # Deliberately minimal: the ports are pure, and every backend that needs a
 # client (redis / boto3 / requests) lives behind an extra below.
 dependencies = [
-    "sqlalchemy>=2.0.52",
+    "sqlalchemy>=2.0.54",
     "pydantic>=2.13.5",
 ]
 
@@ -44,12 +44,12 @@ redis = [
 ]
 # S3-compatible object storage backend.
 s3 = [
-    "boto3>=1.43.93",
+    "boto3>=1.43.98",
 ]
 # PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
 # this extra exists so a host can pull a driver from the same declaration.
 postgres = [
-    "psycopg[binary]>=3.3.5",
+    "psycopg[binary]>=3.3.6",
 ]
 # Durable jobs: the outbox relay and lease-expiry schedules.
 # The tested floor remains above 3.10.1, whose package-scope ``pkg_resources``
@@ -72,8 +72,8 @@ migrations = [
 # Convenience: every optional backend at once.
 all = [
     "redis>=8.1.0",
-    "boto3>=1.43.93",
-    "psycopg[binary]>=3.3.5",
+    "boto3>=1.43.98",
+    "psycopg[binary]>=3.3.6",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
@@ -84,14 +84,14 @@ all = [
 typecheck = [
     "mypy>=2.3.1",
     "types-requests>=2.33.0.20260906",
-    "boto3-stubs[s3]>=1.43.93",
+    "boto3-stubs[s3]>=1.43.98",
 ]
 lint = [
-    "ruff>=0.16.7",
+    "ruff>=0.16.8",
     "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.38.0",
+    "faker>=40.39.0",
     "hypothesis>=6.168.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
@@ -103,7 +103,7 @@ test = [
     "redis>=8.1.0",
     "fakeredis[lua]>=2.38.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.93",
+    "boto3>=1.43.98",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
@@ -115,11 +115,11 @@ test = [
 # in-memory SQLite (built into Python) and needs neither; set
 # JASIL_TEST_DATABASE_URL to run the suite against another backend.
 test-db = [
-    "psycopg[binary]>=3.3.5",
-    "pymysql>=1.2.0",
+    "psycopg[binary]>=3.3.6",
+    "pymysql>=1.2.3",
 ]
 dev = [
-    "hatch>=1.18.0",
+    "hatch>=1.18.1",
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
@@ -157,24 +157,18 @@ exclude-newer = "30 days"
 # the cooldown keeps protecting everything else. Remove an entry once its fix is
 # older than the window.
 [tool.uv.exclude-newer-package]
-# CVE-2026-69247 (Bleichenbacher oracle in PKCS#7 EnvelopedData decryption) is
-# fixed in 50.0.0. Reached only through hatch -> keyring -> secretstorage, so it
-# is a development dependency and never installed by a consumer of this package,
-# but the fix should not sit behind the cooldown regardless.
-cryptography = "0 days"
-# PYSEC-2026-4175, PYSEC-2026-4176 and PYSEC-2026-4177 are fixed in 2.8.0
-# (published 2026-09-15). A runtime transitive dependency of requests and boto3,
-# so the audit workflow fails until the lock moves. Remove once 2.8.0 is older
-# than the window.
-urllib3 = "0 days"
-# GitHub advisories flag mako <= 1.4.1 (fixed in 1.4.2, 2026-09-22), virtualenv
-# <= 21.7.12 (fixed in 21.7.13, 2026-09-18) and uv 0.12.7 - 0.12.17. All three
-# are development-only (alembic's template engine is the exception: mako ships
-# with the `migrations` extra). Dependabot's security job cannot resolve a fix
-# that the cooldown hides, so exempt them until the fixes age out of the window.
-# The uv fix (0.12.18) clears the window on 2026-10-22; drop the `uv` entry then.
+# PYSEC-2026-4320 is fixed in certifi 2026.10.19 (published 2026-10-20). A
+# runtime transitive dependency of requests and botocore, so the audit workflow
+# fails until the lock moves. Remove once 2026.10.19 is older than the window
+# (2026-11-19).
+certifi = "0 days"
+# GitHub advisories flag mako <= 1.4.1 (fixed in 1.4.2, 2026-09-22) and uv
+# 0.12.7 - 0.12.17 (fixed in 0.12.18, 2026-09-22). uv is development-only; mako
+# is alembic's template engine and ships with the `migrations` extra.
+# Dependabot's security job cannot resolve a fix that the cooldown hides, so
+# both stay exempt until their fixes age out of the window on 2026-10-23; drop
+# both entries then.
 mako = "0 days"
-virtualenv = "0 days"
 uv = "0 days"
 
 [[tool.uv.index]]
