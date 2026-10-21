@@ -14,7 +14,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
+from jasil._core.realtime_envelope import MAX_KEY_LENGTH
 from jasil.events import Event
+
+#: Cap on the length of a :class:`RealtimeProvider` hint key, in characters
+#: (code points, not bytes).
+MAX_REALTIME_KEY_LENGTH = MAX_KEY_LENGTH
 
 
 class StateBackendUnavailableError(RuntimeError):
@@ -472,11 +477,6 @@ class MailProvider(Protocol):
     """
 
     def send(self, message: MailMessage) -> str: ...
-
-
-#: Cap on the length of a :class:`RealtimeProvider` hint key, in characters
-#: (code points, not bytes).
-MAX_REALTIME_KEY_LENGTH = 256
 
 
 @runtime_checkable

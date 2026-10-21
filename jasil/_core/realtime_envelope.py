@@ -25,8 +25,6 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
-from jasil.providers import MAX_REALTIME_KEY_LENGTH
-
 __all__ = [
     "DEFAULT_MAX_ENVELOPE_BYTES",
     "ENVELOPE_VERSION",
@@ -47,7 +45,8 @@ ENVELOPE_VERSION = 2
 LEGACY_ENVELOPE_VERSION = 1
 
 #: Cap on the length of a hint key, in characters (code points, not bytes).
-MAX_KEY_LENGTH = MAX_REALTIME_KEY_LENGTH
+#: Re-exported publicly as ``jasil.providers.MAX_REALTIME_KEY_LENGTH``.
+MAX_KEY_LENGTH = 256
 
 #: Default cap on the serialised envelope, in bytes. A hint says *what* changed,
 #: not the data itself; anything near this size belongs in a refetch.
