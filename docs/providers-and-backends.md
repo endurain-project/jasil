@@ -460,6 +460,62 @@ recipients that already received it. Every recipient of a message is visible in
 `To`, and a refused one is only counted in that warning — send one message per
 recipient when either matters.
 
+## RealtimeProvider
+
+Carries a small "something changed for this user, refetch" hint from whichever
+process noticed the change to **every** process that may hold that user's live
+connection. The host keeps the WebSocket or SSE endpoint, its auth and its
+connection registry; JASIL only moves the hint between processes.
+
+```python
+# At startup, in every process that holds client connections:
+platform.realtime.subscribe(lambda user_id, hint: connections.push(user_id, hint))
+platform.realtime.start()
+
+# Anywhere — a route, a durable-job handler, a standalone worker that never started it:
+platform.realtime.notify_user(user.id, {"kind": "activity.imported", "id": activity.id})
+```
+
+| Backend | URI | Notes |
+|---|---|---|
+| `InProcessRealtime` | `memory://` | `notify_user` calls the handlers inline on the caller's thread. `start` / `stop` are no-ops. |
+| `RedisRealtime` | `redis://`, `rediss://`, `unix://` | Redis Pub/Sub on one channel (`realtime_channel`, default `jasil:realtime`; server-wide, so unique per deployment). Every started process receives every hint. |
+
+`realtime_uri` follows `events_uri` when unset, so an existing deployment needs
+no new setting.
+
+!!! warning "A hint is a latency optimisation, never the record"
+    - Delivery is **best-effort, at-most-once and unordered**. A replica that is
+      reconnecting to Redis misses what was published meanwhile, and nothing
+      replays it. The client must treat a hint as "go and look", and must stay
+      correct — through polling or a refetch on reconnect — if it never arrives.
+    - **Transport failures never raise** out of `notify_user`: Redis being down
+      is logged and the hint dropped, so a request or job never fails over a push.
+    - **Programmer errors do raise** `ValueError`: a `hint` that is not a
+      JSON-serialisable `dict`, a `user_id` that is not an `int`, or an envelope
+      over 4096 bytes. Both backends validate identically, so the bug shows up in
+      a local test.
+    - **Every started process receives every hint**, its own included. Filter by
+      your connection registry; there is no per-user routing, topic, ack or
+      history.
+
+Handlers run on the provider's subscriber thread (`InProcessRealtime`: on the
+publisher's thread). Keep them short — on an async server, hand the hint to the
+event loop with `loop.call_soon_threadsafe` — and note that a handler that
+raises is logged and skipped, never retried. A hint arrives as JSON decodes it:
+tuples become lists and keys become strings, in both backends.
+
+The Redis subscriber holds a **dedicated** connection, not one from the shared
+pool, reconnects with capped exponential backoff and jitter, and PINGs an idle
+subscription so a silently dead connection is replaced within about a minute.
+Pub/Sub channels are **server-wide**: the database number in the URI does not
+separate them, so two deployments sharing one Redis server must not share the
+channel name. `Platform.close()` (and `jasil.lifecycle.shutdown()`) stops the
+subscriber.
+
+In a test, `jasil.testing.capture_hints(platform)` returns a list that collects
+every hint published afterwards as `(user_id, hint)`.
+
 ## Writing your own backend
 
 A backend is any object satisfying the protocol. The provider protocols are
@@ -574,6 +630,7 @@ platform = Platform(
     clock=...,
     geocoding=...,
     mail=...,
+    realtime=...,  # optional; defaults to InProcessRealtime()
     recorder=None,
 )
 ```

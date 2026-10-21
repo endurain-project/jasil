@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.6.1` - the API is still settling. Expect breaking changes on
+> **Status:** `0.7.0` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
@@ -21,7 +21,7 @@ capability backends, an event pipeline, durable jobs, and observability.
 
 | Layer | What it does |
 |---|---|
-| **Providers** | Small composable protocols - state, storage, events, lock, clock, geocoding, mail - that domain code depends on instead of Redis, S3, or Postgres. Complete aggregate protocols keep URI-selected backends interchangeable. |
+| **Providers** | Small composable protocols - state, storage, events, realtime hints, lock, clock, geocoding, mail - that domain code depends on instead of Redis, S3, or Postgres. Complete aggregate protocols keep URI-selected backends interchangeable. |
 | **Backends** | A working implementation of each, selected by URI: `memory://` or `redis://`, `local://` or `s3://`, `noop://` or `postgres-advisory://`, `smtp://` or `smtps://`. |
 | **Deployment profiles** | `local` runs single-process with zero extra infrastructure. `distributed` requires shared backends and refuses to guess them. |
 | **Event pipeline** | One envelope, one publish seam, payload schema versioning that survives a rolling deploy. |
@@ -48,7 +48,7 @@ pip install "jasil[all]"             # every optional backend
 
 | Extra | Enables |
 |---|---|
-| `redis` | Redis state store and Redis-Streams event bus |
+| `redis` | Redis state store, Redis-Streams event bus and Pub/Sub realtime hints |
 | `s3` | S3-compatible object storage |
 | `postgres` | PostgreSQL advisory locks |
 | `jobs` | Durable-job scheduling |

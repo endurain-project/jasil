@@ -25,6 +25,7 @@ from jasil.providers import (
     EventBusProvider,
     LockProvider,
     MailProvider,
+    RealtimeProvider,
     StateProvider,
     StorageProvider,
 )
@@ -77,3 +78,8 @@ def get_clock(request: Request) -> ClockProvider:
 def get_mail(request: Request) -> MailProvider:
     """Return the outbound-mail provider."""
     return get_platform(request).mail
+
+
+def get_realtime(request: Request) -> RealtimeProvider:
+    """Return the realtime-hint provider."""
+    return get_platform(request).realtime

@@ -2,7 +2,7 @@
 
 Two things outlive a request and have to be wound down deliberately: the
 durable-job worker thread, and the platform's own resources — the event-bus
-consumer thread and the shared Redis clients. **The order matters.** The worker
+consumer thread, the realtime subscriber thread and the shared Redis clients. **The order matters.** The worker
 runs subscribers, and a subscriber that publishes needs the bus still up, so the
 worker stops first.
 

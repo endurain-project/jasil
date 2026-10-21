@@ -183,7 +183,96 @@ class TestInstallTestPlatform:
         assert jasil_settings.get_settings().data_dir == str(tmp_path)
 
 
+class TestTestRealtime:
+    def test_published_hints_are_captured(self, tmp_path):
+        platform = jasil_testing.install_test_platform(tmp_path)
+        hints = jasil_testing.capture_hints(platform)
+
+        platform.realtime.notify_user(7, {"kind": "activity", "ids": (1, 2)})
+
+        assert hints == [(7, {"kind": "activity", "ids": [1, 2]})]
+
+    def test_hints_before_capture_are_not_recorded(self, tmp_path):
+        platform = jasil_testing.install_test_platform(tmp_path)
+        platform.realtime.notify_user(1, {})
+
+        hints = jasil_testing.capture_hints(platform)
+
+        assert hints == []
+
+    def test_an_invalid_hint_fails_the_test(self, tmp_path):
+        """The programmer error a production publish would raise surfaces here."""
+        platform = jasil_testing.install_test_platform(tmp_path)
+
+        with pytest.raises(ValueError):
+            platform.realtime.notify_user(1, {"p": "x" * 5000})
+
+    def test_an_unset_uri_is_in_process_even_when_events_are_redis(self, tmp_path, monkeypatch):
+        built = []
+        monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
+        monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
+
+        jasil_testing.install_test_platform(
+            tmp_path, settings=jasil_settings.JasilSettings(events_uri="redis://cache:6379/1")
+        )
+
+        assert built[0].realtime_uri == "memory://"
+
+    @pytest.mark.parametrize(("enforce", "expected"), [(True, None), (False, "memory://")])
+    def test_a_multi_process_deployment_gets_in_process_realtime_only_without_enforcement(
+        self, tmp_path, monkeypatch, enforce, expected
+    ):
+        built = []
+        monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
+        monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
+        configured = jasil_settings.JasilSettings(web_workers=4, enforce_deployment_consistency=enforce)
+
+        jasil_testing.install_test_platform(tmp_path, settings=configured)
+
+        assert built[0].realtime_uri == expected
+
+    def test_an_explicit_uri_is_respected(self, tmp_path, monkeypatch):
+        built = []
+        monkeypatch.setattr(jasil_testing, "build_platform", lambda configured, **_: built.append(configured))
+        monkeypatch.setattr(platform_runtime, "set_active_platform", lambda _platform: None)
+
+        jasil_testing.install_test_platform(
+            tmp_path, settings=jasil_settings.JasilSettings(realtime_uri="redis://cache:6379/2")
+        )
+
+        assert built[0].realtime_uri == "redis://cache:6379/2"
+
+    def test_a_real_backend_is_refused_by_capture_hints(self, tmp_path):
+        from jasil.backends.realtime_redis import RedisRealtime
+
+        platform = jasil_testing.install_test_platform(tmp_path)
+        bare = jasil_testing.Platform(
+            profile=platform.profile,
+            state=platform.state,
+            storage=platform.storage,
+            events=platform.events,
+            lock=platform.lock,
+            clock=platform.clock,
+            realtime=RedisRealtime(None),
+        )
+
+        with pytest.raises(TypeError, match="memory://"):
+            jasil_testing.capture_hints(bare)
+
+
 class TestResetAll:
+    def test_it_leaves_no_realtime_handler_behind(self, tmp_path):
+        """A test holding the old platform must not feed the next test's capture list."""
+        platform = jasil_testing.install_test_platform(tmp_path)
+        hints = jasil_testing.capture_hints(platform)
+
+        jasil_testing.reset_all()
+        platform.realtime.notify_user(7, {})
+        fresh = jasil_testing.install_test_platform(tmp_path)
+
+        assert hints == []
+        assert fresh.realtime is not platform.realtime
+
     def test_it_clears_the_settings(self, tmp_path):
         jasil_settings.configure(jasil_settings.JasilSettings(data_dir=str(tmp_path)))
 

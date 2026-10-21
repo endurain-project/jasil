@@ -1,15 +1,15 @@
 """The composition root: build the platform substrate from settings.
 
-``build_platform`` resolves each capability (state, storage, events, lock,
-clock) to a concrete backend based on the deployment profile and returns a
+``build_platform`` resolves each capability (state, storage, events, realtime,
+lock, clock) to a concrete backend based on the deployment profile and returns a
 frozen ``Platform`` holding the providers. It is called once at startup and
 published process-wide via ``jasil.runtime`` so both request and non-request
 code resolve the same instance.
 
 Every capability resolves its backend by URI scheme, independently of the
 profile: ``memory``/``redis`` for the state URI; ``local``/``s3`` for the storage
-URI; ``memory``/``redis`` for the events URI; ``noop``/``postgres-advisory`` for
-the lock URI. The deployment profile only shapes the *defaults* those URIs
+URI; ``memory``/``redis`` for the events and realtime URIs;
+``noop``/``postgres-advisory`` for the lock URI. The deployment profile only shapes the *defaults* those URIs
 resolve to (see the ``resolved_*`` properties on
 :class:`~jasil.settings.JasilSettings`), so ``local``, ``distributed``, and
 ``custom`` all build the same way — the profile just picks memory-vs-Redis and
@@ -39,6 +39,7 @@ from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SEND_DEADLINE_SECONDS as SMTP_SEND_DEADLINE_SECONDS
 from jasil.backends.mail_smtp import SmtpMail
+from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
@@ -50,6 +51,7 @@ from jasil.providers import (
     GeocodingProvider,
     LockProvider,
     MailProvider,
+    RealtimeProvider,
     StateProvider,
     StorageProvider,
 )
@@ -82,6 +84,11 @@ class Platform:
             this is a backend whose ``send`` raises
             :class:`~jasil.providers.MailNotConfiguredError`, so a message is
             never dropped silently.
+        realtime: Cross-process per-user hint channel. Defaults to an
+            :class:`~jasil.backends.realtime_inprocess.InProcessRealtime`, so a
+            hand-built ``Platform`` need not supply it. The host registers its
+            handler with ``subscribe`` and calls ``start`` itself (only the
+            processes holding client connections need to); :meth:`close` stops it.
     """
 
     profile: DeploymentProfile
@@ -93,12 +100,13 @@ class Platform:
     geocoding: GeocodingProvider = field(default_factory=NullGeocoding)
     recorder: EventRecorder | None = None
     mail: MailProvider = field(default_factory=NullMail)
+    realtime: RealtimeProvider = field(default_factory=InProcessRealtime)
 
     def close(self) -> None:
-        """Release what the platform owns: the bus consumer and the Redis clients.
+        """Release what the platform owns: the bus consumer, the realtime subscriber and the Redis clients.
 
         Call once on shutdown, after the host has stopped producing events. Only
-        the two capabilities that hold something beyond the process are affected —
+        the capabilities that hold something beyond the process are affected —
         the rest are pure or borrow the host's engine, which the host closes.
 
         Two things it deliberately does *not* stop, because the platform does not
@@ -112,6 +120,7 @@ class Platform:
             self.events.stop()
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
+        self.realtime.stop()  # the provider contract: never raises
         redis_clients.close_shared_clients()
 
 
@@ -148,17 +157,24 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_mail(settings, clock)
-    return Platform(
-        profile=profile,
-        state=_build_state(settings),
-        storage=_build_storage(settings),
-        events=_build_events(settings, recorder),
-        lock=_build_lock(settings),
-        clock=clock,
-        geocoding=_build_geocoding(settings),
-        mail=mail,
-        recorder=recorder,
-    )
+    try:
+        return Platform(
+            profile=profile,
+            state=_build_state(settings),
+            storage=_build_storage(settings),
+            events=_build_events(settings, recorder),
+            lock=_build_lock(settings),
+            clock=clock,
+            geocoding=_build_geocoding(settings),
+            mail=mail,
+            recorder=recorder,
+            realtime=_build_realtime(settings),
+        )
+    except Exception:
+        # No Platform exists to close, so release the Redis clients a backend
+        # that did build has already opened.
+        redis_clients.close_shared_clients()
+        raise
 
 
 def _check_deployment_consistency(settings: JasilSettings) -> None:
@@ -216,6 +232,20 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
     if scheme in ("redis", "rediss", "unix"):
         return RedisStreamEventBus.from_uri(events_uri, recorder=recorder)
     raise ValueError(f"Unsupported events_uri scheme: {scheme or events_uri!r}")
+
+
+def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
+    realtime_uri = settings.resolved_realtime_uri
+    scheme, _, _ = realtime_uri.partition("://")
+    if scheme == "memory":
+        return InProcessRealtime()
+    if scheme in ("redis", "rediss", "unix"):
+        # Imported lazily, unlike the stream bus: nothing else needs it, and a
+        # ``local`` deployment then never loads the module at all.
+        from jasil.backends.realtime_redis import RedisRealtime
+
+        return RedisRealtime.from_uri(realtime_uri, channel=settings.realtime_channel)
+    raise ValueError(f"Unsupported realtime_uri scheme: {scheme or realtime_uri!r}")
 
 
 def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
