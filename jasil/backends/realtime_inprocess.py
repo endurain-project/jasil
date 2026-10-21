@@ -31,7 +31,8 @@ class InProcessRealtime:
         """Validate the hint, then deliver it to every handler on this thread.
 
         Raises:
-            ValueError: When the hint is invalid (see
+            ValueError: When the key or hint is invalid, or the encoded envelope
+                exceeds the configured byte cap (see
                 :class:`~jasil.providers.RealtimeProvider`).
         """
         decoded = realtime_envelope.decode(realtime_envelope.encode(key, hint, max_bytes=self._max_bytes))
@@ -39,6 +40,11 @@ class InProcessRealtime:
             self._handlers.deliver(*decoded)
 
     def subscribe(self, handler: Callable[[str, dict], None]) -> None:
+        """Register ``handler(key, hint)`` for every delivered hint, regardless of key.
+
+        Callbacks run on the thread calling :meth:`notify`.
+        Handler exceptions are caught so later handlers still run.
+        """
         self._handlers.add(handler)
 
     def clear(self) -> None:

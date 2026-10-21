@@ -127,7 +127,8 @@ class RedisRealtime:
         """Publish a hint to every started process; a transport failure is logged and dropped.
 
         Raises:
-            ValueError: When the hint is invalid (see
+            ValueError: When the key or hint is invalid, or the encoded envelope
+                exceeds the configured byte cap (see
                 :class:`~jasil.providers.RealtimeProvider`).
         """
         payload = realtime_envelope.encode(key, hint, max_bytes=self._max_bytes)
@@ -137,6 +138,11 @@ class RedisRealtime:
             logger.warning("Dropped a realtime hint for key %r: publish failed: %r", key, error)
 
     def subscribe(self, handler: Callable[[str, dict], None]) -> None:
+        """Register ``handler(key, hint)`` for every delivered hint, regardless of key.
+
+        Callbacks run on the subscriber thread after :meth:`start`.
+        Handler exceptions are caught so later handlers still run.
+        """
         self._handlers.add(handler)
 
     def start(self) -> None:

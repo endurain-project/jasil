@@ -529,7 +529,25 @@ class RealtimeProvider(Protocol):
             Idempotent and never raises.
     """
 
-    def notify(self, key: str, hint: dict) -> None: ...
-    def subscribe(self, handler: Callable[[str, dict], None]) -> None: ...
+    def notify(self, key: str, hint: dict) -> None:
+        """Publish a best-effort hint for the opaque audience ``key``.
+
+        Transport failures drop the hint without raising; publishing does not
+        require :meth:`start`.
+
+        Raises:
+            ValueError: When the key or hint violates this provider's validation
+                rules, or the encoded envelope exceeds the backend's byte cap.
+        """
+        ...
+
+    def subscribe(self, handler: Callable[[str, dict], None]) -> None:
+        """Register ``handler(key, hint)`` for all received keys before :meth:`start`.
+
+        Callbacks run on the subscriber thread, or on the caller's thread for
+        the in-process backend. Handler exceptions do not stop other handlers.
+        """
+        ...
+
     def start(self) -> None: ...
     def stop(self) -> None: ...
