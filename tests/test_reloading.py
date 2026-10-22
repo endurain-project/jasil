@@ -15,6 +15,7 @@ import jasil.container as container
 import jasil.settings as settings
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.mail_memory import MemoryMail, NullMail
+from jasil.backends.mail_smtp import SmtpMail
 from jasil.providers import (
     GeocodedPlace,
     GeocodingProvider,
@@ -58,6 +59,16 @@ def _geo(source, base: JasilSettings | None = None):
 def no_network(monkeypatch):
     """Geocoding backends built here must never reach the real upstream."""
     monkeypatch.setattr(HttpGeocoding, "reverse", lambda self, latitude, longitude: None)
+
+
+@pytest.fixture(autouse=True)
+def no_smtp(monkeypatch):
+    """SMTP backends built here must never dial out."""
+
+    def refuse(self, message):
+        raise MailError("test: no network")
+
+    monkeypatch.setattr(SmtpMail, "send", refuse)
 
 
 def _count(caplog, level: int) -> int:
@@ -554,7 +565,7 @@ class TestTransientAndUnexpectedFailures:
         assert isinstance(provider.current_backend(), HttpGeocoding)
 
     def test_an_unexpected_build_error_is_cached_not_raised(self, monkeypatch):
-        def boom(settings):
+        def boom(settings, **_kwargs):
             raise AttributeError("secret-value")
 
         monkeypatch.setattr(container, "_build_geocoding", boom)

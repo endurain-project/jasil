@@ -417,8 +417,9 @@ class TestSources:
 
         assert len(jasil_testing.memory_mail(platform).outbox) == 1
 
-    def test_memory_mail_refuses_a_sourced_smtp_backend(self, tmp_path):
+    def test_memory_mail_refuses_a_sourced_smtp_backend(self, tmp_path, monkeypatch):
         mail = jasil_settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c")
+        monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
         platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(mail))
         with pytest.raises(MailError):
             platform.mail.send(MailMessage(to=["a@b.c"], subject="s", text="t"))
