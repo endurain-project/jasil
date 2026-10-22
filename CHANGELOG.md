@@ -20,6 +20,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 - The `key` appears in the warning logged when a publish fails; do not put a secret in it.
 - **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`. Version 1 envelopes from 0.7.0 replicas are still read, with `str(user_id)` as the key, so a rolling upgrade loses no hints in that direction; 0.7.0 replicas ignore version 2, so hints published by already-upgraded processes do not reach not-yet-upgraded ones until the rollout finishes.
 - `jasil.testing.capture_hints` returns `list[tuple[str, dict]]` of `(key, hint)`.
+- Development tooling moves to uv 0.13: `[tool.uv] required-version` is now `>=0.13.5,<0.14`, the locked `uv` is 0.13.5, and the release build pins the same version. uv is development-only and does not affect installed packages.
+- CI now also runs the default SQLite test matrix on Python 3.15, in addition to 3.12, 3.13 and 3.14. The supported Python versions are unchanged.
 
 ## [0.7.0] - 2026-10-21
 
