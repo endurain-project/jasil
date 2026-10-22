@@ -1,7 +1,7 @@
 name: Test matrix jasil
 
 # Portability matrix on top of the fast default `test-jasil` job:
-#   * every supported Python (3.12, 3.13, 3.14) on the default SQLite backend,
+#   * every supported Python (3.12, 3.13, 3.14, 3.15) on the default SQLite backend,
 #     plus one run on Windows (the storage traversal guard is OS-sensitive);
 #   * the suite against real Postgres, MySQL and MariaDB servers (proving the ORM
 #     models and queries stay database-agnostic);
@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.12", "3.13", "3.14"]
+        python: ["3.12", "3.13", "3.14", "3.15"]
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
