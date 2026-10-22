@@ -28,7 +28,7 @@ import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 import jasil.settings as jasil_settings
-from jasil._core.reloading import ReloadingMail
+from jasil._reloading import ReloadingMail
 from jasil.backends.mail_memory import MemoryMail
 from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.container import Platform, build_platform

@@ -30,7 +30,7 @@ import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
 from jasil._core.mail_problems import SMTP_PORTS, MailProblemCode, mail_problems
-from jasil._core.reloading import ReloadingGeocoding, ReloadingMail, TransientBuildError
+from jasil._reloading import ReloadingGeocoding, ReloadingMail, TransientBuildError
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus

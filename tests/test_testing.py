@@ -398,7 +398,7 @@ class TestSources:
 
         platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(mail))
 
-        from jasil._core.reloading import ReloadingMail
+        from jasil._reloading import ReloadingMail
 
         assert isinstance(platform.mail, ReloadingMail)
 

@@ -62,7 +62,7 @@ def no_network(monkeypatch):
 
 def _count(caplog, level: int) -> int:
     """Records the reloading layer itself logged at ``level``."""
-    return sum(r.levelno == level and r.name == "jasil._core.reloading" for r in caplog.records)
+    return sum(r.levelno == level and r.name == "jasil._reloading" for r in caplog.records)
 
 
 @pytest.fixture
@@ -345,7 +345,7 @@ class TestSourceFailure:
         provider = _mail(source)
         provider.send(MESSAGE)
 
-        with caplog.at_level(logging.DEBUG, logger="jasil._core.reloading"):
+        with caplog.at_level(logging.DEBUG, logger="jasil._reloading"):
             source.error = RuntimeError("db down")
             for _ in range(3):
                 provider.send(MESSAGE)
@@ -518,7 +518,7 @@ class TestTransientAndUnexpectedFailures:
         return calls
 
     def test_an_unresolved_mail_relay_is_retried_after_the_delay(self, monkeypatch):
-        from jasil._core import reloading
+        from jasil import _reloading as reloading
 
         calls = self._resolver(monkeypatch, fail_first=1)
         now = [1000.0]
@@ -538,7 +538,7 @@ class TestTransientAndUnexpectedFailures:
         assert calls["n"] == 2
 
     def test_an_unresolved_geocoding_host_is_retried(self, monkeypatch):
-        from jasil._core import reloading
+        from jasil import _reloading as reloading
 
         self._resolver(monkeypatch, fail_first=1)
         now = [1000.0]

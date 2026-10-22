@@ -9,14 +9,32 @@ re-exported from :mod:`jasil.settings`.
 import ipaddress
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import Protocol
 from urllib.parse import urlsplit
 
 import jasil._core.network as network
 from jasil._core.mail_message import parse_address
 
-if TYPE_CHECKING:
-    from jasil.settings import MailSettings
+
+class _MailConfig(Protocol):
+    """The fields of :class:`~jasil.settings.MailSettings` the rules read.
+
+    Structural, so this vendored helper does not import ``jasil.settings``.
+    """
+
+    @property
+    def uri(self) -> str | None: ...
+    @property
+    def from_address(self) -> str: ...
+    @property
+    def secure(self) -> bool: ...
+    @property
+    def username(self) -> str | None: ...
+    @property
+    def password(self) -> str | None: ...
+    @property
+    def ehlo_hostname(self) -> str | None: ...
+
 
 #: Default ports of the SMTP schemes.
 SMTP_PORTS = {"smtp": 587, "smtps": 465}
@@ -62,7 +80,7 @@ class MailProblem:
     message: str
 
 
-def mail_problems(mail: "MailSettings") -> list[MailProblem]:
+def mail_problems(mail: _MailConfig) -> list[MailProblem]:
     """List everything wrong with ``mail``, without building a backend.
 
     Pure function of the settings, apart from one DNS lookup: with
