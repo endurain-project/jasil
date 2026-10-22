@@ -23,7 +23,7 @@ from jasil.providers import (
     MailNotConfiguredError,
     MailProvider,
 )
-from jasil.settings import GeocodingSettings, JasilSettings, MailSettings, RuntimeSources
+from jasil.settings import GeocodingSettings, JasilSettings, MailSettings, NetworkSettings, RuntimeSources
 
 MESSAGE = MailMessage(to=["to@example.com"], subject="s", text="t")
 GOOD_MAIL = MailSettings(uri="memory://", from_address="a@example.com")
@@ -497,3 +497,68 @@ class TestSecretsStayOutOfLogsAndErrors:
         everything = caplog.text + " ".join(texts) + " ".join(repr(r.args) for r in caplog.records)
         for secret in (self.PASSWORD, self.API_KEY, self.USERNAME):
             assert secret not in everything
+
+
+class TestTransientAndUnexpectedFailures:
+    """A lookup that did not answer is retried; an unexpected build error never escapes."""
+
+    @staticmethod
+    def _resolver(monkeypatch, fail_first: int):
+        import socket
+
+        calls = {"n": 0}
+
+        def getaddrinfo(host, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= fail_first:
+                raise socket.gaierror("temporary failure")
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
+
+        monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+        return calls
+
+    def test_an_unresolved_mail_relay_is_retried_after_the_delay(self, monkeypatch):
+        from jasil._core import reloading
+
+        calls = self._resolver(monkeypatch, fail_first=1)
+        now = [1000.0]
+        monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
+        relay = MailSettings(uri="smtp://relay.internal", secure=False, from_address="a@example.org")
+        provider = _mail(Source(relay))
+
+        with pytest.raises(MailError) as first:
+            provider.send(MESSAGE)
+        assert not isinstance(first.value, MailNotConfiguredError)
+        with pytest.raises(MailError):
+            provider.send(MESSAGE)
+        assert calls["n"] == 1  # remembered until the delay passes
+
+        now[0] += reloading.TRANSIENT_RETRY_SECONDS
+        assert provider._backend.resolve().backend is not None
+        assert calls["n"] == 2
+
+    def test_an_unresolved_geocoding_host_is_retried(self, monkeypatch):
+        from jasil._core import reloading
+
+        self._resolver(monkeypatch, fail_first=1)
+        now = [1000.0]
+        monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
+        # 10.0.0.5 is private, so the SSRF guard needs the allowlist to accept it.
+        base = JasilSettings(network=NetworkSettings(ssrf_allowed_hosts=("geo.internal",)))
+        provider = _geo(Source(GeocodingSettings(uri="nominatim://geo.internal")), base)
+
+        assert provider.reverse(1.0, 2.0) is None
+        assert provider.current_backend() is None
+        now[0] += reloading.TRANSIENT_RETRY_SECONDS
+        provider.reverse(1.0, 2.0)
+        assert isinstance(provider.current_backend(), HttpGeocoding)
+
+    def test_an_unexpected_build_error_is_cached_not_raised(self, monkeypatch):
+        def boom(settings):
+            raise AttributeError("secret-value")
+
+        monkeypatch.setattr(container, "_build_geocoding", boom)
+        provider = _geo(Source(GeocodingSettings(uri="nominatim://geo.example.com")))
+
+        assert provider.reverse(1.0, 2.0) is None
+        assert provider.reverse(1.0, 2.0) is None

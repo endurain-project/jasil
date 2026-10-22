@@ -26,14 +26,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
+import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
-from jasil._core.mail_problems import SMTP_PORTS, mail_problems
-from jasil._core.reloading import ReloadingGeocoding, ReloadingMail
+from jasil._core.mail_problems import SMTP_PORTS, MailProblemCode, mail_problems
+from jasil._core.reloading import ReloadingGeocoding, ReloadingMail, TransientBuildError
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
-from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, build_reverse_endpoint
+from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, resolve_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
@@ -299,7 +300,9 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
 
 def _build_runtime_geocoding(settings: JasilSettings, source: Callable[[], GeocodingSettings]) -> ReloadingGeocoding:
     """Wrap ``source`` so geocoding is rebuilt, with the captured network policy, when it changes."""
-    return ReloadingGeocoding(source, lambda fresh: _build_geocoding(replace(settings, geocoding=fresh)))
+    return ReloadingGeocoding(
+        source, lambda fresh: _build_geocoding(replace(settings, geocoding=fresh), retry_unresolved=True)
+    )
 
 
 def _build_runtime_mail(
@@ -326,7 +329,7 @@ def _build_runtime_mail(
     return ReloadingMail(source, build)
 
 
-def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
+def _build_geocoding(settings: JasilSettings, *, retry_unresolved: bool = False) -> GeocodingProvider:
     """Resolve the reverse-geocoding backend, falling back to a no-op.
 
     Unlike the other capabilities this never raises on a bad configuration:
@@ -342,6 +345,8 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
 
     Args:
         settings: The application settings.
+        retry_unresolved: Raise :class:`TransientBuildError` instead of falling back
+            when the host does not resolve, for a caller that will try again.
 
     Returns:
         The configured :class:`HttpGeocoding`, or :class:`NullGeocoding` when
@@ -392,10 +397,12 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
             logger.warning("geocoding.uri has no host; reverse geocoding is disabled")
             return NullGeocoding()
         # Logs its own reason when it rejects the host.
-        resolved = build_reverse_endpoint(
+        resolved, reason = resolve_reverse_endpoint(
             parts.netloc, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts
         )
         if resolved is None:
+            if retry_unresolved and network.is_unresolvable(reason):
+                raise TransientBuildError("geocoding host could not be resolved")
             return NullGeocoding()
         base_url = resolved
         api_key = None
@@ -443,6 +450,8 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     # which has already run.
     problems = mail_problems(mail)
     if problems:
+        if problems[0].code is MailProblemCode.CLEARTEXT_HOST_UNRESOLVABLE:
+            raise TransientBuildError(problems[0].message)
         raise ValueError(problems[0].message)
     parts = urlsplit(mail.uri)
     scheme = parts.scheme

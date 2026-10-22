@@ -12,6 +12,7 @@ Private to JASIL: hosts reach it only through
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -32,13 +33,35 @@ class SourceUnavailableError(Exception):
     """The source raised and there is no usable backend to fall back on."""
 
 
+class TransientBuildError(ValueError):
+    """A build failed for a reason that may pass (a DNS lookup that did not answer).
+
+    Still a ``ValueError``, so a startup build fails with it as before; a
+    reloading provider caches it only for :data:`TRANSIENT_RETRY_SECONDS`.
+    """
+
+
+#: How long a transient build failure is remembered before the build is retried.
+TRANSIENT_RETRY_SECONDS = 30.0
+
+
 @dataclass(frozen=True)
 class Outcome[S, B]:
-    """What building from ``settings`` produced: a ``backend``, or the ``rejection`` reason."""
+    """What building from ``settings`` produced: a ``backend``, or the ``rejection`` reason.
+
+    ``retry_at`` (a ``time.monotonic`` instant) is set only for a transient
+    failure: until then the outcome is reused, after it the build runs again.
+    """
 
     settings: S
     backend: B | None
     rejection: str | None = None
+    retry_at: float | None = None
+
+    @property
+    def transient(self) -> bool:
+        """True for a failure that is retried rather than remembered until the settings change."""
+        return self.retry_at is not None
 
 
 class ReloadingBackend[S, B]:
@@ -88,7 +111,7 @@ class ReloadingBackend[S, B]:
         self._source_failing = False
         with self._lock:
             current = self._current
-            if current is None or current.settings != fresh:
+            if current is None or current.settings != fresh or self._retry_due(current):
                 current = self._rebuild(fresh)
                 self._current = current
             return current
@@ -103,12 +126,24 @@ class ReloadingBackend[S, B]:
             type(error).__name__,
         )
 
+    @staticmethod
+    def _retry_due(current: Outcome[S, B]) -> bool:
+        return current.retry_at is not None and time.monotonic() >= current.retry_at
+
     def _rebuild(self, fresh: S) -> Outcome[S, B]:
         try:
             return Outcome(fresh, self._build(fresh))
+        except TransientBuildError as error:
+            logger.warning("%s settings could not be verified, will retry: %s", self._label, error)
+            return Outcome(fresh, None, str(error), retry_at=time.monotonic() + TRANSIENT_RETRY_SECONDS)
         except ValueError as error:
             logger.error("%s settings rejected: %s", self._label, error)
             return Outcome(fresh, None, str(error))
+        except Exception as error:
+            # Only the type: the text may carry a setting's value. Cached like a
+            # rejection so a provider that must not raise (geocoding) never does.
+            logger.error("%s settings rejected: building failed with %s", self._label, type(error).__name__)
+            return Outcome(fresh, None, type(error).__name__)
 
 
 class ReloadingMail:
@@ -126,12 +161,16 @@ class ReloadingMail:
 
         Raises:
             MailNotConfiguredError: When the current settings are unset or rejected.
-            MailError: When the settings could not be loaded and no working backend exists.
+            MailError: When the settings could not be loaded and no working backend
+                exists, or the relay host could not be resolved to verify it (retried
+                after a short delay).
         """
         try:
             outcome = self._backend.resolve()
         except SourceUnavailableError as error:
             raise MailError("Mail settings could not be loaded") from error.__cause__
+        if outcome.transient:
+            raise MailError("Mail settings could not be verified; retry")
         if outcome.backend is None:
             raise MailNotConfiguredError("Mail settings are invalid")
         return outcome.backend.send(message)

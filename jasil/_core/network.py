@@ -29,6 +29,13 @@ _HOSTNAME_RE = re.compile(
 # Reasons a destination is refused. Phrased to read correctly after a host value.
 _UNRESOLVABLE = "hostname could not be resolved"
 _UNPARSEABLE = "resolves to an unparseable address"
+
+
+def is_unresolvable(reason: str | None) -> bool:
+    """True when ``reason`` says the lookup failed, which may pass, rather than the host being refused."""
+    return reason == _UNRESOLVABLE
+
+
 _NON_PUBLIC = "resolves to a non-public address"
 _NOT_AN_AUTHORITY = "is not a bare host[:port] authority"
 

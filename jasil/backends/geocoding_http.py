@@ -252,6 +252,18 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
         The ``{scheme}://{host}/reverse`` URL, or ``None`` when the host failed
         SSRF validation (the reason is logged).
     """
+    return resolve_reverse_endpoint(host, use_https=use_https, allowed_hosts=allowed_hosts)[0]
+
+
+def resolve_reverse_endpoint(
+    host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()
+) -> tuple[str | None, str | None]:
+    """Like :func:`build_reverse_endpoint`, but also return why a host was refused.
+
+    Returns:
+        ``(url, None)`` for an accepted host, else ``(None, reason)``. The reason
+        is already logged.
+    """
     reason = network.host_rejection_reason(host, allowed_hosts=allowed_hosts, purpose="reverse_geocoding")
     if reason is not None:
         logger.warning(
@@ -261,6 +273,6 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
             host,
             reason,
         )
-        return None
+        return None, reason
     scheme = "https" if use_https else "http"
-    return f"{scheme}://{host}/reverse"
+    return f"{scheme}://{host}/reverse", None

@@ -69,10 +69,15 @@ class TestEachRule:
 
         monkeypatch.setattr(network.socket, "getaddrinfo", refuse)
 
-        assert _codes(uri="smtp://relay.example.com", **OK, secure=False) == [MailProblemCode.CLEARTEXT_PUBLIC_HOST]
+        assert _codes(uri="smtp://relay.example.com", **OK, secure=False) == [
+            MailProblemCode.CLEARTEXT_HOST_UNRESOLVABLE
+        ]
 
     def test_every_code_has_a_case(self):
-        covered = {code for code, _ in CASES} | {MailProblemCode.CLEARTEXT_PUBLIC_HOST}
+        covered = {code for code, _ in CASES} | {
+            MailProblemCode.CLEARTEXT_PUBLIC_HOST,
+            MailProblemCode.CLEARTEXT_HOST_UNRESOLVABLE,
+        }
 
         assert covered == set(MailProblemCode)
 

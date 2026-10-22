@@ -492,7 +492,7 @@ backend and returns a list of `MailProblem(code, field, message)`; `code` is a
 `invalid_from_address`, `invalid_ehlo_hostname`, `credentials_incomplete`,
 `credentials_not_ascii`, `memory_has_host`, `memory_cleartext_unsupported`,
 `cleartext_with_implicit_tls`, `cleartext_with_credentials`,
-`cleartext_public_host`.
+`cleartext_public_host`, `cleartext_host_unresolvable` (the lookup failed; a build retries it).
 
 ## RealtimeProvider
 

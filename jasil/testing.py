@@ -183,6 +183,8 @@ def memory_mail(platform: Platform) -> MemoryMail:
     mail: object = platform.mail
     if isinstance(mail, ReloadingMail):
         mail = mail.current_backend()
+    if mail is None:
+        raise TypeError("platform.mail has no backend yet; its source is first consulted on the first send")
     if not isinstance(mail, MemoryMail):
         raise TypeError("platform.mail is not the in-memory backend; configure mail.uri as memory://")
     return mail

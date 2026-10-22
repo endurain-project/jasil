@@ -41,6 +41,7 @@ class MailProblemCode(StrEnum):
     CLEARTEXT_WITH_IMPLICIT_TLS = "cleartext_with_implicit_tls"
     CLEARTEXT_WITH_CREDENTIALS = "cleartext_with_credentials"
     CLEARTEXT_PUBLIC_HOST = "cleartext_public_host"
+    CLEARTEXT_HOST_UNRESOLVABLE = "cleartext_host_unresolvable"
 
 
 @dataclass(frozen=True)
@@ -192,7 +193,9 @@ def mail_problems(mail: "MailSettings") -> list[MailProblem]:
                 reason = network.non_public_rejection_reason(hostname)
                 if reason is not None:
                     add(
-                        MailProblemCode.CLEARTEXT_PUBLIC_HOST,
+                        MailProblemCode.CLEARTEXT_HOST_UNRESOLVABLE
+                        if network.is_unresolvable(reason)
+                        else MailProblemCode.CLEARTEXT_PUBLIC_HOST,
                         "mail.secure",
                         f"mail.secure=False requires a private or loopback relay; the host {reason}",
                     )
