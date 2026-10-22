@@ -732,7 +732,8 @@ class LocalStorage:
     def delete_prefix(self, area: str, prefix: str) -> int:
         check_area(area)
         check_segment(prefix, "prefix")
-        self._resolve_legacy(area, prefix)
+        if self._legacy_layout:
+            self._resolve_legacy(area, prefix)
         descendant_prefix = f"{prefix}/"
         keys = [key for key, _ in self.iter_objects(area, prefix) if key == prefix or key.startswith(descendant_prefix)]
         for key in keys:
@@ -765,7 +766,6 @@ class LocalStorage:
         if prefix:
             check_listing_prefix(prefix)
         area_dir = self._resolve_area(area)
-        legacy_area = self._resolve_area(area, legacy=True)
 
         def objects() -> Iterator[tuple[str, float]]:
             try:
@@ -809,6 +809,7 @@ class LocalStorage:
 
             if not self._legacy_layout:
                 return
+            legacy_area = self._resolve_area(area, legacy=True)
             try:
                 if not stat.S_ISDIR(legacy_area.stat().st_mode):
                     return

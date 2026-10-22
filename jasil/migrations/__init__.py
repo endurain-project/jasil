@@ -148,7 +148,12 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
         return ""
     present = set(inspect(connection).get_table_names())
     if present & jasil_table_names():
-        return ""
+        # Creating the unprefixed revisions beside prefixed tables would leave
+        # duplicates, and rev0003 would then skip its renames.
+        raise SchemaCompatibilityError(
+            "The database holds unversioned prefixed JASIL tables; "
+            "call adopt_existing_schema(engine) before upgrade(engine)"
+        )
     if len(_LEGACY_BASELINE_TABLES & present) >= 2:
         # An unversioned pre-0.9 schema: creating the prefixed tables beside it
         # would leave the data behind and make rev0003 skip the rename.

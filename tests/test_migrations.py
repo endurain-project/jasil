@@ -520,6 +520,16 @@ class TestAdoptExistingSchema:
         tables = set(inspect(engine).get_table_names())
         assert not tables & jasil_table_names()
 
+    def test_upgrade_refuses_an_unversioned_prefixed_schema(self, engine):
+        """Running the unprefixed revisions beside prefixed tables would duplicate them."""
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match="adopt_existing_schema"):
+            migrations.upgrade(engine)
+
+        assert not set(inspect(engine).get_table_names()) & legacy_table_names()
+
     def test_a_baseline_schema_with_a_wrong_column_type_fails_closed(self, engine):
         migrations.upgrade(engine, "rev0001")
         _drop_version_table(engine)

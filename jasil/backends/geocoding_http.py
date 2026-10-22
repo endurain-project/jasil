@@ -72,7 +72,7 @@ def _first(data: dict, *names: str) -> str | None:
 
 def _country_code(value: object) -> str | None:
     """Normalise an ISO 3166-1 alpha-2 code to upper case, or None when it is not one."""
-    if isinstance(value, str) and len(value) == 2 and value.isalpha():
+    if isinstance(value, str) and len(value) == 2 and value.isascii() and value.isalpha():
         return value.upper()
     return None
 

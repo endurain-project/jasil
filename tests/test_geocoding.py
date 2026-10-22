@@ -274,6 +274,17 @@ class TestResponseParsing:
         assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
 
     @responses.activate
+    def test_a_non_ascii_country_code_is_dropped(self, backend):
+        # "ßa" is two letters but upper-cases to three.
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            json={"address": {"country": "Portugal", "country_code": "ßa"}},
+        )
+
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
+
+    @responses.activate
     def test_an_answer_with_nothing_useful_resolves_to_none(self, backend):
         responses.add(responses.GET, "https://geo.test/reverse", json={"address": {"postcode": "1700"}})
 

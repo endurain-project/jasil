@@ -910,13 +910,26 @@ class TestLocalStorage:
         assert metadata.content_type is None
         assert metadata.etag is None
 
+    def test_delete_prefix_ignores_a_flat_layout_symlink_when_the_layout_is_off(self, storage, tmp_path):
+        storage.save("archive", "keep.webp", b"keep")
+        source_area = tmp_path / "thumbnails"
+        source_area.mkdir()
+        (source_area / "linked").symlink_to(tmp_path / "archive", target_is_directory=True)
+
+        assert storage.delete_prefix("thumbnails", "linked") == 0
+        assert storage.list_keys("thumbnails") == []
+        assert storage.get("archive", "keep.webp") == b"keep"
+
     def test_a_directory_has_no_object_metadata(self, storage, tmp_path):
         (tmp_path / "thumbnails" / "directory").mkdir(parents=True)
 
         assert storage.stat("thumbnails", "directory") is None
 
     @pytest.mark.parametrize("operation", ["stat", "serve", "delete_prefix"])
-    def test_object_inspection_failures_are_provider_neutral(self, storage, monkeypatch, operation):
+    def test_object_inspection_failures_are_provider_neutral(self, storage, legacy_storage, monkeypatch, operation):
+        if operation == "delete_prefix":
+            # The flat layout is only consulted, and so only fails, when it is on.
+            storage = legacy_storage
         unavailable_path = Mock()
         unavailable_path.stat.side_effect = OSError("storage unavailable")
         unavailable_path.open.side_effect = OSError("storage unavailable")
@@ -1028,7 +1041,8 @@ class TestLocalStorage:
         assert (tmp_path / "thumbnails").exists() is False
         assert tmp_path.is_dir()
 
-    def test_delete_prefix_refuses_a_symlink_into_another_area(self, storage, tmp_path):
+    def test_delete_prefix_refuses_a_symlink_into_another_area(self, legacy_storage, tmp_path):
+        storage = legacy_storage
         storage.save("archive", "keep.webp", b"keep")
         source_area = tmp_path / "thumbnails"
         source_area.mkdir()
