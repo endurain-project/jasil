@@ -28,6 +28,7 @@ import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 import jasil.settings as jasil_settings
+from jasil._reloading import ReloadingMail
 from jasil.backends.mail_memory import MemoryMail
 from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.container import Platform, build_platform
@@ -96,6 +97,7 @@ def install_test_platform(
     *,
     clock: FixedClock | None = None,
     settings: jasil_settings.JasilSettings | None = None,
+    sources: jasil_settings.RuntimeSources | None = None,
 ) -> Platform:
     """Build an all-in-process platform, publish it, and return it.
 
@@ -121,6 +123,9 @@ def install_test_platform(
             stays unset and sending raises. An unset ``realtime_uri`` becomes
             ``memory://`` under the same rule, so hints are delivered inline
             and can be captured with :func:`capture_hints`.
+        sources: Runtime sources to build the platform with, so a host can test
+            against a source. Mail with a source skips the ``memory://``
+            substitution above: the source decides what mail does.
 
     Returns:
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
@@ -138,7 +143,7 @@ def install_test_platform(
                 state_sources=(capabilities.StateSource(label="realtime_uri", uri="memory://"),),
             ),
         )
-    if not configured.mail.uri:
+    if not configured.mail.uri and not (sources and sources.mail):
         # Unconfigured mail would raise on every send; a test wants it recorded.
         recording = replace(configured, mail=replace(configured.mail, uri="memory://", secure=True))
         configured = _prefer_memory(
@@ -151,7 +156,7 @@ def install_test_platform(
             ),
         )
     jasil_settings.configure(configured)
-    platform = build_platform(configured, clock=clock or FixedClock())
+    platform = build_platform(configured, clock=clock or FixedClock(), sources=sources)
     platform_runtime.set_active_platform(platform)
     return platform
 
@@ -161,7 +166,10 @@ def memory_mail(platform: Platform) -> MemoryMail:
 
     ``Platform.mail`` is a :class:`~jasil.providers.MailProvider`, which has no
     ``outbox``; this narrows it for a type checker and fails loudly when the
-    platform was built with a real backend.
+    platform was built with a real backend. For mail with a runtime source it
+    returns the backend built from the settings the source returned last; the
+    outbox belongs to those settings, so a change starts a new, empty one. Call
+    it after a send (the source is not consulted here).
 
     Args:
         platform: The platform from :func:`install_test_platform`.
@@ -172,7 +180,11 @@ def memory_mail(platform: Platform) -> MemoryMail:
     Raises:
         TypeError: When ``platform.mail`` is not the in-memory backend.
     """
-    mail = platform.mail
+    mail: object = platform.mail
+    if isinstance(mail, ReloadingMail):
+        mail = mail.current_backend()
+    if mail is None:
+        raise TypeError("platform.mail has no backend yet; its source is first consulted on the first send")
     if not isinstance(mail, MemoryMail):
         raise TypeError("platform.mail is not the in-memory backend; configure mail.uri as memory://")
     return mail

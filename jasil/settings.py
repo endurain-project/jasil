@@ -30,8 +30,10 @@ raise, because a Redis host or bucket name cannot be inferred. The one exception
 is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode
 
@@ -40,12 +42,16 @@ __all__ = [
     "GeocodingSettings",
     "JasilSettings",
     "JobSettings",
+    "MailProblem",
+    "MailProblemCode",
     "MailSettings",
     "NetworkSettings",
+    "RuntimeSources",
     "StorageSettings",
     "configure",
     "get_settings",
     "is_configured",
+    "mail_problems",
     "reset",
 ]
 
@@ -341,6 +347,29 @@ class JasilSettings:
 
 
 _settings: ConfigSlot[JasilSettings] = ConfigSlot(default_factory=JasilSettings)
+
+
+@dataclass(frozen=True)
+class RuntimeSources:
+    """Callables returning the current settings of capabilities the host edits at runtime.
+
+    Passed to :func:`jasil.container.build_platform`. For a capability with a
+    source, :attr:`JasilSettings.mail` / :attr:`JasilSettings.geocoding` are
+    **ignored**: the platform asks the source instead and rebuilds the backend
+    when the returned settings change.
+
+    Each callable is invoked on every use of the provider (every ``send``, every
+    ``reverse``), outside any lock, and may raise. Making that cheap — a
+    process-local cache, a version stamp — is the host's job; JASIL has no
+    refresh interval.
+
+    Attributes:
+        mail: Returns the current :class:`MailSettings`.
+        geocoding: Returns the current :class:`GeocodingSettings`.
+    """
+
+    mail: Callable[[], MailSettings] | None = None
+    geocoding: Callable[[], GeocodingSettings] | None = None
 
 
 def configure(settings: JasilSettings) -> None:

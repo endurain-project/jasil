@@ -434,6 +434,11 @@ capability exists.
     See [Configuration](configuration.md#networksettings) for the allowlist
     escape hatch.
 
+Geocoding settings can also come from a runtime source: see
+[Runtime sources](configuration.md#runtime-sources). `Platform.geocoding` is then a
+reloading provider that rebuilds when the settings change; it satisfies the same
+protocol, and returns `None` when the source fails and nothing worked before.
+
 ## MailProvider
 
 ```python
@@ -472,6 +477,22 @@ warning logs the refused count, because failing would make a retry re-send to
 recipients that already received it. Every recipient of a message is visible in
 `To`, and a refused one is only counted in that warning — send one message per
 recipient when either matters.
+
+### Runtime-configured mail
+
+`build_platform(settings, sources=RuntimeSources(mail=load_mail))` makes
+`Platform.mail` follow the settings `load_mail()` returns, without a restart. The
+failure behaviour is in [Runtime sources](configuration.md#runtime-sources).
+`mail_problems(mail_settings)` validates a `MailSettings` without building a
+backend and returns a list of `MailProblem(code, field, message)`; `code` is a
+`MailProblemCode`:
+
+`invalid_uri`, `unsupported_scheme`, `uri_carries_credentials`,
+`uri_has_extra_parts`, `invalid_host`, `invalid_port`, `missing_from_address`,
+`invalid_from_address`, `invalid_ehlo_hostname`, `credentials_incomplete`,
+`credentials_not_ascii`, `memory_has_host`, `memory_cleartext_unsupported`,
+`cleartext_with_implicit_tls`, `cleartext_with_credentials`,
+`cleartext_public_host`, `cleartext_host_unresolvable` (the lookup failed; a build retries it).
 
 ## RealtimeProvider
 

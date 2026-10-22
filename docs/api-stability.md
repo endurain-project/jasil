@@ -23,10 +23,10 @@ modules:
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
-| `jasil.settings` | The settings dataclasses and `configure` / `get_settings`. |
+| `jasil.settings` | The settings dataclasses and `configure` / `get_settings`, `RuntimeSources`, and `mail_problems` with `MailProblem` and `MailProblemCode` (the set of codes may grow in a minor release; a code is never renamed or reused). |
 | `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `Base`. |
 | `jasil.correlation` | `configure_provider`, `get_correlation_id`, `set_correlation_id`. |
-| `jasil.container` | `Platform`, `build_platform`. |
+| `jasil.container` | `Platform`, `build_platform` (including its `sources` parameter). |
 | `jasil.capabilities` | `check_deployment_consistency`, `topology_of` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
@@ -102,7 +102,8 @@ These may change in any release, including a patch.
 ### Private modules
 
 `jasil._core` is internal, and the leading underscore is the notice. It holds
-vendored helpers (the SSRF guard, the config slot) whose signatures serve JASIL's
+vendored helpers (the SSRF guard, the config slot, the reloading providers behind
+`RuntimeSources`) whose signatures serve JASIL's
 needs, not yours.
 
 Anything else prefixed with `_`, at any level.

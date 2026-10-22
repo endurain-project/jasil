@@ -19,7 +19,7 @@ import jasil.testing as jasil_testing
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.storage_local import LocalStorage
 from jasil.profile import DeploymentProfile, JobWorkerMode
-from jasil.providers import ClockProvider, ServeFile
+from jasil.providers import ClockProvider, MailError, MailMessage, MailNotConfiguredError, ServeFile
 
 
 @pytest.fixture(autouse=True)
@@ -386,3 +386,43 @@ class TestPlatformClose:
         platform.close()
 
         platform.close()
+
+
+class TestSources:
+    @staticmethod
+    def _sources(value):
+        return jasil_settings.RuntimeSources(mail=lambda: value)
+
+    def test_sources_reach_the_platform(self, tmp_path):
+        mail = jasil_settings.MailSettings(uri="memory://", from_address="a@example.com")
+
+        platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(mail))
+
+        from jasil._reloading import ReloadingMail
+
+        assert isinstance(platform.mail, ReloadingMail)
+
+    def test_the_source_decides_what_mail_does(self, tmp_path):
+        """No ``memory://`` is substituted for a sourced capability: an unset source stays unset."""
+        platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(jasil_settings.MailSettings()))
+
+        with pytest.raises(MailNotConfiguredError):
+            platform.mail.send(MailMessage(to=["a@b.c"], subject="s", text="t"))
+
+    def test_memory_mail_unwraps_a_sourced_memory_backend(self, tmp_path):
+        mail = jasil_settings.MailSettings(uri="memory://", from_address="a@example.com")
+        platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(mail))
+
+        platform.mail.send(MailMessage(to=["a@b.c"], subject="s", text="t"))
+
+        assert len(jasil_testing.memory_mail(platform).outbox) == 1
+
+    def test_memory_mail_refuses_a_sourced_smtp_backend(self, tmp_path, monkeypatch):
+        mail = jasil_settings.MailSettings(uri="smtp://relay.test", from_address="a@b.c")
+        monkeypatch.setattr("socket.getaddrinfo", lambda *args, **kwargs: [])
+        platform = jasil_testing.install_test_platform(tmp_path, sources=self._sources(mail))
+        with pytest.raises(MailError):
+            platform.mail.send(MailMessage(to=["a@b.c"], subject="s", text="t"))
+
+        with pytest.raises(TypeError, match="memory://"):
+            jasil_testing.memory_mail(platform)

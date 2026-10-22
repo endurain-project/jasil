@@ -217,7 +217,7 @@ class TestGeocodingResolution:
         assert isinstance(provider, NullGeocoding)
 
     def test_a_valid_host_is_enabled(self, monkeypatch):
-        monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: f"https://{host}/reverse")
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: (f"https://{host}/reverse", None))
 
         provider = container._build_geocoding(
             _settings(geocoding=settings.GeocodingSettings(uri="nominatim://nominatim.test:8080"))
@@ -241,9 +241,9 @@ class TestGeocodingResolution:
 
         def fake(host, *, use_https, allowed_hosts=()):
             seen["host"], seen["https"] = host, use_https
-            return "https://x/reverse"
+            return "https://x/reverse", None
 
-        monkeypatch.setattr(container, "build_reverse_endpoint", fake)
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", fake)
 
         provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri)))
 
@@ -253,7 +253,7 @@ class TestGeocodingResolution:
     def test_the_configured_user_agent_is_used(self, monkeypatch):
         """Nominatim's usage policy requires an identifying value, and the
         library must not hard-code a host application's name."""
-        monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
         provider = container._build_geocoding(
             _settings(geocoding=settings.GeocodingSettings(uri="photon://photon.test", user_agent="MyApp/1.0"))
@@ -262,7 +262,7 @@ class TestGeocodingResolution:
         assert provider._user_agent == "MyApp/1.0"
 
     def test_the_rate_limit_becomes_a_minimum_interval(self, monkeypatch):
-        monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
         provider = container._build_geocoding(
             _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=2.0))
@@ -271,7 +271,7 @@ class TestGeocodingResolution:
         assert provider._min_interval == 0.5
 
     def test_a_zero_rate_limit_disables_throttling(self, monkeypatch):
-        monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
         provider = container._build_geocoding(
             _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=0))

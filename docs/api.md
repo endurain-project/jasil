@@ -36,6 +36,10 @@ Generated from the source docstrings.
 
 ## Settings
 
+Includes `RuntimeSources` (callables returning mail / geocoding settings, passed to
+`build_platform(sources=)`) and `mail_problems`, `MailProblem` and `MailProblemCode`
+(validate mail settings without building a backend).
+
 ::: jasil.settings
 
 ## Correlation

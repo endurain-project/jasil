@@ -157,6 +157,91 @@ Leaving a URI unset falls back to the profile's default:
     `distributed` or `custom` raises `ValueError` at startup rather than
     starting a deployment that looks healthy and is not.
 
+## Runtime sources
+
+Everything above is read once, at startup. Mail and geocoding can instead follow
+settings a host's operators edit while it runs (stored in the host's database,
+say), without a restart. The host supplies a callable that returns the current
+settings; JASIL decides when to rebuild the backend, caches it, reports it, and
+defines what happens when something fails. JASIL learns nothing about where the
+settings are stored, how they are encrypted or who edits them.
+
+```python
+from jasil.settings import RuntimeSources
+
+platform = jasil_container.build_platform(settings, sources=RuntimeSources(mail=load_mail))
+```
+
+`load_mail` and `load_geocoding` are plain callables returning a `MailSettings` /
+`GeocodingSettings`. A capability with a source ignores `JasilSettings.mail` /
+`.geocoding`; a capability without one is built once from them, exactly as before.
+
+### The contract
+
+- **Called on every use** of the provider: every `send`, every `reverse`. There is
+  no refresh interval, so the host owns making the call cheap. A process-local
+  cache with a short expiry is the usual shape; a version stamp the host bumps on
+  save and checks with one cheap read works too. Each process must notice an
+  edit on its own: JASIL has no push invalidation.
+- **Not called by `build_platform`.** The host may not be able to read its store
+  yet (migrations have not run). The first call is the first `send` / `reverse`.
+- **May raise.** The failure table below says what happens.
+- Called outside JASIL's lock, from whichever thread is sending.
+
+JASIL compares what the source returns with what the cached backend was built
+from (including `password` and `api_key`, which are hidden from `repr` but still
+compared), and rebuilds only on a difference. The result of a build, backend or
+rejection, is cached, so a bad configuration is logged once per change and not on
+every call. The same bad value arriving again after a different one is logged
+again.
+
+### Failure behaviour
+
+| Situation | Mail | Geocoding |
+|---|---|---|
+| The source raises, and the last build produced a working backend | That backend is used, **including its credentials, for as long as the source keeps failing**: revoking them in a store that is down does not take effect until it answers. A warning logs on the first failure of a run, debug after, until the source works again. | Same. |
+| The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception chained. | `reverse` returns `None`. |
+| The settings are invalid | `send` raises `MailNotConfiguredError` whose message carries the reason (never a setting's value), also logged once. The previous backend and its credentials are **never** reused. | `NullGeocoding`; the reason is logged once, as at startup. |
+| The relay or geocoding host does not resolve (mail `secure=False`, geocoding) | `send` raises a plain `MailError`, retryable. The build is retried after 30 seconds, not remembered as a rejection. | `reverse` returns `None`; the build is retried after 30 seconds. |
+| The settings are unset (`uri` empty) | As `NullMail`: `send` raises `MailNotConfiguredError`. | As `NullGeocoding`. |
+
+Both mail errors have no SMTP status, so a durable job retries either one.
+
+### Consistency on every rebuild
+
+The startup deployment-consistency check ignores `settings.mail` when mail has a
+source, since that value is not what will be used. The same rule runs on every
+rebuild instead: a `memory://` URI arriving from the source in a multi-process
+deployment is rejected (`MailNotConfiguredError`) when
+`enforce_deployment_consistency` is on, and built with a warning when it is off.
+A runtime edit cannot bypass the rule.
+
+### Validating on save
+
+`jasil.settings.mail_problems(mail_settings)` lists every problem with a
+`MailSettings` without building a backend, one `MailProblem(code, field, message)`
+each, so an admin form can reject a bad edit instead of storing it. It is the same
+set of rules the builder applies. With `secure=False` on `smtp://` it resolves the
+host to confirm it is private, so it needs a working resolver. The messages never
+echo a value. The one rule it leaves out is the multi-process `memory://` one,
+which needs the topology.
+
+### Good to know
+
+- A geocoding rebuild creates a new `HttpGeocoding`, which resets its throttle: at
+  most one extra immediate request after an edit.
+- A `memory://` mail source gets a fresh, empty outbox on every rebuild.
+- A rebuild happens under a lock, once per change, so concurrent senders wait for
+  it. For `secure=False` that includes one DNS lookup.
+- Nothing is held open between uses, so `Platform.close()` has nothing extra to release.
+
+### What is not reloadable
+
+State, storage, events, the lock and realtime describe the deployment's shape:
+which processes exist and what they share. Changing one under a running process
+would silently split it from its peers, so they stay static and a change needs a
+deploy. Mail and geocoding are leaves: nothing depends on their identity.
+
 ## Host integration
 
 Three seams the host wires once at startup, in this order:
