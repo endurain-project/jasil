@@ -130,7 +130,7 @@ class TestEnvelope:
             assert realtime_envelope.decode(raw) is None
         assert "Ignoring" in caplog.text
 
-    @pytest.mark.parametrize("user_id", [7, 0, -3])
+    @pytest.mark.parametrize("user_id", [7, 0, -3, 10**300])
     def test_a_version_1_envelope_decodes_with_the_user_id_as_the_key(self, user_id):
         raw = json.dumps({"v": 1, "user_id": user_id, "hint": {"a": 1}})
 

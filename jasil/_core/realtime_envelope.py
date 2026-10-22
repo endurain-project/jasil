@@ -122,15 +122,18 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
     version = envelope.get("v")
     if type(version) is int and version == ENVELOPE_VERSION:
         key = envelope.get("key")
+        key_ok = isinstance(key, str) and _key_problem(key) is None
     elif type(version) is int and version == LEGACY_ENVELOPE_VERSION:
         user_id = envelope.get("user_id")
         # ``bool`` is an ``int`` subclass; ``True`` was never a user id.
         key = str(user_id) if isinstance(user_id, int) and not isinstance(user_id, bool) else None
+        # A v1 id is already a validated int; the v2 key cap does not apply to it.
+        key_ok = key is not None
     else:
         logger.warning("Ignoring a realtime hint with unsupported envelope version %r", version)
         return None
     hint = envelope.get("hint")
-    if not isinstance(key, str) or _key_problem(key) is not None or not isinstance(hint, dict) or not _encodes(hint):
+    if not key_ok or not isinstance(hint, dict) or not _encodes(hint):
         logger.warning("Ignoring a malformed realtime hint envelope")
         return None
     return key, hint
