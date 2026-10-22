@@ -228,7 +228,7 @@ class JasilSettings:
         events_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``.
         lock_uri: ``noop://`` or ``postgres-advisory://``.
         realtime_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``
-            — the channel that carries per-user realtime hints to every process
+            — the channel that carries keyed realtime hints to every process
             (see :class:`~jasil.providers.RealtimeProvider`). Unset, it follows
             the resolved ``events_uri`` in every profile — ``memory://`` under
             the ``local`` defaults, the event bus's Redis otherwise — because

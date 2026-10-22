@@ -84,7 +84,7 @@ class Platform:
             this is a backend whose ``send`` raises
             :class:`~jasil.providers.MailNotConfiguredError`, so a message is
             never dropped silently.
-        realtime: Cross-process per-user hint channel. Defaults to an
+        realtime: Cross-process keyed hint channel. Defaults to an
             :class:`~jasil.backends.realtime_inprocess.InProcessRealtime`, so a
             hand-built ``Platform`` need not supply it. The host registers its
             handler with ``subscribe`` and calls ``start`` itself (only the

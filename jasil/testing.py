@@ -178,11 +178,11 @@ def memory_mail(platform: Platform) -> MemoryMail:
     return mail
 
 
-def capture_hints(platform: Platform) -> list[tuple[int, dict]]:
+def capture_hints(platform: Platform) -> list[tuple[str, dict]]:
     """Record every realtime hint the platform delivers from now on.
 
     Registers a handler on the in-process realtime backend and returns the list
-    it appends to, as ``(user_id, hint)`` in publish order. The hint is the
+    it appends to, as ``(key, hint)`` in publish order. The hint is the
     decoded copy a real subscriber would receive, so a value that does not
     survive JSON (a tuple, an integer key) shows up the way production sends it.
 
@@ -198,8 +198,8 @@ def capture_hints(platform: Platform) -> list[tuple[int, dict]]:
     realtime = platform.realtime
     if not isinstance(realtime, InProcessRealtime):
         raise TypeError("platform.realtime is not the in-process backend; configure realtime_uri as memory://")
-    captured: list[tuple[int, dict]] = []
-    realtime.subscribe(lambda user_id, hint: captured.append((user_id, hint)))
+    captured: list[tuple[str, dict]] = []
+    realtime.subscribe(lambda key, hint: captured.append((key, hint)))
     return captured
 
 

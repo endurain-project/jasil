@@ -100,7 +100,7 @@ holds, and *multi-node* only for the first:
 channel must not resolve to process-local memory when the deployment is
 multi-process. The stores would diverge silently across processes, and a hint
 published by one process (another replica, a standalone job worker) would never
-reach the process holding the user's connection. An unset `realtime_uri` follows
+reach the process holding the connection it is for. An unset `realtime_uri` follows
 `events_uri`, so it is judged (and named in the refusal) as the event bus.
 
 **Cross-node storage.** Blob storage must not resolve to the local filesystem

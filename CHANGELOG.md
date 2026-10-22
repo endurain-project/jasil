@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.8.0] - 2026-10-22
+
+### Added
+
+- `jasil.providers.MAX_REALTIME_KEY_LENGTH` (256), the cap `notify` enforces on a key.
+
+### Changed
+
+- **BREAKING: the realtime hint channel is addressed by an opaque string key, not a user id.** `RealtimeProvider.notify_user(user_id: int, hint)` is now `notify(key: str, hint)`, and `subscribe` handlers are called as `handler(key: str, hint)`. The `key` names the audience (a user id, device id, organisation, cache name, ...); its meaning belongs to the host and JASIL does no per-key routing. There is no deprecated `notify_user` alias. A host that used integer user ids passes `str(user_id)` and parses it back in its handler.
+- `notify` raises `ValueError` for a `key` that is not a `str`, is empty, is over 256 characters (`MAX_REALTIME_KEY_LENGTH`, counted in code points), or holds an unpaired Unicode surrogate, in addition to the existing hint and envelope-size checks. Both backends validate identically.
+- A received envelope whose `key` or `hint` holds an unpaired Unicode surrogate (sent JSON-escaped), or whose `hint` holds `NaN` / infinity, is logged and dropped instead of reaching the handlers, so a subscriber never sees a hint that `notify` would have refused.
+- The `key` appears in the warning logged when a publish fails; do not put a secret in it.
+- **BREAKING: the realtime wire envelope is now version 2**, `{"v": 2, "key": "<str>", "hint": {...}}`. Version 1 envelopes from 0.7.0 replicas are still read, with `str(user_id)` as the key, so a rolling upgrade loses no hints in that direction; 0.7.0 replicas ignore version 2, so hints published by already-upgraded processes do not reach not-yet-upgraded ones until the rollout finishes.
+- `jasil.testing.capture_hints` returns `list[tuple[str, dict]]` of `(key, hint)`.
+- Development tooling moves to uv 0.13: `[tool.uv] required-version` is now `>=0.13.5,<0.14`, the locked `uv` is 0.13.5, and the release build pins the same version. uv is development-only and does not affect installed packages.
+- CI now also runs the default SQLite test matrix on Python 3.15, in addition to 3.12, 3.13 and 3.14. The supported Python versions are unchanged.
+
 ## [0.7.0] - 2026-10-21
 
 ### Added
@@ -248,6 +265,7 @@ still settling: `0.x` releases may break it, and the SemVer guarantees in
 - The Redis state backend escapes glob metacharacters before turning a caller's key prefix into a `SCAN`/`MATCH` pattern, so a prefix holding `*`, `?` or `[...]` matches only itself and never widens onto keys the caller did not name. A prefix built from a tenant or user identifier is therefore safe.
 - The local storage backend rejects absolute and parent-traversal area and key values before any filesystem access, and percent-encodes both into the URL it returns, so a key holding `?`, `#` or `%` cannot alter the URL it lands in.
 
+[0.8.0]: https://github.com/endurain-project/jasil/releases/tag/v0.8.0
 [0.7.0]: https://github.com/endurain-project/jasil/releases/tag/v0.7.0
 [0.6.0]: https://github.com/endurain-project/jasil/releases/tag/v0.6.0
 [0.5.1]: https://github.com/endurain-project/jasil/releases/tag/v0.5.1

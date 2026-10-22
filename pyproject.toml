@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.7.0"
+version = "0.8.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -140,11 +140,11 @@ docs = [
 # ``tool_version_not_supported`` when ``required-version`` excludes it. Raising
 # this floor above the uv that Dependabot bundles silently stops all dependency
 # updates, security ones included. Check what it supports before raising it.
-required-version = ">=0.12.1,<0.13"
+required-version = ">=0.13.5,<0.14"
 # The locked `uv` is a transitive dependency of hatch, separate from the uv that
-# runs the build. Keep it on the same 0.12 series as `required-version` so the
+# runs the build. Keep it on the same 0.13 series as `required-version` so the
 # lock never jumps a minor series on an unrelated upgrade.
-constraint-dependencies = ["uv<0.13"]
+constraint-dependencies = ["uv<0.14"]
 # Supply-chain cooldown: refuse dependency versions published in the last 30
 # days, so a compromised release has time to be caught before it can enter a
 # build.

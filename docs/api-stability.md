@@ -19,7 +19,7 @@ modules:
 
 | Module | Surface |
 |---|---|
-| `jasil.providers` | The capability protocols and their method signatures. |
+| `jasil.providers` | The capability protocols and their method signatures, and `MAX_REALTIME_KEY_LENGTH`. |
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
@@ -50,10 +50,12 @@ default is additive.
 
 `RealtimeProvider`'s four methods and its contract are covered: best-effort,
 at-most-once, unordered delivery; transport failures never raise from
-`notify_user`; an invalid hint raises `ValueError`; every started process
-receives every hint. The realtime wire envelope (`{"v": 1, "user_id", "hint"}`)
+`notify`; an invalid hint raises `ValueError`; every started process
+receives every hint. The realtime wire envelope (`{"v": 2, "key", "hint"}`)
 is covered like the event envelope: a new version is added alongside, never in
-place of, the one a running replica reads. The default 4096-byte cap may grow
+place of, the one a running replica reads. 0.8 writes version 2 and still reads
+version 1 (`{"v": 1, "user_id", "hint"}`, its `user_id` delivered as the key
+`str(user_id)`). The default 4096-byte cap may grow
 but will not shrink within a minor series.
 
 Adding a method to a protocol is **breaking** — every host-supplied backend would
