@@ -19,7 +19,7 @@ modules:
 
 | Module | Surface |
 |---|---|
-| `jasil.providers` | The capability protocols and their method signatures, and `MAX_REALTIME_KEY_LENGTH`. |
+| `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), and `MAX_REALTIME_KEY_LENGTH`. |
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
@@ -79,10 +79,13 @@ be able to read what a new one writes, or a rolling deploy breaks.
 
 ### Database schema
 
-The columns, indexes and constraints of `event_log`, `event_outbox`,
-`processing_jobs`, and `job_workers`. Schema changes ship as Alembic revisions,
-and a revision must be forward-compatible with the previous release: during a
-rolling deploy the old code runs against the new schema.
+The columns, indexes and constraints of `jasil_event_log`, `jasil_event_outbox`,
+`jasil_processing_jobs`, `jasil_job_workers`, and `jasil_job_attempts`. Schema
+changes ship as Alembic revisions, and a revision must be forward-compatible with
+the previous release: during a rolling deploy the old code runs against the new
+schema. The one exception is the `jasil_` prefix rename (`rev0003`, 0.9.0), which
+needs every older process stopped first; see
+[Upgrading from 0.8](observability.md#upgrading-from-08-or-earlier-the-jasil_-prefix).
 
 Removing a column is a major change. Adding a nullable one is not.
 

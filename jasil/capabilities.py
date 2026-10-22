@@ -16,12 +16,12 @@ change here.
 
 Five consistency rules are enforced:
 
-- **Cross-process backends** — ephemeral *state* (rate limiting, throttling,
+- **Cross-process backends** — ephemeral *state* (rate limiting, escalating gates,
   single-use tokens), the *event* bus and the *realtime* hint channel — must not
   resolve to process-local memory when the topology is multi-process; the stores
   and the bus would diverge silently across processes, and a hint published by
   one process (a job worker, another replica) would never reach the process
-  holding the user's connection. All three share the ``memory://`` /
+  holding the client's connection. All three share the ``memory://`` /
   ``redis://`` vocabulary and are validated by :func:`check_state_consistency`.
 - **Cross-node storage** must not resolve to the local filesystem when the
   topology is multi-node (the ``distributed`` profile), where replicas run on
@@ -272,7 +272,7 @@ def check_state_consistency(
 
     A multi-process deployment that resolves a cross-process backend to
     process-local memory is fatally misconfigured: ephemeral state (rate-limit
-    counters, lockout gates, single-use tokens) and the in-process event bus
+    counters, escalating gates, single-use tokens) and the in-process event bus
     would silently diverge across processes, and in-process realtime hints would
     never leave the process that published them. State stores, the event bus and
     the realtime channel share the ``memory://`` / ``redis://`` vocabulary, so all

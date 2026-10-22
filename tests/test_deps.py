@@ -60,6 +60,7 @@ class TestPlatformDependencies:
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
             pytest.param(deps.get_mail, "mail", id="mail"),
+            pytest.param(deps.get_geocoding, "geocoding", id="geocoding"),
             pytest.param(deps.get_realtime, "realtime", id="realtime"),
         ],
     )
@@ -84,6 +85,7 @@ class TestResolutionOrder:
             pytest.param(deps.get_lock, "lock", id="lock"),
             pytest.param(deps.get_clock, "clock", id="clock"),
             pytest.param(deps.get_mail, "mail", id="mail"),
+            pytest.param(deps.get_geocoding, "geocoding", id="geocoding"),
             pytest.param(deps.get_realtime, "realtime", id="realtime"),
         ],
     )

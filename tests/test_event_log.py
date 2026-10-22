@@ -136,7 +136,7 @@ class TestHandlerNameClamping:
 
     def test_the_column_is_declared_at_the_same_width_it_is_clamped_to(self, mapped_base):
         """The drift this constant was extracted to prevent."""
-        assert mapped_base.metadata.tables["event_log"].c.handler_name.type.length == MAX_HANDLER_NAME_LENGTH
+        assert mapped_base.metadata.tables["jasil_event_log"].c.handler_name.type.length == MAX_HANDLER_NAME_LENGTH
 
     def test_a_clamped_name_round_trips_to_the_database(self, db):
         """The point of the clamp: the write must actually land."""
@@ -164,7 +164,7 @@ class TestWorkerIdClamping:
         assert len(row.worker_id) == MAX_WORKER_ID_LENGTH
 
     def test_the_column_is_declared_at_the_same_width_it_is_clamped_to(self, mapped_base):
-        assert mapped_base.metadata.tables["event_log"].c.worker_id.type.length == MAX_WORKER_ID_LENGTH
+        assert mapped_base.metadata.tables["jasil_event_log"].c.worker_id.type.length == MAX_WORKER_ID_LENGTH
 
 
 class TestSummary:

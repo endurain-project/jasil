@@ -132,7 +132,7 @@ characters in it. This is the mitigation that makes that safe.
 ## Secrets in transit through the pipeline (CWE-532)
 
 **Where.** An event's `payload` and `metadata` are stored and transmitted
-**verbatim** — to `event_outbox`, `processing_jobs`, and `event_log`, serialized
+**verbatim** — to `jasil_event_outbox`, `jasil_processing_jobs`, and `jasil_event_log`, serialized
 onto the Redis stream, and `metadata` is logged in full when a best-effort
 subscriber fails.
 
@@ -145,8 +145,8 @@ identifiers it persists (`event_type`, `source`, `subscriber_id`), which are
 developer-authored, but a `metadata` dict is yours and reaches the log intact.
 
 The same holds for failure text. A handler's exception message is stored,
-truncated to 4000 characters, in `processing_jobs.last_error` and, one row per
-attempt, in `job_attempts.error`, and `jasil.admin.get_job` returns it. Do not
+truncated to 4000 characters, in `jasil_processing_jobs.last_error` and, one row per
+attempt, in `jasil_job_attempts.error`, and `jasil.admin.get_job` returns it. Do not
 put a secret in an exception message, and keep `jasil.admin` behind the host's own
 authorization.
 

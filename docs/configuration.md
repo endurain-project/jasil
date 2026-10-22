@@ -46,9 +46,12 @@ fields.
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
 | `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
+| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Ignored for `memory://`. |
+| `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |
+| `storage` | `StorageSettings()` | Options of the `local://` storage backend. |
 | `mail` | `MailSettings()` | Outbound mail backend. |
 | `network` | `NetworkSettings()` | Outbound egress. |
 
@@ -63,7 +66,7 @@ fields.
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
-| `record_attempts` | `True` | Write one `job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
+| `record_attempts` | `True` | Write one `jasil_job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
 | `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
 | `max_attempts` | `5` | Attempts before a job is dead-lettered. |
 | `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. A job's history goes after the job row itself is pruned; pending, claimed and dead-lettered jobs keep theirs. `<= 0` disables. |
@@ -72,7 +75,7 @@ fields.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `enabled` | `False` | Record every event's lifecycle to `event_log`. |
+| `enabled` | `False` | Record every event's lifecycle to `jasil_event_log`. |
 | `retention_days` | `30` | Age at which trail rows are pruned. `<= 0` disables. |
 
 Both `jobs.enabled` and `event_log.enabled` default to **off**, because both
@@ -83,14 +86,19 @@ because you installed it.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `provider` | `""` | `"nominatim"`, `"photon"`, or `"geocode"`. Anything else disables the capability. |
+| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
 | `rate_limit` | `1.0` | Maximum requests per second; `<= 0` disables throttling. |
-| `api_key` | `None` | Required by geocode.maps.co. |
-| `nominatim_host` | `""` | Bare `host[:port]` authority. |
-| `nominatim_use_https` | `True` | |
-| `photon_host` | `""` | Bare `host[:port]` authority. |
-| `photon_use_https` | `True` | |
+| `api_key` | `None` | Required by `geocode://`. |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
+
+### `StorageSettings`
+
+Settings of the `local://` backend; `s3://` takes none.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `local_url_prefix` | `""` | URL path prefix of the links `local://` builds, for a host serving the data directory under a path such as `/media`. |
+| `local_legacy_layout` | `False` | Also read, list and delete objects in the flat `{data_dir}/{area}/{key}` layout written by JASIL 0.3 and earlier and by the application JASIL was extracted from. Off, that directory is never consulted, so no other file under `data_dir` can be served as an object. |
 
 ### `MailSettings`
 

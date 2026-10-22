@@ -44,10 +44,10 @@ class EventLog(Base):
         completed_at: When processing finished (success or failure).
     """
 
-    __tablename__ = "event_log"
+    __tablename__ = "jasil_event_log"
     __table_args__ = (
-        Index("idx_event_log_type_status", "event_type", "status"),
-        Index("idx_event_log_created", "created_at"),
+        Index("idx_jasil_event_log_type_status", "event_type", "status"),
+        Index("idx_jasil_event_log_created", "created_at"),
         # A GIN index on event_metadata (jsonb_path_ops) is created in the
         # Alembic migration for ``@>`` correlation queries; it is Postgres-only
         # so it is intentionally not declared here (SQLite create_all in tests

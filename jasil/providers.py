@@ -110,13 +110,13 @@ type ServePlan = ServeFile | ServeRedirect | ServeStream
 
 @dataclass(frozen=True)
 class TieredFailureOutcome:
-    """Result of an atomic tiered-lockout increment.
+    """Result of :meth:`StateProvider.record_tiered_failure`.
 
     Attributes:
-        count: The failure counter value after this attempt.
-        locked_until_epoch: Wall-clock epoch (seconds) the lock is active until,
-            or ``None`` when not locked.
-        newly_locked: True only when *this* call created (or renewed) the lock.
+        count: The counter value after this call.
+        locked_until_epoch: Wall-clock epoch (seconds) the gate is closed until,
+            or ``None`` when it is open.
+        newly_locked: True only when *this* call closed (or extended) the gate.
     """
 
     count: int
@@ -131,10 +131,10 @@ class StateProvider(Protocol):
     The single seam through which domain code reads and writes short-lived
     shared state, so a store never needs to know whether it is backed by a
     process-local dict (``local``) or Redis (``distributed``). Beyond plain
-    key/value access it exposes the few *atomic* primitives that login-throttling
-    and single-use-token stores need (``set_if_absent``, ``get_and_delete``,
-    ``record_tiered_failure``) so their correctness does not depend on the
-    backend.
+    key/value access it exposes the few *atomic* primitives whose correctness
+    would otherwise depend on the backend: one-winner claims and single-use values
+    (``set_if_absent``, ``get_and_delete``) and an escalating gate over repeated
+    events (``record_tiered_failure``).
     """
 
     def get(self, key: str) -> bytes | None: ...
@@ -151,7 +151,26 @@ class StateProvider(Protocol):
         gate_key: str,
         tiers: tuple[tuple[int, int], ...],
         counter_ttl_seconds: int,
-    ) -> TieredFailureOutcome: ...
+    ) -> TieredFailureOutcome:
+        """Count one occurrence and close a gate for longer as the count climbs.
+
+        An escalating throttle over any repeated event — failed attempts, abusive
+        requests, repeated errors; what the events *are* is the caller's. The
+        call is atomic across processes. While the gate is closed it returns the
+        current count **without** incrementing, so a caller that keeps arriving
+        cannot push the count into a higher tier and extend its own penalty.
+
+        Args:
+            counter_key: Key of the running count, which expires
+                ``counter_ttl_seconds`` after the latest occurrence.
+            gate_key: Key holding the instant the gate stays closed until.
+            tiers: ``(threshold, close_seconds)`` pairs in ascending threshold
+                order. When the new count reaches a threshold the gate closes for
+                that tier's seconds; the highest tier reached wins.
+            counter_ttl_seconds: How long the count survives without a new
+                occurrence.
+        """
+        ...
 
 
 @runtime_checkable
@@ -377,15 +396,28 @@ class ClockProvider(Protocol):
 class GeocodedPlace:
     """A place resolved from coordinates. Any field may be ``None``.
 
+    The fields are administrative levels, not any host's vocabulary, and every
+    backend fills them the same way: a given level means the same thing whichever
+    upstream service answered.
+
     Attributes:
-        city: Populated place name, when the provider resolved one.
-        town: Sub-locality (district/town), when the provider resolved one.
-        country: Country name, when the provider resolved one.
+        locality: The populated place — the city, town, village or hamlet the
+            coordinate is in.
+        sublocality: A subdivision of the locality (district, suburb, borough,
+            neighbourhood).
+        region: The first-level administrative area (state, province, region).
+        country: Country name.
+        country_code: ISO 3166-1 alpha-2 code, upper-case.
+        display_name: The upstream's own single-line description of the place,
+            for the services that supply one.
     """
 
-    city: str | None = None
-    town: str | None = None
+    locality: str | None = None
+    sublocality: str | None = None
+    region: str | None = None
     country: str | None = None
+    country_code: str | None = None
+    display_name: str | None = None
 
 
 @runtime_checkable
@@ -400,8 +432,8 @@ class GeocodingProvider(Protocol):
     rate limiting) lives behind this interface instead of in a domain module.
 
     Implementations must not raise for an upstream failure — geocoding is
-    best-effort enrichment, and a provider outage must never fail the import or
-    backfill that triggered it. Return ``None`` when nothing resolves.
+    best-effort enrichment, and a provider outage must never fail the caller's
+    own work. Return ``None`` when nothing resolves.
     """
 
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None: ...

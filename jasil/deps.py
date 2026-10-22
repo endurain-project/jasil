@@ -23,6 +23,7 @@ from jasil.container import Platform
 from jasil.providers import (
     ClockProvider,
     EventBusProvider,
+    GeocodingProvider,
     LockProvider,
     MailProvider,
     RealtimeProvider,
@@ -73,6 +74,11 @@ def get_lock(request: Request) -> LockProvider:
 def get_clock(request: Request) -> ClockProvider:
     """Return the clock provider."""
     return get_platform(request).clock
+
+
+def get_geocoding(request: Request) -> GeocodingProvider:
+    """Return the reverse-geocoding provider."""
+    return get_platform(request).geocoding
 
 
 def get_mail(request: Request) -> MailProvider:

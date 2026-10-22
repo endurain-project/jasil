@@ -61,6 +61,22 @@ def _failure_detail(error: Exception) -> str:
     return f"{type(error).__name__} (HTTP {status})" if status is not None else type(error).__name__
 
 
+def _first(data: dict, *names: str) -> str | None:
+    """Return the first non-empty string value among ``names`` in ``data``."""
+    for name in names:
+        value = data.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _country_code(value: object) -> str | None:
+    """Normalise an ISO 3166-1 alpha-2 code to upper case, or None when it is not one."""
+    if isinstance(value, str) and len(value) == 2 and value.isalpha():
+        return value.upper()
+    return None
+
+
 class NullGeocoding:
     """``GeocodingProvider`` that resolves nothing.
 
@@ -123,23 +139,33 @@ class HttpGeocoding:
         return f"{self._base_url}?{urlencode(params)}"
 
     def _parse(self, payload: dict) -> GeocodedPlace | None:
-        """Extract city/town/country from a service response, or None when empty."""
+        """Map a service response onto :class:`GeocodedPlace`, or None when empty.
+
+        Each service names its levels differently; this is the one place that
+        knows how, so a caller sees the same meaning whichever answered.
+        """
         if self._service == "photon":
-            # Photon uses 'district' for city and 'city' for town.
             features = payload.get("features", [])
             data = features[0].get("properties", {}) if features else {}
-            city = data.get("district")
-            town = data.get("city")
+            place = GeocodedPlace(
+                locality=_first(data, "city", "town", "village", "locality"),
+                sublocality=_first(data, "district", "suburb"),
+                region=_first(data, "state"),
+                country=_first(data, "country"),
+                country_code=_country_code(data.get("countrycode")),
+            )
         else:
-            # Nominatim and geocode.maps.co share a shape; 'town' is the district.
+            # Nominatim and geocode.maps.co share a shape.
             data = payload.get("address", {})
-            city = data.get("city")
-            town = data.get("town")
-        country = data.get("country")
-
-        if not any((city, town, country)):
-            return None
-        return GeocodedPlace(city=city, town=town, country=country)
+            place = GeocodedPlace(
+                locality=_first(data, "city", "town", "village", "municipality", "hamlet"),
+                sublocality=_first(data, "suburb", "city_district", "borough", "neighbourhood", "quarter"),
+                region=_first(data, "state", "region", "province"),
+                country=_first(data, "country"),
+                country_code=_country_code(data.get("country_code")),
+                display_name=_first(payload, "display_name"),
+            )
+        return place if any(vars(place).values()) else None
 
     def _throttle(self) -> None:
         """Sleep as needed to respect the configured request rate."""
@@ -184,7 +210,7 @@ class HttpGeocoding:
         Returns:
             The resolved place, or ``None`` when nothing resolved or the request
             failed. Never raises — geocoding is best-effort enrichment and must
-            not fail the import or backfill that triggered it.
+            not fail the caller's own work.
         """
         # The coordinates are deliberately not logged: they are a location fix
         # belonging to the host's user, and this is a library — it does not get to

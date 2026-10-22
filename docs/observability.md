@@ -1,15 +1,16 @@
 # Observability
 
-JASIL owns four operational tables. The event/outbox/job tables are append-only;
+JASIL owns five operational tables, every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
 the worker registry updates one row per restart-unique instance. This page covers
 what goes in them, how to create them, and how to bound their growth.
 
 | Table | Written by | Purpose |
 |---|---|---|
-| `event_log` | The bus and the publish facade | One row per event, recording its lifecycle. |
-| `event_outbox` | The publish facade | Staged events awaiting relay. |
-| `processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
-| `job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
+| `jasil_event_log` | The bus and the publish facade | One row per event, recording its lifecycle. |
+| `jasil_event_outbox` | The publish facade | Staged events awaiting relay. |
+| `jasil_processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
+| `jasil_job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
+| `jasil_job_attempts` | Durable workers | One row per attempt to run a job. See [Job attempts](#job-attempts). |
 
 ## The event log
 
@@ -29,7 +30,7 @@ how long it took, and why it failed:
 | Status | Meaning |
 |---|---|
 | `published` | Written, dispatch not finished. |
-| `queued` | Handed to the durable job queue (terminal here; execution is tracked in `processing_jobs` and `job_attempts`). |
+| `queued` | Handed to the durable job queue (terminal here; execution is tracked in `jasil_processing_jobs` and `jasil_job_attempts`). |
 | `processing` | A consumer picked it up. |
 | `completed` | Handlers succeeded. |
 | `failed` | A handler raised. |
@@ -68,7 +69,7 @@ gets a UUIDv4 instance id on startup and records:
 - optional host-supplied role, label, and neutral metadata, capped at 16 KiB of
     serialized JSON.
 
-Public summaries derive active claim counts directly from `processing_jobs`, so
+Public summaries derive active claim counts directly from `jasil_processing_jobs`, so
 reaping a crashed worker cannot leave phantom load on the dashboard.
 
 A dedicated heartbeat thread beats every `heartbeat_interval_seconds`, not on
@@ -113,7 +114,7 @@ health automatically.
 
 ## Job attempts
 
-`processing_jobs` says where a job is *now*. `job_attempts` keeps what happened:
+`jasil_processing_jobs` says where a job is *now*. `jasil_job_attempts` keeps what happened:
 one row for every attempt to run it. A worker opens the row in the transaction
 that claims the job, and whichever path ends that claim closes it in the same
 transaction as the job's own state change, so the history can never disagree with
@@ -215,8 +216,33 @@ migrate" into a clear message at boot rather than a confusing query error later.
 !!! note "It will not touch your tables"
     JASIL's migrations use their own version table, `jasil_alembic_version`, so
     they never collide with your Alembic history. Every operation is scoped to
-    JASIL's four tables, so autogenerate cannot propose dropping yours — even
+    JASIL's five tables, so autogenerate cannot propose dropping yours — even
     though both live in the same registry.
+
+### Upgrading from 0.8 or earlier: the `jasil_` prefix
+
+Up to 0.8 the tables had no prefix (`event_log`, `event_outbox`,
+`processing_jobs`, `job_workers`, `job_attempts`). Revision `rev0003` renames each
+table, its indexes and its unique constraint to the `jasil_` names. No column or
+row changes.
+
+- **Stop every process running 0.8 or earlier before `upgrade()`.** The old code
+  looks the old names up, so a rolling deployment across this revision is not
+  possible. This is the one revision that is not forward-compatible with the
+  previous release.
+- PostgreSQL renames in place and is instant. SQLite and MySQL rename the table
+  and recreate its indexes; on SQLite the table carrying the unique constraint is
+  rebuilt.
+- A **fresh** database is created with the final names directly, so a host that
+  already has a table called `event_log` of its own can install JASIL. The rename
+  only ever touches an unprefixed table when no prefixed one exists.
+- `adopt_existing_schema()` recognises an unversioned pre-0.9 schema (at least two
+  of `event_log`, `event_outbox` and `processing_jobs`) and adopts it at its old
+  revision; `upgrade()` then renames it. A lone unprefixed `event_log` is taken to
+  be yours and is left alone.
+- Anything of yours that names the old tables (a reporting query, a dashboard)
+  must be updated. Downgrading `rev0003` restores the old names, and fails if a
+  table of yours has since taken one.
 
 ### Adopting existing tables
 
@@ -288,7 +314,7 @@ it, or call `jasil_retention.prune_expired_records()` yourself if you schedule
 work some other way.
 
 Register it on **every** replica, like the durable-job maintenance. The two are
-separate calls because retention also prunes the `event_log`, so it applies to a
+separate calls because retention also prunes the `jasil_event_log`, so it applies to a
 deployment that never enabled durable jobs.
 
 The two windows are independent, and `<= 0` disables either.
@@ -297,13 +323,13 @@ The two windows are independent, and `<= 0` disables either.
 
 | Deleted | Kept |
 |---|---|
-| Any `event_log` row past the window | Unrelayed `event_outbox` rows — pending work |
-| Relayed `event_outbox` rows | `pending` / `claimed` jobs — in flight |
+| Any `jasil_event_log` row past the window | Unrelayed `jasil_event_outbox` rows — pending work |
+| Relayed `jasil_event_outbox` rows | `pending` / `claimed` jobs — in flight |
 | `completed` jobs | `dead_letter` jobs — human-actionable |
 | Stopped or stale worker rows past job retention | Recent/running worker rows |
-| `job_attempts` past the window, and orphans of pruned jobs | Attempts of `pending`, `claimed` and `dead_letter` jobs |
+| `jasil_job_attempts` past the window, and orphans of pruned jobs | Attempts of `pending`, `claimed` and `dead_letter` jobs |
 
-Every `event_log` row is prunable regardless of status: it is a safe-to-lose
+Every `jasil_event_log` row is prunable regardless of status: it is a safe-to-lose
 observability trail, and nothing in it is a source of truth. The job tables are
 the opposite — pruning an in-flight row would silently drop derived work, so
 status is checked on every delete.

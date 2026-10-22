@@ -53,12 +53,12 @@ class TestItFitsPersistedWorkerColumns:
         assert len(process_identity()) == MAX_WORKER_ID_LENGTH
 
     def test_the_lease_column_is_declared_at_that_width(self, mapped_base):
-        column = mapped_base.metadata.tables["processing_jobs"].c.locked_by
+        column = mapped_base.metadata.tables["jasil_processing_jobs"].c.locked_by
 
         assert column.type.length == MAX_WORKER_ID_LENGTH
 
     def test_the_event_log_column_is_declared_at_that_width(self, mapped_base):
-        column = mapped_base.metadata.tables["event_log"].c.worker_id
+        column = mapped_base.metadata.tables["jasil_event_log"].c.worker_id
 
         assert column.type.length == MAX_WORKER_ID_LENGTH
 

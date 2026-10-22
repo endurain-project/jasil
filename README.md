@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.8.0` - the API is still settling. Expect breaking changes on
+> **Status:** `0.9.0` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
@@ -121,7 +121,7 @@ delivery to a transactional outbox is a configuration change, not a rewrite:
 ```python
 from jasil.publisher import publish
 
-publish("activity.created", {"activity_id": 42}, source="api:store_activity", db=db)
+publish("order.created", {"order_id": 42}, source="api:create_order", db=db)
 ```
 
 ## Going distributed

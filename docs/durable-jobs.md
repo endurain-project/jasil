@@ -20,7 +20,7 @@ jasil_settings.configure(
 publish(..., db=session)
       │
       ▼
- event_outbox ─────relay─────▶ processing_jobs ─────worker─────▶ subscriber
+ jasil_event_outbox ─────relay─────▶ jasil_processing_jobs ─────worker─────▶ subscriber
   (one row per         (one row per                    (claim, run,
    event)               event × subscriber)             complete or fail)
 ```
@@ -99,7 +99,7 @@ claimed by that worker and need another matching worker.
     queue. If a subscriber moves from queue `a` to `b` and no worker still selects
     `a`, its pending rows on `a` wait forever. Keep a worker on the old queue until
     it drains, or reassign the rows once:
-    `UPDATE processing_jobs SET queue = 'b' WHERE queue = 'a' AND subscriber_id = '<id>' AND status = 'pending'`.
+    `UPDATE jasil_processing_jobs SET queue = 'b' WHERE queue = 'a' AND subscriber_id = '<id>' AND status = 'pending'`.
 
 !!! note "The attempt is counted at claim time"
     Not at completion. A worker that crashes mid-run still consumes an attempt,

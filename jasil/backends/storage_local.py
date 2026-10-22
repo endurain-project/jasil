@@ -70,11 +70,16 @@ class LocalStorage:
 
     A logical ``(area, key)`` maps to a leaf file under
     ``{base_dir}/.jasil-objects/v1``. The private encoding lets one key coexist
-    with its descendants, matching object storage. Objects written by JASIL
-    0.3 and earlier at ``{base_dir}/{area}/{key}`` remain readable and are
-    migrated when overwritten. Keys are server-generated (e.g. ``42.webp``);
-    both area and key are validated so a stray value can never escape the base
-    directory.
+    with its descendants, matching object storage. Keys are server-generated
+    (e.g. ``42.webp``); both area and key are validated so a stray value can never
+    escape the base directory.
+
+    **The flat layout is opt-in.** Objects written by JASIL 0.3 and earlier, and
+    by the application JASIL was extracted from, sit at ``{base_dir}/{area}/{key}``.
+    With ``legacy_layout=True`` they remain readable, listed and deletable, and
+    are migrated to the versioned layout when overwritten. Off (the default), that
+    directory is never consulted, so any other file under ``base_dir`` - one the
+    host keeps there for its own reasons - cannot be served as a storage object.
 
     **:meth:`url` cannot enforce response controls.** It returns a plain path for
     the host's own web server to serve, and JASIL neither runs that server nor
@@ -84,11 +89,14 @@ class LocalStorage:
     Args:
         base_dir: Absolute storage root every area subdirectory lives under.
         url_prefix: URL path prefix returned by :meth:`url` (default: root).
+        legacy_layout: Also read, list and delete objects in the flat
+            ``{base_dir}/{area}/{key}`` layout (see above).
     """
 
-    def __init__(self, base_dir: str, url_prefix: str = "") -> None:
+    def __init__(self, base_dir: str, url_prefix: str = "", *, legacy_layout: bool = False) -> None:
         self._base = Path(base_dir)
         self._url_prefix = url_prefix.rstrip("/")
+        self._legacy_layout = legacy_layout
         self._warned_about_delivery_controls = False
 
     def _resolve_storage_path(
@@ -201,12 +209,16 @@ class LocalStorage:
         path = self._current_object_path(area, key)
         if path is not None:
             return path
+        if not self._legacy_layout:
+            return None
         legacy_path = self._resolve_legacy(area, key)
         if self._is_regular_file(legacy_path):
             return legacy_path
         return None
 
     def _remove_legacy_object(self, area: str, key: str) -> None:
+        if not self._legacy_layout:
+            return
         path = self._resolve_legacy(area, key)
         try:
             if stat.S_ISREG(path.stat().st_mode):
@@ -626,6 +638,8 @@ class LocalStorage:
         path = self._current_object_path(area, key)
         validate_stream_range(offset, length)
         if path is None:
+            if not self._legacy_layout:
+                raise FileNotFoundError(f"Storage object not found: {area}/{key}")
             path = self._resolve_legacy(area, key)
             try:
                 source = path.open("rb")
@@ -650,6 +664,8 @@ class LocalStorage:
     def stat(self, area: str, key: str) -> ObjectStat | None:
         path = self._current_object_path(area, key)
         if path is None:
+            if not self._legacy_layout:
+                return None
             path = self._resolve_legacy(area, key)
         try:
             metadata = path.stat()
@@ -699,6 +715,8 @@ class LocalStorage:
                 self._prune_empty_directories(current_path.parent)
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        if not self._legacy_layout:
+            return
         legacy_path = self._resolve_legacy(area, key)
         try:
             if stat.S_ISREG(legacy_path.stat().st_mode):
@@ -787,6 +805,8 @@ class LocalStorage:
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
+            if not self._legacy_layout:
+                return
             try:
                 if not stat.S_ISDIR(legacy_area.stat().st_mode):
                     return

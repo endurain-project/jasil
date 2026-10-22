@@ -1,8 +1,8 @@
 """JASIL's SQLAlchemy registry plumbing and session-factory helpers.
 
 **Option B (the host owns the ``Base``).** JASIL's companion tables —
-``event_log``, ``processing_jobs``, ``event_outbox``, ``job_workers``, and
-``job_attempts`` — must
+``jasil_event_log``, ``jasil_processing_jobs``, ``jasil_event_outbox``,
+``jasil_job_workers``, and ``jasil_job_attempts`` — must
 live in the same declarative registry as the host's own models so that one
 ``create_all`` / migration run and one metadata object cover the whole schema.
 The host owns that registry; JASIL maps its models **into** it.
@@ -62,6 +62,7 @@ __all__ = [
     "is_models_mapped",
     "is_sessionmaker_configured",
     "jasil_table_names",
+    "legacy_table_names",
     "map_models",
     "mapper_registry",
     "reset",
@@ -94,8 +95,22 @@ _MODEL_MODULES: tuple[str, ...] = (
 )
 
 #: Tables JASIL owns. The migrations scope every operation to these, so a host
-#: sharing the registry never has its own tables added, dropped, or diffed.
+#: sharing the registry never has its own tables added, dropped, or diffed. Every
+#: name carries the ``jasil_`` prefix, so none can collide with a host's own.
 _TABLE_NAMES: frozenset[str] = frozenset(
+    {
+        "jasil_event_log",
+        "jasil_processing_jobs",
+        "jasil_event_outbox",
+        "jasil_job_workers",
+        "jasil_job_attempts",
+    }
+)
+
+#: The unprefixed names JASIL's tables had up to 0.8. Only the migrations read
+#: them, to rename the tables and to recognise an unversioned pre-0.9 schema; a
+#: table with one of these names is otherwise the host's, never JASIL's.
+_LEGACY_TABLE_NAMES: frozenset[str] = frozenset(
     {"event_log", "processing_jobs", "event_outbox", "job_workers", "job_attempts"}
 )
 
@@ -103,6 +118,16 @@ _TABLE_NAMES: frozenset[str] = frozenset(
 def jasil_table_names() -> frozenset[str]:
     """Return the names of the tables JASIL owns."""
     return _TABLE_NAMES
+
+
+def legacy_table_names() -> frozenset[str]:
+    """Return the unprefixed table names JASIL used before 0.9.
+
+    Not JASIL's tables any longer: a database may well hold an unrelated table
+    with one of these names. They exist so the migrations can rename the old
+    tables and adopt an old unversioned schema.
+    """
+    return _LEGACY_TABLE_NAMES
 
 
 def get_active_base() -> type[DeclarativeBase]:

@@ -59,8 +59,14 @@ from jasil.settings import JasilSettings, get_settings
 
 logger = logging.getLogger(__name__)
 
-#: Reverse-geocoding services this build knows how to talk to.
-_GEOCODING_SERVICES = ("nominatim", "photon", "geocode")
+#: ``geocoding.uri`` schemes: the service each selects, and whether it is reached over HTTPS.
+_GEOCODING_SCHEMES = {
+    "nominatim": ("nominatim", True),
+    "nominatim+http": ("nominatim", False),
+    "photon": ("photon", True),
+    "photon+http": ("photon", False),
+    "geocode": ("geocode", True),
+}
 
 
 @dataclass(frozen=True)
@@ -214,7 +220,11 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
     if scheme == "local":
         # Root the backend at the configured data dir; each storage *area* is a
         # subdirectory under it.
-        return LocalStorage(rest or settings.data_dir)
+        return LocalStorage(
+            rest or settings.data_dir,
+            url_prefix=settings.storage.local_url_prefix,
+            legacy_layout=settings.storage.local_legacy_layout,
+        )
     if scheme == "s3":
         # Imported lazily: boto3 is the optional `s3` extra and is absent from the
         # default image, so a top-level import would break non-S3 deployments.
@@ -230,7 +240,11 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
     if scheme == "memory":
         return InProcessEventBus(recorder=recorder)
     if scheme in ("redis", "rediss", "unix"):
-        return RedisStreamEventBus.from_uri(events_uri, recorder=recorder)
+        if not settings.events_stream or not settings.events_group:
+            raise ValueError("events_stream and events_group must not be empty")
+        return RedisStreamEventBus.from_uri(
+            events_uri, stream=settings.events_stream, group=settings.events_group, recorder=recorder
+        )
     raise ValueError(f"Unsupported events_uri scheme: {scheme or events_uri!r}")
 
 
@@ -272,7 +286,7 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     """Resolve the reverse-geocoding backend, falling back to a no-op.
 
     Unlike the other capabilities this never raises on a bad configuration:
-    geocoding is optional enrichment, so an unsupported provider, an unset API
+    geocoding is optional enrichment, so an unsupported scheme, an unset API
     key, or a host that fails SSRF validation disables the capability rather than
     preventing the application from starting.
 
@@ -291,45 +305,60 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     """
     geo = settings.geocoding
     min_interval = 1.0 / geo.rate_limit if geo.rate_limit > 0 else 0.0
-    provider = geo.provider
 
-    if not provider:
+    if not geo.uri:
         # Unset means "not wanted", not "misconfigured" — so this stays quiet.
         logger.debug("Reverse geocoding is not configured; using the no-op backend")
         return NullGeocoding()
 
-    if provider not in _GEOCODING_SERVICES:
+    # The URI is never echoed: it is operator input, and keeping it out of the
+    # log costs nothing.
+    try:
+        parts = urlsplit(geo.uri)
+        _ = parts.port  # validates the port
+    except ValueError:
+        logger.warning("geocoding.uri is not a valid URI; reverse geocoding is disabled")
+        return NullGeocoding()
+    if parts.scheme not in _GEOCODING_SCHEMES or "://" not in geo.uri:
         logger.warning(
-            "geocoding.provider %r is not a supported service (expected one of: %s); reverse geocoding is disabled",
-            provider,
-            ", ".join(_GEOCODING_SERVICES),
+            "geocoding.uri scheme %r is not supported (expected one of: %s); reverse geocoding is disabled",
+            parts.scheme,
+            ", ".join(_GEOCODING_SCHEMES),
+        )
+        return NullGeocoding()
+    if "@" in parts.netloc or parts.path.strip("/") or parts.query or parts.fragment:
+        logger.warning(
+            "geocoding.uri must be scheme://host[:port] with no userinfo, path, query or fragment; reverse geocoding is disabled"
         )
         return NullGeocoding()
 
-    if provider == "geocode":
+    service, use_https = _GEOCODING_SCHEMES[parts.scheme]
+    if service == "geocode":
+        if parts.netloc:
+            logger.warning("geocoding.uri for geocode:// takes no host; reverse geocoding is disabled")
+            return NullGeocoding()
         if not geo.api_key:
-            logger.warning(
-                "geocoding.provider is 'geocode' but no geocoding.api_key is set; reverse geocoding is disabled"
-            )
+            logger.warning("geocoding.uri is geocode:// but no geocoding.api_key is set; reverse geocoding is disabled")
             return NullGeocoding()
         # Fixed, vendor-operated host — nothing operator-supplied to validate.
         base_url = "https://geocode.maps.co/reverse"
         api_key = geo.api_key
     else:
-        if provider == "nominatim":
-            host, use_https = geo.nominatim_host, geo.nominatim_use_https
-        else:
-            host, use_https = geo.photon_host, geo.photon_use_https
+        if not parts.netloc:
+            logger.warning("geocoding.uri has no host; reverse geocoding is disabled")
+            return NullGeocoding()
         # Logs its own reason when it rejects the host.
-        resolved = build_reverse_endpoint(host, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts)
+        resolved = build_reverse_endpoint(
+            parts.netloc, use_https=use_https, allowed_hosts=settings.network.ssrf_allowed_hosts
+        )
         if resolved is None:
             return NullGeocoding()
         base_url = resolved
         api_key = None
 
-    logger.info("Reverse geocoding enabled via %s (%s), rate limit %s/s", provider, base_url, geo.rate_limit)
+    logger.info("Reverse geocoding enabled via %s (%s), rate limit %s/s", service, base_url, geo.rate_limit)
     return HttpGeocoding(
-        provider,
+        service,
         base_url,
         api_key=api_key,
         min_interval_seconds=min_interval,

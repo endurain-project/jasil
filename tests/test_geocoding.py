@@ -187,22 +187,52 @@ class TestResponseParsing:
         responses.add(
             responses.GET,
             "https://geo.test/reverse",
-            json={"address": {"city": "Lisboa", "town": "Alvalade", "country": "Portugal"}},
+            json={
+                "display_name": "Alvalade, Lisboa, Portugal",
+                "address": {
+                    "city": "Lisboa",
+                    "suburb": "Alvalade",
+                    "state": "Lisboa",
+                    "country": "Portugal",
+                    "country_code": "pt",
+                },
+            },
         )
 
-        assert backend.reverse(38.7, -9.1) == GeocodedPlace(city="Lisboa", town="Alvalade", country="Portugal")
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(
+            locality="Lisboa",
+            sublocality="Alvalade",
+            region="Lisboa",
+            country="Portugal",
+            country_code="PT",
+            display_name="Alvalade, Lisboa, Portugal",
+        )
 
     @responses.activate
     def test_a_photon_answer_is_mapped(self):
-        """Photon names things differently: 'district' is the city, 'city' the town."""
+        """Photon names things differently, but lands on the same levels."""
         backend = HttpGeocoding("photon", "https://geo.test/reverse")
         responses.add(
             responses.GET,
             "https://geo.test/reverse",
-            json={"features": [{"properties": {"district": "Lisboa", "city": "Alvalade", "country": "Portugal"}}]},
+            json={
+                "features": [
+                    {
+                        "properties": {
+                            "city": "Lisboa",
+                            "district": "Alvalade",
+                            "state": "Lisboa",
+                            "country": "Portugal",
+                            "countrycode": "PT",
+                        }
+                    }
+                ]
+            },
         )
 
-        assert backend.reverse(38.7, -9.1) == GeocodedPlace(city="Lisboa", town="Alvalade", country="Portugal")
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(
+            locality="Lisboa", sublocality="Alvalade", region="Lisboa", country="Portugal", country_code="PT"
+        )
 
     @responses.activate
     def test_an_empty_photon_feature_list_resolves_to_nothing(self):
@@ -216,7 +246,32 @@ class TestResponseParsing:
         """A country alone is still worth recording."""
         responses.add(responses.GET, "https://geo.test/reverse", json={"address": {"country": "Portugal"}})
 
-        assert backend.reverse(38.7, -9.1) == GeocodedPlace(city=None, town=None, country="Portugal")
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        ("address", "locality"),
+        [
+            ({"city": "A", "town": "B"}, "A"),
+            ({"town": "B", "village": "C"}, "B"),
+            ({"village": "C"}, "C"),
+            ({"hamlet": "D"}, "D"),
+        ],
+    )
+    def test_the_locality_is_the_most_specific_settlement_type_present(self, backend, address, locality):
+        responses.add(responses.GET, "https://geo.test/reverse", json={"address": address})
+
+        assert backend.reverse(38.7, -9.1).locality == locality
+
+    @responses.activate
+    def test_a_malformed_country_code_is_dropped(self, backend):
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            json={"address": {"country": "Portugal", "country_code": "portugal"}},
+        )
+
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
 
     @responses.activate
     def test_an_answer_with_nothing_useful_resolves_to_none(self, backend):
@@ -361,7 +416,7 @@ class TestTheResponseBodyIsCapped:
             status=200,
         )
 
-        assert backend.reverse(38.7, -9.1) == GeocodedPlace(city=None, town=None, country="Portugal")
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
 
 
 class TestThrottling:

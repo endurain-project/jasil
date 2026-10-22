@@ -40,7 +40,7 @@ up before you fill them:
 
 | Field | Where it goes |
 |---|---|
-| `payload` | Written verbatim to `event_outbox` and `processing_jobs`, to `event_log` when the trail is enabled, and serialized onto the Redis stream on the `redis://` bus. |
+| `payload` | Written verbatim to `jasil_event_outbox` and `jasil_processing_jobs`, to `jasil_event_log` when the trail is enabled, and serialized onto the Redis stream on the `redis://` bus. |
 | `metadata` | The same three tables and the same stream — **and** into log records, whole, whenever a best-effort subscriber fails. |
 
 So:
@@ -161,7 +161,7 @@ to would strand the row forever, so the registry check is not optional.
 publish(...)
     │
     ├─ durable jobs on + subscriber registered + db given
-    │      └─▶ event_outbox ──relay──▶ processing_jobs ──▶ subscriber
+    │      └─▶ jasil_event_outbox ──relay──▶ jasil_processing_jobs ──▶ subscriber
     │
     └─ otherwise
            └─▶ event bus ──▶ subscriber (in-process, or via Redis Streams)
