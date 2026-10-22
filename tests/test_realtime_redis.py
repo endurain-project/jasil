@@ -240,6 +240,17 @@ class TestReceive:
 
         assert inbox.wait_for(1) == [("7", {"a": 1})]
 
+    def test_a_v1_envelope_from_an_older_replica_is_delivered(self, server, make_realtime):
+        """A rolling upgrade still has 0.7 replicas publishing user_id; it arrives as the str key."""
+        realtime = make_realtime()
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+        realtime.start()
+
+        _publish_raw(server, json.dumps({"v": 1, "user_id": 7, "hint": {"a": 1}}))
+
+        assert inbox.wait_for(1) == [("7", {"a": 1})]
+
 
 class TestLifecycle:
     def test_a_restart_does_not_revive_a_thread_stop_gave_up_on(self, make_realtime, monkeypatch):
