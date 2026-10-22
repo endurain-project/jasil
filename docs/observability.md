@@ -287,6 +287,12 @@ Point your own `env.py` at your `Base.metadata` and add JASIL's `versions`
 directory to your `version_locations`. The self-contained runner above needs no
 host wiring, but it is not mandatory.
 
+One limit of the unified history: only `jasil.migrations.upgrade()` creates a
+fresh database with the `jasil_` names directly. Run from your own history,
+`rev0001` creates the unprefixed tables and `rev0003` renames them, so a table of
+yours called `event_log` (or another old name) still collides on a fresh
+install. Create JASIL's tables with `upgrade()` first if that applies to you.
+
 ## Retention
 
 The append-only rows and retained worker instances grow without bound unless

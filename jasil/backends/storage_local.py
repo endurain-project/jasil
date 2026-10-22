@@ -80,6 +80,8 @@ class LocalStorage:
     are migrated to the versioned layout when overwritten. Off (the default), that
     directory is never consulted, so any other file under ``base_dir`` - one the
     host keeps there for its own reasons - cannot be served as a storage object.
+    It also means an overwrite or delete leaves any flat-layout copy of that key in
+    place, since JASIL cannot know the file is its own.
 
     **:meth:`url` cannot enforce response controls.** It returns a plain path for
     the host's own web server to serve, and JASIL neither runs that server nor

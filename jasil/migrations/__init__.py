@@ -21,7 +21,9 @@ Hosts that prefer a single, unified Alembic history can instead point their own
 ``env.py`` at their ``Base.metadata`` (the base passed to
 :func:`jasil.orm.map_models`) and add this package's ``versions`` directory to
 their ``version_locations`` — but the self-contained runner here needs no host
-wiring.
+wiring. Only :func:`upgrade` creates a fresh database with the ``jasil_`` names
+directly; from a host's own history ``rev0001`` first creates the unprefixed names
+and ``rev0003`` renames them.
 """
 
 from collections.abc import Iterator, Sequence

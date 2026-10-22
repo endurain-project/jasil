@@ -148,7 +148,7 @@ class HttpGeocoding:
             features = payload.get("features", [])
             data = features[0].get("properties", {}) if features else {}
             place = GeocodedPlace(
-                locality=_first(data, "city", "town", "village", "locality"),
+                locality=_first(data, "city", "town", "village"),
                 sublocality=_first(data, "district", "suburb"),
                 region=_first(data, "state"),
                 country=_first(data, "country"),

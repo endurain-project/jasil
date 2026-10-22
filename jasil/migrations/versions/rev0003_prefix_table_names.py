@@ -3,7 +3,7 @@
 JASIL's tables live in the host's database and the host's declarative registry,
 so a generic name such as ``event_log`` or ``job_attempts`` can collide with a
 table the host already has. This revision renames each table, its indexes and
-its unique constraint; no column or row changes.
+its unique constraint (and, on PostgreSQL, its primary-key index); no column or row changes.
 
 A database created by this release already has the prefixed names (the earlier
 revisions create them directly when a fresh install is heading here), and this
@@ -109,6 +109,8 @@ def _rename(tables: Sequence[str], *, to_prefixed: bool) -> None:
             continue
         op.rename_table(source(table), target(table))
         if on_postgres:
+            # The primary-key index keeps the old table's name through a rename.
+            op.execute(f'ALTER INDEX IF EXISTS "{source(table)}_pkey" RENAME TO "{target(table)}_pkey"')
             for index, _ in indexes:
                 op.execute(f'ALTER INDEX "{source(index)}" RENAME TO "{target(index)}"')
             if table == "event_log":
