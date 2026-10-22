@@ -133,7 +133,7 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
         logger.warning("Ignoring a realtime hint with unsupported envelope version %r", version)
         return None
     hint = envelope.get("hint")
-    if not key_ok or not isinstance(hint, dict) or not _encodes(hint):
+    if not key_ok or not isinstance(key, str) or not isinstance(hint, dict) or not _encodes(hint):
         logger.warning("Ignoring a malformed realtime hint envelope")
         return None
     return key, hint

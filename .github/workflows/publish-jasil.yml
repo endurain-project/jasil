@@ -156,7 +156,7 @@ jobs:
           # pyproject.toml to read `required-version` from. Any version inside
           # the range declared there will do; this one is pinned so a release
           # build is reproducible.
-          version: "0.12.24"
+          version: "0.13.5"
           enable-cache: false
 
       - name: Download build artifacts
