@@ -1,7 +1,7 @@
 """Startup capability report and deployment-consistency checks.
 
 Renders how each infrastructure capability (state, storage, events, realtime, lock,
-mail, clock)
+mail, geocoding, clock)
 is wired for a human-readable startup log, and detects fatal inconsistencies — a
 deployment that *requires* a shared backend but resolves one to a process- or
 node-local implementation.
@@ -61,7 +61,7 @@ from jasil.profile import (
     classify_state_uri,
     resolve_topology,
 )
-from jasil.settings import JasilSettings
+from jasil.settings import JasilSettings, RuntimeSources
 
 # Shown in the report when a capability URI was left to the profile.
 _PROFILE_DEFAULT = "profile default"
@@ -146,16 +146,27 @@ def _mail_backend_of(uri: str | None, *, secure: bool) -> str:
     return f"{scheme} (cleartext)" if scheme == "smtp" and not secure else scheme
 
 
+def _geocoding_backend_of(uri: str | None) -> str:
+    """Name the geocoding backend for the report without ever echoing the value."""
+    if not uri:
+        return "disabled"
+    scheme, separator, _ = uri.partition("://")
+    return scheme.lower() if separator and scheme.replace("+", "").isalnum() else "invalid"
+
+
 def _source_of(configured: str | None, label: str) -> str:
     """Name what supplied a capability URI: the host's setting, or the profile."""
     return label if configured else _PROFILE_DEFAULT
 
 
-def build_capability_report(settings: JasilSettings) -> CapabilityReport:
+def build_capability_report(settings: JasilSettings, sources: RuntimeSources | None = None) -> CapabilityReport:
     """Build the observational capability report for startup logging.
 
     Args:
         settings: The configuration the platform is being built from.
+        sources: The runtime sources, when the host passed any. A sourced
+            capability reports the ``runtime`` backend, since its settings are
+            not known until the first call.
 
     Returns:
         A ``CapabilityReport`` reflecting the effective wiring: the backend each
@@ -166,6 +177,25 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
         ValueError: When a capability URI is unset under a profile that has no
             default for it.
     """
+    sources = sources if sources is not None else RuntimeSources()
+    mail_row = (
+        CapabilityRow("mail", "runtime", "runtime source")
+        if sources.mail
+        else CapabilityRow(
+            "mail",
+            _mail_backend_of(settings.mail.uri, secure=settings.mail.secure),
+            "mail.uri" if settings.mail.uri else "not configured",
+        )
+    )
+    geocoding_row = (
+        CapabilityRow("geocoding", "runtime", "runtime source")
+        if sources.geocoding
+        else CapabilityRow(
+            "geocoding",
+            _geocoding_backend_of(settings.geocoding.uri),
+            "geocoding.uri" if settings.geocoding.uri else "not configured",
+        )
+    )
     rows = (
         CapabilityRow("state", _scheme_of(settings.resolved_state_uri), _source_of(settings.state_uri, "state_uri")),
         CapabilityRow(
@@ -182,11 +212,8 @@ def build_capability_report(settings: JasilSettings) -> CapabilityReport:
             else f"follows events_uri ({_source_of(settings.events_uri, 'events_uri')})",
         ),
         CapabilityRow("lock", _scheme_of(settings.resolved_lock_uri), _source_of(settings.lock_uri, "lock_uri")),
-        CapabilityRow(
-            "mail",
-            _mail_backend_of(settings.mail.uri, secure=settings.mail.secure),
-            "mail.uri" if settings.mail.uri else "not configured",
-        ),
+        mail_row,
+        geocoding_row,
         CapabilityRow("clock", "system", "always the system clock"),
     )
     return CapabilityReport(topology=topology_of(settings), rows=rows)

@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.10.0] - 2026-10-22
+
+### Added
+
+- **Runtime-configured mail and geocoding.** `RuntimeSources(mail=..., geocoding=...)` holds callables that return the current `MailSettings` / `GeocodingSettings`; pass it as `build_platform(settings, sources=...)`. `Platform.mail` / `Platform.geocoding` then follow the source without a restart: the backend is rebuilt only when the returned settings change, the outcome (backend or rejection) is cached so a bad configuration is logged once per change, and a source that raises falls back to the last working backend (mail raises a retryable `MailError` and geocoding returns `None` when there is none). Invalid mail settings raise `MailNotConfiguredError` and never reuse earlier credentials. The multi-process `memory://` rule is applied on every rebuild. `build_platform` never calls a source; the first call is the first use. State, storage, events, lock and realtime stay static. See [Runtime sources](docs/configuration.md#runtime-sources).
+- `mail_problems(mail_settings)`, `MailProblem` and `MailProblemCode` in `jasil.settings`: validate mail settings without building a backend, for a host that checks operator input on save. The builder now raises the first reported problem, so there is one copy of the rules.
+- The startup capability report gains a `geocoding` row, and reports a sourced capability as `runtime` / `runtime source`.
+- `jasil.testing.install_test_platform(..., sources=)`; `memory_mail` follows a sourced `memory://` backend.
+
+No breaking changes: a host that passes no sources sees no difference, apart from the extra `geocoding` line in the startup log.
+
 ## [0.9.0] - 2026-10-22
 
 A release about not assuming the application JASIL was extracted from. Several defaults, names and value shapes were Endurain's; they are now neutral. Most of it is breaking; read **Upgrading** first.

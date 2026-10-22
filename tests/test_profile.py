@@ -22,7 +22,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import JasilSettings, JobSettings, MailSettings
+from jasil.settings import GeocodingSettings, JasilSettings, JobSettings, MailSettings, RuntimeSources
 
 LOCAL = DeploymentProfile.LOCAL
 DISTRIBUTED = DeploymentProfile.DISTRIBUTED
@@ -180,7 +180,7 @@ class TestCapabilityReport:
         names = [row.name for row in report.rows]
 
         assert sorted(names) == sorted(set(names))
-        assert {"state", "storage", "events", "realtime", "lock", "mail", "clock"} == set(names)
+        assert {"state", "storage", "events", "realtime", "lock", "mail", "geocoding", "clock"} == set(names)
 
     def test_mail_reports_disabled_when_unset(self, report):
         row = next(row for row in report.rows if row.name == "mail")
@@ -209,6 +209,36 @@ class TestCapabilityReport:
 
         assert row.backend == "invalid"
         assert "hunter2" not in row.backend + row.source
+
+    def test_geocoding_reports_disabled_when_unset(self, report):
+        row = next(row for row in report.rows if row.name == "geocoding")
+
+        assert (row.backend, row.source) == ("disabled", "not configured")
+
+    def test_geocoding_reports_its_scheme_without_the_host_or_key(self):
+        settings = JasilSettings(geocoding=GeocodingSettings(uri="nominatim+http://secret-host:8080", api_key="k3y"))
+
+        row = next(row for row in build_capability_report(settings).rows if row.name == "geocoding")
+
+        assert (row.backend, row.source) == ("nominatim+http", "geocoding.uri")
+
+    def test_a_sourced_capability_reports_the_runtime_source_not_the_static_value(self):
+        settings = JasilSettings(
+            mail=MailSettings(uri="smtps://static.example.com", from_address="a@b.c"),
+            geocoding=GeocodingSettings(uri="geocode://", api_key="k3y"),
+        )
+
+        report = build_capability_report(settings, RuntimeSources(mail=MailSettings, geocoding=GeocodingSettings))
+
+        rows = {row.name: (row.backend, row.source) for row in report.rows}
+        assert rows["mail"] == rows["geocoding"] == ("runtime", "runtime source")
+        assert "static.example.com" not in report.render()
+
+    def test_only_the_sourced_capability_reports_runtime(self):
+        report = build_capability_report(JasilSettings(), RuntimeSources(mail=MailSettings))
+
+        rows = {row.name: row.backend for row in report.rows}
+        assert (rows["mail"], rows["geocoding"]) == ("runtime", "disabled")
 
     def test_the_clock_row_is_always_present(self, report):
         """The clock is the one capability with no alternative backend."""

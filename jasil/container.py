@@ -21,15 +21,15 @@ silently diverge across processes or nodes stops the build rather than becoming 
 production mystery.
 """
 
-import ipaddress
 import logging
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
-import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
 import jasil.capabilities as capabilities
-from jasil._core.mail_message import parse_address
+from jasil._core.mail_problems import SMTP_PORTS, mail_problems
+from jasil._core.reloading import ReloadingGeocoding, ReloadingMail
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
@@ -55,7 +55,7 @@ from jasil.providers import (
     StateProvider,
     StorageProvider,
 )
-from jasil.settings import JasilSettings, get_settings
+from jasil.settings import GeocodingSettings, JasilSettings, MailSettings, RuntimeSources, get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +130,12 @@ class Platform:
         redis_clients.close_shared_clients()
 
 
-def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvider | None = None) -> Platform:
+def build_platform(
+    settings: JasilSettings | None = None,
+    *,
+    clock: ClockProvider | None = None,
+    sources: RuntimeSources | None = None,
+) -> Platform:
     """Assemble the ``Platform`` for the configured deployment profile.
 
     Args:
@@ -139,6 +144,11 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
         clock: Time source to wire into the platform and the backends that stamp
             time (mail ``Date``). Defaults to :class:`SystemClock`; a test
             helper passes a controllable one.
+        sources: Callables returning the current mail and/or geocoding settings.
+            For a capability with a source, ``settings.mail`` / ``settings.geocoding``
+            are ignored and ``Platform.mail`` / ``Platform.geocoding`` follow the
+            source without a restart (see :class:`~jasil.settings.RuntimeSources`).
+            No source is called here: the first call happens on first use.
 
     Returns:
         A frozen ``Platform`` wiring each provider to its selected backend.
@@ -151,8 +161,9 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
-    _check_deployment_consistency(settings)
-    logger.info("JASIL platform capabilities:\n%s", capabilities.build_capability_report(settings).render())
+    sources = sources if sources is not None else RuntimeSources()
+    _check_deployment_consistency(settings, sources)
+    logger.info("JASIL platform capabilities:\n%s", capabilities.build_capability_report(settings, sources).render())
     profile = settings.profile
     # Build the recorder once and share it: the event bus records the lifecycle
     # of best-effort (bus-delivered) events, while the publish facade uses the
@@ -162,7 +173,7 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
     clock = clock if clock is not None else SystemClock()
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
-    mail = _build_mail(settings, clock)
+    mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
     try:
         return Platform(
             profile=profile,
@@ -171,7 +182,9 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
             events=_build_events(settings, recorder),
             lock=_build_lock(settings),
             clock=clock,
-            geocoding=_build_geocoding(settings),
+            geocoding=_build_runtime_geocoding(settings, sources.geocoding)
+            if sources.geocoding
+            else _build_geocoding(settings),
             mail=mail,
             recorder=recorder,
             realtime=_build_realtime(settings),
@@ -183,14 +196,16 @@ def build_platform(settings: JasilSettings | None = None, *, clock: ClockProvide
         raise
 
 
-def _check_deployment_consistency(settings: JasilSettings) -> None:
+def _check_deployment_consistency(settings: JasilSettings, sources: RuntimeSources | None = None) -> None:
     """Stop a build whose wiring contradicts its topology, unless the host opted out.
 
     Checked before any backend is constructed, so the failure names the setting
     rather than surfacing later as a connection error — or, worse, as a
     deployment that starts happily and diverges across replicas.
     """
-    issues = capabilities.check_deployment_consistency(settings)
+    # A sourced capability's static value is not what will be used.
+    checked = replace(settings, mail=MailSettings()) if sources is not None and sources.mail else settings
+    issues = capabilities.check_deployment_consistency(checked)
     if not issues:
         return
     if not settings.enforce_deployment_consistency:
@@ -282,6 +297,35 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
     raise ValueError(f"Unsupported lock_uri scheme: {scheme or lock_uri!r}")
 
 
+def _build_runtime_geocoding(settings: JasilSettings, source: Callable[[], GeocodingSettings]) -> ReloadingGeocoding:
+    """Wrap ``source`` so geocoding is rebuilt, with the captured network policy, when it changes."""
+    return ReloadingGeocoding(source, lambda fresh: _build_geocoding(replace(settings, geocoding=fresh)))
+
+
+def _build_runtime_mail(
+    settings: JasilSettings, clock: ClockProvider, source: Callable[[], MailSettings]
+) -> ReloadingMail:
+    """Wrap ``source`` so mail is rebuilt, with the captured topology and clock, when it changes."""
+
+    def build(fresh: MailSettings) -> MailProvider:
+        # The startup consistency check cannot see a value that arrives later, so
+        # the same rule runs on every rebuild: a runtime edit cannot bypass it.
+        issues = (
+            capabilities.check_mail_consistency(
+                topology=capabilities.topology_of(settings), mail_uri=fresh.uri, mail_label="mail.uri"
+            )
+            if fresh.uri
+            else []
+        )
+        for issue in issues:
+            if settings.enforce_deployment_consistency:
+                raise ValueError(issue)
+            logger.warning("Inconsistent deployment wiring: %s", issue)
+        return _build_mail(replace(settings, mail=fresh), clock)
+
+    return ReloadingMail(source, build)
+
+
 def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     """Resolve the reverse-geocoding backend, falling back to a no-op.
 
@@ -366,10 +410,6 @@ def _build_geocoding(settings: JasilSettings) -> GeocodingProvider:
     )
 
 
-#: Default ports of the SMTP schemes.
-_SMTP_PORTS = {"smtp": 587, "smtps": 465}
-
-
 def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     """Resolve the mail backend.
 
@@ -398,66 +438,20 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
     if not mail.uri:
         logger.debug("Mail is not configured; sending will raise MailNotConfiguredError")
         return NullMail()
-    # The URI is never echoed in an error: it is operator input, but keeping
-    # error text free of it costs nothing and keeps a mistyped credential out of logs.
-    # ``urlsplit`` quietly strips whitespace and accepts ``memory:``; require the
-    # literal form so what is built is what the consistency check inspected.
-    if mail.uri != mail.uri.strip() or "://" not in mail.uri:
-        raise ValueError("mail.uri is not a valid URI")
-    try:
-        parts = urlsplit(mail.uri)
-        port = parts.port
-        hostname = parts.hostname
-    except ValueError:
-        raise ValueError("mail.uri is not a valid URI") from None
-    scheme = parts.scheme
-    if scheme not in ("memory", *_SMTP_PORTS):
-        raise ValueError(f"Unsupported mail.uri scheme: {scheme or '(none)'!r}")
-    if parts.username is not None or parts.password is not None:
-        raise ValueError("mail.uri must not carry credentials; use mail.username and mail.password")
-    if parts.path or parts.query or parts.fragment:
-        raise ValueError("mail.uri must be scheme://host[:port] with no path, query or fragment")
-    if bool(mail.username) != bool(mail.password):
-        raise ValueError("mail.username and mail.password must be set together")
-    if mail.from_address:
-        try:
-            parse_address(mail.from_address, role="sender")
-        except ValueError:
-            raise ValueError("mail.from_address is not a valid email address") from None
-    if mail.ehlo_hostname is not None and not network.is_valid_hostname(mail.ehlo_hostname):
-        raise ValueError("mail.ehlo_hostname is not a valid hostname")
-
-    # A multi-process memory:// is refused by the deployment-consistency check,
+    # The rules live in one place, shared with hosts that validate on save. A
+    # multi-process memory:// is refused by the deployment-consistency check,
     # which has already run.
+    problems = mail_problems(mail)
+    if problems:
+        raise ValueError(problems[0].message)
+    parts = urlsplit(mail.uri)
+    scheme = parts.scheme
+    # ``mail_problems`` has rejected an SMTP URI without a valid host.
+    hostname = parts.hostname or ""
     if scheme == "memory":
-        if parts.netloc:
-            raise ValueError("mail.uri for memory:// takes no host")
-        if not mail.secure:
-            raise ValueError("mail.secure=False applies only to smtp://")
         logger.warning("Mail is memory:// (messages are recorded in the process outbox, never delivered)")
         return MemoryMail(clock, mail.from_address)
-
-    if not hostname:
-        raise ValueError("mail.uri has no valid host")
-    try:
-        ipaddress.ip_address(hostname)
-    except ValueError:
-        if not network.is_valid_hostname(hostname):
-            raise ValueError("mail.uri has no valid host") from None
-    if port == 0:
-        raise ValueError("mail.uri has an invalid port")
-    if not mail.from_address:
-        raise ValueError("mail.from_address is required for smtp:// and smtps://")
     if not mail.secure:
-        # Cleartext is an explicit, narrow exception: a relay on the same host or
-        # private network (a local MTA, a dev catcher). AUTH is never sent over it.
-        if scheme == "smtps":
-            raise ValueError("mail.secure=False cannot be combined with smtps://")
-        if mail.username or mail.password:
-            raise ValueError("mail.secure=False cannot be combined with credentials")
-        reason = network.non_public_rejection_reason(hostname)
-        if reason is not None:
-            raise ValueError(f"mail.secure=False requires a private or loopback relay; the host {reason}")
         logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
     if settings.jobs.enabled and settings.jobs.max_runtime_seconds <= SMTP_SEND_DEADLINE_SECONDS:
         # A running job keeps its lease, but only up to ``max_runtime_seconds``: past
@@ -470,7 +464,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
             settings.jobs.max_runtime_seconds,
             SMTP_SEND_DEADLINE_SECONDS,
         )
-    resolved_port = port or _SMTP_PORTS[scheme]
+    resolved_port = parts.port or SMTP_PORTS[scheme]
     logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")
     return SmtpMail(
         hostname,
