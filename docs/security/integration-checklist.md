@@ -109,7 +109,7 @@ through.
       standalone workers with explicit non-empty allowlists, sizing each queue's
       process group.
 - [ ] Remember that durable jobs do not require Redis. Do not introduce a second
-      queue as a source of truth beside `processing_jobs`.
+      queue as a source of truth beside `jasil_processing_jobs`.
 - [ ] Set `max_runtime_seconds` above the longest handler you expect, and keep
       `lease_seconds` at least three `heartbeat_interval_seconds`. The heartbeat
       renews a running job's lease, so `lease_seconds` bounds how long a worker may

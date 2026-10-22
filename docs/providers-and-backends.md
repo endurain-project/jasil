@@ -38,10 +38,13 @@ otherwise depend on the backend:
 - **`set_if_absent(key, value, ttl)`** — atomic claim. Returns `True` for exactly
   one caller.
 - **`get_and_delete(key)`** — atomic read-and-consume, for single-use tokens.
-- **`record_tiered_failure(...)`** — an atomic tiered lockout. Under a lock in
-  memory, as a Lua script on Redis. A caller that is already locked out gets its
-  count back *without* incrementing, so hammering while locked cannot inflate the
-  counter into the next tier and extend its own lockout.
+- **`record_tiered_failure(counter_key, gate_key, tiers, counter_ttl_seconds)`**
+  — an atomic escalating gate over any repeated event (failed attempts, abusive
+  requests, repeated errors; what they are is yours). Each call counts one
+  occurrence, and when the count reaches a tier's threshold the gate closes for
+  that tier's seconds. Under a lock in memory, as a Lua script on Redis. While
+  the gate is closed a call gets the count back *without* incrementing, so
+  hammering cannot push the count into the next tier and extend its own penalty.
 
 !!! note "One conformance suite, both backends"
     The two backends are held to a single shared test suite, because a
@@ -124,10 +127,13 @@ tampered sidecar is rejected rather than aliased. The physical path is private
 and may change in a future major layout version; use `serve()` or `url()` rather
 than constructing it.
 
-Local objects created by JASIL 0.3 and earlier at `{data_dir}/{area}/{key}` are
-read, listed, served, and deleted transparently. Rewriting a legacy object moves
-that logical key into the versioned layout. Legacy files that are never touched
-remain valid and can be removed through normal `delete` or `delete_prefix`
+Objects in the flat `{data_dir}/{area}/{key}` layout, written by JASIL 0.3 and
+earlier and by the application JASIL was extracted from, are **not** consulted by
+default, so no other file under `data_dir` can be served as an object. Set
+`storage.local_legacy_layout=True` ([Configuration](configuration.md#storagesettings))
+to read, list, serve, and delete them transparently. Rewriting a legacy object
+moves that logical key into the versioned layout, and legacy files that are never
+touched remain valid and can be removed through normal `delete` or `delete_prefix`
 operations.
 
 ### Streaming contract
@@ -374,7 +380,7 @@ consumer stays pending. For retry, backoff, dead-lettering and replay, enable
 
     **Avoid it.** If losing an event matters, enable
     [durable jobs](durable-jobs.md). Publishing then routes through the
-    transactional outbox and `processing_jobs`, which have the retry, backoff and
+    transactional outbox and `jasil_processing_jobs`, which have the retry, backoff and
     dead-letter path this bus deliberately does not.
 
 ## LockProvider
@@ -406,10 +412,17 @@ it from the platform.
 | Backend | Notes |
 |---|---|
 | `NullGeocoding` | Resolves nothing. Selected when geocoding is unconfigured or misconfigured. |
-| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co. Requires the `geocoding` extra. |
+| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co, chosen by the `geocoding.uri` scheme. Requires the `geocoding` extra. |
+
+`reverse(latitude, longitude)` returns a `GeocodedPlace` or `None`. Its fields are
+administrative levels, filled the same way whichever service answered:
+`locality` (the city, town, village or hamlet), `sublocality` (district, suburb),
+`region` (state or province), `country`, `country_code` (ISO 3166-1 alpha-2) and
+`display_name` (where the service supplies one). Map them onto your own
+vocabulary in your own code.
 
 Geocoding is the one capability that never fails startup: an unsupported
-provider, a missing API key, or a host that fails SSRF validation disables the
+scheme, a missing API key, or a host that fails SSRF validation disables the
 capability and logs why, rather than preventing the application from starting.
 "Disabled" is an explicit backend so callers never branch on whether the
 capability exists.
@@ -480,7 +493,7 @@ platform.realtime.subscribe(lambda key, hint: connections.push(key, hint))
 platform.realtime.start()
 
 # Anywhere — a route, a durable-job handler, a standalone worker that never started it:
-platform.realtime.notify(str(user.id), {"kind": "activity.imported", "id": activity.id})
+platform.realtime.notify(str(account.id), {"kind": "order.updated", "id": order.id})
 ```
 
 | Backend | URI | Notes |

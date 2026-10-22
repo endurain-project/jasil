@@ -23,6 +23,9 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
+from jasil.migrations._names import index as ix
+from jasil.migrations._names import table as tb
+
 revision: str = "rev0002"
 down_revision: str | None = "rev0001"
 branch_labels: str | Sequence[str] | None = None
@@ -33,7 +36,7 @@ _JSON = sa.JSON().with_variant(JSONB(), "postgresql")
 
 def upgrade() -> None:
     op.add_column(
-        "processing_jobs",
+        tb("processing_jobs"),
         sa.Column(
             "queue",
             sa.String(100),
@@ -45,12 +48,12 @@ def upgrade() -> None:
     # ``status`` leads so a claim's range scan over queues never walks retained
     # completed or dead-letter rows.
     op.create_index(
-        "idx_processing_jobs_queue_claim",
-        "processing_jobs",
+        ix("idx_processing_jobs_queue_claim"),
+        tb("processing_jobs"),
         ["status", "queue", "available_at"],
     )
     op.create_table(
-        "job_workers",
+        tb("job_workers"),
         sa.Column("instance_id", sa.String(36), primary_key=True, comment="Restart-unique worker instance UUID"),
         sa.Column(
             "started_at", sa.DateTime(timezone=True), nullable=False, comment="When this worker instance started"
@@ -77,11 +80,11 @@ def upgrade() -> None:
             comment="Optional host-supplied neutral metadata",
         ),
     )
-    op.create_index("idx_job_workers_heartbeat", "job_workers", ["last_heartbeat_at"])
-    op.create_index("idx_job_workers_stopped", "job_workers", ["stopped_at"])
-    op.create_index("idx_processing_jobs_worker_claim", "processing_jobs", ["status", "locked_by"])
+    op.create_index(ix("idx_job_workers_heartbeat"), tb("job_workers"), ["last_heartbeat_at"])
+    op.create_index(ix("idx_job_workers_stopped"), tb("job_workers"), ["stopped_at"])
+    op.create_index(ix("idx_processing_jobs_worker_claim"), tb("processing_jobs"), ["status", "locked_by"])
     op.create_table(
-        "job_attempts",
+        tb("job_attempts"),
         sa.Column("id", sa.String(36), primary_key=True, comment="Attempt identifier (UUIDv4)"),
         sa.Column(
             "job_id",
@@ -117,23 +120,23 @@ def upgrade() -> None:
         sa.Column("duration_ms", sa.Integer, nullable=True, comment="Handler wall time in milliseconds"),
         sa.Column("error", sa.Text, nullable=True, comment="Failure reason (truncated for storage)"),
     )
-    op.create_index("idx_job_attempts_job", "job_attempts", ["job_id", "claimed_at"])
-    op.create_index("idx_job_attempts_worker", "job_attempts", ["worker_id", "claimed_at"])
-    op.create_index("idx_job_attempts_event", "job_attempts", ["event_id"])
-    op.create_index("idx_job_attempts_claimed", "job_attempts", ["claimed_at"])
-    op.create_index("idx_job_attempts_finished", "job_attempts", ["finished_at"])
+    op.create_index(ix("idx_job_attempts_job"), tb("job_attempts"), ["job_id", "claimed_at"])
+    op.create_index(ix("idx_job_attempts_worker"), tb("job_attempts"), ["worker_id", "claimed_at"])
+    op.create_index(ix("idx_job_attempts_event"), tb("job_attempts"), ["event_id"])
+    op.create_index(ix("idx_job_attempts_claimed"), tb("job_attempts"), ["claimed_at"])
+    op.create_index(ix("idx_job_attempts_finished"), tb("job_attempts"), ["finished_at"])
 
 
 def downgrade() -> None:
-    op.drop_index("idx_job_attempts_finished", table_name="job_attempts")
-    op.drop_index("idx_job_attempts_claimed", table_name="job_attempts")
-    op.drop_index("idx_job_attempts_event", table_name="job_attempts")
-    op.drop_index("idx_job_attempts_worker", table_name="job_attempts")
-    op.drop_index("idx_job_attempts_job", table_name="job_attempts")
-    op.drop_table("job_attempts")
-    op.drop_index("idx_processing_jobs_worker_claim", table_name="processing_jobs")
-    op.drop_index("idx_job_workers_stopped", table_name="job_workers")
-    op.drop_index("idx_job_workers_heartbeat", table_name="job_workers")
-    op.drop_table("job_workers")
-    op.drop_index("idx_processing_jobs_queue_claim", table_name="processing_jobs")
-    op.drop_column("processing_jobs", "queue")
+    op.drop_index(ix("idx_job_attempts_finished"), table_name=tb("job_attempts"))
+    op.drop_index(ix("idx_job_attempts_claimed"), table_name=tb("job_attempts"))
+    op.drop_index(ix("idx_job_attempts_event"), table_name=tb("job_attempts"))
+    op.drop_index(ix("idx_job_attempts_worker"), table_name=tb("job_attempts"))
+    op.drop_index(ix("idx_job_attempts_job"), table_name=tb("job_attempts"))
+    op.drop_table(tb("job_attempts"))
+    op.drop_index(ix("idx_processing_jobs_worker_claim"), table_name=tb("processing_jobs"))
+    op.drop_index(ix("idx_job_workers_stopped"), table_name=tb("job_workers"))
+    op.drop_index(ix("idx_job_workers_heartbeat"), table_name=tb("job_workers"))
+    op.drop_table(tb("job_workers"))
+    op.drop_index(ix("idx_processing_jobs_queue_claim"), table_name=tb("processing_jobs"))
+    op.drop_column(tb("processing_jobs"), "queue")

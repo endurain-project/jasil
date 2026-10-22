@@ -6,6 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.9.0] - 2026-10-22
+
+A release about not assuming the application JASIL was extracted from. Several defaults, names and value shapes were Endurain's; they are now neutral. Most of it is breaking; read **Upgrading** first.
+
+### Upgrading
+
+1. **Stop every process running 0.8 or earlier**, then run `migrations.upgrade(engine)` (or `adopt_existing_schema` then `upgrade`). Revision `rev0003` renames JASIL's tables, and the old code looks the old names up, so a rolling deployment across it is not possible.
+2. Update anything of yours that names the tables (reports, dashboards, raw SQL): see the new names below.
+3. Replace the `GeocodingSettings` fields and read the new `GeocodedPlace` fields (below).
+4. If you have objects in the flat `{data_dir}/{area}/{key}` layout, set `StorageSettings(local_legacy_layout=True)`. It is now off by default.
+
+### Changed
+
+- **BREAKING: every JASIL table, index and constraint is prefixed `jasil_`.** `event_log`, `event_outbox`, `processing_jobs`, `job_workers` and `job_attempts` become `jasil_event_log`, `jasil_event_outbox`, `jasil_processing_jobs`, `jasil_job_workers` and `jasil_job_attempts`; indexes read `idx_jasil_...` and the unique constraint `uq_jasil_processing_jobs_event_subscriber`. The tables live in the host's database and registry, and a generic name could collide with the host's own. No column or row changes.
+  - Migration `rev0003` renames each table with its indexes, unique constraint and, on PostgreSQL, primary-key index. PostgreSQL renames in place (instant); SQLite and MySQL recreate the indexes under the new names. Downgrading restores the old names and fails if a table of the host's has since taken one.
+  - A **fresh** database is created with the final names directly, so a host that already owns a table called `event_log` can install JASIL, and the rename never touches an unprefixed table when a prefixed one exists. This holds for `jasil.migrations.upgrade()` only: a host that runs JASIL's revisions from its own Alembic history gets the unprefixed tables from `rev0001` first, which `rev0003` then renames, so a host table of the same name still collides there.
+  - `adopt_existing_schema` recognises an unversioned pre-0.9 schema (at least two of `event_log`, `event_outbox`, `processing_jobs`) and adopts it at its old revision for `upgrade()` to rename; a lone unprefixed `event_log` is taken to be the host's and left alone. PostgreSQL adoption checks the GIN index under whichever name its schema has.
+  - `jasil.orm.jasil_table_names()` returns the new names; `jasil.orm.legacy_table_names()` returns the old ones, for migration tooling. `jasil.migrations.jasil_include_object` no longer includes the unprefixed names, so a host's own `event_log` is never diffed or dropped.
+- **BREAKING: `GeocodedPlace` carries administrative levels, not one application's vocabulary.** `city` / `town` / `country` become `locality`, `sublocality`, `region`, `country`, `country_code` (ISO 3166-1 alpha-2, upper-case) and `display_name`. Every service is mapped onto the same levels: for Nominatim and geocode.maps.co, `locality` is the first of city, town, village, municipality or hamlet and `sublocality` the first of suburb, city_district, borough, neighbourhood or quarter; for Photon, `locality` is the first of city, town or village and `sublocality` the first of district or suburb. Previously Photon's `district` was reported as `city` and its `city` as `town`, and Nominatim's `town` as "the district". Map the levels onto your own terms in your own code.
+- **BREAKING: `GeocodingSettings` is configured by a URI like every other capability.** `provider`, `nominatim_host`, `nominatim_use_https`, `photon_host` and `photon_use_https` are replaced by `uri`: `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://...` or `photon+http://...` (cleartext), or `geocode://` (geocode.maps.co; needs `api_key`). An unusable value still disables geocoding and is logged rather than failing startup. `api_key` is now excluded from the settings' `repr`.
+- **BREAKING: the flat `{data_dir}/{area}/{key}` storage layout is off by default.** `LocalStorage` used to fall back to it for every read, listing and delete, so any other file under the data directory could be served as an object. It is now opt-in with `LocalStorage(..., legacy_layout=True)` or `StorageSettings(local_legacy_layout=True)`; with it off, an overwrite or delete leaves a flat-layout copy of the key in place. Hosts holding objects written by JASIL 0.3 or earlier, or by the application JASIL was extracted from, need it.
+- `StateProvider.record_tiered_failure` and `TieredFailureOutcome` are documented as the general escalating-gate primitive they are, with the argument semantics written out, instead of as a login lockout. No signature or behaviour changes.
+
+### Added
+
+- `JasilSettings.events_stream` (default `jasil:events`) and `events_group` (default `jasil`) name the Redis Stream and consumer group of the event bus, so two deployments sharing a Redis database no longer consume each other's events. Empty values fail the build. Defaults are unchanged.
+- `StorageSettings` (`JasilSettings.storage`) with `local_url_prefix`, which sets the prefix of `local://` URLs (the backend always accepted one; nothing could set it), and `local_legacy_layout`.
+- `jasil.deps.get_geocoding`, beside the dependency for every other provider.
+
 ## [0.8.0] - 2026-10-22
 
 ### Added

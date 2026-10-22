@@ -62,8 +62,8 @@ jasil_settings.configure(
 
     This is the whole point of the profile. Falling back to `memory://` would
     give every replica its own private copy of state that is supposed to be
-    shared — a rate limiter that permits N times the configured rate, a lockout
-    that never triggers, a session that exists on one replica and not another.
+    shared — a rate limiter that permits N times the configured rate, an escalating
+    gate that never closes, a session that exists on one replica and not another.
     None of that fails loudly. A refusal to start does.
 
 Durable jobs have a separate database topology from the capability URIs above.

@@ -3,7 +3,7 @@
 Only imported by the composition root when ``state_uri`` selects Redis, so the
 ``local`` profile keeps using the in-memory backend. Backed by a ``decode_responses=False`` client so values round-trip as
 raw ``bytes`` per the ``StateProvider`` contract; ``incr`` uses Redis ``INCRBY`` for
-atomic, cross-process counters (rate-limit, lockout) that a single-process dict
+atomic, cross-process counters (rate limits, escalating gates) that a single-process dict
 cannot provide.
 """
 
@@ -15,7 +15,7 @@ from typing import Any, Concatenate
 import jasil._core.redis_clients as redis_clients
 from jasil.providers import StateBackendUnavailableError, TieredFailureOutcome
 
-# Atomic tiered-lockout script (KEYS: gate, counter; ARGV: now, counter_ttl,
+# Atomic escalating-gate script (KEYS: gate, counter; ARGV: now, counter_ttl,
 # then (threshold, lock_seconds) pairs ascending). Mirrors the in-memory backend:
 # an already-locked caller returns its current count WITHOUT incrementing, an
 # expired gate is cleared, otherwise the counter is bumped and the highest

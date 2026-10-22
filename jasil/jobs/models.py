@@ -66,18 +66,18 @@ class ProcessingJob(Base):
         completed_at: When the job reached a terminal state (completed/dead_letter).
     """
 
-    __tablename__ = "processing_jobs"
+    __tablename__ = "jasil_processing_jobs"
     __table_args__ = (
-        UniqueConstraint("event_id", "subscriber_id", name="uq_processing_jobs_event_subscriber"),
+        UniqueConstraint("event_id", "subscriber_id", name="uq_jasil_processing_jobs_event_subscriber"),
         # Unselected workers discover due work across every queue with this index.
-        Index("idx_processing_jobs_claim", "status", "available_at"),
+        Index("idx_jasil_processing_jobs_claim", "status", "available_at"),
         # Selective and fair claims pin ``status = 'pending'`` first so the range scan
         # over queues never walks retained completed or dead-letter rows.
-        Index("idx_processing_jobs_queue_claim", "status", "queue", "available_at"),
+        Index("idx_jasil_processing_jobs_queue_claim", "status", "queue", "available_at"),
         # The reaper scans claimed rows whose lease has expired.
-        Index("idx_processing_jobs_lease", "status", "lease_expires_at"),
+        Index("idx_jasil_processing_jobs_lease", "status", "lease_expires_at"),
         # Heartbeats and worker summaries count active leases by worker.
-        Index("idx_processing_jobs_worker_claim", "status", "locked_by"),
+        Index("idx_jasil_processing_jobs_worker_claim", "status", "locked_by"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -209,15 +209,15 @@ class JobAttempt(Base):
 
     Attributes:
         id: Attempt identifier (UUIDv4 string).
-        job_id: The ``processing_jobs.id`` this attempt ran.
+        job_id: The ``jasil_processing_jobs.id`` this attempt ran.
         event_id: The originating envelope ``event_id``; links every subscriber's
             job for one event.
         event_type: The domain-event channel.
         subscriber_id: The durable subscriber that ran.
         queue: The named queue the job was claimed from.
-        attempt: ``processing_jobs.attempts`` at claim; restarts at 1 after a
+        attempt: ``jasil_processing_jobs.attempts`` at claim; restarts at 1 after a
             dead-letter replay.
-        worker_id: The worker instance (``job_workers.instance_id``) that claimed it.
+        worker_id: The worker instance (``jasil_job_workers.instance_id``) that claimed it.
         claimed_at: When the worker took the lease.
         started_at: When the handler began; ``NULL`` if it never ran.
         finished_at: When the attempt ended; ``NULL`` while open.
@@ -227,18 +227,18 @@ class JobAttempt(Base):
         error: The failure reason (truncated for storage), if it failed.
     """
 
-    __tablename__ = "job_attempts"
+    __tablename__ = "jasil_job_attempts"
     __table_args__ = (
         # One job's history, and closing the open attempt of a claim.
-        Index("idx_job_attempts_job", "job_id", "claimed_at"),
+        Index("idx_jasil_job_attempts_job", "job_id", "claimed_at"),
         # One worker's history.
-        Index("idx_job_attempts_worker", "worker_id", "claimed_at"),
+        Index("idx_jasil_job_attempts_worker", "worker_id", "claimed_at"),
         # Every subscriber's job for one event.
-        Index("idx_job_attempts_event", "event_id"),
+        Index("idx_jasil_job_attempts_event", "event_id"),
         # Retention, and the windows of attempts that were claimed in them.
-        Index("idx_job_attempts_claimed", "claimed_at"),
+        Index("idx_jasil_job_attempts_claimed", "claimed_at"),
         # Statistics windows: attempts that *ended* since a cutoff.
-        Index("idx_job_attempts_finished", "finished_at"),
+        Index("idx_jasil_job_attempts_finished", "finished_at"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -316,10 +316,10 @@ class JobAttempt(Base):
 class JobWorker(Base):
     """One restart-unique durable worker instance and its latest heartbeat."""
 
-    __tablename__ = "job_workers"
+    __tablename__ = "jasil_job_workers"
     __table_args__ = (
-        Index("idx_job_workers_heartbeat", "last_heartbeat_at"),
-        Index("idx_job_workers_stopped", "stopped_at"),
+        Index("idx_jasil_job_workers_heartbeat", "last_heartbeat_at"),
+        Index("idx_jasil_job_workers_stopped", "stopped_at"),
     )
 
     instance_id: Mapped[str] = mapped_column(
@@ -393,10 +393,10 @@ class EventOutbox(Base):
         relayed_at: When the relay fanned the event out; ``NULL`` while pending.
     """
 
-    __tablename__ = "event_outbox"
+    __tablename__ = "jasil_event_outbox"
     __table_args__ = (
         # The relay scans unrelayed rows oldest-first.
-        Index("idx_event_outbox_relayed", "relayed_at", "created_at"),
+        Index("idx_jasil_event_outbox_relayed", "relayed_at", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(

@@ -11,6 +11,9 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
+from jasil.migrations._names import index as ix
+from jasil.migrations._names import table as tb
+
 revision: str = "rev0001"
 down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
@@ -23,7 +26,7 @@ _JSON = sa.JSON().with_variant(JSONB(), "postgresql")
 
 def upgrade() -> None:
     op.create_table(
-        "event_log",
+        tb("event_log"),
         sa.Column("id", sa.String(36), primary_key=True, comment="Envelope event_id (UUIDv4); stable across retries"),
         sa.Column("event_type", sa.String(100), nullable=False, comment="Domain-event channel, e.g. order.created"),
         sa.Column(
@@ -78,11 +81,11 @@ def upgrade() -> None:
             comment="When processing finished (success or failure)",
         ),
     )
-    op.create_index("idx_event_log_type_status", "event_log", ["event_type", "status"])
-    op.create_index("idx_event_log_created", "event_log", ["created_at"])
+    op.create_index(ix("idx_event_log_type_status"), tb("event_log"), ["event_type", "status"])
+    op.create_index(ix("idx_event_log_created"), tb("event_log"), ["created_at"])
 
     op.create_table(
-        "event_outbox",
+        tb("event_outbox"),
         sa.Column("id", sa.String(36), primary_key=True, comment="Outbox row identifier (UUIDv4)"),
         sa.Column(
             "event_id", sa.String(36), nullable=False, comment="Envelope event_id carried onto the fanned-out jobs"
@@ -118,10 +121,10 @@ def upgrade() -> None:
             comment="When the relay fanned the event out; NULL while pending",
         ),
     )
-    op.create_index("idx_event_outbox_relayed", "event_outbox", ["relayed_at", "created_at"])
+    op.create_index(ix("idx_event_outbox_relayed"), tb("event_outbox"), ["relayed_at", "created_at"])
 
     op.create_table(
-        "processing_jobs",
+        tb("processing_jobs"),
         sa.Column("id", sa.String(36), primary_key=True, comment="Job identifier (UUIDv4)"),
         sa.Column(
             "event_id",
@@ -211,18 +214,18 @@ def upgrade() -> None:
         ),
         # The idempotent-consumer guarantee: a subscriber runs at most once per
         # event, enforced by the database rather than by the relay's logic.
-        sa.UniqueConstraint("event_id", "subscriber_id", name="uq_processing_jobs_event_subscriber"),
+        sa.UniqueConstraint("event_id", "subscriber_id", name=ix("uq_processing_jobs_event_subscriber")),
     )
-    op.create_index("idx_processing_jobs_claim", "processing_jobs", ["status", "available_at"])
-    op.create_index("idx_processing_jobs_lease", "processing_jobs", ["status", "lease_expires_at"])
+    op.create_index(ix("idx_processing_jobs_claim"), tb("processing_jobs"), ["status", "available_at"])
+    op.create_index(ix("idx_processing_jobs_lease"), tb("processing_jobs"), ["status", "lease_expires_at"])
 
     # Postgres-only: a GIN index makes ``event_metadata @> '{...}'`` correlation
     # lookups usable on a large trail. Not declared on the model because SQLite
     # cannot build it.
     if op.get_bind().dialect.name == "postgresql":
         op.create_index(
-            "idx_event_log_metadata_gin",
-            "event_log",
+            ix("idx_event_log_metadata_gin"),
+            tb("event_log"),
             ["event_metadata"],
             postgresql_using="gin",
             postgresql_ops={"event_metadata": "jsonb_path_ops"},
@@ -231,12 +234,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
-        op.drop_index("idx_event_log_metadata_gin", table_name="event_log")
-    op.drop_index("idx_processing_jobs_lease", table_name="processing_jobs")
-    op.drop_index("idx_processing_jobs_claim", table_name="processing_jobs")
-    op.drop_table("processing_jobs")
-    op.drop_index("idx_event_outbox_relayed", table_name="event_outbox")
-    op.drop_table("event_outbox")
-    op.drop_index("idx_event_log_created", table_name="event_log")
-    op.drop_index("idx_event_log_type_status", table_name="event_log")
-    op.drop_table("event_log")
+        op.drop_index(ix("idx_event_log_metadata_gin"), table_name=tb("event_log"))
+    op.drop_index(ix("idx_processing_jobs_lease"), table_name=tb("processing_jobs"))
+    op.drop_index(ix("idx_processing_jobs_claim"), table_name=tb("processing_jobs"))
+    op.drop_table(tb("processing_jobs"))
+    op.drop_index(ix("idx_event_outbox_relayed"), table_name=tb("event_outbox"))
+    op.drop_table(tb("event_outbox"))
+    op.drop_index(ix("idx_event_log_created"), table_name=tb("event_log"))
+    op.drop_index(ix("idx_event_log_type_status"), table_name=tb("event_log"))
+    op.drop_table(tb("event_log"))

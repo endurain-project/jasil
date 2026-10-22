@@ -21,13 +21,19 @@ Hosts that prefer a single, unified Alembic history can instead point their own
 ``env.py`` at their ``Base.metadata`` (the base passed to
 :func:`jasil.orm.map_models`) and add this package's ``versions`` directory to
 their ``version_locations`` — but the self-contained runner here needs no host
-wiring.
+wiring. Only :func:`upgrade` creates a fresh database with the ``jasil_`` names
+directly; from a host's own history ``rev0001`` first creates the unprefixed names
+and ``rev0003`` renames them.
 """
 
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from jasil._core import optional_deps
+from jasil.migrations import _names
 
 try:
     import alembic as _alembic
@@ -54,7 +60,20 @@ __all__ = [
 VERSION_TABLE = "jasil_alembic_version"
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent
-_POSTGRES_GIN_INDEX = "idx_event_log_metadata_gin"
+
+#: The first revision after which every table carries the ``jasil_`` prefix.
+_PREFIXED_FROM = "rev0003"
+#: The PostgreSQL-only GIN index on the event log's metadata, by the table it is on:
+#: the prefixed name used from rev0003 on, and the unprefixed one before it.
+_POSTGRES_GIN_INDEXES = {
+    "jasil_event_log": "idx_jasil_event_log_metadata_gin",
+    "event_log": "idx_event_log_metadata_gin",
+}
+
+#: What an unversioned pre-0.9 schema always holds. A lone ``event_log`` table is
+#: far more likely the host's own than JASIL's, so two of the three together mark
+#: one - a damaged schema missing a table is still recognised and refused.
+_LEGACY_BASELINE_TABLES = frozenset({"event_log", "event_outbox", "processing_jobs"})
 
 
 class SchemaCompatibilityError(RuntimeError):
@@ -108,9 +127,58 @@ def _run(engine: "Engine", command_name: str, *args: Any) -> None:
         _run_on_connection(connection, command_name, *args)
 
 
+def _fresh_install_prefix(connection: Any, revision: str) -> str:
+    """Return the table prefix a run to ``revision`` should create tables with.
+
+    ``jasil_`` for a fresh database heading to :data:`_PREFIXED_FROM` or later, so
+    JASIL never creates an unprefixed table that a host's own could already
+    occupy; empty everywhere else (see :mod:`jasil.migrations._names`). Fresh means
+    no recorded revision and no prefixed table. A single unprefixed table of the
+    same name proves nothing, since it may be the host's; two of the baseline
+    tables together are an unversioned old schema, which is refused.
+    """
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect
+
+    from jasil.orm import jasil_table_names
+
+    context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
+    if context.get_current_revision() is not None:
+        return ""
+    present = set(inspect(connection).get_table_names())
+    if present & jasil_table_names():
+        # Creating the unprefixed revisions beside prefixed tables would leave
+        # duplicates, and rev0003 would then skip its renames.
+        raise SchemaCompatibilityError(
+            "The database holds unversioned prefixed JASIL tables; "
+            "call adopt_existing_schema(engine) before upgrade(engine)"
+        )
+    if len(_LEGACY_BASELINE_TABLES & present) >= 2:
+        # An unversioned pre-0.9 schema: creating the prefixed tables beside it
+        # would leave the data behind and make rev0003 skip the rename.
+        raise SchemaCompatibilityError(
+            "The database holds unversioned, unprefixed JASIL tables from 0.8 or earlier; "
+            "call adopt_existing_schema(engine) before upgrade(engine)"
+        )
+    steps = {script.revision for script in ScriptDirectory.from_config(_config()).iterate_revisions(revision, "base")}
+    return _names.PREFIX if _PREFIXED_FROM in steps else ""
+
+
 def upgrade(engine: "Engine", revision: str = "head") -> None:
-    """Create or upgrade JASIL's tables to ``revision`` (default ``head``)."""
-    _run(engine, "upgrade", revision)
+    """Create or upgrade JASIL's tables to ``revision`` (default ``head``).
+
+    On a fresh database the tables are created with their final ``jasil_`` names
+    directly. A 0.8 database (unprefixed names) is renamed in place by ``rev0003``,
+    so **stop every process running 0.8 or earlier before running this**.
+    """
+    _require_alembic()
+    # On its own connection: inspecting begins a transaction, and Alembic only
+    # commits one it began itself.
+    with engine.connect() as connection:
+        prefix = _fresh_install_prefix(connection, revision)
+    with _names.use_prefix(prefix):
+        _run(engine, "upgrade", revision)
 
 
 def downgrade(engine: "Engine", revision: str) -> None:
@@ -159,14 +227,25 @@ def _format_difference(difference: Any) -> str:
     return f"{table_name}: incompatible schema operation {operation!r}"
 
 
-def _adoption_include_object(obj: Any, name: str | None, type_: str, reflected: bool, compare_to: Any) -> bool:
-    if type_ == "index":
-        if name == _POSTGRES_GIN_INDEX:
-            return False
-        if reflected and compare_to is None:
-            # Additional non-unique indexes do not change JASIL's write contract.
-            return False
-    return jasil_include_object(obj, name, type_, reflected, compare_to)
+def _adoption_include_object(tables: frozenset[str]) -> Any:
+    """Build the ``include_object`` hook for comparing one candidate schema.
+
+    Only the candidate's own tables are compared: under the unprefixed naming a
+    host's unrelated ``event_log`` can sit in the same database.
+    """
+
+    def include_object(obj: Any, name: str | None, type_: str, reflected: bool, compare_to: Any) -> bool:
+        if type_ == "table":
+            return name in tables
+        if type_ == "index":
+            if name in _POSTGRES_GIN_INDEXES.values():
+                return False
+            if reflected and compare_to is None:
+                # Additional non-unique indexes do not change JASIL's write contract.
+                return False
+        return True
+
+    return include_object
 
 
 def _primary_key_differences(inspector: Any, metadata: Any, table_names: frozenset[str]) -> list[str]:
@@ -179,24 +258,25 @@ def _primary_key_differences(inspector: Any, metadata: Any, table_names: frozens
     return differences
 
 
-def _postgres_gin_differences(connection: Any, inspector: Any) -> list[str]:
+def _postgres_gin_differences(connection: Any, inspector: Any, table_name: str) -> list[str]:
     if connection.dialect.name != "postgresql":
         return []
 
-    indexes = {index["name"]: index for index in inspector.get_indexes("event_log")}
-    index = indexes.get(_POSTGRES_GIN_INDEX)
+    gin_index = _POSTGRES_GIN_INDEXES[table_name]
+    indexes = {index["name"]: index for index in inspector.get_indexes(table_name)}
+    index = indexes.get(gin_index)
     if index is None:
-        return [f"event_log: missing index {_POSTGRES_GIN_INDEX!r}"]
+        return [f"{table_name}: missing index {gin_index!r}"]
 
     differences = []
     if index.get("column_names") != ["event_metadata"]:
-        differences.append(f"event_log: index {_POSTGRES_GIN_INDEX!r} must cover only 'event_metadata'")
+        differences.append(f"{table_name}: index {gin_index!r} must cover only 'event_metadata'")
     options = index.get("dialect_options", {})
     if options.get("postgresql_using") != "gin":
-        differences.append(f"event_log: index {_POSTGRES_GIN_INDEX!r} must use GIN")
+        differences.append(f"{table_name}: index {gin_index!r} must use GIN")
     operators = options.get("postgresql_ops")
     if operators is not None and operators.get("event_metadata") != "jsonb_path_ops":
-        differences.append(f"event_log: index {_POSTGRES_GIN_INDEX!r} must use jsonb_path_ops")
+        differences.append(f"{table_name}: index {gin_index!r} must use jsonb_path_ops")
     return differences
 
 
@@ -221,6 +301,41 @@ class _MetadataOps:
                     return
         raise RuntimeError(f"downgrade drops unknown index {index_name!r}")
 
+    def create_index(self, index_name: str, table_name: str, columns: Sequence[str], **kwargs: Any) -> None:
+        from sqlalchemy import Index
+
+        table = self._metadata.tables[table_name]
+        Index(index_name, *(table.c[column] for column in columns), **kwargs)
+
+    def rename_table(self, old_table_name: str, new_table_name: str, **kwargs: Any) -> None:
+        table = self._metadata.tables[old_table_name]
+        self._metadata.remove(table)
+        table.to_metadata(self._metadata, name=new_table_name)
+
+    def drop_constraint(self, constraint_name: str, table_name: str, type_: str | None = None, **kwargs: Any) -> None:
+        table = self._metadata.tables[table_name]
+        for constraint in list(table.constraints):
+            if constraint.name == constraint_name:
+                table.constraints.discard(constraint)
+                return
+        raise RuntimeError(f"downgrade drops unknown constraint {constraint_name!r}")
+
+    def create_unique_constraint(
+        self, constraint_name: str, table_name: str, columns: Sequence[str], **kwargs: Any
+    ) -> None:
+        from sqlalchemy import UniqueConstraint
+
+        table = self._metadata.tables[table_name]
+        table.append_constraint(UniqueConstraint(*(table.c[column] for column in columns), name=constraint_name))
+
+    @contextmanager
+    def batch_alter_table(self, table_name: str, **kwargs: Any) -> Iterator["_MetadataBatchOps"]:
+        yield _MetadataBatchOps(self, table_name)
+
+    def get_bind(self) -> Any:
+        """Report a dialect no migration branches on, so the portable path is taken."""
+        return SimpleNamespace(dialect=SimpleNamespace(name="metadata"))
+
     def drop_table(self, table_name: str, **kwargs: Any) -> None:
         self._metadata.remove(self._metadata.tables[table_name])
 
@@ -234,15 +349,28 @@ class _MetadataOps:
         )
 
 
+class _MetadataBatchOps:
+    """The table-scoped operations of ``op.batch_alter_table`` for :class:`_MetadataOps`."""
+
+    def __init__(self, ops: _MetadataOps, table_name: str) -> None:
+        self._ops = ops
+        self._table_name = table_name
+
+    def drop_constraint(self, constraint_name: str, type_: str | None = None, **kwargs: Any) -> None:
+        self._ops.drop_constraint(constraint_name, self._table_name, type_=type_)
+
+    def create_unique_constraint(self, constraint_name: str, columns: Sequence[str], **kwargs: Any) -> None:
+        self._ops.create_unique_constraint(constraint_name, self._table_name, columns)
+
+
 def _copy_jasil_metadata(metadata: Any, only: frozenset[str] | None = None) -> Any:
     from sqlalchemy import MetaData
 
-    from jasil.orm import jasil_table_names
+    from jasil.orm import jasil_table_names, legacy_table_names
 
     copied = MetaData()
-    for table_name in sorted(
-        jasil_table_names() & set(metadata.tables) & (set(metadata.tables) if only is None else only)
-    ):
+    known = jasil_table_names() | legacy_table_names()
+    for table_name in sorted(known & set(metadata.tables) & (set(metadata.tables) if only is None else only)):
         metadata.tables[table_name].to_metadata(copied)
     return copied
 
@@ -284,10 +412,13 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
     from alembic.autogenerate import compare_metadata
     from alembic.runtime.migration import MigrationContext
 
-    from jasil.orm import jasil_table_names
+    from jasil.orm import jasil_table_names, legacy_table_names
 
     expected_tables = frozenset(metadata.tables)
-    present_tables = frozenset(inspector.get_table_names()) & jasil_table_names()
+    # The names this candidate's scheme can use: a host's unrelated ``event_log``
+    # is not "unexpected" when the candidate is the prefixed schema.
+    universe = legacy_table_names() if expected_tables & legacy_table_names() else jasil_table_names()
+    present_tables = frozenset(inspector.get_table_names()) & universe
     missing = sorted(expected_tables - present_tables)
     unexpected = sorted(present_tables - expected_tables)
     differences = []
@@ -304,7 +435,7 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
         connection,
         opts={
             "compare_type": True,
-            "include_object": _adoption_include_object,
+            "include_object": _adoption_include_object(common),
         },
     )
     detailed = [
@@ -313,8 +444,8 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
         if difference[0] != "remove_table"
     ]
     detailed.extend(_primary_key_differences(inspector, restricted, common))
-    if "event_log" in common:
-        detailed.extend(_postgres_gin_differences(connection, inspector))
+    for table_name in common & _POSTGRES_GIN_INDEXES.keys():
+        detailed.extend(_postgres_gin_differences(connection, inspector, table_name))
     return differences + detailed, count + len(detailed)
 
 
@@ -341,7 +472,7 @@ def adopt_existing_schema(engine: "Engine") -> bool:
     from alembic.runtime.migration import MigrationContext
     from sqlalchemy import inspect
 
-    from jasil.orm import jasil_table_names
+    from jasil.orm import jasil_table_names, legacy_table_names
 
     with engine.connect() as connection:
         context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
@@ -349,11 +480,20 @@ def adopt_existing_schema(engine: "Engine") -> bool:
             return False
 
         inspector = inspect(connection)
-        if not set(inspector.get_table_names()) & jasil_table_names():
+        present = set(inspector.get_table_names())
+        if present & jasil_table_names():
+            candidate_names = jasil_table_names()
+        elif len(_LEGACY_BASELINE_TABLES & present) >= 2:
+            # Unprefixed tables from before 0.9. Two baseline tables are needed:
+            # one alone is the host's own.
+            candidate_names = legacy_table_names()
+        else:
             return False
 
         closest: tuple[str, list[str], int] | None = None
         for revision, metadata in _revision_schemas():
+            if not set(metadata.tables) <= candidate_names:
+                continue
             differences, weight = _schema_differences(connection, inspector, metadata)
             if not differences:
                 command.stamp(_config(connection), revision)

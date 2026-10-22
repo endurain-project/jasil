@@ -225,6 +225,10 @@ class TestLocalStorage:
     def storage(self, tmp_path):
         return LocalStorage(str(tmp_path), url_prefix="/media")
 
+    @pytest.fixture
+    def legacy_storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), url_prefix="/media", legacy_layout=True)
+
     def test_a_blob_round_trips(self, storage):
         storage.save("thumbnails", "1.webp", b"bytes")
 
@@ -339,7 +343,8 @@ class TestLocalStorage:
 
         assert isinstance(excinfo.value.__cause__, OSError)
 
-    def test_a_legacy_object_remains_readable_and_visible(self, storage, tmp_path):
+    def test_a_legacy_object_remains_readable_and_visible(self, legacy_storage, tmp_path):
+        storage = legacy_storage
         legacy_path = tmp_path / "thumbnails" / "legacy.webp"
         legacy_path.parent.mkdir()
         legacy_path.write_bytes(b"legacy")
@@ -355,7 +360,32 @@ class TestLocalStorage:
         assert storage.url("thumbnails", "legacy.webp") == "/media/thumbnails/legacy.webp"
         assert storage.list_keys("thumbnails") == ["legacy.webp"]
 
-    def test_overwriting_a_legacy_object_migrates_it_to_the_versioned_layout(self, storage, tmp_path):
+    def test_the_flat_layout_is_ignored_unless_enabled(self, storage, tmp_path):
+        """A file the host keeps under ``base_dir`` must not be servable as an object."""
+        stray = tmp_path / "thumbnails" / "stray.webp"
+        stray.parent.mkdir()
+        stray.write_bytes(b"not an object")
+
+        assert storage.get("thumbnails", "stray.webp") is None
+        assert storage.exists("thumbnails", "stray.webp") is False
+        assert storage.stat("thumbnails", "stray.webp") is None
+        assert storage.list_keys("thumbnails") == []
+        with pytest.raises(FileNotFoundError):
+            storage.open_stream("thumbnails", "stray.webp")
+
+    def test_deleting_never_touches_the_flat_layout_unless_enabled(self, storage, tmp_path):
+        stray = tmp_path / "thumbnails" / "stray.webp"
+        stray.parent.mkdir()
+        stray.write_bytes(b"not an object")
+
+        storage.delete("thumbnails", "stray.webp")
+        storage.save("thumbnails", "stray.webp", b"current")
+
+        assert stray.read_bytes() == b"not an object"
+        assert storage.get("thumbnails", "stray.webp") == b"current"
+
+    def test_overwriting_a_legacy_object_migrates_it_to_the_versioned_layout(self, legacy_storage, tmp_path):
+        storage = legacy_storage
         legacy_path = tmp_path / "thumbnails" / "legacy.webp"
         legacy_path.parent.mkdir()
         legacy_path.write_bytes(b"legacy")
@@ -368,11 +398,12 @@ class TestLocalStorage:
 
     def test_a_legacy_cleanup_failure_does_not_hide_the_committed_replacement(
         self,
-        storage,
+        legacy_storage,
         tmp_path,
         monkeypatch,
         caplog,
     ):
+        storage = legacy_storage
         legacy_path = tmp_path / "thumbnails" / "legacy.webp"
         legacy_path.parent.mkdir()
         legacy_path.write_bytes(b"legacy")
@@ -399,7 +430,8 @@ class TestLocalStorage:
 
         storage._prune_empty_directories(Path("unused"))
 
-    def test_prefix_deletion_counts_duplicate_legacy_and_current_objects_once(self, storage, tmp_path):
+    def test_prefix_deletion_counts_duplicate_legacy_and_current_objects_once(self, legacy_storage, tmp_path):
+        storage = legacy_storage
         storage.save("thumbnails", "release/a.webp", b"current")
         legacy_path = tmp_path / "thumbnails" / "release" / "a.webp"
         legacy_path.parent.mkdir(parents=True)
@@ -410,7 +442,10 @@ class TestLocalStorage:
         assert storage.list_keys("thumbnails") == []
 
     @pytest.mark.parametrize("legacy_parent", [True, False])
-    def test_legacy_and_current_objects_can_form_one_logical_tree(self, storage, tmp_path, legacy_parent, caplog):
+    def test_legacy_and_current_objects_can_form_one_logical_tree(
+        self, legacy_storage, tmp_path, legacy_parent, caplog
+    ):
+        storage = legacy_storage
         legacy_key = "release/1" if legacy_parent else "release/1/archive.bin"
         current_key = "release/1/archive.bin" if legacy_parent else "release/1"
         legacy_path = tmp_path / "packages" / legacy_key
@@ -875,13 +910,26 @@ class TestLocalStorage:
         assert metadata.content_type is None
         assert metadata.etag is None
 
+    def test_delete_prefix_ignores_a_flat_layout_symlink_when_the_layout_is_off(self, storage, tmp_path):
+        storage.save("archive", "keep.webp", b"keep")
+        source_area = tmp_path / "thumbnails"
+        source_area.mkdir()
+        (source_area / "linked").symlink_to(tmp_path / "archive", target_is_directory=True)
+
+        assert storage.delete_prefix("thumbnails", "linked") == 0
+        assert storage.list_keys("thumbnails") == []
+        assert storage.get("archive", "keep.webp") == b"keep"
+
     def test_a_directory_has_no_object_metadata(self, storage, tmp_path):
         (tmp_path / "thumbnails" / "directory").mkdir(parents=True)
 
         assert storage.stat("thumbnails", "directory") is None
 
     @pytest.mark.parametrize("operation", ["stat", "serve", "delete_prefix"])
-    def test_object_inspection_failures_are_provider_neutral(self, storage, monkeypatch, operation):
+    def test_object_inspection_failures_are_provider_neutral(self, storage, legacy_storage, monkeypatch, operation):
+        if operation == "delete_prefix":
+            # The flat layout is only consulted, and so only fails, when it is on.
+            storage = legacy_storage
         unavailable_path = Mock()
         unavailable_path.stat.side_effect = OSError("storage unavailable")
         unavailable_path.open.side_effect = OSError("storage unavailable")
@@ -993,7 +1041,8 @@ class TestLocalStorage:
         assert (tmp_path / "thumbnails").exists() is False
         assert tmp_path.is_dir()
 
-    def test_delete_prefix_refuses_a_symlink_into_another_area(self, storage, tmp_path):
+    def test_delete_prefix_refuses_a_symlink_into_another_area(self, legacy_storage, tmp_path):
+        storage = legacy_storage
         storage.save("archive", "keep.webp", b"keep")
         source_area = tmp_path / "thumbnails"
         source_area.mkdir()

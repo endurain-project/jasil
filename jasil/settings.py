@@ -19,7 +19,7 @@ Every component reads the installed settings through :func:`get_settings`.
 
 **Shape.** Configuration is grouped by concern — :class:`JobSettings`,
 :class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
-:class:`NetworkSettings` —
+:class:`NetworkSettings`, :class:`StorageSettings` —
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
 
@@ -42,6 +42,7 @@ __all__ = [
     "JobSettings",
     "MailSettings",
     "NetworkSettings",
+    "StorageSettings",
     "configure",
     "get_settings",
     "is_configured",
@@ -114,25 +115,24 @@ class GeocodingSettings:
     """Reverse-geocoding backend configuration.
 
     Attributes:
-        provider: ``"nominatim"``, ``"photon"``, or ``"geocode"``. Any other
-            value (including the empty default) disables the capability.
+        uri: ``nominatim://host[:port]`` or ``photon://host[:port]`` (HTTPS),
+            ``nominatim+http://host[:port]`` or ``photon+http://host[:port]``
+            (cleartext, for a self-hosted instance on a private network), or
+            ``geocode://`` (geocode.maps.co, a fixed host; needs ``api_key``).
+            The host must be a bare authority — no userinfo, path, query or
+            fragment — and passes SSRF validation (see
+            :class:`NetworkSettings`). Unset disables the capability; so does
+            any value that cannot be used, which is logged. Geocoding never
+            fails the platform build.
         rate_limit: Maximum requests per second; ``<= 0`` disables throttling.
         api_key: API key, for the services requiring one (geocode.maps.co).
-        nominatim_host: Bare ``host[:port]`` authority for Nominatim.
-        nominatim_use_https: Address Nominatim over HTTPS.
-        photon_host: Bare ``host[:port]`` authority for Photon.
-        photon_use_https: Address Photon over HTTPS.
         user_agent: ``User-Agent`` sent upstream. Nominatim's usage policy
             requires an identifying value, so hosts should set their own.
     """
 
-    provider: str = ""
+    uri: str | None = None
     rate_limit: float = 1.0
-    api_key: str | None = None
-    nominatim_host: str = ""
-    nominatim_use_https: bool = True
-    photon_host: str = ""
-    photon_use_https: bool = True
+    api_key: str | None = field(default=None, repr=False)
     user_agent: str = "jasil (ReverseGeocoding)"
 
 
@@ -189,6 +189,25 @@ class NetworkSettings:
     ssrf_allowed_hosts: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class StorageSettings:
+    """Settings of the ``local://`` storage backend; ``s3://`` takes none.
+
+    Attributes:
+        local_url_prefix: URL path prefix of the links ``local://`` builds, for a
+            host that serves the data directory under a path such as ``/media``.
+            Empty serves from the root. Ignored for ``s3://``.
+        local_legacy_layout: Also read, list and delete objects in the flat
+            ``{data_dir}/{area}/{key}`` layout written by JASIL 0.3 and earlier
+            and by the application JASIL was extracted from. Off by default, so
+            no other file under ``data_dir`` can be served as an object. Ignored
+            for ``s3://``.
+    """
+
+    local_url_prefix: str = ""
+    local_legacy_layout: bool = False
+
+
 # Capability defaults for the single-process profile. The distributed and custom
 # profiles have no equivalent: a Redis host, bucket name, or DSN cannot be
 # guessed, so leaving one unset there is a configuration error rather than a
@@ -235,6 +254,14 @@ class JasilSettings:
             both need the same reach across processes, and a deployment
             upgrading from a release without this setting must keep building.
             Set it to put hints on a different Redis.
+        events_stream: The Redis Stream key carrying best-effort events. Streams
+            live in one Redis database, so two deployments sharing a database must
+            use different streams (and consumer groups) or they would consume each
+            other's events. Ignored for ``memory://``. Must not be empty.
+        events_group: The Redis consumer group the event bus reads as. Replicas of
+            one deployment share a group, so each event is handled once; two
+            deployments reading the same stream must not. Ignored for
+            ``memory://``. Must not be empty.
         realtime_channel: The Redis Pub/Sub channel carrying realtime hints.
             Pub/Sub channels are server-wide — the database number in the URI
             does not separate them — so two deployments sharing one Redis server
@@ -244,6 +271,7 @@ class JasilSettings:
         geocoding: Reverse-geocoding backend configuration.
         mail: Outbound-mail backend configuration.
         network: Outbound-egress configuration.
+        storage: Settings of the ``local://`` storage backend.
     """
 
     profile: DeploymentProfile = DeploymentProfile.LOCAL
@@ -257,11 +285,14 @@ class JasilSettings:
     lock_uri: str | None = None
     realtime_uri: str | None = None
     realtime_channel: str = "jasil:realtime"
+    events_stream: str = "jasil:events"
+    events_group: str = "jasil"
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
     mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
+    storage: StorageSettings = field(default_factory=StorageSettings)
 
     def _resolve(self, name: str) -> str:
         """Return an explicit capability URI, or the profile's default.

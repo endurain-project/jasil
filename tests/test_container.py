@@ -87,6 +87,26 @@ class TestStorageResolution:
             container._build_storage(_settings(storage_uri="ftp://files"))
 
 
+class TestLocalStorageSettings:
+    def test_the_defaults_serve_from_the_root_with_no_flat_layout(self, tmp_path):
+        storage = container._build_storage(_settings(data_dir=str(tmp_path)))
+
+        assert storage._url_prefix == ""
+        assert storage._legacy_layout is False
+
+    def test_the_configured_prefix_and_layout_reach_the_backend(self, tmp_path):
+        storage = container._build_storage(
+            _settings(
+                data_dir=str(tmp_path),
+                storage=settings.StorageSettings(local_url_prefix="/media/", local_legacy_layout=True),
+            )
+        )
+
+        assert storage._url_prefix == "/media"
+        assert storage._legacy_layout is True
+        assert storage.url("avatars", "1.webp").startswith("/media/")
+
+
 class TestEventsResolution:
     def test_memory_uri_selects_the_in_process_bus(self):
         assert isinstance(container._build_events(_settings(events_uri="memory://"), None), InProcessEventBus)
@@ -99,6 +119,24 @@ class TestEventsResolution:
     def test_an_unknown_scheme_is_refused(self):
         with pytest.raises(ValueError, match="Unsupported events_uri scheme"):
             container._build_events(_settings(events_uri="kafka://broker"), None)
+
+    def test_the_default_stream_and_group_reach_the_stream_bus(self):
+        bus = container._build_events(_settings(events_uri="redis://c:6379/1"), None)
+
+        assert (bus._stream, bus._group) == ("jasil:events", "jasil")
+
+    def test_the_configured_stream_and_group_reach_the_stream_bus(self):
+        """Two deployments on one Redis database must be able to keep their events apart."""
+        bus = container._build_events(
+            _settings(events_uri="redis://c:6379/1", events_stream="tenant-a:events", events_group="tenant-a"), None
+        )
+
+        assert (bus._stream, bus._group) == ("tenant-a:events", "tenant-a")
+
+    @pytest.mark.parametrize("override", [{"events_stream": ""}, {"events_group": ""}])
+    def test_an_empty_stream_or_group_is_refused(self, override):
+        with pytest.raises(ValueError, match="events_stream and events_group must not be empty"):
+            container._build_events(_settings(events_uri="redis://c:6379/1", **override), None)
 
 
 class TestLockResolution:
@@ -131,24 +169,41 @@ class TestGeocodingResolution:
 
         assert caplog.text == ""
 
-    def test_an_unsupported_provider_disables_it(self, caplog):
+    def test_an_unsupported_scheme_disables_it(self, caplog):
         """A non-empty typo *is* worth warning about \u2014 someone meant to enable it."""
         with caplog.at_level("WARNING"):
-            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(provider="mapquest")))
+            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri="mapquest://x")))
 
         assert isinstance(provider, NullGeocoding)
-        assert "not a supported service" in caplog.text
+        assert "not supported" in caplog.text
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "nominatim.test",
+            "nominatim://",
+            "nominatim://user:pw@nominatim.test",
+            "nominatim://nominatim.test/reverse",
+            "nominatim://nominatim.test?x=1",
+            "nominatim://nominatim.test:notaport",
+            "geocode://geocode.maps.co",
+        ],
+    )
+    def test_a_malformed_uri_disables_it(self, uri):
+        provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri, api_key="k")))
+
+        assert isinstance(provider, NullGeocoding)
 
     def test_geocode_without_an_api_key_is_disabled(self, caplog):
         with caplog.at_level("WARNING"):
-            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(provider="geocode")))
+            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri="geocode://")))
 
         assert isinstance(provider, NullGeocoding)
         assert "api_key" in caplog.text
 
     def test_geocode_with_an_api_key_is_enabled(self):
         provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(provider="geocode", api_key="k"))
+            _settings(geocoding=settings.GeocodingSettings(uri="geocode://", api_key="k"))
         )
 
         assert isinstance(provider, HttpGeocoding)
@@ -156,7 +211,7 @@ class TestGeocodingResolution:
     def test_a_host_failing_ssrf_validation_disables_it(self, monkeypatch):
         """A private or malformed host must not be dialed, and must not stop startup."""
         provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(provider="nominatim", nominatim_host="http://bad"))
+            _settings(geocoding=settings.GeocodingSettings(uri="nominatim://127.0.0.1"))
         )
 
         assert isinstance(provider, NullGeocoding)
@@ -165,10 +220,35 @@ class TestGeocodingResolution:
         monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: f"https://{host}/reverse")
 
         provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(provider="nominatim", nominatim_host="nominatim.test"))
+            _settings(geocoding=settings.GeocodingSettings(uri="nominatim://nominatim.test:8080"))
         )
 
         assert isinstance(provider, HttpGeocoding)
+        assert provider._service == "nominatim"
+        assert provider._base_url == "https://nominatim.test:8080/reverse"
+
+    @pytest.mark.parametrize(
+        ("uri", "service", "use_https"),
+        [
+            ("nominatim://h.test", "nominatim", True),
+            ("nominatim+http://h.test", "nominatim", False),
+            ("photon://h.test", "photon", True),
+            ("photon+http://h.test", "photon", False),
+        ],
+    )
+    def test_the_scheme_selects_the_service_and_transport(self, monkeypatch, uri, service, use_https):
+        seen = {}
+
+        def fake(host, *, use_https, allowed_hosts=()):
+            seen["host"], seen["https"] = host, use_https
+            return "https://x/reverse"
+
+        monkeypatch.setattr(container, "build_reverse_endpoint", fake)
+
+        provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri)))
+
+        assert provider._service == service
+        assert seen == {"host": "h.test", "https": use_https}
 
     def test_the_configured_user_agent_is_used(self, monkeypatch):
         """Nominatim's usage policy requires an identifying value, and the
@@ -176,11 +256,7 @@ class TestGeocodingResolution:
         monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
 
         provider = container._build_geocoding(
-            _settings(
-                geocoding=settings.GeocodingSettings(
-                    provider="photon", photon_host="photon.test", user_agent="MyApp/1.0"
-                )
-            )
+            _settings(geocoding=settings.GeocodingSettings(uri="photon://photon.test", user_agent="MyApp/1.0"))
         )
 
         assert provider._user_agent == "MyApp/1.0"
@@ -189,7 +265,7 @@ class TestGeocodingResolution:
         monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
 
         provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(provider="photon", photon_host="p.test", rate_limit=2.0))
+            _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=2.0))
         )
 
         assert provider._min_interval == 0.5
@@ -198,7 +274,7 @@ class TestGeocodingResolution:
         monkeypatch.setattr(container, "build_reverse_endpoint", lambda host, **kw: "https://x/reverse")
 
         provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(provider="photon", photon_host="p.test", rate_limit=0))
+            _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=0))
         )
 
         assert provider._min_interval == 0
