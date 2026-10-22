@@ -108,17 +108,20 @@ class ReloadingBackend[S, B]:
             if current is not None and current.backend is not None:
                 return current
             raise SourceUnavailableError(f"{self._label} settings could not be loaded") from error
-        self._source_failing = False
         with self._lock:
+            self._source_failing = False
             current = self._current
+            # One build per change, under the lock: every other caller needs that
+            # same new backend, so none gains by running ahead of it.
             if current is None or current.settings != fresh or self._retry_due(current):
                 current = self._rebuild(fresh)
                 self._current = current
             return current
 
     def _note_source_failure(self, error: Exception) -> None:
-        level = logging.DEBUG if self._source_failing else logging.WARNING
-        self._source_failing = True
+        with self._lock:
+            level = logging.DEBUG if self._source_failing else logging.WARNING
+            self._source_failing = True
         logger.log(
             level,
             "%s settings source raised %s; using the last working backend if there is one",
@@ -172,7 +175,8 @@ class ReloadingMail:
         if outcome.transient:
             raise MailError("Mail settings could not be verified; retry")
         if outcome.backend is None:
-            raise MailNotConfiguredError("Mail settings are invalid")
+            # The reason carries no setting's value (see ``ReloadingBackend``).
+            raise MailNotConfiguredError(f"Mail settings are invalid: {outcome.rejection}")
         return outcome.backend.send(message)
 
 

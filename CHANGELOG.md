@@ -15,7 +15,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - The startup capability report gains a `geocoding` row, and reports a sourced capability as `runtime` / `runtime source`.
 - `jasil.testing.install_test_platform(..., sources=)`; `memory_mail` follows a sourced `memory://` backend.
 
-No breaking changes: a host that passes no sources sees no difference, apart from the extra `geocoding` line in the startup log.
+No breaking changes: a host that passes no sources sees no difference, apart from the extra `geocoding` line in the startup log (anything parsing that output should expect it).
 
 ## [0.9.0] - 2026-10-22
 

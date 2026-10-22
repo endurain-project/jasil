@@ -199,9 +199,9 @@ again.
 
 | Situation | Mail | Geocoding |
 |---|---|---|
-| The source raises, and the last build produced a working backend | That backend is used. A warning logs on the first failure of a run, debug after, until the source works again. | Same. |
+| The source raises, and the last build produced a working backend | That backend is used, **including its credentials, for as long as the source keeps failing**: revoking them in a store that is down does not take effect until it answers. A warning logs on the first failure of a run, debug after, until the source works again. | Same. |
 | The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception chained. | `reverse` returns `None`. |
-| The settings are invalid | `send` raises `MailNotConfiguredError`. The reason is logged once, without any value. The previous backend and its credentials are **never** reused. | `NullGeocoding`; the reason is logged once, as at startup. |
+| The settings are invalid | `send` raises `MailNotConfiguredError` whose message carries the reason (never a setting's value), also logged once. The previous backend and its credentials are **never** reused. | `NullGeocoding`; the reason is logged once, as at startup. |
 | The relay or geocoding host does not resolve (mail `secure=False`, geocoding) | `send` raises a plain `MailError`, retryable. The build is retried after 30 seconds, not remembered as a rejection. | `reverse` returns `None`; the build is retried after 30 seconds. |
 | The settings are unset (`uri` empty) | As `NullMail`: `send` raises `MailNotConfiguredError`. | As `NullGeocoding`. |
 

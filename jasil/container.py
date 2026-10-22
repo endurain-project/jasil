@@ -175,6 +175,9 @@ def build_platform(
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
+    geocoding = (
+        _build_runtime_geocoding(settings, sources.geocoding) if sources.geocoding else _build_geocoding(settings)
+    )
     try:
         return Platform(
             profile=profile,
@@ -183,9 +186,7 @@ def build_platform(
             events=_build_events(settings, recorder),
             lock=_build_lock(settings),
             clock=clock,
-            geocoding=_build_runtime_geocoding(settings, sources.geocoding)
-            if sources.geocoding
-            else _build_geocoding(settings),
+            geocoding=geocoding,
             mail=mail,
             recorder=recorder,
             realtime=_build_realtime(settings),
