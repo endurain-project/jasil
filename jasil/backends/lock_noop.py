@@ -1,6 +1,6 @@
 """No-op ``LockProvider`` backend (single process; always acquires)."""
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 
@@ -13,5 +13,5 @@ class NoopLock:
     """
 
     @contextmanager
-    def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Iterator[bool]:
+    def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Generator[bool]:
         yield True

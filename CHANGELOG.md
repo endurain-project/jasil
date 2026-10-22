@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.10.1] - 2026-10-22
+
+### Fixed
+
+- A subscriber without a `__name__` (a `functools.partial` or a callable object) no longer raises `AttributeError` from the event-recording or the subscriber-failure logging path; its `repr` is used instead.
+
+### Changed
+
+- `@contextmanager` functions are annotated `Generator[...]` rather than `Iterator[...]`, as typeshed now prefers. No runtime change.
+- Development: the Astral `ty` type checker runs beside mypy as an advisory CI job (`jasil (ty, advisory)`); mypy remains the gate.
+
+No breaking changes.
+
 ## [0.10.0] - 2026-10-22
 
 ### Added

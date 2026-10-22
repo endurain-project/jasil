@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.10.0"
+version = "0.10.1"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -83,6 +83,7 @@ all = [
 [dependency-groups]
 typecheck = [
     "mypy>=2.3.1",
+    "ty>=0.0.83",
     "types-requests>=2.33.0.20260906",
     "boto3-stubs[s3]>=1.43.98",
 ]
@@ -206,6 +207,7 @@ format-check = "ruff format --check ."
 lint-imports = "lint-imports"
 test = "pytest"
 typecheck = "mypy"
+typecheck-ty = "ty check"
 validate = ["lint", "format", "test", "typecheck"]
 check = ["lint-check", "format-check", "lint-imports", "test", "typecheck"]
 
@@ -270,6 +272,27 @@ module = [
     "jasil.jobs.models",
 ]
 follow_imports = "skip"
+
+# ``ty`` runs beside mypy as an advisory, non-blocking CI job (it is pre-1.0);
+# mypy stays the gate. Same scope as ``[tool.mypy]``.
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["jasil"]
+exclude = ["jasil/migrations/env.py", "jasil/migrations/versions/", "jasil/**/models.py"]
+
+# ``mail_smtp`` builds its ``SMTP`` / ``SMTP_SSL`` subclass dynamically (see
+# ``_tracked``), which ``ty`` cannot model: it reports the subclass's own
+# attributes and the valid ``context`` argument as errors. mypy covers this file
+# through targeted ignores.
+[[tool.ty.overrides]]
+include = ["jasil/backends/mail_smtp.py"]
+
+[tool.ty.overrides.rules]
+unsupported-base = "ignore"
+unresolved-attribute = "ignore"
+unknown-argument = "ignore"
 
 [tool.ruff]
 target-version = "py312"

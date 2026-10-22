@@ -14,7 +14,7 @@ lock name is hashed to a signed 64-bit key because ``pg_advisory_lock`` keys are
 
 import hashlib
 import logging
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -55,7 +55,7 @@ class PgAdvisoryLock:
         return cls(jasil_orm.get_engine())
 
     @contextmanager
-    def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Iterator[bool]:
+    def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Generator[bool]:
         del ttl_seconds  # session advisory locks are not TTL-based
         key = advisory_key(name)
         connection = self._engine.connect()

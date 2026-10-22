@@ -49,7 +49,7 @@ def best_effort(handler: Callable[[Event], None]) -> Callable[[Event], None]:
                 extra={
                     "event_type": event.event_type,
                     "event_id": event.event_id,
-                    "subscriber": handler.__name__,
+                    "subscriber": getattr(handler, "__name__", repr(handler)),
                     # The whole correlation dict: which keys matter is the host's
                     # to decide, so none are singled out here. This is why
                     # ``metadata`` must never carry a secret.

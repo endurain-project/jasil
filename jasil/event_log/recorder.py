@@ -9,7 +9,7 @@ processing — observability is best-effort by design.
 
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 
 from sqlalchemy.orm import Session
@@ -78,7 +78,7 @@ class EventLogRecorder:
         worker_id: str,
         handler_name: str | None,
         record_processing: bool = True,
-    ) -> Iterator[None]:
+    ) -> Generator[None]:
         """
         Record ``processing`` then ``completed`` / ``failed`` around handlers.
 

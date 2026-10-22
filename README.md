@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.10.0` - the API is still settling. Expect breaking changes on
+> **Status:** `0.10.1` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
@@ -150,7 +150,8 @@ profile system exists to prevent.
 uv sync --all-extras --group dev
 uv run pytest              # tests + coverage gate
 uv run ruff check .        # lint
-uv run mypy                # type check
+uv run mypy                # type check (the gate)
+uv run ty check            # advisory type check (non-blocking in CI)
 uv run lint-imports        # architectural import contracts
 ```
 

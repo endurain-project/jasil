@@ -174,7 +174,7 @@ class RedisStreamEventBus:
                 for handler in handlers:
                     handler(event)
             else:
-                handler_name = ",".join(handler.__name__ for handler in handlers) or None
+                handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
                 with recorder.track(event, worker_id=self._consumer, handler_name=handler_name):
                     for handler in handlers:
                         handler(event)

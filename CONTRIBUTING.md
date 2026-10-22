@@ -109,7 +109,8 @@ to avoid a red build:
 ```bash
 uv run ruff check .          # lint
 uv run ruff format .         # format
-uv run mypy                  # type check
+uv run mypy                  # type check (the gate)
+uv run ty check              # advisory type check (non-blocking in CI)
 uv run lint-imports          # architectural import contracts
 uv run pytest                # tests + coverage gate
 ```

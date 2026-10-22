@@ -15,7 +15,7 @@ the handler copies the context (``contextvars.copy_context()``).
 
 import contextvars
 import threading
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 __all__ = ["job_lease", "lease_lost"]
@@ -42,7 +42,7 @@ def lease_lost() -> bool:
 
 
 @contextmanager
-def job_lease(lost: threading.Event) -> Iterator[None]:
+def job_lease(lost: threading.Event) -> Generator[None]:
     """Bind ``lost`` as the lease-lost signal of the enclosed handler call.
 
     Args:

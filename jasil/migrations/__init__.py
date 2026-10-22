@@ -26,7 +26,7 @@ directly; from a host's own history ``rev0001`` first creates the unprefixed nam
 and ``rev0003`` renames them.
 """
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -329,7 +329,7 @@ class _MetadataOps:
         table.append_constraint(UniqueConstraint(*(table.c[column] for column in columns), name=constraint_name))
 
     @contextmanager
-    def batch_alter_table(self, table_name: str, **kwargs: Any) -> Iterator["_MetadataBatchOps"]:
+    def batch_alter_table(self, table_name: str, **kwargs: Any) -> Generator["_MetadataBatchOps"]:
         yield _MetadataBatchOps(self, table_name)
 
     def get_bind(self) -> Any:

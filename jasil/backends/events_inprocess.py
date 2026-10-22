@@ -41,7 +41,7 @@ class InProcessEventBus:
                 handler(event)
             return
         recorder.record_published(event)
-        handler_name = ",".join(handler.__name__ for handler in handlers) or None
+        handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
         with recorder.track(event, worker_id=_INPROCESS_WORKER, handler_name=handler_name, record_processing=False):
             for handler in handlers:
                 handler(event)

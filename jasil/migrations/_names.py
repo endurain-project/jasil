@@ -16,7 +16,7 @@ that derives an older revision's schema - it is empty, which is what those
 revisions always meant.
 """
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 
@@ -29,7 +29,7 @@ _prefix: ContextVar[str] = ContextVar("jasil_migration_table_prefix", default=""
 
 
 @contextmanager
-def use_prefix(prefix: str) -> Iterator[None]:
+def use_prefix(prefix: str) -> Generator[None]:
     """Make the revisions that follow the prefix convention use ``prefix``."""
     token = _prefix.set(prefix)
     try:
