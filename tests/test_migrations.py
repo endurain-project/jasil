@@ -509,6 +509,17 @@ class TestAdoptExistingSchema:
         assert jasil_table_names() <= tables
         assert not tables & legacy_table_names()
 
+    def test_upgrade_refuses_an_unversioned_pre_prefix_schema(self, engine):
+        """Creating empty prefixed tables beside the old ones would strand the data."""
+        migrations.upgrade(engine, "rev0002")
+        _drop_version_table(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match="adopt_existing_schema"):
+            migrations.upgrade(engine)
+
+        tables = set(inspect(engine).get_table_names())
+        assert not tables & jasil_table_names()
+
     def test_a_baseline_schema_with_a_wrong_column_type_fails_closed(self, engine):
         migrations.upgrade(engine, "rev0001")
         _drop_version_table(engine)

@@ -133,8 +133,9 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     ``jasil_`` for a fresh database heading to :data:`_PREFIXED_FROM` or later, so
     JASIL never creates an unprefixed table that a host's own could already
     occupy; empty everywhere else (see :mod:`jasil.migrations._names`). Fresh means
-    no recorded revision and no prefixed table. An unprefixed table of the same
-    name proves nothing, since it may be the host's.
+    no recorded revision and no prefixed table. A single unprefixed table of the
+    same name proves nothing, since it may be the host's; two of the baseline
+    tables together are an unversioned old schema, which is refused.
     """
     from alembic.runtime.migration import MigrationContext
     from alembic.script import ScriptDirectory
@@ -145,8 +146,16 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
     if context.get_current_revision() is not None:
         return ""
-    if set(inspect(connection).get_table_names()) & jasil_table_names():
+    present = set(inspect(connection).get_table_names())
+    if present & jasil_table_names():
         return ""
+    if len(_LEGACY_BASELINE_TABLES & present) >= 2:
+        # An unversioned pre-0.9 schema: creating the prefixed tables beside it
+        # would leave the data behind and make rev0003 skip the rename.
+        raise SchemaCompatibilityError(
+            "The database holds unversioned, unprefixed JASIL tables from 0.8 or earlier; "
+            "call adopt_existing_schema(engine) before upgrade(engine)"
+        )
     steps = {script.revision for script in ScriptDirectory.from_config(_config()).iterate_revisions(revision, "base")}
     return _names.PREFIX if _PREFIXED_FROM in steps else ""
 

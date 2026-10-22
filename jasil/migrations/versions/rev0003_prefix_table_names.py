@@ -85,6 +85,9 @@ _GIN_INDEX = "idx_event_log_metadata_gin"
 def _prefixed(name: str) -> str:
     """Return ``name`` as it is called from this revision on.
 
+    Deliberately not :func:`jasil.migrations._names.index`: that one follows the
+    runner's context variable, while this revision always means the final names.
+
     Indexes and constraints read ``idx_<table>_...`` / ``uq_<table>_...``; the
     prefix goes after the ``idx_`` / ``uq_`` marker so the convention is kept.
     """
@@ -112,7 +115,7 @@ def _rename(tables: Sequence[str], *, to_prefixed: bool) -> None:
             # The primary-key index keeps the old table's name through a rename.
             op.execute(f'ALTER INDEX IF EXISTS "{source(table)}_pkey" RENAME TO "{target(table)}_pkey"')
             for index, _ in indexes:
-                op.execute(f'ALTER INDEX "{source(index)}" RENAME TO "{target(index)}"')
+                op.execute(f'ALTER INDEX IF EXISTS "{source(index)}" RENAME TO "{target(index)}"')
             if table == "event_log":
                 op.execute(f'ALTER INDEX IF EXISTS "{source(_GIN_INDEX)}" RENAME TO "{target(_GIN_INDEX)}"')
         else:
