@@ -113,13 +113,18 @@ expired on the last attempt, or the reaper recovered a worker that died.
 `error` is the stored last failure reason (`str | None`).
 
 * **At least once.** Delivery is recorded in `dead_letter_notified_at` only after the
-  callback returns. A crash, or a callback that raises, leaves the callback owed and
-  a later reaper pass calls it again, no sooner than 60 seconds after the job last
-  changed. **Make the callback idempotent.**
+  callback returns. A crash, or a callback that raises, leaves the callback owed and a
+  later reaper pass calls it again, after a backoff that starts at 60 seconds and
+  doubles per failure up to an hour. Each delivery first claims the job with a
+  5-minute lease, so a worker and a reaper (or two reapers) do not run it together.
+  The count and the last failure are kept in `dead_letter_attempts` and
+  `dead_letter_callback_error`. **Make the callback idempotent.**
 * **After the transition, outside the handler.** It runs in the worker or reaper
   process, after the dead-letter is committed and in no session of the failed handler.
   An exception from it is logged and swallowed; the job stays `dead_letter`.
-* **It runs inline.** The worker (or reaper) waits for it, so keep it short.
+* **It runs inline.** The worker (or reaper) waits for it, after the failure has been
+  logged, so keep it short and give any network call its own timeout. A callback that
+  outlasts its 5-minute lease may be started a second time by another process.
 * **Check your own state.** A handler that finishes after its lease was taken still
   writes its result, but the job stays `dead_letter`. The callback may then run for
   work that succeeded, so read the app's record before overwriting it.
@@ -128,7 +133,8 @@ expired on the last attempt, or the reaper recovered a worker that died.
 * **Register it where the reaper runs.** The callback lives in the process-local
   registry. A process that did not register it never delivers or consumes the
   notification, so register subscribers, callbacks included, in every process that
-  runs a worker or the reaper.
+  runs a worker or the reaper. A job whose subscriber has no callback in the process
+  doing the sweep is skipped without a log line.
 * **Dead letters before this feature** are not called back; the migration marks them
   as delivered.
 

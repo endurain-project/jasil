@@ -89,7 +89,9 @@ class Event:
         metadata: Correlation context (request_id, plus any host-defined keys).
         retry_count: Processing attempts so far; 0 on first publish. In a durable
             handler it is the attempt being run, counted from 1 (see
-            :attr:`attempt`).
+            :attr:`attempt`), so it means different things in-process and
+            durable: read :attr:`attempt` and :attr:`is_last_attempt` rather than
+            comparing it yourself.
         max_attempts: The attempt ceiling of the durable job this event was
             delivered for; ``None`` for an event that is not a durable delivery.
             Set by the job runner from the job row, the same value it uses to
@@ -111,7 +113,7 @@ class Event:
 
     @property
     def attempt(self) -> int | None:
-        """The 1-based attempt a durable handler is running; ``None`` outside one."""
+        """The 1-based attempt a durable handler is running; ``None`` when ``max_attempts`` is unset (not a durable delivery)."""
         return self.retry_count if self.max_attempts is not None else None
 
     @property

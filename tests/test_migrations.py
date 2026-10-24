@@ -326,11 +326,11 @@ class TestDeadLetterNotified:
 
         migrations.downgrade(engine, "rev0003")
         columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
-        assert "dead_letter_notified_at" not in columns
+        assert not columns & {"dead_letter_notified_at", "dead_letter_notify_after", "dead_letter_attempts"}
 
         migrations.upgrade(engine)
         columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
-        assert "dead_letter_notified_at" in columns
+        assert {"dead_letter_notified_at", "dead_letter_notify_after", "dead_letter_attempts"} <= columns
 
 
 class TestOfflineSql:

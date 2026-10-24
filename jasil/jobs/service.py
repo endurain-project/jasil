@@ -301,7 +301,7 @@ def reap_expired_jobs_scheduled() -> None:
     disjoint rows and a loser never overwrites the winner's requeue.
     """
     import jasil.jobs.crud as jobs_crud
-    from jasil.jobs.dead_letter import deliver_dead_letters
+    from jasil.jobs.dead_letter import deliver_after_reap
 
     platform = platform_runtime.get_active_platform()
     now = platform.clock.now()
@@ -311,15 +311,6 @@ def reap_expired_jobs_scheduled() -> None:
         # worker, not just say that one happened.
         holders = jobs_crud.expired_lease_holders(now=now, db=db)
         reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
-    # After the transition is committed. The second call is the sweep for callbacks a
-    # crash left owed; it only looks at subscribers registered in this process.
-    for job_ids in (dead_lettered, None):
-        try:
-            deliver_dead_letters(
-                registry=jobs_registry.registry, session_factory=session_factory, clock=platform.clock, job_ids=job_ids
-            )
-        except Exception:
-            logger.exception("Dead-letter callbacks could not be delivered")
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.
@@ -328,6 +319,13 @@ def reap_expired_jobs_scheduled() -> None:
             reclaimed,
             extra={"workers": holders},
         )
+    # Last, after the reap is logged: a slow callback must not hide it.
+    deliver_after_reap(
+        registry=jobs_registry.registry,
+        session_factory=session_factory,
+        clock=platform.clock,
+        dead_lettered=dead_lettered,
+    )
 
 
 def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:

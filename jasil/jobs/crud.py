@@ -810,7 +810,8 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
     Returns:
         ``(reclaimed, dead_lettered_ids)``: the number of jobs reclaimed, and the
         ids among the selected ones that are ``dead_letter`` after the pass (a
-        concurrent reaper's may be included; delivery tolerates that).
+        concurrent reaper's may be included; delivery claims each job with a
+        compare-and-set, so only one process runs its callback).
     """
     id_stmt = (
         select(ProcessingJob.id)
@@ -1114,6 +1115,9 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
                 lease_expires_at=None,
                 completed_at=None,
                 dead_letter_notified_at=None,
+                dead_letter_notify_after=None,
+                dead_letter_attempts=0,
+                dead_letter_callback_error=None,
             )
         ),
     )
@@ -1137,6 +1141,7 @@ class DeadLetterJob:
     timestamp: str
     schema_version: int
     last_error: str | None
+    delivery_attempt: int
 
     def to_event(self) -> Event:
         """The envelope as the handler last saw it, with its final attempt counts."""
@@ -1153,59 +1158,83 @@ class DeadLetterJob:
         )
 
 
-def dead_letters_awaiting_callback(
+def claim_dead_letter_callbacks(
     subscriber_ids: Iterable[str],
     *,
+    now: datetime,
+    lease_seconds: float,
     db: Session,
     job_ids: Iterable[str] | None = None,
-    idle_before: datetime | None = None,
     limit: int = 100,
 ) -> list[DeadLetterJob]:
     """
-    Return dead-lettered jobs whose subscriber's callback has not yet succeeded.
+    Claim the dead-lettered jobs whose subscriber's callback is owed and due.
+
+    A job is due while ``dead_letter_notified_at`` is NULL and its
+    ``dead_letter_notify_after`` is unset or past. Each claim is a compare-and-set
+    that pushes ``dead_letter_notify_after`` ``lease_seconds`` ahead and counts the
+    delivery, so of several processes going for the same job (a worker and a
+    reaper, or two reapers) exactly one wins and the others skip it. The lease also
+    keeps a slow callback from being started a second time before it is given up on.
 
     Args:
         subscriber_ids: Subscribers that have a callback in this process.
+        now: Current instant.
+        lease_seconds: How long the claim holds off other deliveries.
         db: Active database session.
         job_ids: Restrict to these jobs (the ones this process just dead-lettered).
-        idle_before: Only jobs last updated at or before this instant. A sweep
-            passes it so it leaves a job whose own worker is still delivering.
-        limit: Maximum number of jobs returned.
+        limit: Maximum number of jobs claimed.
 
     Returns:
-        The jobs, oldest first.
+        The jobs this call claimed, oldest first.
     """
     subscribers = list(subscriber_ids)
     if not subscribers:
         return []
-    statement = select(ProcessingJob).where(
+    due = (
         ProcessingJob.status == STATUS_DEAD_LETTER,
         ProcessingJob.dead_letter_notified_at.is_(None),
-        ProcessingJob.subscriber_id.in_(subscribers),
+        or_(ProcessingJob.dead_letter_notify_after.is_(None), ProcessingJob.dead_letter_notify_after <= now),
     )
+    statement = select(ProcessingJob).where(*due, ProcessingJob.subscriber_id.in_(subscribers))
     if job_ids is not None:
         statement = statement.where(ProcessingJob.id.in_(list(job_ids)))
-    if idle_before is not None:
-        statement = statement.where(ProcessingJob.updated_at <= idle_before)
     rows = db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
-    jobs = [
-        DeadLetterJob(
-            id=row.id,
-            event_id=row.event_id,
-            event_type=row.event_type,
-            subscriber_id=row.subscriber_id,
-            source=row.source,
-            payload=dict(row.payload),
-            metadata=dict(row.job_metadata) if row.job_metadata else None,
-            attempts=row.attempts,
-            max_attempts=row.max_attempts,
-            timestamp=as_utc(row.created_at).isoformat(),
-            schema_version=row.schema_version,
-            last_error=row.last_error,
+    lease_until = now + timedelta(seconds=lease_seconds)
+    jobs: list[DeadLetterJob] = []
+    for row in rows:
+        claimed = cast(
+            CursorResult[Any],
+            db.execute(
+                update(ProcessingJob)
+                .where(ProcessingJob.id == row.id, *due)
+                .values(
+                    dead_letter_notify_after=lease_until,
+                    dead_letter_attempts=ProcessingJob.dead_letter_attempts + 1,
+                )
+                .execution_options(synchronize_session=False)
+            ),
         )
-        for row in rows
-    ]
-    db.rollback()  # read only; end the transaction before callbacks run
+        if claimed.rowcount != 1:
+            continue
+        jobs.append(
+            DeadLetterJob(
+                id=row.id,
+                event_id=row.event_id,
+                event_type=row.event_type,
+                subscriber_id=row.subscriber_id,
+                source=row.source,
+                payload=dict(row.payload),
+                metadata=dict(row.job_metadata) if row.job_metadata else None,
+                attempts=row.attempts,
+                max_attempts=row.max_attempts,
+                timestamp=as_utc(row.created_at).isoformat(),
+                schema_version=row.schema_version,
+                last_error=row.last_error,
+                delivery_attempt=row.dead_letter_attempts + 1,
+            )
+        )
+    db.commit()
     return jobs
 
 
@@ -1217,20 +1246,32 @@ def mark_dead_letter_notified(job_id: str, *, now: datetime, db: Session) -> boo
         True when this call set the marker; False when the job was no longer an
         un-notified dead letter (already recorded, or replayed meanwhile).
     """
-    return _touch_dead_letter(job_id, db=db, now=now, notified_at=now)
+    return _update_dead_letter(
+        job_id, db=db, dead_letter_notified_at=now, dead_letter_notify_after=None, dead_letter_callback_error=None
+    )
 
 
-def defer_dead_letter_callback(job_id: str, *, now: datetime, db: Session) -> bool:
+def defer_dead_letter_callback(job_id: str, *, retry_at: datetime, error: str, db: Session) -> bool:
     """
-    Push a failed callback's retry back by one sweep grace period.
+    Schedule a failed callback's next delivery and keep the failure for diagnosis.
 
-    Bumps ``updated_at`` so the sweep, which skips recently updated rows, does not
-    call a failing callback again on every pass.
+    Leaves ``updated_at`` alone, which is the instant the job was dead-lettered.
+
+    Args:
+        job_id: The dead-lettered job.
+        retry_at: Earliest instant the callback may be delivered again.
+        error: What the callback raised.
+        db: Active database session.
     """
-    return _touch_dead_letter(job_id, db=db, now=now, notified_at=None)
+    return _update_dead_letter(
+        job_id,
+        db=db,
+        dead_letter_notify_after=retry_at,
+        dead_letter_callback_error=fit_length(error, MAX_STORED_ERROR_LENGTH),
+    )
 
 
-def _touch_dead_letter(job_id: str, *, db: Session, now: datetime, notified_at: datetime | None) -> bool:
+def _update_dead_letter(job_id: str, *, db: Session, **values: Any) -> bool:
     updated = cast(
         CursorResult[Any],
         db.execute(
@@ -1240,7 +1281,7 @@ def _touch_dead_letter(job_id: str, *, db: Session, now: datetime, notified_at: 
                 ProcessingJob.status == STATUS_DEAD_LETTER,
                 ProcessingJob.dead_letter_notified_at.is_(None),
             )
-            .values(updated_at=now, dead_letter_notified_at=notified_at)
+            .values(**values)
         ),
     )
     db.commit()

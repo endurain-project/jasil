@@ -17,7 +17,7 @@ import jasil.jobs.service as jobs_service
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import Event, new_event
-from jasil.jobs.dead_letter import SWEEP_GRACE_SECONDS, deliver_dead_letters
+from jasil.jobs.dead_letter import CLAIM_LEASE_SECONDS, RETRY_BASE_SECONDS, deliver_dead_letters
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -200,7 +200,7 @@ class TestHandlerException:
     def test_a_later_sweep_does_not_repeat_a_delivered_callback(self, runner, clock, db, calls):
         enqueue(db, max_attempts=1)
         runner.run_once()
-        clock.advance(SWEEP_GRACE_SECONDS * 2)
+        clock.advance(CLAIM_LEASE_SECONDS * 2)
 
         runner.reap_once()
 
@@ -288,25 +288,48 @@ class TestReaperRecovery:
     def test_the_sweep_delivers_a_callback_the_crash_left_owed(self, runner, clock, db, calls):
         self._crash_after_commit(db, clock, runner)
         assert calls == []
-        clock.advance(SWEEP_GRACE_SECONDS + 1)
+        clock.advance(1)
 
         runner.reap_once()
 
         assert [error for _e, error in calls] == ["boom"]
         assert stored_job(db).dead_letter_notified_at is not None
 
-    def test_the_sweep_leaves_a_fresh_dead_letter_to_the_process_delivering_it(self, runner, clock, db, calls):
+    def test_a_delivery_in_flight_elsewhere_is_not_started_again(self, runner, registry, clock, db, calls):
+        """The claim lease keeps a slow callback from running twice at once."""
         self._crash_after_commit(db, clock, runner)
-        clock.advance(SWEEP_GRACE_SECONDS - 1)
+        with runner._session_factory() as other:
+            claimed = jobs_crud.claim_dead_letter_callbacks(
+                registry.dead_letter_subscriber_ids(),
+                now=clock.now(),
+                lease_seconds=CLAIM_LEASE_SECONDS,
+                db=other,
+            )
+        assert len(claimed) == 1
 
         runner.reap_once()
-
         assert calls == []
+
+        clock.advance(CLAIM_LEASE_SECONDS + 1)
+        runner.reap_once()
+        assert len(calls) == 1
+
+    def test_only_one_of_two_claimers_wins(self, runner, registry, clock, db, calls):
+        self._crash_after_commit(db, clock, runner)
+        subscribers = registry.dead_letter_subscriber_ids()
+
+        def claim():
+            with runner._session_factory() as session:
+                return jobs_crud.claim_dead_letter_callbacks(
+                    subscribers, now=clock.now(), lease_seconds=CLAIM_LEASE_SECONDS, db=session
+                )
+
+        assert [len(claim()), len(claim())] == [1, 0]
 
     def test_a_crash_after_the_callback_repeats_it(self, runner, registry, clock, db, calls, session_factory):
         """At least once: the marker is written after the callback returns."""
         self._crash_after_commit(db, clock, runner)
-        clock.advance(SWEEP_GRACE_SECONDS + 1)
+        clock.advance(1)
         job_id = stored_job(db).id
         # The first delivery's callback ran but the marker write never happened.
         calls.append("ran before the crash")
@@ -319,7 +342,7 @@ class TestReaperRecovery:
     def test_a_process_without_the_callback_leaves_it_owed(self, runner, registry, clock, db):
         registry.register("a.b", "s", _boom)
         self._crash_after_commit(db, clock, runner)
-        clock.advance(SWEEP_GRACE_SECONDS + 1)
+        clock.advance(1)
 
         runner.reap_once()
 
@@ -355,18 +378,57 @@ class TestCallbackRaising:
         assert job.dead_letter_notified_at is None
         assert "Dead-letter callback failed" in caplog.text
 
-    def test_it_is_retried_by_the_sweep_not_on_every_pass(self, runner, clock, db, failing):
+    def test_it_is_retried_after_a_growing_backoff_not_on_every_pass(self, runner, clock, db, failing):
         enqueue(db, max_attempts=1)
         runner.run_once()
         assert len(failing) == 1
 
-        clock.advance(SWEEP_GRACE_SECONDS - 1)
+        clock.advance(RETRY_BASE_SECONDS - 1)
         runner.reap_once()
         assert len(failing) == 1
 
         clock.advance(2)
         runner.reap_once()
         assert len(failing) == 2
+
+        clock.advance(RETRY_BASE_SECONDS + 1)  # the second wait is twice as long
+        runner.reap_once()
+        assert len(failing) == 2
+
+        clock.advance(RETRY_BASE_SECONDS)
+        runner.reap_once()
+        assert len(failing) == 3
+
+    def test_the_failure_is_stored_and_the_dead_letter_time_is_kept(self, runner, clock, db, failing):
+        enqueue(db, max_attempts=1)
+        runner.run_once()
+        dead_at = stored_job(db).updated_at
+        clock.advance(RETRY_BASE_SECONDS + 1)
+
+        runner.reap_once()
+
+        job = stored_job(db)
+        assert job.updated_at == dead_at
+        assert job.dead_letter_attempts == 2
+        assert job.dead_letter_callback_error == "RuntimeError: app is down"
+
+    def test_the_failure_is_logged_before_the_callback_runs(self, runner, registry, db, caplog):
+        order = []
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda _e, _r: order.append("callback"))
+        enqueue(db, max_attempts=1)
+
+        class Spy(__import__("logging").Handler):
+            def emit(self, record):
+                order.append(record.getMessage())
+
+        spy = Spy()
+        __import__("logging").getLogger("jasil.jobs.runner").addHandler(spy)
+        try:
+            runner.run_once()
+        finally:
+            __import__("logging").getLogger("jasil.jobs.runner").removeHandler(spy)
+
+        assert order.index("Durable job failed") < order.index("callback")
 
     def test_one_failing_callback_does_not_stop_the_next(self, runner, registry, clock, db, session_factory):
         done = []
@@ -388,7 +450,6 @@ class TestCallbackRaising:
         enqueue(db, max_attempts=1)
         db.execute(text("UPDATE jasil_processing_jobs SET status = 'dead_letter', last_error = 'x'"))
         db.commit()
-        clock.advance(SWEEP_GRACE_SECONDS + 1)
 
         def broken():
             raise RuntimeError("database down")
@@ -417,7 +478,7 @@ class TestReplay:
         replayed = stored_job(db)
         assert replayed.dead_letter_notified_at is None
         assert replayed.status == jobs_crud.STATUS_PENDING
-        clock.advance(SWEEP_GRACE_SECONDS * 2)
+        clock.advance(CLAIM_LEASE_SECONDS * 2)
         runner.reap_once()
         assert len(calls) == 1  # replaying does not call it
 
@@ -432,7 +493,7 @@ class TestNoCallback:
         enqueue(db, max_attempts=1)
 
         assert runner.run_once() == 1
-        clock.advance(SWEEP_GRACE_SECONDS * 2)
+        clock.advance(CLAIM_LEASE_SECONDS * 2)
         runner.reap_once()
 
         job = stored_job(db)

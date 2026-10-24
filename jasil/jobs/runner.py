@@ -17,7 +17,7 @@ import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
-from jasil.jobs.dead_letter import deliver_dead_letters
+from jasil.jobs.dead_letter import deliver_after_reap, deliver_dead_letters
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
@@ -261,7 +261,8 @@ class JobRunner:
 
     def reap_once(self) -> int:
         """
-        Requeue (or dead-letter) jobs whose lease expired.
+        Requeue (or dead-letter) jobs whose lease expired, then run the owed
+        ``on_dead_letter`` callbacks of subscribers registered here.
 
         Returns:
             The number of jobs reclaimed.
@@ -269,21 +270,13 @@ class JobRunner:
         now = self._clock.now()
         with self._session_factory() as db:
             reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
-        self._deliver_dead_letters(dead_lettered)
-        self._deliver_dead_letters(None)
+        deliver_after_reap(
+            registry=self._registry,
+            session_factory=self._session_factory,
+            clock=self._clock,
+            dead_lettered=dead_lettered,
+        )
         return reclaimed
-
-    def _deliver_dead_letters(self, job_ids: list[str] | None) -> None:
-        """Run owed ``on_dead_letter`` callbacks; never raises, the transition is committed."""
-        try:
-            deliver_dead_letters(
-                registry=self._registry,
-                session_factory=self._session_factory,
-                clock=self._clock,
-                job_ids=job_ids,
-            )
-        except Exception as error:
-            logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
 
     def _run_job(self, job: ClaimedJob) -> bool:
         """Run one job and record its outcome.
@@ -389,8 +382,6 @@ class JobRunner:
                 extra={**self._context(job), "duration_ms": duration_ms},
             )
             return True
-        if status == jobs_crud.STATUS_DEAD_LETTER:
-            self._deliver_dead_letters([job.id])
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
@@ -403,6 +394,17 @@ class JobRunner:
                 "duration_ms": duration_ms,
             },
         )
+        if status == jobs_crud.STATUS_DEAD_LETTER:
+            # After the log line, so a slow callback cannot hide the failure.
+            try:
+                deliver_dead_letters(
+                    registry=self._registry,
+                    session_factory=self._session_factory,
+                    clock=self._clock,
+                    job_ids=[job.id],
+                )
+            except Exception as delivery_error:
+                logger.error("Dead-letter callbacks could not be delivered", exc_info=delivery_error)
         return False
 
     def _event_from(self, job: ClaimedJob) -> Event:
