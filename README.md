@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.10.1` - the API is still settling. Expect breaking changes on
+> **Status:** `0.11.0` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
