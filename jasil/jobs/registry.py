@@ -16,6 +16,10 @@ from jasil.events import MAX_EVENT_TYPE_LENGTH, Event
 
 JobHandler = Callable[[Event], None]
 
+#: Called as ``callback(event, error)`` once a subscriber's job has been dead-lettered.
+#: ``error`` is the stored last failure reason, or ``None`` when there is none.
+DeadLetterCallback = Callable[[Event, str | None], None]
+
 #: Width of the ``processing_jobs.subscriber_id`` column, imported by the model
 #: so the two cannot drift.
 MAX_SUBSCRIBER_ID_LENGTH = 200
@@ -73,6 +77,7 @@ class JobHandlerRegistry:
         self._handlers: dict[str, JobHandler] = {}
         self._by_event_type: dict[str, list[str]] = defaultdict(list)
         self._queues: dict[str, str] = {}
+        self._dead_letter: dict[str, DeadLetterCallback] = {}
 
     def register(
         self,
@@ -81,6 +86,7 @@ class JobHandlerRegistry:
         handler: JobHandler,
         *,
         queue: str = DEFAULT_QUEUE,
+        on_dead_letter: DeadLetterCallback | None = None,
     ) -> None:
         """
         Register (or replace) a durable subscriber.
@@ -90,6 +96,18 @@ class JobHandlerRegistry:
             subscriber_id: The stable durable-subscriber identifier.
             handler: The callable that processes an event for this subscriber.
             queue: Durable-job queue assigned to this subscriber's fan-out.
+            on_dead_letter: Optional ``callback(event, error)`` run after a job of
+                this subscriber has become ``dead_letter``, whether its last
+                attempt raised, its lease expired, or the reaper recovered it.
+                It runs in the worker or reaper process, outside any handler
+                session, after the transition is committed; an exception from it
+                is logged and never undoes the dead-letter. Delivery is
+                **at least once**: it is repeated after a crash or a failure, so
+                the callback must be idempotent. ``event.retry_count`` and
+                ``event.max_attempts`` describe the final attempt. A replay does
+                not call it again until the job dead-letters again. Registering
+                again without it removes an earlier callback, as the handler is
+                replaced.
 
         Returns:
             None.
@@ -105,6 +123,10 @@ class JobHandlerRegistry:
         validate_queue_name(queue)
         self._handlers[subscriber_id] = handler
         self._queues[subscriber_id] = queue
+        if on_dead_letter is None:
+            self._dead_letter.pop(subscriber_id, None)
+        else:
+            self._dead_letter[subscriber_id] = on_dead_letter
         if subscriber_id not in self._by_event_type[event_type]:
             self._by_event_type[event_type].append(subscriber_id)
 
@@ -119,6 +141,14 @@ class JobHandlerRegistry:
             The registered handler, or ``None`` when none is registered.
         """
         return self._handlers.get(subscriber_id)
+
+    def dead_letter_callback(self, subscriber_id: str) -> DeadLetterCallback | None:
+        """Return the ``on_dead_letter`` callback of a subscriber, or ``None``."""
+        return self._dead_letter.get(subscriber_id)
+
+    def dead_letter_subscriber_ids(self) -> frozenset[str]:
+        """Return the subscriber ids registered with an ``on_dead_letter`` callback."""
+        return frozenset(self._dead_letter)
 
     def queue_for(self, subscriber_id: str) -> str:
         """Return the queue assigned to a registered subscriber.
@@ -172,6 +202,7 @@ class JobHandlerRegistry:
         self._handlers.clear()
         self._by_event_type.clear()
         self._queues.clear()
+        self._dead_letter.clear()
 
 
 # Process-wide default registry: durable subscribers register here at startup and

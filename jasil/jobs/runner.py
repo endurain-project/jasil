@@ -17,6 +17,7 @@ import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
+from jasil.jobs.dead_letter import deliver_dead_letters
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
@@ -42,6 +43,7 @@ class ClaimedJob:
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
         queue: Named queue from which the job was claimed.
+        max_attempts: The attempt ceiling stamped on the job row.
     """
 
     id: str
@@ -55,6 +57,7 @@ class ClaimedJob:
     timestamp: str
     schema_version: int
     queue: str
+    max_attempts: int
 
 
 class JobRunner:
@@ -265,7 +268,22 @@ class JobRunner:
         """
         now = self._clock.now()
         with self._session_factory() as db:
-            return jobs_crud.reclaim_expired_leases(now=now, db=db)
+            reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
+        self._deliver_dead_letters(dead_lettered)
+        self._deliver_dead_letters(None)
+        return reclaimed
+
+    def _deliver_dead_letters(self, job_ids: list[str] | None) -> None:
+        """Run owed ``on_dead_letter`` callbacks; never raises, the transition is committed."""
+        try:
+            deliver_dead_letters(
+                registry=self._registry,
+                session_factory=self._session_factory,
+                clock=self._clock,
+                job_ids=job_ids,
+            )
+        except Exception as error:
+            logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
 
     def _run_job(self, job: ClaimedJob) -> bool:
         """Run one job and record its outcome.
@@ -371,6 +389,8 @@ class JobRunner:
                 extra={**self._context(job), "duration_ms": duration_ms},
             )
             return True
+        if status == jobs_crud.STATUS_DEAD_LETTER:
+            self._deliver_dead_letters([job.id])
         level = logging.ERROR if status == jobs_crud.STATUS_DEAD_LETTER else logging.WARNING
         logger.log(
             level,
@@ -395,6 +415,7 @@ class JobRunner:
             metadata=job.metadata or {},
             retry_count=job.attempts,
             schema_version=job.schema_version,
+            max_attempts=job.max_attempts,
         )
 
     def _snapshot(self, job: ProcessingJob) -> ClaimedJob:
@@ -410,4 +431,5 @@ class JobRunner:
             timestamp=as_utc(job.created_at).isoformat(),
             schema_version=job.schema_version,
             queue=job.queue,
+            max_attempts=job.max_attempts,
         )

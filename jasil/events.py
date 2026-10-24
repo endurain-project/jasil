@@ -87,7 +87,13 @@ class Event:
         timestamp: ISO-8601 UTC timestamp of the first publish (not the retry).
         payload: Domain data, homogeneous per ``event_type``.
         metadata: Correlation context (request_id, plus any host-defined keys).
-        retry_count: Processing attempts so far; 0 on first publish.
+        retry_count: Processing attempts so far; 0 on first publish. In a durable
+            handler it is the attempt being run, counted from 1 (see
+            :attr:`attempt`).
+        max_attempts: The attempt ceiling of the durable job this event was
+            delivered for; ``None`` for an event that is not a durable delivery.
+            Set by the job runner from the job row, the same value it uses to
+            decide dead-lettering.
         schema_version: Which version of ``payload``'s shape this event carries,
             owned by the publishing domain. Defaults to
             :data:`INITIAL_SCHEMA_VERSION` so existing producers are unchanged.
@@ -101,6 +107,17 @@ class Event:
     metadata: dict = field(default_factory=dict)
     retry_count: int = 0
     schema_version: int = INITIAL_SCHEMA_VERSION
+    max_attempts: int | None = None
+
+    @property
+    def attempt(self) -> int | None:
+        """The 1-based attempt a durable handler is running; ``None`` outside one."""
+        return self.retry_count if self.max_attempts is not None else None
+
+    @property
+    def is_last_attempt(self) -> bool:
+        """True when a failure now dead-letters the job; False outside a durable handler."""
+        return self.max_attempts is not None and self.retry_count >= self.max_attempts
 
 
 def new_event(

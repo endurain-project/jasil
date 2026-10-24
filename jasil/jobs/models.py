@@ -64,6 +64,9 @@ class ProcessingJob(Base):
         created_at: When the job was enqueued.
         updated_at: When the job last changed state.
         completed_at: When the job reached a terminal state (completed/dead_letter).
+        dead_letter_notified_at: When the subscriber's ``on_dead_letter`` callback
+            last returned without raising; NULL while one is still owed. Cleared
+            by a dead-letter replay.
     """
 
     __tablename__ = "jasil_processing_jobs"
@@ -190,6 +193,11 @@ class ProcessingJob(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="When the job reached a terminal state (completed/dead_letter)",
+    )
+    dead_letter_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the on_dead_letter callback last succeeded; NULL while one is owed",
     )
 
 

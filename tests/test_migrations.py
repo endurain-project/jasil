@@ -296,6 +296,43 @@ class TestPrefixRename:
         assert jasil_table_names() <= set(inspect(engine).get_table_names())
 
 
+class TestDeadLetterNotified:
+    def test_existing_dead_letters_are_not_called_back_after_the_upgrade(self, engine):
+        migrations.upgrade(engine, "rev0003")
+        with engine.begin() as connection:
+            for status in ("dead_letter", "pending"):
+                connection.execute(
+                    text(
+                        """INSERT INTO jasil_processing_jobs (
+                            id, event_id, event_type, subscriber_id, source, payload, status,
+                            max_attempts, available_at, created_at, updated_at
+                        ) VALUES (
+                            :status, :event_id, 'a.b', 's', 't', '{}', :status,
+                            1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                        )"""
+                    ),
+                    {"status": status, "event_id": f"e-{status}"},
+                )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            rows = dict(connection.execute(text("SELECT id, dead_letter_notified_at FROM jasil_processing_jobs")).all())
+        assert rows["dead_letter"] is not None
+        assert rows["pending"] is None
+
+    def test_it_downgrades_and_upgrades_again(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0003")
+        columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
+        assert "dead_letter_notified_at" not in columns
+
+        migrations.upgrade(engine)
+        columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
+        assert "dead_letter_notified_at" in columns
+
+
 class TestOfflineSql:
     @pytest.mark.parametrize("span", ["rev0002:rev0003", "base:rev0003"])
     def test_the_prefix_rename_can_be_rendered_as_sql(self, span):

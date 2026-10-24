@@ -294,21 +294,32 @@ def relay_outbox_scheduled() -> None:
 
 
 def reap_expired_jobs_scheduled() -> None:
-    """Requeue or dead-letter jobs with expired leases.
+    """Requeue or dead-letter jobs with expired leases, then run owed dead-letter callbacks.
 
     Runs on every replica; ``reclaim_expired_leases`` combines ``FOR UPDATE SKIP
     LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
     disjoint rows and a loser never overwrites the winner's requeue.
     """
     import jasil.jobs.crud as jobs_crud
+    from jasil.jobs.dead_letter import deliver_dead_letters
 
     platform = platform_runtime.get_active_platform()
     now = platform.clock.now()
-    with jasil_orm.get_sessionmaker()() as db:
+    session_factory = jasil_orm.get_sessionmaker()
+    with session_factory() as db:
         # Read before reclaiming, which clears the holder: a crash should name the
         # worker, not just say that one happened.
         holders = jobs_crud.expired_lease_holders(now=now, db=db)
-        reclaimed = jobs_crud.reclaim_expired_leases(now=now, db=db)
+        reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
+    # After the transition is committed. The second call is the sweep for callbacks a
+    # crash left owed; it only looks at subscribers registered in this process.
+    for job_ids in (dead_lettered, None):
+        try:
+            deliver_dead_letters(
+                registry=jobs_registry.registry, session_factory=session_factory, clock=platform.clock, job_ids=job_ids
+            )
+        except Exception:
+            logger.exception("Dead-letter callbacks could not be delivered")
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.
