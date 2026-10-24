@@ -17,7 +17,14 @@ import jasil.jobs.service as jobs_service
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import Event, new_event
-from jasil.jobs.dead_letter import CLAIM_LEASE_SECONDS, RETRY_BASE_SECONDS, deliver_dead_letters
+from jasil.jobs.dead_letter import (
+    CLAIM_LEASE_SECONDS,
+    MAX_DELIVERIES,
+    RETRY_BASE_SECONDS,
+    RETRY_MAX_SECONDS,
+    SWEEP_WINDOW,
+    deliver_dead_letters,
+)
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -246,7 +253,7 @@ class TestLeaseExpiry:
         assert calls == []
         assert stored_job(db).status == jobs_crud.STATUS_PENDING
 
-    def test_the_scheduled_reaper_calls_back_for_the_process_wide_registry(
+    def test_the_scheduled_delivery_calls_back_for_the_process_wide_registry(
         self, tmp_path, session_factory, db, monkeypatch
     ):
         monkeypatch.setattr(
@@ -262,6 +269,9 @@ class TestLeaseExpiry:
             jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=-1, now=now, db=db)
 
             jobs_service.reap_expired_jobs_scheduled()
+            assert received == []  # the reaper itself never runs a callback
+
+            jobs_service.deliver_dead_letters_scheduled()
         finally:
             jobs_registry.registry.clear()
 
@@ -454,7 +464,7 @@ class TestCallbackRaising:
         def broken():
             raise RuntimeError("database down")
 
-        calls = iter([session_factory, broken])
+        calls = iter([session_factory, broken, session_factory])
 
         def factory():
             return next(calls)()
@@ -507,3 +517,70 @@ class TestNoCallback:
 
         assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock) == 0
         assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock, job_ids=[]) == 0
+
+
+class TestDeliveryGuards:
+    def _dead(self, db):
+        enqueue(db, max_attempts=1)
+        db.execute(
+            text("UPDATE jasil_processing_jobs SET status = 'dead_letter', last_error = 'x', updated_at = :t"),
+            {"t": T0},
+        )
+        db.commit()
+
+    def test_a_stale_claim_cannot_overwrite_a_newer_delivery(self, registry, clock, db, session_factory):
+        self._dead(db)
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: None)
+        first = jobs_crud.claim_dead_letter_callbacks(["s"], now=T0, lease_seconds=10, db=db)[0]
+        second = jobs_crud.claim_dead_letter_callbacks(["s"], now=T0 + timedelta(seconds=11), lease_seconds=10, db=db)[
+            0
+        ]
+
+        assert not jobs_crud.mark_dead_letter_notified(first.id, delivery_attempt=first.delivery_attempt, now=T0, db=db)
+        assert stored_job(db).dead_letter_notified_at is None
+        assert jobs_crud.mark_dead_letter_notified(second.id, delivery_attempt=second.delivery_attempt, now=T0, db=db)
+
+    def test_a_callback_that_always_fails_is_given_up_on(self, registry, clock, db, session_factory):
+        self._dead(db)
+
+        def failing(_event, _error):
+            raise RuntimeError("nope")
+
+        registry.register("a.b", "s", _boom, on_dead_letter=failing)
+        for _ in range(MAX_DELIVERIES + 3):
+            clock.advance(RETRY_MAX_SECONDS + 1)
+            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=None)
+
+        job = stored_job(db)
+        assert job.dead_letter_attempts == MAX_DELIVERIES
+        assert job.dead_letter_notified_at is None
+
+    def test_the_sweep_ignores_old_history_but_a_targeted_pass_does_not(self, registry, clock, db, session_factory):
+        received = []
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: received.append(r))
+        self._dead(db)
+        clock.advance(SWEEP_WINDOW.total_seconds() + 1)
+        job_id = stored_job(db).id
+
+        assert deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock) == 0
+        assert (
+            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=[job_id]) == 1
+        )
+
+    def test_a_job_is_not_leased_until_its_own_callback_starts(self, registry, clock, db, session_factory):
+        for _ in range(2):
+            enqueue(db, max_attempts=1)
+        db.execute(text("UPDATE jasil_processing_jobs SET status = 'dead_letter', updated_at = :t"), {"t": T0})
+        db.commit()
+        leased_during_callback = []
+
+        def callback(_event, _error):
+            db.rollback()
+            leased_during_callback.append(
+                db.query(ProcessingJob).filter(ProcessingJob.dead_letter_notify_after.is_not(None)).count()
+            )
+
+        registry.register("a.b", "s", _boom, on_dead_letter=callback)
+
+        assert deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock) == 2
+        assert leased_during_callback == [1, 1]

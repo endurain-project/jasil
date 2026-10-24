@@ -86,6 +86,14 @@ class ProcessingJob(Base):
         Index("idx_jasil_processing_jobs_lease", "status", "lease_expires_at"),
         # Heartbeats and worker summaries count active leases by worker.
         Index("idx_jasil_processing_jobs_worker_claim", "status", "locked_by"),
+        # The on_dead_letter sweep finds the few dead letters whose callback is owed
+        # without walking every retained one.
+        Index(
+            "idx_jasil_processing_jobs_dead_letter",
+            "status",
+            "dead_letter_notified_at",
+            "dead_letter_notify_after",
+        ),
     )
 
     id: Mapped[str] = mapped_column(

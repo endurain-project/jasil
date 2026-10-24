@@ -73,6 +73,11 @@ def upgrade() -> None:
             comment="Most recent on_dead_letter callback failure (truncated for storage)",
         ),
     )
+    op.create_index(
+        "idx_jasil_processing_jobs_dead_letter",
+        _JOBS,
+        ["status", "dead_letter_notified_at", "dead_letter_notify_after"],
+    )
     jobs = sa.table(
         _JOBS,
         sa.column("status", sa.String),
@@ -88,6 +93,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_index("idx_jasil_processing_jobs_dead_letter", table_name=_JOBS)
     for column in (
         "dead_letter_callback_error",
         "dead_letter_attempts",

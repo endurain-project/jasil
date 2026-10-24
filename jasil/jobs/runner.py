@@ -81,6 +81,7 @@ class JobRunner:
     ) -> None:
         self._record_attempts = record_attempts
         self._registry = registry
+        self._dead_lettered: set[str] = set()
         self._clock = clock
         self._session_factory = session_factory
         self._worker_id = worker_id
@@ -293,6 +294,19 @@ class JobRunner:
             # After the outcome is written, so the heartbeat keeps renewing the
             # lease through the completion write.
             self._leases.finish(job.id)
+        if job.id in self._dead_lettered:
+            self._dead_lettered.discard(job.id)
+            # After the failure is logged and the lease released, so a slow callback
+            # cannot hide the failure or keep the lease keeper tracking a finished job.
+            try:
+                deliver_dead_letters(
+                    registry=self._registry,
+                    session_factory=self._session_factory,
+                    clock=self._clock,
+                    job_ids=[job.id],
+                )
+            except Exception as delivery_error:
+                logger.error("Dead-letter callbacks could not be delivered", exc_info=delivery_error)
         return lost_claim or lost.is_set()
 
     def _mark_started(self, job: ClaimedJob) -> None:
@@ -395,16 +409,8 @@ class JobRunner:
             },
         )
         if status == jobs_crud.STATUS_DEAD_LETTER:
-            # After the log line, so a slow callback cannot hide the failure.
-            try:
-                deliver_dead_letters(
-                    registry=self._registry,
-                    session_factory=self._session_factory,
-                    clock=self._clock,
-                    job_ids=[job.id],
-                )
-            except Exception as delivery_error:
-                logger.error("Dead-letter callbacks could not be delivered", exc_info=delivery_error)
+            # Delivered by ``_run_job`` once the lease is released.
+            self._dead_lettered.add(job.id)
         return False
 
     def _event_from(self, job: ClaimedJob) -> Event:
