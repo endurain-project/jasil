@@ -17,6 +17,7 @@ import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
+from jasil.jobs.dead_letter import deliver_after_reap, deliver_dead_letters
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
@@ -42,6 +43,7 @@ class ClaimedJob:
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
         queue: Named queue from which the job was claimed.
+        max_attempts: The attempt ceiling stamped on the job row.
     """
 
     id: str
@@ -55,6 +57,7 @@ class ClaimedJob:
     timestamp: str
     schema_version: int
     queue: str
+    max_attempts: int
 
 
 class JobRunner:
@@ -78,6 +81,7 @@ class JobRunner:
     ) -> None:
         self._record_attempts = record_attempts
         self._registry = registry
+        self._dead_lettered: set[str] = set()
         self._clock = clock
         self._session_factory = session_factory
         self._worker_id = worker_id
@@ -258,14 +262,22 @@ class JobRunner:
 
     def reap_once(self) -> int:
         """
-        Requeue (or dead-letter) jobs whose lease expired.
+        Requeue (or dead-letter) jobs whose lease expired, then run the owed
+        ``on_dead_letter`` callbacks of subscribers registered here.
 
         Returns:
             The number of jobs reclaimed.
         """
         now = self._clock.now()
         with self._session_factory() as db:
-            return jobs_crud.reclaim_expired_leases(now=now, db=db)
+            reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
+        deliver_after_reap(
+            registry=self._registry,
+            session_factory=self._session_factory,
+            clock=self._clock,
+            dead_lettered=dead_lettered,
+        )
+        return reclaimed
 
     def _run_job(self, job: ClaimedJob) -> bool:
         """Run one job and record its outcome.
@@ -282,6 +294,19 @@ class JobRunner:
             # After the outcome is written, so the heartbeat keeps renewing the
             # lease through the completion write.
             self._leases.finish(job.id)
+        if job.id in self._dead_lettered:
+            self._dead_lettered.discard(job.id)
+            # After the failure is logged and the lease released, so a slow callback
+            # cannot hide the failure or keep the lease keeper tracking a finished job.
+            try:
+                deliver_dead_letters(
+                    registry=self._registry,
+                    session_factory=self._session_factory,
+                    clock=self._clock,
+                    job_ids=[job.id],
+                )
+            except Exception as delivery_error:
+                logger.error("Dead-letter callbacks could not be delivered", exc_info=delivery_error)
         return lost_claim or lost.is_set()
 
     def _mark_started(self, job: ClaimedJob) -> None:
@@ -383,6 +408,9 @@ class JobRunner:
                 "duration_ms": duration_ms,
             },
         )
+        if status == jobs_crud.STATUS_DEAD_LETTER:
+            # Delivered by ``_run_job`` once the lease is released.
+            self._dead_lettered.add(job.id)
         return False
 
     def _event_from(self, job: ClaimedJob) -> Event:
@@ -395,6 +423,7 @@ class JobRunner:
             metadata=job.metadata or {},
             retry_count=job.attempts,
             schema_version=job.schema_version,
+            max_attempts=job.max_attempts,
         )
 
     def _snapshot(self, job: ProcessingJob) -> ClaimedJob:
@@ -410,4 +439,5 @@ class JobRunner:
             timestamp=as_utc(job.created_at).isoformat(),
             schema_version=job.schema_version,
             queue=job.queue,
+            max_attempts=job.max_attempts,
         )

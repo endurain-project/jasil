@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.11.0] - 2026-10-24
+
+### Added
+
+- **Dead-letter hook.** `JobHandlerRegistry.register(..., on_dead_letter=callback)` registers `callback(event, error)`, called once a subscriber's job has become `dead_letter`: the handler raised on its last attempt, the lease expired, or the reaper recovered a crashed worker. It runs in the worker or reaper process after the transition is committed; an exception is logged and swallowed. Delivery is **at least once** (callbacks must be idempotent), tracked by the new `jasil_processing_jobs.dead_letter_notified_at` column (plus `dead_letter_notify_after`, `dead_letter_attempts` and `dead_letter_callback_error` for the claim lease, retry backoff and diagnosis) and a sweep run by its own scheduled job (`jasil_dead_letter_delivery`, so slow callbacks never hold up the lease reaper). Each delivery is claimed with its own lease when its callback starts, its outcome is written only while that claim is still live, a callback that keeps failing is given up on after 10 deliveries, and the sweep ignores jobs dead-lettered more than 7 days ago. `replay_dead_letter_job` clears it. Also `JobHandlerRegistry.dead_letter_callback` / `dead_letter_subscriber_ids`, and `DeadLetterCallback`.
+- **Authoritative attempt counts.** `Event.max_attempts`, and the `Event.attempt` and `Event.is_last_attempt` properties, are filled for durable handlers from the job row, the same values that decide dead-lettering. `attempt` is 1-based and equals `retry_count` inside a durable handler. Handlers no longer need to compare `retry_count` with a setting, which is wrong for jobs enqueued under a different `max_attempts`.
+- `jasil.jobs.crud.reclaim_expired_leases_detailed`, which also returns the ids it dead-lettered.
+
+### Changed
+
+- Migration `rev0004` adds an `idx_jasil_processing_jobs_dead_letter` index and the `dead_letter_notified_at`, `dead_letter_notify_after`, `dead_letter_attempts` and `dead_letter_callback_error` columns and stamps existing dead letters so they are not called back. Run it before deploying; processes of the previous release neither read nor write the column.
+
+No breaking changes: `on_dead_letter` is optional, and a handler registered without it behaves as before.
+
 ## [0.10.1] - 2026-10-22
 
 ### Fixed

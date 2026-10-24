@@ -60,6 +60,86 @@ fan out to several subscribers on different queues, and the relay stamps each
 subscriber's queue on its own job. Names are 1–100 lowercase ASCII characters:
 letters, digits, `.`, `_`, and `-`; an invalid name raises before persistence.
 
+### Attempt counts
+
+A durable handler's `Event` carries the attempt it is running, computed from the
+job row by the same comparison that dead-letters the job:
+
+| Field | Meaning |
+|---|---|
+| `event.attempt` | The 1-based attempt: `1` on the first run. Equal to `event.retry_count` inside a durable handler. `None` outside one. |
+| `event.max_attempts` | The ceiling stamped on the job when it was enqueued. A later change to the `max_attempts` setting does not alter jobs already queued. |
+| `event.is_last_attempt` | `True` when a failure now dead-letters the job (`attempt >= max_attempts`). |
+
+Use `event.is_last_attempt` rather than comparing `retry_count` with a setting.
+A replay (`replay_dead_letter_job`) restarts the count at 1.
+
+### Reacting to a dead letter
+
+A handler that drives user-visible state, such as an import that shows as "queued",
+needs that state to reach a terminal value when JASIL gives up on the job. Register
+an `on_dead_letter` callback beside the handler:
+
+```python
+import jasil.jobs.registry as jobs_registry
+
+
+def import_profile(event):
+    run_import(event.payload["import_id"])  # raises on failure
+
+
+def close_import(event, error):
+    # Idempotent: set a terminal state, never append or increment.
+    with session_factory() as db:
+        record = db.get(ProfileImport, event.payload["import_id"])
+        if record is not None and record.state not in {"done", "failed"}:
+            record.state = "failed"
+            record.detail = error or "gave up"
+            db.commit()
+
+
+jobs_registry.registry.register(
+    "profile.import.requested",
+    "profile.import",
+    import_profile,
+    on_dead_letter=close_import,
+)
+```
+
+`callback(event, error)` is called after the job has become `dead_letter`,
+whichever way it got there: the handler raised on its last attempt, the lease
+expired on the last attempt, or the reaper recovered a worker that died.
+`event` is the job's envelope with its final `retry_count` and `max_attempts`;
+`error` is the stored last failure reason (`str | None`).
+
+* **At least once.** Delivery is recorded in `dead_letter_notified_at` only after the
+  callback returns. A crash, or a callback that raises, leaves the callback owed and a
+  later reaper pass calls it again, after a backoff that starts at 60 seconds and
+  doubles per failure up to an hour. Each delivery first claims the job with a
+  5-minute lease, so a worker and a reaper (or two reapers) do not run it together.
+  The count and the last failure are kept in `dead_letter_attempts` and
+  `dead_letter_callback_error`. **Make the callback idempotent.**
+* **After the transition, outside the handler.** It runs in the worker or reaper
+  process, after the dead-letter is committed and in no session of the failed handler.
+  An exception from it is logged and swallowed; the job stays `dead_letter`.
+* **It runs inline.** The worker (or reaper) waits for it, after the failure has been
+  logged, so keep it short and give any network call its own timeout. A callback that
+  outlasts its 5-minute lease may be started a second time by another process.
+* **Check your own state.** A handler that finishes after its lease was taken still
+  writes its result, but the job stays `dead_letter`. The callback may then run for
+  work that succeeded, so read the app's record before overwriting it.
+* **Replay.** `replay_dead_letter_job` clears the record, and the callback runs
+  again only if the job dead-letters again.
+* **Register it where the reaper runs.** The callback lives in the process-local
+  registry. A process that did not register it never delivers or consumes the
+  notification, so register subscribers, callbacks included, in every process that
+  runs a worker or the reaper. A job whose subscriber has no callback in the process
+  doing the sweep is skipped without a log line.
+* **Dead letters before this feature** are not called back; the migration marks them
+  as delivered.
+
+A subscriber registered without `on_dead_letter` behaves exactly as before.
+
 ## The job state machine
 
 ```

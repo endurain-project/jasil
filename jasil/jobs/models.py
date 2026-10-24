@@ -64,6 +64,14 @@ class ProcessingJob(Base):
         created_at: When the job was enqueued.
         updated_at: When the job last changed state.
         completed_at: When the job reached a terminal state (completed/dead_letter).
+        dead_letter_notified_at: When the subscriber's ``on_dead_letter`` callback
+            last returned without raising; NULL while one is still owed. Cleared
+            by a dead-letter replay.
+        dead_letter_notify_after: Earliest instant a callback delivery may be
+            claimed: the lease of one in flight, or the backoff of a failed one.
+            NULL when it may be claimed at once.
+        dead_letter_attempts: Callback deliveries claimed so far.
+        dead_letter_callback_error: The most recent callback failure (truncated).
     """
 
     __tablename__ = "jasil_processing_jobs"
@@ -78,6 +86,14 @@ class ProcessingJob(Base):
         Index("idx_jasil_processing_jobs_lease", "status", "lease_expires_at"),
         # Heartbeats and worker summaries count active leases by worker.
         Index("idx_jasil_processing_jobs_worker_claim", "status", "locked_by"),
+        # The on_dead_letter sweep finds the few dead letters whose callback is owed
+        # without walking every retained one.
+        Index(
+            "idx_jasil_processing_jobs_dead_letter",
+            "status",
+            "dead_letter_notified_at",
+            "dead_letter_notify_after",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -190,6 +206,28 @@ class ProcessingJob(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="When the job reached a terminal state (completed/dead_letter)",
+    )
+    dead_letter_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the on_dead_letter callback last succeeded; NULL while one is owed",
+    )
+    dead_letter_notify_after: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Earliest instant an on_dead_letter delivery may be claimed (lease or backoff)",
+    )
+    dead_letter_attempts: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="on_dead_letter deliveries claimed so far",
+    )
+    dead_letter_callback_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Most recent on_dead_letter callback failure (truncated for storage)",
     )
 
 

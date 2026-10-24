@@ -417,7 +417,11 @@ class TestScheduleJobMaintenance:
     async def test_it_registers_the_relay_and_the_reaper(self, scheduler):
         jobs_service.schedule_job_maintenance(scheduler)
 
-        assert {job.id for job in scheduler.get_jobs()} == {jobs_service._RELAY_JOB_ID, jobs_service._REAP_JOB_ID}
+        assert {job.id for job in scheduler.get_jobs()} == {
+            jobs_service._RELAY_JOB_ID,
+            jobs_service._REAP_JOB_ID,
+            jobs_service._DEAD_LETTER_JOB_ID,
+        }
 
     async def test_registering_twice_replaces_rather_than_duplicates(self, scheduler):
         """Otherwise a re-entrant startup would run every maintenance job twice."""
@@ -425,4 +429,4 @@ class TestScheduleJobMaintenance:
 
         jobs_service.schedule_job_maintenance(scheduler)
 
-        assert len(scheduler.get_jobs()) == 2
+        assert len(scheduler.get_jobs()) == 3
