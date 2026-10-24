@@ -13,6 +13,7 @@ callback has to be idempotent.
 import logging
 from collections.abc import Callable, Iterable
 from datetime import timedelta
+from functools import partial
 
 from sqlalchemy.orm import Session
 
@@ -88,19 +89,18 @@ def deliver_dead_letters(
             logger.error("Dead-letter callback failed; will retry", exc_info=error, extra=context)
             retry_at = clock.now() + timedelta(seconds=_backoff(job.delivery_attempt))
             _record(
-                lambda db, job=job, retry_at=retry_at, error=error: jobs_crud.defer_dead_letter_callback(
-                    job.id, retry_at=retry_at, error=f"{type(error).__name__}: {error}", db=db
+                partial(
+                    jobs_crud.defer_dead_letter_callback,
+                    job.id,
+                    retry_at=retry_at,
+                    error=f"{type(error).__name__}: {error}",
                 ),
                 session_factory,
                 context,
             )
             continue
         delivered += 1
-        _record(
-            lambda db, job=job: jobs_crud.mark_dead_letter_notified(job.id, now=clock.now(), db=db),
-            session_factory,
-            context,
-        )
+        _record(partial(jobs_crud.mark_dead_letter_notified, job.id, now=clock.now()), session_factory, context)
     return delivered
 
 
@@ -136,13 +136,13 @@ def _backoff(delivery_attempt: int) -> int:
 
 
 def _record(
-    write: Callable[[Session], bool],
+    write: Callable[..., bool],
     session_factory: Callable[[], Session],
     context: dict[str, object],
 ) -> None:
     """Write the delivery outcome; a failure is logged, and the callback then repeats."""
     try:
         with session_factory() as db:
-            write(db)
+            write(db=db)
     except Exception as error:
         logger.error("Dead-letter delivery could not be recorded; it will repeat", exc_info=error, extra=context)
