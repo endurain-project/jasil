@@ -270,6 +270,8 @@ class TestLeaseExpiry:
 
             jobs_service.reap_expired_jobs_scheduled()
             assert received == []  # the reaper itself never runs a callback
+            stored_job(db)
+            db.rollback()  # end the snapshot a REPEATABLE READ server would otherwise keep
 
             jobs_service.deliver_dead_letters_scheduled()
         finally:
