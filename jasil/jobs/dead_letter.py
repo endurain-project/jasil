@@ -11,7 +11,7 @@ callback has to be idempotent.
 """
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import timedelta
 from functools import partial
 
@@ -138,7 +138,7 @@ def _backoff(delivery_attempt: int) -> int:
 def _record(
     write: Callable[..., bool],
     session_factory: Callable[[], Session],
-    context: dict[str, object],
+    context: Mapping[str, object],
 ) -> None:
     """Write the delivery outcome; a failure is logged, and the callback then repeats."""
     try:
