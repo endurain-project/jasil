@@ -11,6 +11,34 @@ import random
 _MAX_SHIFT = 30  # cap the exponent so ``base * 2**n`` cannot overflow
 
 
+def defer_seconds(
+    requested_seconds: float,
+    *,
+    max_seconds: float,
+    jitter: bool = True,
+) -> float:
+    """
+    Compute how long a deferred job waits.
+
+    The request is clamped to ``[0, max_seconds]``; when ``jitter`` is set up to
+    10% of it is added, so jobs deferred to the same instant (a shared rate limit)
+    do not wake together. The result never exceeds ``max_seconds``, jitter included.
+
+    Args:
+        requested_seconds: How far ahead the handler asked to run again; may be
+            negative or absurdly large.
+        max_seconds: Ceiling on the wait.
+        jitter: Whether to add up to 10% of the delay.
+
+    Returns:
+        The wait in seconds, between 0 and ``max_seconds``.
+    """
+    delay = min(max(requested_seconds, 0.0), max_seconds)
+    if jitter:
+        delay += random.uniform(0.0, delay * 0.1)  # noqa: S311 - timing spread, not security
+    return min(delay, max_seconds)
+
+
 def backoff_seconds(
     attempts: int,
     *,

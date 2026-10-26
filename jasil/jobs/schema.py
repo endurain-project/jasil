@@ -93,7 +93,10 @@ class DeadLetterJob(BaseModel):
         event_type: The event channel.
         subscriber_id: The subscriber that failed.
         source: Where the originating event came from.
-        attempts: Attempts made before dead-lettering.
+        attempts: Claims made before dead-lettering, deferred ones included.
+        deferrals: Of those, the claims the handler deferred with ``DeferJob``; they
+            do not count against ``max_attempts``, so the attempts spent are
+            ``attempts - deferrals``.
         max_attempts: The attempt ceiling that was reached.
         last_error: The final failure reason.
         created_at: When the job was enqueued.
@@ -111,6 +114,7 @@ class DeadLetterJob(BaseModel):
     subscriber_id: str
     source: str
     attempts: int
+    deferrals: int = 0
     max_attempts: int
     last_error: str | None
     created_at: datetime
@@ -215,7 +219,9 @@ class JobDetail(BaseModel):
         queue: The named queue.
         source: Where the event came from.
         status: ``pending``, ``claimed``, ``completed`` or ``dead_letter``.
-        attempts: Attempts made so far.
+        attempts: Claims made so far, deferred ones included.
+        deferrals: Of those, the claims the handler deferred with ``DeferJob``;
+            they do not count against ``max_attempts``.
         max_attempts: The attempt ceiling.
         locked_by: The worker holding it now, while claimed.
         last_error: The most recent failure reason.
@@ -240,6 +246,7 @@ class JobDetail(BaseModel):
     source: str
     status: str
     attempts: int
+    deferrals: int = 0
     max_attempts: int
     locked_by: str | None
     last_error: str | None

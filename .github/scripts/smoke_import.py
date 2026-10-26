@@ -49,6 +49,7 @@ EXPECTED_REVISIONS = {
     "rev0002_durable_job_queues.py",
     "rev0003_prefix_table_names.py",
     "rev0004_dead_letter_notified.py",
+    "rev0005_job_deferrals.py",
 }
 
 

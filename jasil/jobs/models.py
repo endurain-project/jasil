@@ -54,7 +54,10 @@ class ProcessingJob(Base):
             worker on a different build can upgrade or refuse it.
         job_metadata: Correlation context (request_id, plus any host-defined keys).
         status: Lifecycle state: pending, claimed, completed, or dead_letter.
-        attempts: Processing attempts so far; incremented when the job is claimed.
+        attempts: Claims so far, deferred ones included; incremented when the job is claimed.
+        deferrals: Claims the handler deferred with ``DeferJob``. ``attempts``
+            keeps counting every claim (it fences the claim); the budget spent
+            against ``max_attempts`` is ``attempts - deferrals``.
         max_attempts: Attempt ceiling before the job is dead-lettered.
         available_at: Earliest instant the job may be claimed (backoff gate).
         locked_by: The worker holding the current lease, when claimed.
@@ -158,6 +161,13 @@ class ProcessingJob(Base):
         default=0,
         server_default="0",
         comment="Processing attempts so far; incremented when claimed",
+    )
+    deferrals: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="Claims the handler deferred with DeferJob; they do not count against max_attempts",
     )
     max_attempts: Mapped[int] = mapped_column(
         Integer,

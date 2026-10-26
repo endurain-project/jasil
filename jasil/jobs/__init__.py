@@ -6,9 +6,12 @@ subscriber, and on failure reschedules with backoff until a maximum attempt
 count, after which the row is dead-lettered. Because the row — not a Redis
 stream entry — is the truth, retries are naturally per-subscriber and the
 ``(event_id, subscriber_id)`` uniqueness doubles as the idempotent-consumer
-marker (enqueuing the same work twice is a no-op).
+marker (enqueuing the same work twice is a no-op). A handler that meets a
+transient, time-bounded condition raises :class:`DeferJob` to run again later
+without failing or using up an attempt.
 """
 
 from jasil._core.job_context import lease_lost
+from jasil.jobs.defer import DeferJob
 
-__all__ = ["lease_lost"]
+__all__ = ["DeferJob", "lease_lost"]

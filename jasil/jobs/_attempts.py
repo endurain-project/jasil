@@ -20,6 +20,7 @@ from jasil.jobs.schema import DurationBuckets, EventJobs, JobAttemptInfo, JobDet
 #: How one attempt to run a job ended, as recorded in ``job_attempts.outcome``.
 OUTCOME_COMPLETED = "completed"  # the handler succeeded and this claim recorded it
 OUTCOME_FAILED = "failed"  # the handler raised; the job was rescheduled with backoff
+OUTCOME_DEFERRED = "deferred"  # the handler asked to run again later; no attempt was consumed
 OUTCOME_DEAD_LETTER = "dead_letter"  # the handler raised on the last attempt
 OUTCOME_LEASE_EXPIRED = "lease_expired"  # the lease ran out with no result: the worker died or went silent
 OUTCOME_SUPERSEDED = "superseded"  # the handler finished after its job was taken: it ran twice
@@ -28,6 +29,7 @@ OUTCOME_ABANDONED = "abandoned"  # exceeded the maximum runtime; signalled and l
 OUTCOMES = (
     OUTCOME_COMPLETED,
     OUTCOME_FAILED,
+    OUTCOME_DEFERRED,
     OUTCOME_DEAD_LETTER,
     OUTCOME_LEASE_EXPIRED,
     OUTCOME_SUPERSEDED,

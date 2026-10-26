@@ -3,21 +3,26 @@
 Records outcomes to ``processing_jobs`` only (the per-subscriber execution
 state), never to ``event_log`` (which stays a one-row-per-event publication
 log). A successful run marks the job ``completed``; a failure reschedules it
-with backoff, or dead-letters it once the attempt ceiling is reached.
+with backoff, or dead-letters it once the attempt ceiling is reached. A handler
+that raises :class:`~jasil.jobs.DeferJob` is rescheduled for the time it names
+without failing or using up an attempt.
 """
 
 import logging
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import timedelta
 
 from sqlalchemy.orm import Session
 
+import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
 from jasil.jobs.dead_letter import deliver_after_reap, deliver_dead_letters
+from jasil.jobs.defer import DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
@@ -38,7 +43,10 @@ class ClaimedJob:
         source: Where the originating event came from.
         payload: The domain payload.
         metadata: Correlation context, if any.
-        attempts: The attempt number this run represents.
+        attempts: The claim number of this run; it fences the claim, and counts
+            deferred claims too.
+        deferrals: Earlier claims of this job the handler deferred. ``attempts -
+            deferrals`` is the attempt this run is against ``max_attempts``.
         timestamp: ISO-8601 enqueue time, used to rebuild the event envelope.
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
@@ -54,6 +62,7 @@ class ClaimedJob:
     payload: dict
     metadata: dict | None
     attempts: int
+    deferrals: int
     timestamp: str
     schema_version: int
     queue: str
@@ -76,6 +85,8 @@ class JobRunner:
         batch_size: int,
         backoff_base_seconds: float,
         backoff_max_seconds: float,
+        defer_max_seconds: float = 86400,
+        max_deferrals: int = 100,
         queues: Iterable[str] | None = None,
         record_attempts: bool = True,
     ) -> None:
@@ -89,6 +100,8 @@ class JobRunner:
         self._batch_size = batch_size
         self._backoff_base_seconds = backoff_base_seconds
         self._backoff_max_seconds = backoff_max_seconds
+        self._defer_max_seconds = defer_max_seconds
+        self._max_deferrals = max_deferrals
         self._queues = normalize_queue_selector(queues)
         self._legacy_queues_backfilled = False
         self._queue_cursor: str | None = None
@@ -337,6 +350,9 @@ class JobRunner:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
             with job_lease(lost):
                 handler(event)
+        except DeferJob as deferral:
+            self._leases.finalize(job.id)
+            return self._defer(job, deferral, duration_ms=self._elapsed_ms(began))
         except Exception as error:
             self._leases.finalize(job.id)
             return self._fail(job, error, duration_ms=self._elapsed_ms(began))
@@ -372,6 +388,56 @@ class JobRunner:
             "attempts": job.attempts,
             "worker_id": self._worker_id,
         }
+
+    def _defer(self, job: ClaimedJob, deferral: DeferJob, *, duration_ms: int | None = None) -> bool:
+        """Reschedule a job its handler deferred; True when the claim was no longer owned.
+
+        Past ``max_deferrals`` the request becomes an ordinary failure.
+        """
+        now = self._clock.now()
+        requested = (as_utc(deferral.retry_at) - now).total_seconds()
+        delay = jobs_backoff.defer_seconds(requested, max_seconds=self._defer_max_seconds)
+        retry_at = now + timedelta(seconds=delay)
+        reason = deferral.reason or str(deferral)
+        with self._session_factory() as db:
+            status = jobs_crud.mark_job_deferred(
+                job.id,
+                reason,
+                worker_id=self._worker_id,
+                attempt=job.attempts,
+                retry_at=retry_at,
+                max_deferrals=self._max_deferrals,
+                now=now,
+                db=db,
+                duration_ms=duration_ms,
+                record_attempt=self._record_attempts,
+            )
+        if status == jobs_crud.STATUS_DEFERRALS_EXHAUSTED:
+            return self._fail(
+                job,
+                RuntimeError(f"deferred more than {self._max_deferrals} times: {reason}"),
+                duration_ms=duration_ms,
+            )
+        if not status:
+            logger.warning(
+                "Durable job deferral skipped because claim ownership was lost",
+                extra={**self._context(job), "duration_ms": duration_ms, "retry_at": retry_at.isoformat()},
+            )
+            return True
+        logger.info(
+            "Durable job deferred",
+            extra={
+                **self._context(job),
+                "event_type": job.event_type,
+                "job_status": jobs_crud.STATUS_PENDING,
+                "retry_at": retry_at.isoformat(),
+                "requested_retry_at": as_utc(deferral.retry_at).isoformat(),
+                "reason": reason,
+                "deferrals": job.deferrals + 1,
+                "duration_ms": duration_ms,
+            },
+        )
+        return False
 
     def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> bool:
         """Record a failure; True when the claim was no longer owned."""
@@ -421,9 +487,10 @@ class JobRunner:
             timestamp=job.timestamp,
             payload=job.payload,
             metadata=job.metadata or {},
-            retry_count=job.attempts,
+            retry_count=job.attempts - job.deferrals,
             schema_version=job.schema_version,
             max_attempts=job.max_attempts,
+            deferral_count=job.deferrals,
         )
 
     def _snapshot(self, job: ProcessingJob) -> ClaimedJob:
@@ -436,6 +503,7 @@ class JobRunner:
             payload=dict(job.payload),
             metadata=dict(job.job_metadata) if job.job_metadata else None,
             attempts=job.attempts,
+            deferrals=job.deferrals,
             timestamp=as_utc(job.created_at).isoformat(),
             schema_version=job.schema_version,
             queue=job.queue,

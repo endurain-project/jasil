@@ -124,6 +124,7 @@ the job.
 |---|---|
 | `completed` | The handler succeeded and this claim recorded it. |
 | `failed` | The handler raised; the job was rescheduled with backoff. |
+| `deferred` | The handler raised `DeferJob`: the job was rescheduled for its `retry_at` and the attempt was not consumed. Not a failure, so alert on `failed`, not on this. |
 | `dead_letter` | The handler raised on the last attempt. |
 | `lease_expired` | The lease ran out with no result: the worker died or went silent. |
 | `superseded` | The handler finished **after** its job had been taken: it ran twice. |

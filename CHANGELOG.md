@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.12.0] - 2026-10-26
+
+### Added
+
+- **`DeferJob`.** A durable handler raises `jasil.jobs.DeferJob(retry_at, reason=None)` to run again later without failing. The job returns to `pending` with `available_at = retry_at` and its lease cleared, `last_error` set to the reason, and the claim is **not** counted against `max_attempts`; it never dead-letters and never runs `on_dead_letter`. `retry_at` is clamped to between now and the new `jobs.defer_max_seconds` (default `86400`) with up to 10% jitter, and after `jobs.max_deferrals` (default `100`) deferrals the next `DeferJob` is an ordinary failure. Applied only while the worker still owns the claim. Recorded as a `deferred` attempt outcome and logged at `INFO`.
+- `Event.deferral_count`, and `deferrals` on `JobDetail` and the admin `DeadLetterJob`.
+- `jasil.jobs.crud.mark_job_deferred`.
+
+### Changed
+
+- Migration `rev0005` adds `jasil_processing_jobs.deferrals` (default 0). `attempts` still counts every claim; the budget against `max_attempts` is `attempts - deferrals`, used by failures, the reaper and `Event.retry_count`. Without deferrals nothing changes. Run the migration before deploying; processes of the previous release neither read nor write the column, and would count a deferred claim as an attempt.
+
+No breaking changes: `DeferJob` is opt-in, and a job that is never deferred behaves exactly as before.
+
 ## [0.11.0] - 2026-10-24
 
 ### Added
