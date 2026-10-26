@@ -160,7 +160,7 @@ class ProcessingJob(Base):
         nullable=False,
         default=0,
         server_default="0",
-        comment="Claims so far (including deferred ones); incremented when claimed",
+        comment="Processing attempts so far; incremented when claimed",
     )
     deferrals: Mapped[int] = mapped_column(
         Integer,

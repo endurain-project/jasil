@@ -93,7 +93,10 @@ class DeadLetterJob(BaseModel):
         event_type: The event channel.
         subscriber_id: The subscriber that failed.
         source: Where the originating event came from.
-        attempts: Attempts made before dead-lettering.
+        attempts: Claims made before dead-lettering, deferred ones included.
+        deferrals: Of those, the claims the handler deferred with ``DeferJob``; they
+            do not count against ``max_attempts``, so the attempts spent are
+            ``attempts - deferrals``.
         max_attempts: The attempt ceiling that was reached.
         last_error: The final failure reason.
         created_at: When the job was enqueued.
@@ -111,6 +114,7 @@ class DeadLetterJob(BaseModel):
     subscriber_id: str
     source: str
     attempts: int
+    deferrals: int = 0
     max_attempts: int
     last_error: str | None
     created_at: datetime

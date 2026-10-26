@@ -361,6 +361,25 @@ class TestDeferralAccounting:
 
         assert _job(db).deferrals == 0
 
+    def test_the_admin_dead_letter_summary_separates_deferred_claims_from_attempts(
+        self, registry, clock, session_factory, db
+    ):
+        def handler(event):
+            if event.deferral_count < 1:
+                raise DeferJob(clock.now())
+            raise RuntimeError("boom")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db, max_attempts=1)
+        runner = _runner(registry, clock, session_factory)
+        for _ in range(2):
+            runner.run_once()
+            clock.advance(1000)
+
+        db.rollback()
+        (dead,) = jobs_crud.get_jobs_summary(db).recent_dead_letter
+        assert (dead.attempts, dead.deferrals, dead.max_attempts) == (2, 1, 1)
+
     def test_a_dead_letter_callback_event_carries_the_budget_counts(self, registry, clock, session_factory, db):
         events = []
 
