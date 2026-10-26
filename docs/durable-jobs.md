@@ -41,7 +41,10 @@ The `subscriber_id` is a stable identifier independent of the Python module
 path — it is stored on every job row, so renaming a module must not orphan
 queued work.
 
-The handler must **raise** on failure. That is what drives retry.
+The handler must **raise** on failure. That is what drives retry. Returning
+normally completes the job. A handler that is only *waiting* (a rate limit that
+clears in a few minutes) raises [`DeferJob`](#deferring-a-job) instead, which
+reschedules the job without failing it.
 
 Every registration has a named queue. Existing calls use `default`; select one
 when the subscriber is registered when independent worker capacity matters:
@@ -70,9 +73,55 @@ job row by the same comparison that dead-letters the job:
 | `event.attempt` | The 1-based attempt: `1` on the first run. Equal to `event.retry_count` inside a durable handler. `None` outside one. |
 | `event.max_attempts` | The ceiling stamped on the job when it was enqueued. A later change to the `max_attempts` setting does not alter jobs already queued. |
 | `event.is_last_attempt` | `True` when a failure now dead-letters the job (`attempt >= max_attempts`). |
+| `event.deferral_count` | How many earlier runs of this job the handler [deferred](#deferring-a-job). They are not attempts, so they are not in `attempt` or `retry_count`. `0` on a first run. |
 
 Use `event.is_last_attempt` rather than comparing `retry_count` with a setting.
-A replay (`replay_dead_letter_job`) restarts the count at 1.
+A replay (`replay_dead_letter_job`) restarts both counts.
+
+### Deferring a job
+
+A handler that meets a transient, time-bounded condition can say *when* to run
+again instead of failing. Raise `DeferJob`:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from jasil.jobs import DeferJob
+
+
+def send_digest(event):
+    try:
+        provider.send(event.payload)
+    except ProviderRateLimited as limited:
+        # The provider says its limit clears in N seconds.
+        raise DeferJob(
+            datetime.now(UTC) + timedelta(seconds=limited.retry_after),
+            reason=f"provider rate limited for {limited.retry_after}s",
+        ) from limited
+```
+
+It is **not a failure**. The runner returns the job to `pending`, available from
+`retry_at`, with its lease cleared and `last_error` set to `reason`. The claim
+does **not** count against `max_attempts`, so a job may be deferred more often
+than it has attempts, and a deferral never dead-letters or runs `on_dead_letter`.
+It is recorded as a `deferred` [attempt](observability.md#job-attempts) and logged
+at `INFO` (`retry_at`, `reason` and `deferrals` in the log context), never `ERROR`.
+
+Guard rails, so a bad value cannot park or spin a job:
+
+- `retry_at` is clamped to between now and `jobs.defer_max_seconds` ahead
+  (default 86400). A naive `datetime` is read as UTC.
+- Up to 10% of the delay is added as jitter, so jobs deferred to the same instant
+  do not wake together. The ceiling is applied after the jitter.
+- After `jobs.max_deferrals` deferrals (default 100) the next `DeferJob` is
+  treated as an ordinary failure, with the usual backoff and dead-lettering, so a
+  job cannot defer forever. `0` disables deferral.
+- Like any write by the runner it applies only while the worker still owns the
+  claim; a lost claim is logged and changes nothing.
+
+The handler's side effects before it raises are not rolled back, so the handler
+stays idempotent, as for any retry. Do not sleep in a handler to wait out a
+condition: that holds a lease and a worker slot. Defer instead.
 
 ### Reacting to a dead letter
 
@@ -197,6 +246,12 @@ downstream outage would all retry at the same instant and stampede the recoverin
 dependency.
 
 Once `attempts` reaches `max_attempts`, the job becomes `dead_letter`.
+
+Only real attempts count. A run the handler [deferred](#deferring-a-job) with
+`DeferJob` is neither a failure nor an attempt: `jasil_processing_jobs.attempts`
+still counts every claim (it identifies the claim), `deferrals` counts the
+deferred ones, and the budget spent against `max_attempts`, and the exponent of
+the backoff above, is `attempts - deferrals`. The reaper uses the same budget.
 
 ### Lease reclamation
 

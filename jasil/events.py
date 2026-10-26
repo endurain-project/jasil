@@ -96,6 +96,9 @@ class Event:
             delivered for; ``None`` for an event that is not a durable delivery.
             Set by the job runner from the job row, the same value it uses to
             decide dead-lettering.
+        deferral_count: How many earlier runs of this durable job the handler
+            deferred with ``DeferJob``; 0 otherwise. Deferred runs are not
+            counted in ``retry_count``.
         schema_version: Which version of ``payload``'s shape this event carries,
             owned by the publishing domain. Defaults to
             :data:`INITIAL_SCHEMA_VERSION` so existing producers are unchanged.
@@ -110,6 +113,7 @@ class Event:
     retry_count: int = 0
     schema_version: int = INITIAL_SCHEMA_VERSION
     max_attempts: int | None = None
+    deferral_count: int = 0
 
     @property
     def attempt(self) -> int | None:

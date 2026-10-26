@@ -215,7 +215,9 @@ class JobDetail(BaseModel):
         queue: The named queue.
         source: Where the event came from.
         status: ``pending``, ``claimed``, ``completed`` or ``dead_letter``.
-        attempts: Attempts made so far.
+        attempts: Claims made so far, deferred ones included.
+        deferrals: Of those, the claims the handler deferred with ``DeferJob``;
+            they do not count against ``max_attempts``.
         max_attempts: The attempt ceiling.
         locked_by: The worker holding it now, while claimed.
         last_error: The most recent failure reason.
@@ -240,6 +242,7 @@ class JobDetail(BaseModel):
     source: str
     status: str
     attempts: int
+    deferrals: int = 0
     max_attempts: int
     locked_by: str | None
     last_error: str | None

@@ -44,6 +44,7 @@ from jasil.jobs._attempts import (
     OUTCOME_ABANDONED,
     OUTCOME_COMPLETED,
     OUTCOME_DEAD_LETTER,
+    OUTCOME_DEFERRED,
     OUTCOME_FAILED,
     OUTCOME_LEASE_EXPIRED,
     OUTCOME_RELEASED,
@@ -58,6 +59,10 @@ STATUS_PENDING = "pending"
 STATUS_CLAIMED = "claimed"
 STATUS_COMPLETED = "completed"
 STATUS_DEAD_LETTER = "dead_letter"
+#: Not a stored status: what :func:`mark_job_deferred` returns for a job it rescheduled.
+STATUS_DEFERRED = "deferred"
+#: Not a stored status: what :func:`mark_job_deferred` returns when the job has used its deferrals.
+STATUS_DEFERRALS_EXHAUSTED = "deferrals_exhausted"
 
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
@@ -735,10 +740,13 @@ def mark_job_failed(
     truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
     status = ""
     attempt_state = db.execute(
-        select(ProcessingJob.attempts, ProcessingJob.max_attempts).where(*ownership)
+        select(ProcessingJob.attempts, ProcessingJob.deferrals, ProcessingJob.max_attempts).where(*ownership)
     ).one_or_none()
     if attempt_state is not None:
-        attempts, max_attempts = attempt_state
+        # A deferred claim is not an attempt, so it neither spends the budget nor
+        # lengthens the backoff.
+        claims, deferrals, max_attempts = attempt_state
+        attempts = claims - deferrals
         if attempts >= max_attempts:
             new_status = STATUS_DEAD_LETTER
             values: dict[str, Any] = {"completed_at": now}
@@ -780,11 +788,101 @@ def mark_job_failed(
     return status
 
 
+def mark_job_deferred(
+    job_id: str,
+    reason: str,
+    *,
+    worker_id: str,
+    attempt: int,
+    retry_at: datetime,
+    max_deferrals: int,
+    now: datetime,
+    db: Session,
+    duration_ms: int | None = None,
+    record_attempt: bool = True,
+) -> str:
+    """
+    Return a claimed job to ``pending`` for ``retry_at`` without spending an attempt.
+
+    Not a failure: the job's ``deferrals`` counter goes up, which is what keeps
+    this claim out of the ``max_attempts`` budget (``attempts`` itself keeps
+    counting, as it fences the claim), and the job never dead-letters. Written
+    only while the caller still owns that exact claim. The attempt row is closed
+    ``deferred`` in the same transaction, or ``superseded`` when the handler asked
+    after its job had been taken from it.
+
+    A job already deferred ``max_deferrals`` times is left untouched and
+    :data:`STATUS_DEFERRALS_EXHAUSTED` is returned: the caller then fails it like
+    any other exception, so a job cannot defer forever.
+
+    ``retry_at`` is used as given: clamping and jitter are the caller's, which
+    knows the configured ceiling.
+
+    Args:
+        job_id: The job being deferred.
+        reason: Why, kept as ``last_error`` (truncated for storage).
+        worker_id: Worker that owns the claim.
+        attempt: Claim generation being deferred.
+        retry_at: Earliest instant the job may be claimed again.
+        max_deferrals: Deferrals a job may take.
+        now: Current instant.
+        db: Active database session.
+        duration_ms: Handler wall time, recorded on the attempt.
+        record_attempt: Close the claim's ``job_attempts`` row.
+
+    Returns:
+        :data:`STATUS_DEFERRED` when rescheduled, :data:`STATUS_DEFERRALS_EXHAUSTED`
+        when the job has used its deferrals, or the empty string when ownership
+        was lost or the job was not found.
+    """
+    ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
+    truncated = fit_length(reason, MAX_STORED_ERROR_LENGTH)
+    status = ""
+    deferrals = db.execute(select(ProcessingJob.deferrals).where(*ownership)).scalar_one_or_none()
+    if deferrals is not None:
+        if deferrals >= max_deferrals:
+            db.rollback()  # nothing was written; end the read transaction
+            return STATUS_DEFERRALS_EXHAUSTED
+        deferred = cast(
+            CursorResult[Any],
+            db.execute(
+                update(ProcessingJob)
+                .where(*ownership)
+                .values(
+                    status=STATUS_PENDING,
+                    deferrals=ProcessingJob.deferrals + 1,
+                    available_at=retry_at,
+                    last_error=truncated,
+                    updated_at=now,
+                    locked_by=None,
+                    locked_at=None,
+                    lease_expires_at=None,
+                )
+            ),
+        )
+        if deferred.rowcount == 1:
+            status = STATUS_DEFERRED
+    if record_attempt:
+        _finish_attempt(
+            db,
+            job_id=job_id,
+            worker_id=worker_id,
+            attempt=attempt,
+            now=now,
+            outcome=OUTCOME_DEFERRED,
+            duration_ms=duration_ms,
+            error=truncated,
+            owned=bool(status),
+        )
+    db.commit()
+    return status
+
+
 def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> int:
     """
     Return jobs whose lease expired (a crashed worker) to a runnable state.
 
-    Exhausted rows (``attempts >= max_attempts``) are dead-lettered; the rest are
+    Exhausted rows (``attempts - deferrals >= max_attempts``) are dead-lettered; the rest are
     made ``pending`` and immediately available again.
 
     Args:
@@ -837,7 +935,7 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
                 ProcessingJob.lease_expires_at < now,
-                ProcessingJob.attempts >= ProcessingJob.max_attempts,
+                ProcessingJob.attempts - ProcessingJob.deferrals >= ProcessingJob.max_attempts,
             )
             .values(
                 status=STATUS_DEAD_LETTER,
@@ -861,7 +959,7 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
                 ProcessingJob.lease_expires_at < now,
-                ProcessingJob.attempts < ProcessingJob.max_attempts,
+                ProcessingJob.attempts - ProcessingJob.deferrals < ProcessingJob.max_attempts,
             )
             .values(
                 status=STATUS_PENDING,
@@ -1107,6 +1205,7 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
             .values(
                 status=STATUS_PENDING,
                 attempts=0,
+                deferrals=0,
                 available_at=now,
                 updated_at=now,
                 last_error=None,
@@ -1151,9 +1250,10 @@ def event_from_row(row: ProcessingJob) -> Event:
         timestamp=as_utc(row.created_at).isoformat(),
         payload=dict(row.payload),
         metadata=dict(row.job_metadata) if row.job_metadata else {},
-        retry_count=row.attempts,
+        retry_count=row.attempts - row.deferrals,
         schema_version=row.schema_version,
         max_attempts=row.max_attempts,
+        deferral_count=row.deferrals,
     )
 
 

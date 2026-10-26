@@ -65,6 +65,8 @@ fields.
 | `batch_size` | `20` | Maximum rows claimed or relayed per pass. |
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
+| `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`; a later `retry_at` is clamped to it (jitter included). |
+| `max_deferrals` | `100` | Deferrals a job may take. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
 | `record_attempts` | `True` | Write one `jasil_job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
 | `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |

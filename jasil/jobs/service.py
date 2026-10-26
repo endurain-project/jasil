@@ -85,6 +85,8 @@ def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
         batch_size=jobs.batch_size,
         backoff_base_seconds=jobs.backoff_base_seconds,
         backoff_max_seconds=jobs.backoff_max_seconds,
+        defer_max_seconds=jobs.defer_max_seconds,
+        max_deferrals=jobs.max_deferrals,
         queues=queues,
         record_attempts=jobs.record_attempts,
     )

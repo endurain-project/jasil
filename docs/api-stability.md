@@ -37,7 +37,7 @@ modules:
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, `get_realtime`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `run_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
-| `jasil.jobs` | `lease_lost`. |
+| `jasil.jobs` | `lease_lost`, `DeferJob`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract and the `on_dead_letter` callback contract: at-least-once, idempotent), `DeadLetterCallback`, `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
 | `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`. |
