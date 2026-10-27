@@ -241,6 +241,7 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
             rest or settings.data_dir,
             url_prefix=settings.storage.local_url_prefix,
             legacy_layout=settings.storage.local_legacy_layout,
+            plain_areas=settings.storage.local_plain_areas,
         )
     if scheme == "s3":
         # Imported lazily: boto3 is the optional `s3` extra and is absent from the

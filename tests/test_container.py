@@ -26,6 +26,7 @@ from jasil.backends.realtime_redis import RedisRealtime
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
+from jasil.backends.storage_s3 import S3Storage
 from jasil.profile import DeploymentProfile, JobWorkerMode
 
 
@@ -86,6 +87,16 @@ class TestStorageResolution:
         with pytest.raises(ValueError, match="Unsupported storage_uri scheme"):
             container._build_storage(_settings(storage_uri="ftp://files"))
 
+    def test_s3_ignores_local_plain_area_settings(self):
+        storage = container._build_storage(
+            _settings(
+                storage_uri="s3://bucket",
+                storage=settings.StorageSettings(local_plain_areas=frozenset({"activity_files"})),
+            )
+        )
+
+        assert isinstance(storage, S3Storage)
+
 
 class TestLocalStorageSettings:
     def test_the_defaults_serve_from_the_root_with_no_flat_layout(self, tmp_path):
@@ -93,17 +104,23 @@ class TestLocalStorageSettings:
 
         assert storage._url_prefix == ""
         assert storage._legacy_layout is False
+        assert storage._plain_areas == frozenset()
 
     def test_the_configured_prefix_and_layout_reach_the_backend(self, tmp_path):
         storage = container._build_storage(
             _settings(
                 data_dir=str(tmp_path),
-                storage=settings.StorageSettings(local_url_prefix="/media/", local_legacy_layout=True),
+                storage=settings.StorageSettings(
+                    local_url_prefix="/media/",
+                    local_legacy_layout=True,
+                    local_plain_areas=frozenset({"activity_files"}),
+                ),
             )
         )
 
         assert storage._url_prefix == "/media"
         assert storage._legacy_layout is True
+        assert storage._plain_areas == frozenset({"activity_files"})
         assert storage.url("avatars", "1.webp").startswith("/media/")
 
 

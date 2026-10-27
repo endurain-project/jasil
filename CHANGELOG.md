@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.13.0] - 2026-10-27
+
+### Added
+
+- `LocalStorage(..., plain_areas=...)` and `StorageSettings.local_plain_areas` opt selected local-storage areas into readable `{data_dir}/{area}/{key}` paths. Other areas retain the private hashed layout, and S3 ignores the setting. Plain areas read and list older hashed-layout objects and migrate them to the plain path on overwrite; delete removes both copies. Plain writes are atomic and do not create identity sidecars.
+- `StorageKeyConflictError` reports a file/directory key conflict in plain local areas. Unlike S3, plain local storage cannot store both `a` and `a/b` in the same area.
+
+No breaking changes: plain areas are opt-in and the default local layout is unchanged.
+
 ## [0.12.0] - 2026-10-26
 
 ### Added

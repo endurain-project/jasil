@@ -127,13 +127,36 @@ tampered sidecar is rejected rather than aliased. The physical path is private
 and may change in a future major layout version; use `serve()` or `url()` rather
 than constructing it.
 
+For local installs that need ordinary files, opt selected areas into the plain
+layout with `StorageSettings(local_plain_areas=frozenset({"activity_files"}))`.
+Those objects live at `{data_dir}/{area}/{key}`; all other areas continue to use
+the private layout. The setting is ignored by S3. In a plain area, a key and one
+of its descendants (for example, `a` and `a/b`) cannot both be stored because a
+filesystem path cannot be both a file and a directory. The conflicting write
+raises `StorageKeyConflictError`. This is the one difference in key/descendant
+namespace semantics between a plain local area and S3; non-conflicting keys keep
+the same provider API and behavior.
+
+Plain-area reads and listings also find objects still in the private hashed
+layout. A plain copy takes precedence when both exist; `serve()` and `url()` use
+the existing copy until an overwrite writes to the plain path, then the hashed
+copy is removed. `delete()` removes both copies. Plain writes use atomic
+replacement and do not create identity sidecars. Because the area is explicitly
+opted in, regular files placed under its directory are included in storage
+listings. Path traversal and symlinks remain rejected.
+Unlike the private layout, plain paths inherit the host filesystem's path-length,
+case-sensitivity, and Unicode-normalization behavior; choose keys that remain
+distinct and addressable on the target filesystem.
+
 Objects in the flat `{data_dir}/{area}/{key}` layout, written by JASIL 0.3 and
 earlier and by the application JASIL was extracted from, are **not** consulted by
-default, so no other file under `data_dir` can be served as an object. Set
+default outside explicitly selected plain areas, so no other file under
+`data_dir` can be served as an object. Set
 `storage.local_legacy_layout=True` ([Configuration](configuration.md#storagesettings))
-to read, list, serve, and delete them transparently. Rewriting a legacy object
-moves that logical key into the versioned layout, and legacy files that are never
-touched remain valid and can be removed through normal `delete` or `delete_prefix`
+to read, list, serve, and delete them transparently in other areas. Rewriting a
+legacy object there moves that logical key into the versioned layout; in a plain
+area, the same flat path is already the active layout. Untouched legacy files
+remain valid and can be removed through normal `delete` or `delete_prefix`
 operations.
 
 ### Streaming contract
@@ -315,7 +338,8 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
     tree is modified outside JASIL.
 
 !!! danger "URL controls are honoured by S3 only"
-    This is the one place the two backends genuinely differ. `s3://` returns a
+    In addition to the plain-area key/descendant limitation above, this is a
+    delivery-contract difference between the backends. `s3://` returns a
     presigned URL that honours `expires_in`, `download_as`, and `content_type`.
     `download_as` pins an `attachment` content disposition, so an untrusted
     object is downloaded rather than rendered inline. `local://` returns a plain

@@ -362,6 +362,26 @@ class TestStorageProtocolConformance:
         assert isinstance(storage, protocol)
 
 
+def test_plain_local_and_s3_areas_match_for_non_conflicting_keys(tmp_path):
+    local = LocalStorage(str(tmp_path), plain_areas=frozenset({AREA}))
+    s3 = S3Storage(_MemoryS3Client(), "blobs", "jasil")
+    objects = {"manifest.json": b"manifest", "processed/42.fit": b"activity"}
+
+    for key, content in objects.items():
+        local.save(AREA, key, content)
+        s3.save(AREA, key, content)
+
+    assert local.list_keys(AREA) == s3.list_keys(AREA) == sorted(objects)
+    for key, content in objects.items():
+        assert local.get(AREA, key) == s3.get(AREA, key) == content
+        assert local.exists(AREA, key) is s3.exists(AREA, key) is True
+        assert local.stat(AREA, key).size == s3.stat(AREA, key).size == len(content)
+        with local.open_stream(AREA, key) as stream:
+            assert stream.read() == content
+        with s3.open_stream(AREA, key) as stream:
+            assert stream.read() == content
+
+
 class TestStreamingConformance:
     def test_a_non_seekable_source_round_trips(self, storage):
         source = _ReadOnceSource(b"package bytes")

@@ -35,6 +35,10 @@ class StorageBackendUnavailableError(RuntimeError):
     """Raised when a storage backend cannot complete an operation."""
 
 
+class StorageKeyConflictError(ValueError):
+    """Raised when plain local storage cannot represent a key and its descendants."""
+
+
 class StorageSizeLimitError(ValueError):
     """Raised when a streaming write exceeds its configured byte limit."""
 
