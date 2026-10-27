@@ -141,7 +141,9 @@ Plain-area reads and listings also find objects still in the private hashed
 layout. A plain copy takes precedence when both exist; `serve()` and `url()` use
 the existing copy until an overwrite writes to the plain path, then the hashed
 copy is removed. `delete()` removes both copies. Plain writes use atomic
-replacement and do not create identity sidecars. Because the area is explicitly
+replacement and stage under the private upload namespace when it is on the same
+filesystem; internal temporary filenames are reserved and excluded from listings.
+Plain writes do not create identity sidecars. Because the area is explicitly
 opted in, regular files placed under its directory are included in storage
 listings. Path traversal and symlinks remain rejected.
 Unlike the private layout, plain paths inherit the host filesystem's path-length,

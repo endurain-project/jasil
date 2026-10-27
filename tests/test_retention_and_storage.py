@@ -300,6 +300,15 @@ class TestLocalStorage:
 
         assert storage.get("activity_files", "a") == b"parent"
 
+    def test_failed_plain_stream_write_does_not_leave_conflicting_directories(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("activity_files", "a/b", io.BytesIO(b"too large"), max_bytes=1)
+
+        assert storage.list_keys("activity_files") == []
+        assert storage.save("activity_files", "a", b"parent") == "a"
+
     def test_plain_upload_completion_rechecks_key_conflicts(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
         session = storage.begin_upload("activity_files", "a/b")
@@ -312,6 +321,19 @@ class TestLocalStorage:
         assert storage.get("activity_files", "a") == b"parent"
         storage.abort_upload(session)
 
+    def test_failed_plain_upload_completion_does_not_leave_conflicting_directories(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        session = storage.begin_upload("activity_files", "a/b")
+        part = _upload_part(storage, session, 1, b"child")
+        invalid_part = PartRef(part_number=part.part_number, size=part.size, validator="wrong")
+
+        with pytest.raises(StorageUploadSessionError):
+            storage.complete_upload(session, [invalid_part])
+
+        assert storage.list_keys("activity_files") == []
+        assert storage.save("activity_files", "a", b"parent") == "a"
+        storage.abort_upload(session)
+
     def test_plain_area_refuses_to_create_a_conflict_with_an_opaque_fallback(self, tmp_path):
         opaque = LocalStorage(str(tmp_path))
         opaque.save("activity_files", "a/b", b"child")
@@ -321,6 +343,14 @@ class TestLocalStorage:
             storage.save("activity_files", "a", b"parent")
 
         assert storage.get("activity_files", "a/b") == b"child"
+
+    def test_plain_area_refuses_a_nested_opaque_ancestor(self, tmp_path):
+        opaque = LocalStorage(str(tmp_path))
+        opaque.save("activity_files", "a/b", b"parent")
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+
+        with pytest.raises(StorageKeyConflictError, match="file/directory conflict"):
+            storage.save("activity_files", "a/b/c", b"child")
 
     def test_plain_area_reads_lists_and_migrates_opaque_objects_on_overwrite(self, tmp_path):
         opaque = LocalStorage(str(tmp_path))
@@ -379,6 +409,75 @@ class TestLocalStorage:
         assert opaque_path.exists() is False
         assert storage.exists("activity_files", "processed/42.fit") is False
 
+    def test_plain_area_delete_reports_opaque_unlink_failures(self, tmp_path, monkeypatch):
+        opaque = LocalStorage(str(tmp_path))
+        opaque.save("activity_files", "processed/42.fit", b"old")
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        opaque_path = opaque._resolve("activity_files", "processed/42.fit")
+        original_unlink = Path.unlink
+
+        def fail_opaque_unlink(path, *args, **kwargs):
+            if path == opaque_path:
+                raise OSError("storage unavailable")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_opaque_unlink)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.delete("activity_files", "processed/42.fit")
+
+        assert storage.exists("activity_files", "processed/42.fit") is True
+
+    def test_plain_stream_temporary_file_is_not_listed(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        original_replace = os.replace
+
+        def inspect_before_replace(source, destination):
+            assert Path(source).is_relative_to(storage._upload_root())
+            assert storage.list_keys("activity_files") == []
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", inspect_before_replace)
+
+        storage.save_stream("activity_files", "42.fit", io.BytesIO(b"activity"))
+
+        assert storage.list_keys("activity_files") == ["42.fit"]
+
+    def test_plain_temporary_names_cannot_be_addressed_as_objects(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        temporary_key = f"{storage_local._PLAIN_TEMP_PREFIX}{'a' * 32}.tmp"
+
+        with pytest.raises(ValueError, match="reserved local staging name"):
+            storage.save("activity_files", temporary_key, b"not an object")
+
+    def test_plain_upload_temporary_file_is_not_listed(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        session = storage.begin_upload("activity_files", "42.fit")
+        part = _upload_part(storage, session, 1, b"activity")
+        original_replace = os.replace
+
+        def inspect_before_replace(source, destination):
+            assert Path(source).is_relative_to(storage._upload_root())
+            assert storage.list_keys("activity_files") == []
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", inspect_before_replace)
+
+        storage.complete_upload(session, [part])
+
+        assert storage.list_keys("activity_files") == ["42.fit"]
+
+    def test_cleanup_removes_abandoned_plain_write_temporary_files(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        staging_root = storage._upload_root()
+        staging_root.mkdir()
+        temporary_file = staging_root / f"{storage_local._PLAIN_TEMP_PREFIX}{'a' * 32}.tmp"
+        temporary_file.write_bytes(b"partial")
+        os.utime(temporary_file, (0, 0))
+
+        assert storage.cleanup_uploads(older_than_epoch=1) == 0
+        assert temporary_file.exists() is False
+
     def test_plain_save_is_atomic_when_replacement_fails(self, tmp_path, monkeypatch):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "42.fit", b"old")
@@ -431,6 +530,33 @@ class TestLocalStorage:
 
         with pytest.raises(ValueError, match="symbolic link"):
             storage.save("activity_files", "processed/42.fit", b"unsafe")
+
+    def test_plain_delete_prefix_rejects_a_symlinked_prefix(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        area = tmp_path / "activity_files"
+        area.mkdir()
+        (area / "linked").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(ValueError, match="symbolic link"):
+            storage.delete_prefix("activity_files", "linked")
+
+    @pytest.mark.parametrize("operation", ["save", "save_stream", "complete_upload"])
+    def test_plain_writes_support_long_filename_components(self, tmp_path, operation):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        key = "x" * 240
+
+        if operation == "save":
+            storage.save("activity_files", key, b"payload")
+        elif operation == "save_stream":
+            storage.save_stream("activity_files", key, io.BytesIO(b"payload"))
+        else:
+            session = storage.begin_upload("activity_files", key)
+            part = _upload_part(storage, session, 1, b"payload")
+            storage.complete_upload(session, [part])
+
+        assert storage.get("activity_files", key) == b"payload"
 
     def test_plain_area_rejects_traversal(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))

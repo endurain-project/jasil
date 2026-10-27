@@ -52,6 +52,7 @@ _OBJECT_KEY_FILE = "key"
 _UPLOADS_DIRECTORY = UPLOAD_STAGING_AREA
 _UPLOAD_MANIFEST = "session.json"
 _UPLOAD_PARTS_DIRECTORY = "parts"
+_PLAIN_TEMP_PREFIX = ".jasil-plain-write-"
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
 _UPLOAD_MAX_PARTS = 10_000
@@ -164,6 +165,8 @@ class LocalStorage:
     def _resolve_plain(self, area: str, key: str) -> Path:
         check_area(area)
         check_segment(key, "key")
+        if self._is_plain_temporary_name(key.rsplit("/", 1)[-1]):
+            raise ValueError("Storage key uses a reserved local staging name")
         try:
             base = self._base.resolve()
             requested = base / area / key
@@ -220,14 +223,43 @@ class LocalStorage:
         if path.is_dir():
             raise StorageKeyConflictError(f"Storage key has a file/directory conflict: {area}/{key}")
 
-        for ancestor in key.split("/")[:-1]:
+        segments = key.split("/")
+        for index in range(1, len(segments)):
+            ancestor = "/".join(segments[:index])
             if self._current_object_path(area, ancestor) is not None:
                 raise StorageKeyConflictError(f"Storage key has a file/directory conflict: {area}/{key}")
         if next(self._iter_opaque_objects(area, f"{key}/"), None) is not None:
             raise StorageKeyConflictError(f"Storage key has a file/directory conflict: {area}/{key}")
 
-    def _write_plain_bytes(self, path: Path, data: bytes) -> None:
-        temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
+    def _temporary_object_path(self, area: str, destination: Path) -> Path:
+        if area not in self._plain_areas:
+            return destination.with_name(f".{destination.name}.{uuid4().hex}")
+        try:
+            staging_root = self._upload_root()
+            staging_root.mkdir(parents=True, exist_ok=True)
+            destination_parent = destination.parent
+            while not destination_parent.exists():
+                destination_parent = destination_parent.parent
+            if staging_root.stat().st_dev == destination_parent.stat().st_dev:
+                return staging_root / f"{_PLAIN_TEMP_PREFIX}{uuid4().hex}.tmp"
+        except OSError as error:
+            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+        return destination.with_name(f"{_PLAIN_TEMP_PREFIX}{uuid4().hex}.tmp")
+
+    @staticmethod
+    def _is_plain_temporary_name(name: str) -> bool:
+        if not name.startswith(_PLAIN_TEMP_PREFIX) or not name.endswith(".tmp"):
+            return False
+        token = name.removeprefix(_PLAIN_TEMP_PREFIX).removesuffix(".tmp")
+        if len(token) != 32:
+            return False
+        try:
+            return UUID(token).hex == token
+        except ValueError:
+            return False
+
+    def _write_plain_bytes(self, area: str, path: Path, data: bytes) -> None:
+        temporary_path = self._temporary_object_path(area, path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with temporary_path.open("xb") as destination:
@@ -236,9 +268,10 @@ class LocalStorage:
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
+            self._prune_empty_directories(path.parent)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
-    def _remove_opaque_object(self, area: str, key: str) -> None:
+    def _remove_opaque_object(self, area: str, key: str, *, best_effort: bool) -> None:
         try:
             path = self._current_object_path(area, key)
             if path is None:
@@ -246,8 +279,13 @@ class LocalStorage:
             path.unlink()
             (path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
             self._prune_empty_directories(path.parent)
-        except (OSError, ValueError, StorageBackendUnavailableError):
-            logger.warning("Failed to remove a migrated opaque local storage object")
+        except (OSError, ValueError, StorageBackendUnavailableError) as error:
+            if best_effort:
+                logger.warning("Failed to remove a migrated opaque local storage object")
+                return
+            if isinstance(error, OSError):
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+            raise
 
     def _verify_object_identity(self, area: str, key: str, path: Path) -> None:
         area_file = self._resolve_area(area).parent / _OBJECT_AREA_FILE
@@ -444,8 +482,8 @@ class LocalStorage:
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
         path = self._prepare_object(area, key)
         if area in self._plain_areas:
-            self._write_plain_bytes(path, data)
-            self._remove_opaque_object(area, key)
+            self._write_plain_bytes(area, path, data)
+            self._remove_opaque_object(area, key, best_effort=True)
         else:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -467,11 +505,13 @@ class LocalStorage:
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Storage stream max_bytes must not be negative")
         path = self._prepare_object(area, key)
-        temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
+        temporary_path = self._temporary_object_path(area, path)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             destination = temporary_path.open("xb")
         except OSError as error:
+            if area in self._plain_areas:
+                self._prune_empty_directories(path.parent)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
         total = 0
@@ -501,9 +541,11 @@ class LocalStorage:
                     destination.close()
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
+            if area in self._plain_areas:
+                self._prune_empty_directories(path.parent)
             raise
         if area in self._plain_areas:
-            self._remove_opaque_object(area, key)
+            self._remove_opaque_object(area, key, best_effort=True)
         else:
             self._remove_legacy_object(area, key)
         return total
@@ -624,7 +666,7 @@ class LocalStorage:
                 raise StorageUploadSessionError(f"Upload part {part.part_number} size does not match")
 
         destination_path = self._prepare_object(session.area, session.key)
-        temporary_path = destination_path.with_name(f".{destination_path.name}.{uuid4().hex}")
+        temporary_path = self._temporary_object_path(session.area, destination_path)
         try:
             destination_path.parent.mkdir(parents=True, exist_ok=True)
             with temporary_path.open("xb") as destination:
@@ -649,13 +691,17 @@ class LocalStorage:
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
+            if session.area in self._plain_areas:
+                self._prune_empty_directories(destination_path.parent)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
+            if session.area in self._plain_areas:
+                self._prune_empty_directories(destination_path.parent)
             raise
         if session.area in self._plain_areas:
-            self._remove_opaque_object(session.area, session.key)
+            self._remove_opaque_object(session.area, session.key, best_effort=True)
         else:
             self._remove_legacy_object(session.area, session.key)
         try:
@@ -690,7 +736,13 @@ class LocalStorage:
         try:
             for candidate in candidates:
                 try:
-                    if candidate.is_symlink() or not candidate.is_dir():
+                    if candidate.is_symlink():
+                        continue
+                    if self._is_plain_temporary_name(candidate.name):
+                        if candidate.stat().st_mtime < older_than_epoch:
+                            candidate.unlink()
+                        continue
+                    if not candidate.is_dir():
                         continue
                     created_epoch = candidate.stat().st_mtime
                     if created_epoch >= older_than_epoch:
@@ -797,7 +849,7 @@ class LocalStorage:
                 pass
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
-            self._remove_opaque_object(area, key)
+            self._remove_opaque_object(area, key, best_effort=False)
             return
 
         current_path = self._current_object_path(area, key)
@@ -823,7 +875,9 @@ class LocalStorage:
     def delete_prefix(self, area: str, prefix: str) -> int:
         check_area(area)
         check_segment(prefix, "prefix")
-        if self._legacy_layout:
+        if area in self._plain_areas:
+            self._resolve_plain(area, prefix)
+        elif self._legacy_layout:
             self._resolve_legacy(area, prefix)
         descendant_prefix = f"{prefix}/"
         keys = [key for key, _ in self.iter_objects(area, prefix) if key == prefix or key.startswith(descendant_prefix)]
@@ -904,6 +958,8 @@ class LocalStorage:
                 try:
                     if stat.S_ISDIR(plain_area.stat().st_mode):
                         for candidate in plain_area.rglob("*"):
+                            if self._is_plain_temporary_name(candidate.name):
+                                continue
                             try:
                                 resolved = candidate.resolve()
                             except RuntimeError:
