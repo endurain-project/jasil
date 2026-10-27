@@ -212,12 +212,17 @@ class StorageSettings:
         local_legacy_layout: Also read, list and delete objects in the flat
             ``{data_dir}/{area}/{key}`` layout written by JASIL 0.3 and earlier
             and by the application JASIL was extracted from. Off by default, so
-            no other file under ``data_dir`` can be served as an object. Ignored
+            files in other non-opted-in areas are not served as objects. Ignored
+            for ``s3://``.
+        local_plain_areas: Areas stored directly under ``data_dir`` as
+            ``{data_dir}/{area}/{key}`` for human browsing. Opaque-layout objects
+            in these areas remain readable until overwritten or deleted. Ignored
             for ``s3://``.
     """
 
     local_url_prefix: str = ""
     local_legacy_layout: bool = False
+    local_plain_areas: frozenset[str] = frozenset()
 
 
 # Capability defaults for the single-process profile. The distributed and custom

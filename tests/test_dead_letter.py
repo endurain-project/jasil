@@ -264,7 +264,10 @@ class TestLeaseExpiry:
         received = []
         jobs_registry.registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: received.append((e, r)))
         try:
-            now = platform_runtime.get_active_platform().clock.now()
+            # MySQL's DATETIME keeps whole seconds and rounds on write, so a
+            # microsecond-precision ``now`` would leave ``available_at`` up to a
+            # second in the future and the claim below would select nothing.
+            now = platform_runtime.get_active_platform().clock.now().replace(microsecond=0)
             jobs_crud.enqueue_job(new_event("a.b", {}, source="t"), "s", max_attempts=1, now=now, db=db)
             jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=-1, now=now, db=db)
 

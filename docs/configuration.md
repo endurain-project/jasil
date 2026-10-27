@@ -100,7 +100,8 @@ Settings of the `local://` backend; `s3://` takes none.
 | Field | Default | Meaning |
 |---|---|---|
 | `local_url_prefix` | `""` | URL path prefix of the links `local://` builds, for a host serving the data directory under a path such as `/media`. |
-| `local_legacy_layout` | `False` | Also read, list and delete objects in the flat `{data_dir}/{area}/{key}` layout written by JASIL 0.3 and earlier and by the application JASIL was extracted from. Off, that directory is never consulted, so no other file under `data_dir` can be served as an object. |
+| `local_legacy_layout` | `False` | Also read, list and delete older flat-layout objects in areas not selected by `local_plain_areas`. Off, those directories are never consulted, so other files under `data_dir` cannot be served as objects. |
+| `local_plain_areas` | `frozenset()` | Areas intentionally stored as browsable files at `{data_dir}/{area}/{key}`. Other areas stay in the private hashed layout. Ignored for `s3://`. |
 
 ### `MailSettings`
 
