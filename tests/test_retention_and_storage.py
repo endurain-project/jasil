@@ -291,6 +291,25 @@ class TestLocalStorage:
         assert storage.get("activity_files", first_key) == b"first"
         assert storage.exists("activity_files", second_key) is False
 
+    @pytest.mark.parametrize("probe", ["exists", "is_dir"])
+    def test_plain_conflict_checks_translate_filesystem_errors(self, tmp_path, monkeypatch, probe):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        conflict_parent = tmp_path / "activity_files" / "a"
+        conflict_parent.mkdir(parents=True)
+        original_probe = getattr(Path, probe)
+
+        def fail_conflict_probe(path):
+            if path == conflict_parent:
+                raise PermissionError("permission denied")
+            return original_probe(path)
+
+        monkeypatch.setattr(Path, probe, fail_conflict_probe)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save("activity_files", "a/b", b"child")
+
+        assert isinstance(excinfo.value.__cause__, PermissionError)
+
     def test_plain_stream_write_rejects_file_and_directory_key_conflicts(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "a", b"parent")
@@ -494,7 +513,9 @@ class TestLocalStorage:
             storage.save("activity_files", "42.fit", b"new")
 
         assert (tmp_path / "activity_files" / "42.fit").read_bytes() == b"old"
-        assert list((tmp_path / "activity_files").glob(".42.fit.*")) == []
+        temporary_pattern = f"{storage_local._PLAIN_TEMP_PREFIX}*"
+        assert list((tmp_path / "activity_files").glob(temporary_pattern)) == []
+        assert list(storage._upload_root().glob(temporary_pattern)) == []
 
     def test_plain_area_delete_removes_plain_and_opaque_copies(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
@@ -557,6 +578,40 @@ class TestLocalStorage:
             storage.complete_upload(session, [part])
 
         assert storage.get("activity_files", key) == b"payload"
+
+    @pytest.mark.parametrize("operation", ["save", "save_stream", "complete_upload"])
+    def test_plain_writes_recreate_a_parent_removed_before_atomic_replace(self, tmp_path, monkeypatch, operation):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        key = "processed/42.fit"
+        destination = tmp_path / "activity_files" / key
+        payload = b"activity"
+
+        def write():
+            if operation == "save":
+                storage.save("activity_files", key, payload)
+            elif operation == "save_stream":
+                storage.save_stream("activity_files", key, io.BytesIO(payload))
+            else:
+                session = storage.begin_upload("activity_files", key)
+                part = _upload_part(storage, session, 1, payload)
+                storage.complete_upload(session, [part])
+
+        original_replace = os.replace
+        replaced = False
+
+        def remove_parent_then_replace(source, target):
+            nonlocal replaced
+            if target == destination and not replaced:
+                target.parent.rmdir()
+                replaced = True
+                raise FileNotFoundError("destination parent was concurrently removed")
+            return original_replace(source, target)
+
+        monkeypatch.setattr(os, "replace", remove_parent_then_replace)
+
+        write()
+
+        assert storage.get("activity_files", key) == payload
 
     def test_plain_area_rejects_traversal(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))

@@ -146,6 +146,13 @@ filesystem; internal temporary filenames are reserved and excluded from listings
 Plain writes do not create identity sidecars. Because the area is explicitly
 opted in, regular files placed under its directory are included in storage
 listings. Path traversal and symlinks remain rejected.
+
+While hashed-layout objects remain in a plain area, each write scans that opaque
+area to detect descendant-key conflicts; hashed paths cannot be queried by key
+prefix. Write latency therefore grows with the number of unmigrated objects.
+Overwrite those objects into the plain layout before relying on write latency in
+a large area.
+
 Unlike the private layout, plain paths inherit the host filesystem's path-length,
 case-sensitivity, and Unicode-normalization behavior; choose keys that remain
 distinct and addressable on the target filesystem.
