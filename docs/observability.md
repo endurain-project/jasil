@@ -1,6 +1,6 @@
 # Observability
 
-JASIL owns five operational tables, every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
+JASIL owns five operational tables — and four more for the [audit trail](audit.md) — every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
 the worker registry updates one row per restart-unique instance. This page covers
 what goes in them, how to create them, and how to bound their growth.
 
@@ -11,6 +11,8 @@ what goes in them, how to create them, and how to bound their growth.
 | `jasil_processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
 | `jasil_job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
 | `jasil_job_attempts` | Durable workers | One row per attempt to run a job. See [Job attempts](#job-attempts). |
+
+The audit trail's `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance` are covered in [Audit trail](audit.md); they share the migrations below and are *not* pruned by `jasil.retention`.
 
 ## The event log
 
@@ -214,10 +216,16 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 `verify_schema_current` is a useful fail-fast at startup — it turns "forgot to
 migrate" into a clear message at boot rather than a confusing query error later.
 
+!!! note "Revision `rev0006` (0.14): the audit trail"
+    Adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On PostgreSQL
+    (13 or newer) it also partitions the log by day, installs the append-only triggers and creates the two
+    `SECURITY DEFINER` functions, so run it as the role that should own them. Processes of the previous release
+    are unaffected. Details in [Audit trail → Upgrading](audit.md#upgrading).
+
 !!! note "It will not touch your tables"
     JASIL's migrations use their own version table, `jasil_alembic_version`, so
     they never collide with your Alembic history. Every operation is scoped to
-    JASIL's five tables, so autogenerate cannot propose dropping yours — even
+    JASIL's own tables, so autogenerate cannot propose dropping yours — even
     though both live in the same registry.
 
 ### Upgrading from 0.8 or earlier: the `jasil_` prefix

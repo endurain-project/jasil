@@ -23,8 +23,14 @@ allowed to drift is what produced the bug recorded on
 """
 
 __all__ = [
+    "MAX_AUDIT_ACTION_ID_LENGTH",
+    "MAX_AUDIT_ID_LENGTH",
+    "MAX_AUDIT_NAME_LENGTH",
     "MAX_HANDLER_NAME_LENGTH",
+    "MAX_IP_ADDRESS_LENGTH",
+    "MAX_REQUEST_ID_LENGTH",
     "MAX_STORED_ERROR_LENGTH",
+    "MAX_USER_AGENT_LENGTH",
     "MAX_WORKER_ID_LENGTH",
     "MAX_WORKER_LABEL_LENGTH",
     "MAX_WORKER_ROLE_LENGTH",
@@ -100,3 +106,20 @@ def fit_length(value: str | None, limit: int) -> str | None:
     if value is None or len(value) <= limit:
         return value
     return value[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+#: Widths of the ``jasil_audit_log`` columns holding host-supplied identifiers. The
+#: host writes the action id, the actor, credential and target ids, so an over-long
+#: one is rejected (:func:`check_length`) rather than clipped: a truncated target id
+#: would point an investigator at the wrong record.
+MAX_AUDIT_ACTION_ID_LENGTH = 100
+MAX_AUDIT_ID_LENGTH = 64
+MAX_AUDIT_NAME_LENGTH = 50
+
+#: Widths of the audit columns copied from the request. The client controls a
+#: ``User-Agent`` and may influence a request id, so these are clipped
+#: (:func:`fit_length`): refusing the request would lose the very row that records it.
+MAX_REQUEST_ID_LENGTH = 100
+MAX_USER_AGENT_LENGTH = 512
+#: Longest textual IPv6 address, including an IPv4-mapped suffix.
+MAX_IP_ADDRESS_LENGTH = 45

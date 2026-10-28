@@ -50,6 +50,7 @@ fields.
 | `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
+| `audit` | `AuditSettings()` | [Audit trail](audit.md). |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |
 | `storage` | `StorageSettings()` | Options of the `local://` storage backend. |
 | `mail` | `MailSettings()` | Outbound mail backend. |
@@ -83,6 +84,26 @@ fields.
 Both `jobs.enabled` and `event_log.enabled` default to **off**, because both
 write to the database. A library should not start writing to your database
 because you installed it.
+
+### `AuditSettings`
+
+The [audit trail](audit.md). Unlike the two above it defaults to **on**, because it writes nothing until the host
+calls `stage` or `record_detached`. Values are checked when the object is built, so a bad one raises `ValueError`
+where you configure JASIL.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `True` | Write audit rows. `False` still validates every call, then writes nothing; maintenance does nothing. |
+| `retention_days` | `90` | Age at which whole daily partitions are dropped. `<= 0` keeps every row. When positive it must be at least `retention_floor_days`. Your deployment profiles map onto this value; JASIL supplies only the neutral default. |
+| `retention_floor_days` | `30` | The youngest cutoff the database-side guard `jasil_audit_drop_partitions` accepts. **Baked into the function when migration `rev0006` runs**; changing the setting later does not change the guard (see [the retention floor](audit.md#the-retention-floor)). At least `1`. |
+| `legal_hold` | `False` | Suspend all pruning. |
+| `partition_days_ahead` | `7` | Days of daily partitions maintenance keeps created ahead of today (PostgreSQL). A row whose day has none is rejected, so this is the margin by which maintenance may stop. At least `1`. |
+| `checkpoint_window_minutes` | `15` | Length of a tamper-evidence window. At least `1`, and it must divide a day (1440). |
+| `checkpoint_grace_minutes` | `5` | How long past its end a window waits before it is sealed. Longer than your longest audited transaction plus replica clock skew. |
+| `signing_key` | `None` | Ed25519 private key, base64 of the 32 raw bytes. `None` writes unsigned, hash-chained checkpoints. Needs `jasil[audit]`. Not shown in `repr`. |
+| `external_sink_uri` | `None` | `file:///directory` or `s3://bucket/prefix`: a write-once copy of every checkpoint kept outside the database. |
+| `max_details_bytes` | `4096` | Largest serialized `details` payload a row may carry. At least `1`. |
+| `app_name`, `app_version` | `None` | Stamped on every row. |
 
 ### `GeocodingSettings`
 

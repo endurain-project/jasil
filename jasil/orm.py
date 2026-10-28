@@ -2,7 +2,8 @@
 
 **Option B (the host owns the ``Base``).** JASIL's companion tables —
 ``jasil_event_log``, ``jasil_processing_jobs``, ``jasil_event_outbox``,
-``jasil_job_workers``, and ``jasil_job_attempts`` — must
+``jasil_job_workers``, ``jasil_job_attempts``, ``jasil_audit_log``,
+``jasil_audit_actions``, ``jasil_audit_checkpoints`` and ``jasil_instance`` — must
 live in the same declarative registry as the host's own models so that one
 ``create_all`` / migration run and one metadata object cover the whole schema.
 The host owns that registry; JASIL maps its models **into** it.
@@ -27,8 +28,9 @@ Host applications:
    base may call ``map_models()`` with no argument and use JASIL's convenience
    :data:`Base`.
 
-   Two modules reach a model directly and therefore inherit that ordering
-   constraint: :mod:`jasil.jobs.crud` and :mod:`jasil.event_log.crud`. Import
+   Three modules reach a model directly and therefore inherit that ordering
+   constraint: :mod:`jasil.jobs.crud`, :mod:`jasil.event_log.crud` and
+   :mod:`jasil.audit.models`. Import
    them inside a function, or only after ``map_models`` has run. Every other
    public entry point — :mod:`jasil.publisher`, :mod:`jasil.retention`,
    :mod:`jasil.jobs.service`, :mod:`jasil.container`, :mod:`jasil.deps`,
@@ -90,6 +92,7 @@ _active_base: type[DeclarativeBase] | None = None
 # Every module defining a JASIL companion model. ``map_models`` imports each, and
 # each binds its classes to the active base via ``get_active_base()``.
 _MODEL_MODULES: tuple[str, ...] = (
+    "jasil.audit.models",
     "jasil.event_log.models",
     "jasil.jobs.models",
 )
@@ -104,6 +107,10 @@ _TABLE_NAMES: frozenset[str] = frozenset(
         "jasil_event_outbox",
         "jasil_job_workers",
         "jasil_job_attempts",
+        "jasil_audit_log",
+        "jasil_audit_actions",
+        "jasil_audit_checkpoints",
+        "jasil_instance",
     }
 )
 

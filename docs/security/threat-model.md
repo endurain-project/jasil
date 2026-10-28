@@ -202,6 +202,19 @@ that ignores the signal mid-side-effect, and a handler abandoned past
 double-charge, double-send, or double-count, that is a correctness bug in the
 handler, not in the queue.
 
+## Tampering with the audit trail
+
+**Guarded.** `jasil_audit_log` is append-only for every role but its owner: `UPDATE`, `DELETE` and `TRUNCATE` are
+rejected by triggers, retention drops whole partitions through a `SECURITY DEFINER` function that refuses a cutoff
+inside a floor fixed in the database, and the recommended grants give the application `INSERT` only. Signed,
+hash-chained checkpoints over fixed windows, copied to a write-once sink, make a change by anyone else detectable
+(`verify_checkpoints`). An audited change and its row share a transaction, so a change cannot happen unrecorded.
+
+**Yours.** Nothing stops the table owner or a database superuser: they can disable the triggers and rewrite rows,
+checkpoints and chain together. The signing key and the external sink must therefore live outside the database
+operators' reach, and verification must run somewhere they do not control. See
+[Audit trail → What this does not do](../audit.md#what-this-does-not-do).
+
 ## Out of scope
 
 These are real risks that JASIL deliberately does not address, because it cannot:

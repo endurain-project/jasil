@@ -46,6 +46,7 @@ from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
 from jasil.profile import DeploymentProfile
 from jasil.providers import (
+    AuditSink,
     ClockProvider,
     EventBusProvider,
     EventRecorder,
@@ -91,6 +92,8 @@ class Platform:
             this is a backend whose ``send`` raises
             :class:`~jasil.providers.MailNotConfiguredError`, so a message is
             never dropped silently.
+        audit_sink: Write-once external copy of the audit checkpoints, or ``None`` when
+            ``audit.external_sink_uri`` is unset (or auditing is disabled).
         realtime: Cross-process keyed hint channel. Defaults to an
             :class:`~jasil.backends.realtime_inprocess.InProcessRealtime`, so a
             hand-built ``Platform`` need not supply it. The host registers its
@@ -108,6 +111,7 @@ class Platform:
     recorder: EventRecorder | None = None
     mail: MailProvider = field(default_factory=NullMail)
     realtime: RealtimeProvider = field(default_factory=InProcessRealtime)
+    audit_sink: AuditSink | None = None
 
     def close(self) -> None:
         """Release what the platform owns: the bus consumer, the realtime subscriber and the Redis clients.
@@ -190,6 +194,7 @@ def build_platform(
             mail=mail,
             recorder=recorder,
             realtime=_build_realtime(settings),
+            audit_sink=_build_audit_sink(settings),
         )
     except Exception:
         # No Platform exists to close, so release the Redis clients a backend
@@ -278,6 +283,23 @@ def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
 
         return RedisRealtime.from_uri(realtime_uri, channel=settings.realtime_channel)
     raise ValueError(f"Unsupported realtime_uri scheme: {scheme or realtime_uri!r}")
+
+
+def _build_audit_sink(settings: JasilSettings) -> AuditSink | None:
+    uri = settings.audit.external_sink_uri
+    if not uri or not settings.audit.enabled:
+        return None
+    scheme, _, _ = uri.partition("://")
+    if scheme == "file":
+        from jasil.backends.audit_sink_file import FileAuditSink
+
+        return FileAuditSink.from_uri(uri)
+    if scheme == "s3":
+        from jasil.backends.audit_sink_storage import StorageAuditSink
+        from jasil.backends.storage_s3 import S3Storage
+
+        return StorageAuditSink(S3Storage.from_uri(uri))
+    raise ValueError(f"Unsupported audit.external_sink_uri scheme: {scheme or 'missing'!r}")
 
 
 def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:

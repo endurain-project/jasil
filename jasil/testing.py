@@ -18,11 +18,15 @@ optional extra::
         jasil_testing.reset_all()
 """
 
-from dataclasses import dataclass, replace
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jasil._core.redis_clients as redis_clients
+import jasil.audit as jasil_audit
+import jasil.audit.service as audit_service
 import jasil.capabilities as capabilities
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
@@ -34,9 +38,11 @@ from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.container import Platform, build_platform
 
 __all__ = [
+    "AuditCapture",
     "FixedClock",
     "InProcessRealtime",
     "MemoryMail",
+    "capture_audit",
     "capture_hints",
     "install_test_platform",
     "memory_mail",
@@ -215,10 +221,110 @@ def capture_hints(platform: Platform) -> list[tuple[str, dict]]:
     return captured
 
 
+@dataclass
+class AuditCapture:
+    """The audit rows staged or recorded while a :func:`capture_audit` block was open.
+
+    Attributes:
+        entries: Every entry, in the order it was staged. An entry is captured when it is *staged*, so a
+            row whose transaction later rolled back is still listed; assert on the database to test
+            that.
+    """
+
+    entries: list[jasil_audit.AuditEntry] = field(default_factory=list)
+
+    def matching(
+        self,
+        action_id: str,
+        *,
+        outcome: jasil_audit.Outcome | str | None = None,
+        target_id: str | None = None,
+        **fields: object,
+    ) -> list[jasil_audit.AuditEntry]:
+        """Return the captured entries that match every given criterion.
+
+        Args:
+            action_id: The action id.
+            outcome: The outcome, when it matters.
+            target_id: The target id, when it matters.
+            **fields: Any other :class:`~jasil.audit.AuditEntry` field and the value it must have.
+
+        Returns:
+            The matching entries, in staging order.
+        """
+        wanted: dict[str, object] = {"action_id": action_id, **fields}
+        if outcome is not None:
+            wanted["outcome"] = str(jasil_audit.Outcome(outcome))
+        if target_id is not None:
+            wanted["target_id"] = target_id
+        return [entry for entry in self.entries if all(getattr(entry, name) == value for name, value in wanted.items())]
+
+    def assert_audited(
+        self,
+        action_id: str,
+        *,
+        outcome: jasil_audit.Outcome | str | None = None,
+        target_id: str | None = None,
+        **fields: object,
+    ) -> jasil_audit.AuditEntry:
+        """Assert that at least one captured entry matches, and return the first.
+
+        Args:
+            action_id: The action id.
+            outcome: The outcome, when it matters.
+            target_id: The target id, when it matters.
+            **fields: Any other :class:`~jasil.audit.AuditEntry` field and the value it must have.
+
+        Returns:
+            The first matching entry, for further assertions on its ``details``.
+
+        Raises:
+            AssertionError: When nothing matches; the message lists what was captured.
+        """
+        found = self.matching(action_id, outcome=outcome, target_id=target_id, **fields)
+        if not found:
+            captured = ", ".join(f"{entry.action_id}[{entry.outcome}]" for entry in self.entries) or "nothing"
+            raise AssertionError(
+                f"{action_id} was not audited (outcome={outcome}, target_id={target_id}); got {captured}"
+            )
+        return found[0]
+
+    def assert_not_audited(self, action_id: str) -> None:
+        """Assert that no captured entry has ``action_id``.
+
+        Args:
+            action_id: The action id.
+
+        Raises:
+            AssertionError: When one does.
+        """
+        if self.matching(action_id):
+            raise AssertionError(f"{action_id} was audited")
+
+
+@contextmanager
+def capture_audit() -> Generator[AuditCapture]:
+    """Collect every audit entry staged or recorded inside the block.
+
+    Entries are captured after validation and before persistence, so the capture works with
+    ``audit.enabled = False``, without a database, and the same whether durable jobs are enabled or not —
+    audit rows never go through the bus or the outbox.
+
+    Yields:
+        The capture, which fills as the block runs.
+    """
+    capture = AuditCapture()
+    remove = audit_service.add_observer(capture.entries.append)
+    try:
+        yield capture
+    finally:
+        remove()
+
+
 def reset_all() -> None:
     """Clear every process-wide slot JASIL installs, except the ORM mapping.
 
-    Covers the settings, the correlation provider, the published platform (and
+    Covers the settings, the correlation provider, the audit catalog and context, the published platform (and
     the realtime handlers registered on it), the durable subscriber registry, and
     the memoized Redis clients. Call it in
     fixture teardown; leaving any one of them set is how a passing test starts
@@ -241,6 +347,7 @@ def reset_all() -> None:
             realtime.clear()
     jasil_settings.reset()
     correlation.reset()
+    jasil_audit.reset()
     platform_runtime.reset()
     jobs_registry.registry.clear()
     redis_clients.reset_shared_clients()

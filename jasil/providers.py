@@ -381,6 +381,23 @@ class EventRecorder(Protocol):
     ) -> AbstractContextManager[None]: ...
 
 
+class AuditSinkConflictError(RuntimeError):
+    """An :class:`AuditSink` already holds different content under the name being written."""
+
+
+@runtime_checkable
+class AuditSink(Protocol):
+    """A write-once copy of audit checkpoints, kept outside the audited database.
+
+    ``write_once`` stores ``content`` under ``name`` and never replaces it: writing the same bytes again
+    is a no-op (a retry after a crash), writing different bytes raises
+    :class:`AuditSinkConflictError`. That is the property that makes the copy evidence: whoever can
+    rewrite the database cannot, through this interface, rewrite what was already sent.
+    """
+
+    def write_once(self, name: str, content: bytes) -> None: ...
+
+
 @runtime_checkable
 class LockProvider(Protocol):
     """Best-effort mutual exclusion for scheduled/backfill work."""

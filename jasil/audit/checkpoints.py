@@ -1,0 +1,391 @@
+"""Tamper evidence: signed, hash-chained checkpoints over fixed time windows of the audit log.
+
+Database permissions stop everyone but the table owner from changing a row. Checkpoints are what
+*detect* a change by someone who can, and they keep the evidence outside what that person can reach.
+
+Every ``checkpoint_window_minutes`` of ``occurred_at`` is a window. Once a window is
+``checkpoint_grace_minutes`` past its end it is sealed: its rows are serialized canonically in
+``(occurred_at, id)`` order, hashed together with the previous checkpoint's hash (so the checkpoints form
+a chain), optionally signed with Ed25519, stored in ``jasil_audit_checkpoints`` and, when configured,
+copied to a write-once external sink. The grace period exists because ``occurred_at`` is taken when the
+row is staged but the row is only visible once its transaction commits: sealing at the window's end
+would let a slow transaction look like a later insertion.
+
+There is deliberately no per-row hash chain: it would serialize every insert across replicas.
+
+Detection, not prevention: someone who can rewrite the rows *and* the checkpoints *and* holds the
+signing key can forge a consistent history. The signature (key kept out of the database) and the
+external sink are what make that hard; see ``docs/audit.md``.
+"""
+
+import base64
+import binascii
+import functools
+import hashlib
+import importlib
+import json
+import logging
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from itertools import groupby
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+import jasil.orm as jasil_orm
+import jasil.runtime as platform_runtime
+from jasil._core import optional_deps
+from jasil._core.timestamps import as_utc
+from jasil.audit import service
+from jasil.audit.schema import VerificationReport, VerificationStatus, WindowVerification
+from jasil.settings import AuditSettings, get_settings
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["seal_pending_windows", "verify_checkpoints"]
+
+#: Windows sealed per maintenance run, so a long backlog (first run on an old log, or after an outage)
+#: is worked off over several runs instead of holding the lock for minutes.
+MAX_WINDOWS_PER_RUN = 1000
+
+_MESSAGE_PREFIX = "jasil-audit-checkpoint-v1"
+_FETCH_SIZE = 1000
+
+_COLUMNS = (
+    "id",
+    "occurred_at",
+    "action_id",
+    "category",
+    "severity",
+    "outcome",
+    "actor_type",
+    "actor_id",
+    "credential_type",
+    "credential_id",
+    "on_behalf_of_id",
+    "target_type",
+    "target_id",
+    "target_owner_id",
+    "request_id",
+    "event_id",
+    "source",
+    "ip_address",
+    "user_agent",
+    "details",
+    "details_version",
+    "instance_id",
+    "app_name",
+    "app_version",
+)
+
+_unsigned_warned = False
+
+
+@dataclass(frozen=True)
+class _Digest:
+    row_count: int
+    hash: str
+
+
+def _iso(moment: datetime) -> str:
+    return as_utc(moment).isoformat(timespec="microseconds")
+
+
+def canonical_row(row: Any) -> bytes:
+    """Serialize one audit row to the bytes that are hashed.
+
+    A JSON array of the columns in a fixed order with keys sorted inside ``details``, so the bytes depend
+    on the stored values and on nothing a database or driver may reorder.
+    """
+    values = [_iso(row.occurred_at) if name == "occurred_at" else getattr(row, name) for name in _COLUMNS]
+    return json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def _window_rows(db: Session, start: datetime, end: datetime) -> Iterator[Any]:
+    """Yield the window's rows ordered by ``(occurred_at, id)``.
+
+    The database orders by ``occurred_at`` only and the ``id`` tiebreak is applied here, because ordering
+    a text column is collation-dependent and a restore into a differently collated database would
+    otherwise change the bytes that were hashed.
+    """
+    from jasil.audit.models import AuditLog
+
+    statement = (
+        select(AuditLog)
+        .where(AuditLog.occurred_at >= start, AuditLog.occurred_at < end)
+        .order_by(AuditLog.occurred_at)
+        .execution_options(yield_per=_FETCH_SIZE)
+    )
+    for _, group in groupby(db.scalars(statement), key=lambda row: as_utc(row.occurred_at)):
+        yield from sorted(group, key=lambda row: row.id)
+
+
+def _digest(db: Session, start: datetime, end: datetime, prev_hash: str | None) -> _Digest:
+    hasher = hashlib.sha256()
+    count = 0
+    for row in _window_rows(db, start, end):
+        hasher.update(canonical_row(row) + b"\n")
+        count += 1
+    hasher.update((prev_hash or "").encode())
+    return _Digest(count, hasher.hexdigest())
+
+
+def _message(start: datetime, end: datetime, digest: _Digest, prev_hash: str | None) -> bytes:
+    return "|".join(
+        (_MESSAGE_PREFIX, _iso(start), _iso(end), str(digest.row_count), digest.hash, prev_hash or "")
+    ).encode()
+
+
+def _ed25519() -> Any:
+    try:
+        module: Any = importlib.import_module("cryptography.hazmat.primitives.asymmetric.ed25519")
+    except ImportError:
+        module = None
+    return optional_deps.require(module, package="cryptography", extra="audit", feature="Audit checkpoint signing")
+
+
+def _key_id(public_key: Any) -> str:
+    from cryptography.hazmat.primitives import serialization
+
+    raw = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+@functools.lru_cache(maxsize=4)
+def _signer(signing_key: str) -> tuple[Any, str]:
+    """Load the private key once; return ``(private_key, key_id)``."""
+    ed25519 = _ed25519()
+    try:
+        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(signing_key, validate=True))
+    except (ValueError, binascii.Error):
+        raise ValueError("audit.signing_key must be the base64 of a 32-byte Ed25519 private key") from None
+    return private_key, _key_id(private_key.public_key())
+
+
+def _public_key(public_key: str) -> Any:
+    ed25519 = _ed25519()
+    try:
+        return ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key, validate=True))
+    except (ValueError, binascii.Error):
+        raise ValueError("the public key must be the base64 of a 32-byte Ed25519 public key") from None
+
+
+def _sign(settings: AuditSettings, message: bytes) -> tuple[str | None, str | None]:
+    global _unsigned_warned
+    if settings.signing_key is None:
+        if not _unsigned_warned:
+            logger.warning("audit.signing_key is not set: checkpoints are hash-chained but not signed")
+            _unsigned_warned = True
+        return None, None
+    private_key, key_id = _signer(settings.signing_key)
+    return base64.b64encode(private_key.sign(message)).decode(), key_id
+
+
+def _sink_name(start: datetime) -> str:
+    return f"checkpoint-{as_utc(start).strftime('%Y%m%dT%H%M%SZ')}.json"
+
+
+def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
+    document = {
+        "v": 1,
+        "instance_id": instance_id,
+        "window_start": _iso(checkpoint.window_start),
+        "window_end": _iso(checkpoint.window_end),
+        "row_count": checkpoint.row_count,
+        "hash": checkpoint.hash,
+        "prev_hash": checkpoint.prev_hash,
+        "signature": checkpoint.signature,
+        "key_id": checkpoint.key_id,
+    }
+    return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+
+
+def seal_pending_windows(now: datetime | None = None) -> int:
+    """
+    Seal every window that has passed its grace period.
+
+    Reads each window on a short session, writes it to the external sink (if configured) with no
+    transaction open, then stores the checkpoint on another short session. The sink comes first: if it is
+    down the checkpoint is not stored and the window is retried on the next run, so the copy outside the
+    database is never missing a checkpoint that the database has. Sealing is deterministic (the signature
+    is too), so a retry after a crash between the two writes produces the same bytes.
+
+    Args:
+        now: The instant to seal up to; the platform clock when omitted.
+
+    Returns:
+        How many checkpoints were written.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: On a database error.
+        AuditSinkConflictError: When the sink already holds different content for a window.
+    """
+    from jasil.audit.models import AuditCheckpoint, AuditLog
+
+    settings = get_settings().audit
+    now = now or service.now()
+    window = timedelta(minutes=settings.checkpoint_window_minutes)
+    grace = timedelta(minutes=settings.checkpoint_grace_minutes)
+    sink = platform_runtime.get_active_platform().audit_sink if platform_runtime.is_platform_active() else None
+    written = 0
+    sessionmaker = jasil_orm.get_sessionmaker()
+
+    with sessionmaker() as db:
+        last = db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc()).limit(1)).first()
+        if last is not None:
+            start, prev_hash = as_utc(last.window_end), last.hash
+        else:
+            first = db.scalar(select(func.min(AuditLog.occurred_at)))
+            if first is None:
+                return 0
+            epoch = as_utc(first).timestamp()
+            start = datetime.fromtimestamp(epoch - epoch % window.total_seconds(), UTC)
+            prev_hash = None
+        instance_id = service.ensure_instance_id(service.engine_of(db))
+
+    while written < MAX_WINDOWS_PER_RUN and start + window + grace <= now:
+        end = start + window
+        with sessionmaker() as db:
+            digest = _digest(db, start, end, prev_hash)
+        signature, key_id = _sign(settings, _message(start, end, digest, prev_hash))
+        checkpoint = AuditCheckpoint(
+            window_start=start,
+            window_end=end,
+            row_count=digest.row_count,
+            hash=digest.hash,
+            prev_hash=prev_hash,
+            signature=signature,
+            key_id=key_id,
+        )
+        if sink is not None:
+            sink.write_once(_sink_name(start), _sink_payload(checkpoint, instance_id))
+        with sessionmaker() as db:
+            db.add(checkpoint)
+            db.commit()
+        written += 1
+        start, prev_hash = end, digest.hash
+    if written:
+        service.note_maintenance(last_checkpoint_at=start)
+    return written
+
+
+def _prune_cutoffs(db: Session) -> list[datetime]:
+    """Return the cutoff of every recorded ``audit.retention.prune``."""
+    from jasil.audit.catalog import RETENTION_PRUNE, RetentionPruneDetails
+    from jasil.audit.models import AuditLog
+
+    cutoffs = []
+    for details in db.scalars(select(AuditLog.details).where(AuditLog.action_id == RETENTION_PRUNE.id)):
+        try:
+            cutoffs.append(as_utc(RetentionPruneDetails.model_validate(details).cutoff))
+        except ValueError:
+            logger.warning("An audit.retention.prune row has unreadable details; it accounts for no window")
+    return cutoffs
+
+
+def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetime) -> VerificationReport:
+    """
+    Recompute the checkpoint windows in a range and report each as ``ok`` or what is wrong with it.
+
+    For every checkpoint whose window lies inside ``[from_ts, to_ts]`` the window's rows are read and
+    hashed again and compared with the stored hash and row count, the link to the previous checkpoint is
+    checked, and the signature is verified when ``public_key`` is given. A gap between two checkpoints is
+    reported as ``missing_window``. A window whose rows are gone is accepted only if an
+    ``audit.retention.prune`` row with a cutoff past the window's start accounts for it; its chain link and
+    signature are still checked, its rows cannot be.
+
+    The host or the observability product decides when to call this; to raise an alarm, stage or record
+    ``audit.integrity.violation`` for each window that is not ``ok``.
+
+    Args:
+        public_key: Base64 of the 32-byte Ed25519 public key, or ``None`` to check hashes and chain only.
+            After a key rotation verify each period with the key that signed it.
+        from_ts: Earliest window start to verify.
+        to_ts: Latest window end to verify.
+
+    Returns:
+        One entry per checkpoint window and per gap, oldest first.
+
+    Raises:
+        ValueError: When ``public_key`` is not a valid key.
+        ImportError: When a key is given and ``cryptography`` is not installed (``jasil[audit]``).
+    """
+    from jasil.audit.models import AuditCheckpoint
+
+    verifier = _public_key(public_key) if public_key is not None else None
+    start_bound, end_bound = as_utc(from_ts), as_utc(to_ts)
+    results: list[WindowVerification] = []
+
+    with jasil_orm.get_sessionmaker()() as db:
+        previous = db.scalars(
+            select(AuditCheckpoint)
+            .where(AuditCheckpoint.window_start < start_bound)
+            .order_by(AuditCheckpoint.window_start.desc())
+            .limit(1)
+        ).first()
+        checkpoints = db.scalars(
+            select(AuditCheckpoint)
+            .where(AuditCheckpoint.window_start >= start_bound, AuditCheckpoint.window_end <= end_bound)
+            .order_by(AuditCheckpoint.window_start)
+        ).all()
+        cutoffs = _prune_cutoffs(db)
+
+        for checkpoint in checkpoints:
+            start, end = as_utc(checkpoint.window_start), as_utc(checkpoint.window_end)
+            if previous is not None and as_utc(previous.window_end) != start:
+                results.append(
+                    WindowVerification(
+                        window_start=as_utc(previous.window_end),
+                        window_end=start,
+                        status=VerificationStatus.MISSING_WINDOW,
+                    )
+                )
+            expected_prev = previous.hash if previous is not None else None
+            digest = _digest(db, start, end, checkpoint.prev_hash)
+            rows_match = digest.row_count == checkpoint.row_count and digest.hash == checkpoint.hash
+            pruned = (
+                not rows_match
+                and digest.row_count == 0
+                and checkpoint.row_count > 0
+                and any(cutoff > start for cutoff in cutoffs)
+            )
+            status = VerificationStatus.OK if rows_match or pruned else VerificationStatus.ROW_MISMATCH
+            if status is VerificationStatus.OK and verifier is not None and not _signature_ok(verifier, checkpoint):
+                status = VerificationStatus.BAD_SIGNATURE
+            if status is VerificationStatus.OK and checkpoint.prev_hash != expected_prev:
+                # With no predecessor in the database the first checkpoint must start the chain; one that
+                # names a predecessor means the head of the chain was removed.
+                status = VerificationStatus.BROKEN_CHAIN
+            results.append(
+                WindowVerification(
+                    window_start=start,
+                    window_end=end,
+                    status=status,
+                    pruned=pruned,
+                    expected_rows=checkpoint.row_count,
+                    actual_rows=None if pruned else digest.row_count,
+                )
+            )
+            previous = checkpoint
+
+    return VerificationReport(
+        ok=all(result.status is VerificationStatus.OK for result in results),
+        signed=verifier is not None,
+        windows=results,
+    )
+
+
+def _signature_ok(verifier: Any, checkpoint: Any) -> bool:
+    from cryptography.exceptions import InvalidSignature
+
+    if checkpoint.signature is None:
+        return False
+    digest = _Digest(checkpoint.row_count, checkpoint.hash)
+    message = _message(checkpoint.window_start, checkpoint.window_end, digest, checkpoint.prev_hash)
+    try:
+        verifier.verify(base64.b64decode(checkpoint.signature, validate=True), message)
+    except (InvalidSignature, ValueError, binascii.Error):
+        return False
+    return True

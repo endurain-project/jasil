@@ -22,11 +22,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Distributions behind an optional extra. None may be loaded as a side effect of
 # importing the package or any module on its pure surface.
-OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler")
+OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler", "cryptography")
 
 # Modules a host may import without opting into any extra.
 PURE_MODULES = (
     "jasil",
+    "jasil.audit",
     "jasil.capabilities",
     "jasil.correlation",
     "jasil.events",

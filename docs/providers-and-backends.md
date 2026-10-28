@@ -710,3 +710,16 @@ platform = Platform(
     recorder=None,
 )
 ```
+
+## AuditSink
+
+A write-once copy of the [audit checkpoints](audit.md#the-external-sink), kept outside the audited database.
+`Platform.audit_sink` is `None` unless `audit.external_sink_uri` is set.
+
+| Backend | URI | Notes |
+|---|---|---|
+| `FileAuditSink` | `file:///absolute/directory` | Exclusive-create, read-only files. |
+| `StorageAuditSink` | `s3://bucket/prefix` | Over the S3 storage backend; use a separate bucket with Object Lock. |
+
+`write_once(name, content)` never replaces an object: the same bytes again are a no-op, different bytes raise
+`AuditSinkConflictError`.

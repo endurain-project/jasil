@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import jasil.audit as jasil_audit
 import jasil.correlation as correlation
 import jasil.orm as orm
 import jasil.settings as settings
@@ -41,6 +42,7 @@ def _reset_process_state():
     yield
     settings.reset()
     correlation.reset()
+    jasil_audit.reset()
 
 
 @pytest.fixture(scope="session")
@@ -83,3 +85,48 @@ def db(session_factory):
     """An open session against the test database."""
     with session_factory() as session:
         yield session
+
+
+class AuditEnv:
+    """A test platform with a fixed clock and the audit settings a test wants.
+
+    Attributes:
+        clock: The platform clock; advance it to move ``occurred_at`` and the checkpoint windows.
+        platform: The installed platform.
+    """
+
+    def __init__(self, tmp_path, session_factory) -> None:
+        import jasil.audit.service as audit_service
+        import jasil.testing as jasil_testing
+
+        self._tmp_path = tmp_path
+        self._overrides: dict = {}
+        self.clock = jasil_testing.FixedClock()
+        self.configure()
+        # The first audit write resolves the instance id on a session of its own. Resolve it before a
+        # test holds an open transaction, so that session cannot commit the test's pending work (all
+        # SQLite sessions in a test share one connection).
+        with session_factory() as db:
+            audit_service.ensure_instance_id(audit_service.engine_of(db))
+
+    def configure(self, **audit_overrides) -> None:
+        """Reinstall the platform with these audit settings on top of the ones set before."""
+        import jasil.settings as jasil_settings
+        import jasil.testing as jasil_testing
+
+        self._overrides.update(audit_overrides)
+        self.platform = jasil_testing.install_test_platform(
+            self._tmp_path,
+            clock=self.clock,
+            settings=jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(**self._overrides)),
+        )
+
+
+@pytest.fixture
+def audit_env(tmp_path, session_factory):
+    """A platform on a fixed clock, with auditing on and the instance id already resolved."""
+    import jasil.testing as jasil_testing
+
+    environment = AuditEnv(tmp_path, session_factory)
+    yield environment
+    jasil_testing.reset_all()

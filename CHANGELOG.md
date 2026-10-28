@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [0.14.0] - 2026-10-28
+
+### Added
+
+- **Audit trail (`jasil.audit`).** A complete, append-only record of who did what, written synchronously on the caller's own session so the audit row and the change commit or roll back together, identically with or without durable jobs. `stage(db, action, ...)` / `stage_many` add the row to the caller's session and never commit; they **fail closed** (validation and storage errors propagate). `record_detached(action, outcome=..., ...)` writes on a session of its own for denials, failed logins and CLI commands and **fails open** (logged, counted, never raised); `get_audit_health()` reports `write_failures`, `last_failure_at`, `furthest_partition_date` and `last_checkpoint_at`. See [Audit trail](docs/audit.md).
+- **Catalog.** `AuditAction`, `AuditCatalog`, `get_catalog()`, `Category`, `Severity`, `Outcome`. Ids are `<module>.<resource>.<verb>`, stable forever; `details` are validated against a versioned `details_model` and capped at `audit.max_details_bytes`. The substrate registers `audit.retention.prune`, `audit.retention.change`, `audit.integrity.violation` and `audit.catalog.sync`. `sync_catalog()` publishes the catalog to `jasil_audit_actions` for readers that cannot import the host's code.
+- **Context.** `AuditContext`, `set_context`, `get_context`, `audit_context(...)`, `configure_provider`: a `ContextVar` modelled on `jasil.correlation`. `request_id` is always read from `jasil.correlation`.
+- **Query surface.** `list_entries` (keyset-paginated, always time-bounded, fourteen filters), `get_entry`, `summary`, `list_catalog` and `verify_checkpoints`, with Pydantic schemas.
+- **Maintenance.** `run_audit_maintenance()` and `schedule_audit_maintenance(scheduler, run_at_startup=True)`: catalog sync, retention-change record, partitions, checkpoints, retention, each step isolated, under its own lock. Scheduled by the host, like `jasil.retention`.
+- **Tamper evidence.** Signed (Ed25519), hash-chained checkpoints over fixed windows with a grace period, stored in `jasil_audit_checkpoints` and optionally copied to a write-once external sink: `AuditSink` / `AuditSinkConflictError` in `jasil.providers`, `Platform.audit_sink`, and the `file://` and `s3://` backends selected by `audit.external_sink_uri`. New optional extra `jasil[audit]` (`cryptography`); unsigned, hash-chained checkpoints need nothing.
+- `AuditSettings` (`JasilSettings.audit`): `enabled`, `retention_days` (90), `retention_floor_days` (30), `legal_hold`, `partition_days_ahead` (7), `checkpoint_window_minutes` (15), `checkpoint_grace_minutes` (5), `signing_key`, `external_sink_uri`, `max_details_bytes` (4096), `app_name`, `app_version`. Values are validated when the object is built.
+- `grants_sql(runtime_role, reader_role, maintenance_role=None, schema=None)` and `retention_floor_sql(days, schema="public")` return the SQL for the host to run.
+- `jasil.testing.capture_audit()` / `AuditCapture` (with `assert_audited`), working with `audit.enabled = False` and in both `JOBS_ENABLED` modes; `reset_all()` also resets the audit state.
+
+### Changed
+
+- Migration `rev0006` adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On PostgreSQL (13 or newer) `jasil_audit_log` is range-partitioned by day, `UPDATE`, `DELETE` and `TRUNCATE` are rejected by triggers, and two `SECURITY DEFINER` functions (`jasil_audit_ensure_partitions`, `jasil_audit_drop_partitions`) manage partitions; the latter refuses a cutoff inside a retention floor baked in from `audit.retention_floor_days` when the migration runs, and drops whole partitions only. Other dialects get a plain table. Run the migration as the role that should own the table and functions; processes of the previous release neither read nor write the new tables. Downgrading drops the audit trail.
+- `Platform` has a new field `audit_sink` (default `None`).
+
+No breaking changes: nothing is written until the host calls the audit API, and every addition is optional.
+
 ## [0.13.0] - 2026-10-27
 
 ### Added

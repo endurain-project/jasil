@@ -133,6 +133,20 @@ through.
       container-health policy in the host rather than mapping status to health
       automatically.
 
+## The audit trail
+
+- [ ] Run migration `rev0006` as the role that should own the audit table and functions, and
+      [grant](../audit.md#roles-and-grants) the application `INSERT` on `jasil_audit_log` and nothing else on it.
+- [ ] Give the observability product a separate, `SELECT`-only role, and run `run_audit_maintenance` as a role
+      that can read the log, ideally not the application's.
+- [ ] Set the context (`set_context`/`audit_context`) in every entry point: with none, rows say `anonymous`/`api`.
+- [ ] Keep `details` to ids and changed field names. Never a secret, a token or a password.
+- [ ] Schedule `schedule_audit_maintenance` on every replica and alert on `get_audit_health()`
+      (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing partition fails audited writes.
+- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a bucket with Object Lock),
+      and verify on a schedule with `verify_checkpoints`.
+- [ ] Do not expose a read route for the trail from the host application.
+
 ## Logging
 
 - [ ] JASIL logs through `logging.getLogger(__name__)` and configures nothing.

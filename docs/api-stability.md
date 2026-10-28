@@ -19,7 +19,7 @@ modules:
 
 | Module | Surface |
 |---|---|
-| `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), and `MAX_REALTIME_KEY_LENGTH`. |
+| `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), `AuditSink` and `AuditSinkConflictError`, and `MAX_REALTIME_KEY_LENGTH`. |
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
@@ -30,13 +30,14 @@ modules:
 | `jasil.capabilities` | `check_deployment_consistency`, `topology_of` and the individual `check_*` rules. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
-| `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `InProcessRealtime` (`clear`), `capture_hints`, `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
+| `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `InProcessRealtime` (`clear`), `capture_hints`, `capture_audit` with `AuditCapture` (`entries`, `matching`, `assert_audited`, `assert_not_audited`), `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
 | `jasil.admin` | `get_jobs_summary`, `get_event_log_summary`, `get_workers_summary`, `get_job`, `get_event_jobs`, `get_worker_attempts`, `replay_dead_letter_job`, and the response schemas re-exported alongside them. |
 | `jasil.publisher` | `publish`, `publish_committing`, `publish_many_committing`, `publish_on_commit`, `publish_many_on_commit`. |
 | `jasil.subscribers` | `best_effort`. |
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, `get_realtime`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `run_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
+| `jasil.audit` | Every name in its `__all__`: the catalog (`AuditAction`, `AuditCatalog`, `Category`, `Severity`, `Outcome`, `get_catalog`, the built-in actions and their details models), the context (`AuditContext`, `ActorType`, `Source`, `set_context`, `get_context`, `audit_context`, `configure_provider`, `reset_context`), the write paths (`stage`, `stage_many`, `record_detached`, `AuditRecord`, `get_audit_health`), the query surface (`list_entries`, `get_entry`, `summary`, `list_catalog`, `verify_checkpoints` and the schemas they return), maintenance (`run_audit_maintenance`, `schedule_audit_maintenance`, `sync_catalog`) and the SQL helpers (`grants_sql`, `retention_floor_sql`). The underscore modules (`jasil.audit._postgres`) are private. A host's architecture test should treat `jasil.audit` as public surface. |
 | `jasil.jobs` | `lease_lost`, `DeferJob`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract and the `on_dead_letter` callback contract: at-least-once, idempotent), `DeadLetterCallback`, `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
@@ -80,7 +81,11 @@ be able to read what a new one writes, or a rolling deploy breaks.
 ### Database schema
 
 The columns, indexes and constraints of `jasil_event_log`, `jasil_event_outbox`,
-`jasil_processing_jobs`, `jasil_job_workers`, and `jasil_job_attempts`. Schema
+`jasil_processing_jobs`, `jasil_job_workers`, `jasil_job_attempts`, `jasil_audit_log`,
+`jasil_audit_actions`, `jasil_audit_checkpoints`, and `jasil_instance`; and, on PostgreSQL, the names and
+signatures of `jasil_audit_ensure_partitions(integer)` and `jasil_audit_drop_partitions(timestamptz)`, the
+append-only behaviour of `jasil_audit_log`, and that retention drops whole partitions. The partition names
+(`jasil_audit_log_pYYYYMMDD`) are covered too. Schema
 changes ship as Alembic revisions, and a revision must be forward-compatible with
 the previous release: during a rolling deploy the old code runs against the new
 schema. The one exception is the `jasil_` prefix rename (`rev0003`, 0.9.0), which
@@ -92,8 +97,8 @@ Removing a column is a major change. Adding a nullable one is not.
 ### Exception types
 
 `StateBackendUnavailableError`, `StorageBackendUnavailableError`,
-`StorageKeyConflictError`, `StorageSizeLimitError`, `StorageUploadSessionError`, and
-`UnsupportedEventVersionError` — what raises them and what they inherit from.
+`StorageKeyConflictError`, `StorageSizeLimitError`, `StorageUploadSessionError`,
+`UnsupportedEventVersionError`, `UnknownAuditActionError`, `AuditDetailsError`, and `AuditSinkConflictError` — what raises them and what they inherit from.
 
 ## Not covered
 

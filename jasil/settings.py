@@ -18,7 +18,7 @@ it once at startup::
 Every component reads the installed settings through :func:`get_settings`.
 
 **Shape.** Configuration is grouped by concern — :class:`JobSettings`,
-:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
+:class:`EventLogSettings`, :class:`AuditSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
 :class:`NetworkSettings`, :class:`StorageSettings` —
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
@@ -38,6 +38,7 @@ from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode
 
 __all__ = [
+    "AuditSettings",
     "EventLogSettings",
     "GeocodingSettings",
     "JasilSettings",
@@ -120,6 +121,84 @@ class EventLogSettings:
 
     enabled: bool = False
     retention_days: int = 30
+
+
+@dataclass(frozen=True)
+class AuditSettings:
+    """Audit-trail configuration (see :mod:`jasil.audit`).
+
+    The values are checked when the object is built, so a bad one fails where the host
+    configures JASIL rather than on the first audited request.
+
+    Attributes:
+        enabled: Write audit rows. When false :func:`jasil.audit.stage` and
+            :func:`jasil.audit.record_detached` validate their arguments and then do nothing,
+            and :func:`jasil.audit.run_audit_maintenance` is a no-op.
+        retention_days: Age at which whole daily partitions are dropped. ``<= 0`` keeps every
+            row. Must be at least ``retention_floor_days`` when positive. The host maps its
+            deployment profile onto this value; JASIL only supplies the neutral default.
+        retention_floor_days: The youngest age the database-side guard will let
+            ``jasil_audit_drop_partitions`` drop, whatever the caller asks for. The value used is
+            the one baked into the function when migration ``rev0006`` ran; see
+            :func:`jasil.audit.retention_floor_sql` to change it. Must be at least 1.
+        legal_hold: Suspend all pruning.
+        partition_days_ahead: How many days of daily partitions the maintenance keeps created
+            ahead of today (PostgreSQL). A row whose day has no partition is rejected, so this is
+            the margin by which maintenance may stop running. Must be at least 1.
+        checkpoint_window_minutes: Length of one tamper-evidence window. Must be at least 1 and divide a
+            day (1440 minutes) evenly, so that no window straddles two daily partitions.
+        checkpoint_grace_minutes: How long past its end a window waits before it is sealed, so a
+            transaction that inserted a row inside it but commits later is still counted.
+        signing_key: Ed25519 private key, base64 of the 32 raw bytes, used to sign checkpoints.
+            ``None`` writes unsigned, hash-chained checkpoints. Needs ``jasil[audit]``.
+        external_sink_uri: ``file:///directory`` or ``s3://bucket/prefix`` — a write-once copy of
+            every checkpoint, kept outside the database. ``None`` keeps checkpoints in the
+            database only.
+        max_details_bytes: Largest serialized ``details`` payload a row may carry. Must be at
+            least 1.
+        app_name: Stamped on every row as ``app_name``.
+        app_version: Stamped on every row as ``app_version``.
+    """
+
+    enabled: bool = True
+    retention_days: int = 90
+    retention_floor_days: int = 30
+    legal_hold: bool = False
+    partition_days_ahead: int = 7
+    checkpoint_window_minutes: int = 15
+    checkpoint_grace_minutes: int = 5
+    signing_key: str | None = field(default=None, repr=False)
+    external_sink_uri: str | None = None
+    max_details_bytes: int = 4096
+    app_name: str | None = None
+    app_version: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject values the audit machinery cannot honour.
+
+        Raises:
+            ValueError: When a numeric setting is out of range, or ``retention_days`` is positive
+                but below ``retention_floor_days`` (every prune would be refused by the guard).
+        """
+        minimums = {
+            "retention_floor_days": 1,
+            "partition_days_ahead": 1,
+            "checkpoint_window_minutes": 1,
+            "checkpoint_grace_minutes": 0,
+            "max_details_bytes": 1,
+        }
+        for name, minimum in minimums.items():
+            if getattr(self, name) < minimum:
+                raise ValueError(f"audit.{name} must be at least {minimum}, not {getattr(self, name)}")
+        if 1440 % self.checkpoint_window_minutes:
+            raise ValueError(
+                f"audit.checkpoint_window_minutes ({self.checkpoint_window_minutes}) must divide a day (1440) evenly"
+            )
+        if 0 < self.retention_days < self.retention_floor_days:
+            raise ValueError(
+                f"audit.retention_days ({self.retention_days}) must be at least audit.retention_floor_days "
+                f"({self.retention_floor_days}), or <= 0 to keep every row"
+            )
 
 
 @dataclass(frozen=True)
@@ -285,6 +364,7 @@ class JasilSettings:
             must use different channels. Ignored for ``memory://``.
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
+        audit: Audit-trail configuration.
         geocoding: Reverse-geocoding backend configuration.
         mail: Outbound-mail backend configuration.
         network: Outbound-egress configuration.
@@ -306,6 +386,7 @@ class JasilSettings:
     events_group: str = "jasil"
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
+    audit: AuditSettings = field(default_factory=AuditSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
     mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
