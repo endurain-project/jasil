@@ -25,6 +25,9 @@ event = new_event(
 | `payload` | Domain data, homogeneous per `event_type`. |
 | `metadata` | Correlation context. |
 | `schema_version` | Which version of the payload's shape this carries. |
+| `retry_count` | Processing attempts so far: 0 on first publish; in a durable handler, the attempt being run, from 1. Read `attempt` and `is_last_attempt` rather than comparing it. |
+| `max_attempts` | The durable job's attempt ceiling; `None` outside a durable delivery. |
+| `deferral_count` | How many earlier runs of this durable job deferred with `DeferJob`; not counted in `retry_count`. |
 
 The envelope is frozen. Handlers share one instance, so a mutation would be
 visible to every other handler.

@@ -65,7 +65,7 @@ files. You build a settings object from whatever source you like and install it.
     application is built on `AsyncSession` throughout, the event log and durable
     jobs will not fit without a second, synchronous engine.
 
-    Async support is a candidate for a later release; it is not in `0.1.0`.
+    Async support is a candidate for a later release; no release has it yet.
 
 ## Quick start
 

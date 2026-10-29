@@ -23,11 +23,11 @@ modules:
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri` with its `StateBackendKind`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
-| `jasil.settings` | The settings dataclasses and `configure` / `get_settings`, `RuntimeSources`, and `mail_problems` with `MailProblem` and `MailProblemCode` (the set of codes may grow in a minor release; a code is never renamed or reused). |
-| `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `Base`, `jasil_table_names`, `legacy_table_names`. |
+| `jasil.settings` | The settings dataclasses and `configure` / `get_settings` / `is_configured`, `RuntimeSources`, and `mail_problems` with `MailProblem` and `MailProblemCode` (the set of codes may grow in a minor release; a code is never renamed or reused). |
+| `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `is_models_mapped`, `is_sessionmaker_configured`, `Base`, `jasil_table_names`, `legacy_table_names`. |
 | `jasil.correlation` | `configure_provider`, `get_correlation_id`, `set_correlation_id`. |
 | `jasil.container` | `Platform`, `build_platform` (including its `sources` parameter). |
-| `jasil.capabilities` | `check_deployment_consistency`, `topology_of`, the individual `check_*` rules, and `build_capability_report` (the function and its `render()` method). The *rendered* report is not covered — see below. |
+| `jasil.capabilities` | `check_deployment_consistency`, `topology_of`, the individual `check_*` rules and the `StateSource` that `check_state_consistency` takes, and `build_capability_report` with the `CapabilityReport` (`topology`, `rows`, `render()`) and `CapabilityRow` (`name`, `backend`, `source`) it returns. The *rendered* report is not covered — see below. |
 | `jasil.runtime` | `set_active_platform`, `get_active_platform`, `is_platform_active`, `get_state`, `reset`. |
 | `jasil.lifecycle` | `shutdown`, and the order in which it releases what JASIL owns. |
 | `jasil.testing` | `FixedClock`, `MemoryMail` (`outbox`, `built`, `clear`), `InProcessRealtime` (`clear`), `capture_hints`, `capture_audit` with `AuditCapture` (`entries`, `matching`, `assert_audited`, `assert_not_audited`), `install_test_platform`, `memory_mail`, `reset_all`. Covered because a host's test suite depends on it as much as its production code does. |
@@ -41,7 +41,7 @@ modules:
 | `jasil.jobs` | `lease_lost`, `DeferJob`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract and the `on_dead_letter` callback contract: at-least-once within 10 deliveries and a 7-day window, delivered by the scheduled sweep, idempotent), `DeadLetterCallback`, `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
-| `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`, `jasil_include_object`. |
+| `jasil.migrations` | `upgrade`, `downgrade`, `adopt_existing_schema`, `SchemaCompatibilityError`, `head_revision`, `db_revision`, `verify_schema_current`, `jasil_include_object`, and `VERSION_TABLE`, the name of JASIL's Alembic version table. |
 
 ### Provider protocols
 
@@ -128,6 +128,27 @@ The `str()` of an exception. The **type** is stable; the wording is not.
 Tuning defaults — `lease_seconds`, `max_runtime_seconds`, `batch_size`, backoff
 parameters, retention windows — may be adjusted in a minor release if a better
 value is found. Pin any you depend on by setting them explicitly.
+
+### Names exported for JASIL's own use
+
+These are importable, some from a module's `__all__`, but they serve JASIL's
+wiring and tests:
+
+- `jasil.orm.get_active_base` and `jasil.orm.mapper_registry`.
+- The `reset()` functions of `jasil.orm`, `jasil.settings` and `jasil.correlation`.
+  A host's tests call `jasil.testing.reset_all`, which is covered.
+- `jasil.jobs.service.relay_outbox_scheduled`, `reap_expired_jobs_scheduled` and
+  `deliver_dead_letters_scheduled`. Register them with `schedule_job_maintenance`,
+  which is covered, rather than by name.
+
+### Backend classes
+
+The classes under `jasil.backends` (`MemoryState`, `RedisState`, `LocalStorage`,
+`S3Storage`, `SmtpMail` and the rest), with their constructors and any method
+beyond the protocol they implement. A backend is chosen by its URI scheme, which
+is covered, and used through its provider protocol, which is covered too. The two
+test doubles `jasil.testing` re-exports, `MemoryMail` and `InProcessRealtime`, are
+covered there.
 
 ### Internal helpers
 

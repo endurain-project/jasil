@@ -292,12 +292,13 @@ correlation.configure_provider(my_middleware.get_request_id)
 `map_models` must run **before any JASIL model module is imported** — importing
 one beforehand raises a `RuntimeError` telling you so.
 
-In practice that constrains two modules only:
+In practice that constrains the model modules and the internals that use them:
 
 | Module | Safe to import at module scope? |
 |---|---|
-| `jasil.jobs.crud`, `jasil.event_log.crud` | **No** — import them inside a function, or after `map_models` has run. |
-| everything else, including `jasil.publisher`, `jasil.retention`, `jasil.jobs.service`, `jasil.container`, `jasil.deps`, `jasil.testing` | Yes, from anywhere. |
+| `jasil.jobs.models`, `jasil.event_log.models`, `jasil.audit.models`, `jasil.jobs.crud`, `jasil.event_log.crud` | **No** — import them inside a function, or after `map_models` has run. |
+| The durable-job and event-log internals: `jasil.jobs.runner`, `worker`, `heartbeat`, `relay`, `outbox`, `dead_letter`, and `jasil.event_log.recorder` | **No**, for the same reason. |
+| everything else, including `jasil.audit`, `jasil.publisher`, `jasil.retention`, `jasil.jobs.service`, `jasil.jobs.registry`, `jasil.admin`, `jasil.migrations`, `jasil.container`, `jasil.deps`, `jasil.testing` | Yes, from anywhere. |
 
 That split matters because `jasil.publisher` is imported by every module that
 publishes an event, deep in your import graph and long before any startup hook
