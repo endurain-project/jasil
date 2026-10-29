@@ -14,7 +14,7 @@ sessions.
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
 import jasil.orm as jasil_orm
 from jasil._core.cursors import decode_cursor, encode_cursor
@@ -150,7 +150,7 @@ def summary(hours: int = 24) -> AuditSummary:
     until = service.now()
     window = [AuditLog.occurred_at >= until - timedelta(hours=hours), AuditLog.occurred_at <= until]
 
-    def counts(column: ColumnElement[str]) -> dict[str, int]:
+    def counts(column: SQLColumnExpression[str]) -> dict[str, int]:
         return {key: count for key, count in db.execute(select(column, func.count()).where(*window).group_by(column))}
 
     with jasil_orm.get_sessionmaker()() as db:
