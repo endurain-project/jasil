@@ -1,5 +1,6 @@
 """The event envelope and the payload-versioning skew rules."""
 
+import dataclasses
 import uuid
 from datetime import datetime
 from typing import ClassVar
@@ -68,7 +69,7 @@ class TestNewEvent:
         """Handlers share one envelope; a mutation would be visible to the others."""
         event = new_event("a.b", {}, source="test")
 
-        with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             event.event_type = "other"  # type: ignore[misc]
 
 

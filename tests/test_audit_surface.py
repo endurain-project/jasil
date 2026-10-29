@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 import jasil.audit as jasil_audit
@@ -147,7 +148,7 @@ class TestInstanceId:
         db.commit()
         db.add(Instance(id=2, instance_id="b"))
 
-        with pytest.raises(Exception, match=r"(?i)constraint|check"):
+        with pytest.raises(DBAPIError, match=r"(?i)constraint|check"):
             db.commit()
         db.rollback()
 

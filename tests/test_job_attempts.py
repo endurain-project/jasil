@@ -300,7 +300,7 @@ class TestAHandlerThatOutlivesItsLease:
         first, second = _attempts(db, job.id)
         assert (first.worker_id, first.attempt, first.outcome) == ("worker-1", 1, "superseded")
         assert first.duration_ms == 150_000
-        assert first.error == ("boom" if fails else None)
+        assert first.error == ("RuntimeError: boom" if fails else None)
         assert (second.worker_id, second.attempt, second.outcome) == ("other", 2, None)
         stored = _job(db)
         assert (stored.status, stored.locked_by) == (jobs_crud.STATUS_CLAIMED, "other")

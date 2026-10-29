@@ -180,6 +180,11 @@ operations.
     `max_bytes` while reading. On a breach they raise `StorageSizeLimitError`, and
     no partial new object is visible: local disk removes its temporary file and S3
     calls `AbortMultipartUpload`. The previous object, if any, stays in place.
+- Every local write (`save`, `save_stream`, an upload part, `complete_upload`)
+    goes to a temporary file that is flushed to disk before an atomic rename
+    publishes it, and the directory holding the new name is synced after, so a
+    write that returned survives a crash. A crash mid-write can leave a hidden
+    temporary file beside the object; it is never listed or served.
 - `open_stream` returns a read-once, non-seekable binary stream on **both**
     backends. Always close it, normally with `with`. A missing object raises
     `FileNotFoundError`; it never becomes an empty stream.
@@ -243,7 +248,9 @@ storage uses durable manifests and atomic part files under the reserved
 the same reserved namespace and maps their opaque IDs to native multipart upload
 IDs. Both backends reserve that area name so switching backends cannot expose
 session state as ordinary objects. `.jasil-objects` is also reserved for the
-local physical layout.
+local physical layout, and so is every other area whose name starts with
+`.jasil-`, in any letter case (a case-insensitive filesystem would otherwise
+reach the reserved directories under another spelling).
 
 `upload_part` and `complete_upload` raise `StorageUploadSessionError` for an
 unknown, cleaned, completed, mismatched, or foreign session and for a stale part

@@ -24,9 +24,11 @@ whenever configuration is.
   into a URL — `evil.example.com/x` becomes `https://evil.example.com/x/reverse`,
   whose hostname check passes.
 - Every A/AAAA record the name resolves to must be public unicast. A single
-  private, loopback, link-local, multicast, unspecified, or reserved answer
-  rejects the host. Requiring *all* answers is what defeats a name that returns
-  a public address on the first lookup and a private one on the next.
+  private, loopback, link-local, multicast, unspecified, reserved, or otherwise
+  not globally reachable answer (such as the shared address space
+  `100.64.0.0/10`) rejects the host. Requiring *all* answers defeats a name that
+  mixes public and private addresses in one lookup; it does not defeat one that
+  changes its answer after the check (see the limits below).
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
@@ -63,7 +65,8 @@ field through which a caller could set an arbitrary header.
 not offer STARTTLS rather than downgrading, and AUTH is sent only after TLS is
 up. The one opt-out, `mail.secure = False`, is cleartext and is accepted only for
 `smtp://`, only when the host resolves exclusively to private, loopback or
-link-local addresses, and never with credentials. The check runs at startup and
+link-local addresses (IPv6 ranges a gateway carries to a public IPv4 host, NAT64,
+Teredo and 6to4, do not count), and never with credentials. The check runs at startup and
 again on every send, and the connection goes to the address that was checked
 rather than to the name, so a DNS change cannot redirect cleartext mail to a
 public host. Every

@@ -12,7 +12,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import suppress
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import BinaryIO
+from typing import IO, Any, BinaryIO
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -190,8 +190,10 @@ class LocalStorage:
             temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                temporary_path.write_text(value, encoding="utf-8")
-                os.replace(temporary_path, path)
+                with temporary_path.open("x", encoding="utf-8") as handle:
+                    handle.write(value)
+                    _sync(handle)
+                self._install(temporary_path, path)
             except OSError as error:
                 with suppress(OSError):
                     temporary_path.unlink(missing_ok=True)
@@ -280,7 +282,8 @@ class LocalStorage:
                 path.parent.mkdir(parents=True, exist_ok=True)
             with temporary_path.open("xb") as destination:
                 destination.write(data)
-            self._replace_plain_object(temporary_path, path)
+                _sync(destination)
+            self._install(temporary_path, path)
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
@@ -288,16 +291,20 @@ class LocalStorage:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     @staticmethod
-    def _replace_plain_object(temporary_path: Path, destination: Path) -> None:
-        """Atomically install a plain object, recreating a concurrently pruned parent once."""
+    def _install(temporary_path: Path, destination: Path) -> None:
+        """Atomically move a synced temporary file over ``destination`` and make the new name durable.
+
+        Recreates a parent that a concurrent prune removed, once.
+        """
         for attempt in range(2):
             destination.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.replace(temporary_path, destination)
-                return
+                break
             except FileNotFoundError:
                 if attempt:
                     raise
+        _sync_directory(destination.parent)
 
     def _discard_replaced_object(self, area: str, key: str) -> None:
         """Remove the prior representation after a new object is committed."""
@@ -562,11 +569,9 @@ class LocalStorage:
                 except OSError as error:
                     raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
             try:
+                _sync(destination)
                 destination.close()
-                if area in self._plain_areas:
-                    self._replace_plain_object(temporary_path, path)
-                else:
-                    os.replace(temporary_path, path)
+                self._install(temporary_path, path)
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
@@ -622,11 +627,12 @@ class LocalStorage:
         try:
             session_directory.mkdir(parents=True)
             (session_directory / _UPLOAD_PARTS_DIRECTORY).mkdir()
-            (session_directory / _UPLOAD_MANIFEST).write_text(
-                json.dumps(manifest, separators=(",", ":")),
-                encoding="utf-8",
-            )
+            with (session_directory / _UPLOAD_MANIFEST).open("x", encoding="utf-8") as handle:
+                handle.write(json.dumps(manifest, separators=(",", ":")))
+                _sync(handle)
             os.utime(session_directory, (created_epoch, created_epoch))
+            _sync_directory(session_directory)
+            _sync_directory(session_directory.parent)
         except OSError as error:
             with suppress(OSError):
                 shutil.rmtree(session_directory)
@@ -669,8 +675,9 @@ class LocalStorage:
                 digest.update(chunk)
             reader.verify_complete()
             try:
+                _sync(destination)
                 destination.close()
-                os.replace(temporary_path, part_path)
+                self._install(temporary_path, part_path)
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
@@ -719,10 +726,8 @@ class LocalStorage:
                             copied += len(chunk)
                     if copied != part.size or f'"sha256-{digest.hexdigest()}"' != part.validator:
                         raise StorageUploadSessionError(f"Upload part {part.part_number} does not match its reference")
-            if session.area in self._plain_areas:
-                self._replace_plain_object(temporary_path, destination_path)
-            else:
-                os.replace(temporary_path, destination_path)
+                _sync(destination)
+            self._install(temporary_path, destination_path)
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
@@ -1115,3 +1120,23 @@ class LocalStorage:
         except (OSError, ValueError) as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         return f"{self._url_prefix}/{quote(relative_path, safe='/')}"
+
+
+def _sync(handle: IO[Any]) -> None:
+    """Flush ``handle`` to the disk, so the rename that publishes it cannot outlive its bytes in a crash."""
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _sync_directory(directory: Path) -> None:
+    """Make a new entry in ``directory`` durable: syncing a file does not sync the name pointing to it.
+
+    Windows cannot open a directory for syncing and journals the metadata itself, so there it is skipped.
+    """
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)

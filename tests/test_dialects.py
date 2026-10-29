@@ -68,6 +68,11 @@ class TestSupportsSkipLocked:
         """MariaDB reports as 'mysql' but gained SKIP LOCKED at a different version."""
         assert supports_skip_locked(_bind("mysql", server_version_info=version, is_mariadb=True)) is expected
 
+    @pytest.mark.parametrize(("version", "expected"), [((10, 6, 0), True), ((10, 5, 0), False)])
+    def test_a_mariadb_url_is_recognised_too(self, version, expected):
+        """A ``mariadb+...`` engine's dialect is named ``mariadb`` rather than ``mysql``."""
+        assert supports_skip_locked(_bind("mariadb", server_version_info=version, is_mariadb=True)) is expected
+
     def test_an_unknown_mysql_version_is_unsupported(self):
         """``server_version_info`` is only populated after connecting."""
         assert supports_skip_locked(_bind("mysql", server_version_info=None)) is False

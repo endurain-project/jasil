@@ -12,7 +12,9 @@ to share a rule they both enforce.
 
 OBJECT_STORAGE_AREA = ".jasil-objects"
 UPLOAD_STAGING_AREA = ".jasil-upload-sessions"
-_INTERNAL_AREAS = frozenset({OBJECT_STORAGE_AREA, UPLOAD_STAGING_AREA})
+# Every area under this prefix is JASIL's, compared case-insensitively: on a case-insensitive filesystem
+# ``.JASIL-OBJECTS`` is the same directory as ``.jasil-objects``.
+_RESERVED_AREA_PREFIX = ".jasil-"
 
 __all__ = ["OBJECT_STORAGE_AREA", "UPLOAD_STAGING_AREA", "check_area", "check_listing_prefix", "check_segment"]
 
@@ -22,7 +24,7 @@ def check_area(area: str) -> None:
     check_segment(area, "area")
     if "/" in area:
         raise ValueError(f"Storage area must be a single path component: {area!r}")
-    if area in _INTERNAL_AREAS:
+    if area.casefold().startswith(_RESERVED_AREA_PREFIX):
         raise ValueError(f"Storage area is reserved: {area!r}")
 
 

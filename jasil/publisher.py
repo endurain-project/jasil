@@ -328,9 +328,10 @@ def publish_on_commit(
       dispatched. Dispatch failures are logged and swallowed.
 
     "Outermost" is the session's outermost transaction. If the session joined an
-    external transaction (``join_transaction_mode="create_savepoint"``), its
-    ``commit()`` is that session's outermost commit even though the enclosing
-    transaction may still roll back.
+    external transaction (bound to a connection that already has one open, in any
+    ``join_transaction_mode``), its ``commit()`` is that session's outermost commit
+    and the events are dispatched then, even though the enclosing transaction may
+    still roll back.
 
     Publishing starts the session's transaction if none is active. Sessions are
     synchronous ``sqlalchemy.orm.Session`` instances; each carries its own pending

@@ -61,7 +61,10 @@ jobs_registry.registry.register(
 Queue ownership belongs to the subscriber rather than the event. One event can
 fan out to several subscribers on different queues, and the relay stamps each
 subscriber's queue on its own job. Names are 1–100 lowercase ASCII characters:
-letters, digits, `.`, `_`, and `-`; an invalid name raises before persistence.
+letters, digits, `.`, `_`, and `-`, starting with a letter or a digit; an invalid
+name raises before persistence. Registering a `subscriber_id` again replaces its
+handler, queue and callback, and moves it to the new event type if it was
+registered under another one.
 
 ### Attempt counts
 
@@ -159,7 +162,8 @@ jobs_registry.registry.register(
 whichever way it got there: the handler raised on its last attempt, the lease
 expired on the last attempt, or the reaper recovered a worker that died.
 `event` is the job's envelope with its final `retry_count` and `max_attempts`;
-`error` is the stored last failure reason (`str | None`).
+`error` is the stored last failure reason (`str | None`); for an exception it is
+`"<ExceptionType>: <message>"`, so it names the failure even when the message is empty.
 
 * **At least once.** Delivery is recorded in `dead_letter_notified_at` only after the
   callback returns. A crash, or a callback that raises, leaves the callback owed and a

@@ -111,6 +111,7 @@ def enqueue_job(
         "event_type": event.event_type,
         "subscriber_id": subscriber_id,
         "source": event.source,
+        "event_timestamp": event.timestamp,
         "payload": event.payload,
         "schema_version": event.schema_version,
         "job_metadata": event.metadata or None,
@@ -943,6 +944,7 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
                 completed_at=now,
                 updated_at=now,
                 locked_by=None,
+                locked_at=None,
                 lease_expires_at=None,
             )
             # ``fetch`` rather than the default in-Python evaluation: the criteria now
@@ -1235,10 +1237,18 @@ class DeadLetterJob:
     event: Event
     last_error: str | None
     delivery_attempt: int
+    #: When the job became ``dead_letter`` (its ``completed_at``). A replay clears it, so it tells this dead
+    #: letter apart from a later one of the same job, whose delivery count starts again.
+    dead_at: datetime | None
 
     def to_event(self) -> Event:
         """The envelope handed to the callback."""
         return self.event
+
+
+def envelope_timestamp(row: ProcessingJob) -> str:
+    """Return the publish timestamp a job's envelope carries; a job from before ``rev0007`` has its enqueue time."""
+    return row.event_timestamp or as_utc(row.created_at).isoformat()
 
 
 def event_from_row(row: ProcessingJob) -> Event:
@@ -1247,7 +1257,7 @@ def event_from_row(row: ProcessingJob) -> Event:
         event_id=row.event_id,
         event_type=row.event_type,
         source=row.source,
-        timestamp=as_utc(row.created_at).isoformat(),
+        timestamp=envelope_timestamp(row),
         payload=dict(row.payload),
         metadata=dict(row.job_metadata) if row.job_metadata else {},
         retry_count=row.attempts - row.deferrals,
@@ -1334,30 +1344,29 @@ def claim_dead_letter_callbacks(
                 event=event_from_row(row),
                 last_error=row.last_error,
                 delivery_attempt=row.dead_letter_attempts + 1,
+                dead_at=row.completed_at,
             )
         )
     db.commit()
     return jobs
 
 
-def mark_dead_letter_notified(job_id: str, *, delivery_attempt: int, now: datetime, db: Session) -> bool:
+def mark_dead_letter_notified(claim: DeadLetterJob, *, now: datetime, db: Session) -> bool:
     """
-    Record that the dead-letter callback succeeded for ``job_id``.
+    Record that the dead-letter callback succeeded for the job ``claim`` delivered.
 
     Args:
-        job_id: The dead-lettered job.
-        delivery_attempt: The claim being settled (``DeadLetterJob.delivery_attempt``).
+        claim: The delivery being settled, as :func:`claim_dead_letter_callbacks` returned it.
         now: Current instant.
         db: Active database session.
 
     Returns:
         True when this call set the marker; False when the claim was no longer
-        this one's (already recorded, re-claimed after its lease ran out, or
-        replayed meanwhile).
+        the live one (already recorded, re-claimed after its lease ran out, or
+        replayed meanwhile, also when the job has dead-lettered again since).
     """
     return _update_dead_letter(
-        job_id,
-        delivery_attempt,
+        claim,
         db=db,
         dead_letter_notified_at=now,
         dead_letter_notify_after=None,
@@ -1365,48 +1374,60 @@ def mark_dead_letter_notified(job_id: str, *, delivery_attempt: int, now: dateti
     )
 
 
-def defer_dead_letter_callback(
-    job_id: str, *, delivery_attempt: int, retry_at: datetime, error: str, db: Session
-) -> bool:
+def defer_dead_letter_callback(claim: DeadLetterJob, *, retry_at: datetime, error: str, db: Session) -> bool:
     """
     Schedule a failed callback's next delivery and keep the failure for diagnosis.
 
     Leaves ``updated_at`` alone, which is the instant the job was dead-lettered.
 
     Args:
-        job_id: The dead-lettered job.
-        delivery_attempt: The claim being settled (``DeadLetterJob.delivery_attempt``).
+        claim: The delivery being settled, as :func:`claim_dead_letter_callbacks` returned it.
         retry_at: Earliest instant the callback may be delivered again.
         error: What the callback raised.
         db: Active database session.
+
+    Returns:
+        True when the claim was still the live one and the retry was recorded.
     """
     return _update_dead_letter(
-        job_id,
-        delivery_attempt,
+        claim,
         db=db,
         dead_letter_notify_after=retry_at,
         dead_letter_callback_error=fit_length(error, MAX_STORED_ERROR_LENGTH),
     )
 
 
-def release_dead_letter_claim(job_id: str, *, delivery_attempt: int, db: Session) -> bool:
-    """Undo a claim whose callback was never run, so the delivery is not counted."""
+def release_dead_letter_claim(claim: DeadLetterJob, *, db: Session) -> bool:
+    """
+    Undo a claim whose callback was never run, so the delivery is not counted.
+
+    Args:
+        claim: The delivery being released, as :func:`claim_dead_letter_callbacks` returned it.
+        db: Active database session.
+
+    Returns:
+        True when the claim was still the live one and was released.
+    """
     return _update_dead_letter(
-        job_id, delivery_attempt, db=db, dead_letter_notify_after=None, dead_letter_attempts=delivery_attempt - 1
+        claim, db=db, dead_letter_notify_after=None, dead_letter_attempts=claim.delivery_attempt - 1
     )
 
 
-def _update_dead_letter(job_id: str, delivery_attempt: int, *, db: Session, **values: Any) -> bool:
-    """Write to a dead letter only while ``delivery_attempt`` is still the live claim."""
+def _update_dead_letter(claim: DeadLetterJob, *, db: Session, **values: Any) -> bool:
+    """Write to a dead letter only while ``claim`` is still the live claim of the same dead letter."""
+    same_dead_letter = (
+        ProcessingJob.completed_at.is_(None) if claim.dead_at is None else ProcessingJob.completed_at == claim.dead_at
+    )
     updated = cast(
         CursorResult[Any],
         db.execute(
             update(ProcessingJob)
             .where(
-                ProcessingJob.id == job_id,
+                ProcessingJob.id == claim.id,
                 ProcessingJob.status == STATUS_DEAD_LETTER,
                 ProcessingJob.dead_letter_notified_at.is_(None),
-                ProcessingJob.dead_letter_attempts == delivery_attempt,
+                ProcessingJob.dead_letter_attempts == claim.delivery_attempt,
+                same_dead_letter,
             )
             .values(**values)
         ),
@@ -1468,7 +1489,7 @@ def _insert_ignoring_duplicate(values: dict, db: Session):
         return pg_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
     if dialect == "sqlite":
         return sqlite_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect == "mysql":  # pragma: no cover - exercised on MySQL, not in SQLite tests
+    if dialect in ("mysql", "mariadb"):  # pragma: no cover - exercised on MySQL, not in SQLite tests
         # MySQL has no ON CONFLICT DO NOTHING. Assigning a column to *itself*
         # is the standard no-op form; ``INSERT IGNORE`` would also swallow
         # unrelated errors such as truncation.
@@ -1476,5 +1497,5 @@ def _insert_ignoring_duplicate(values: dict, db: Session):
         return statement.on_duplicate_key_update(event_id=ProcessingJob.event_id)
     raise RuntimeError(
         f"JASIL's durable jobs need an insert-or-ignore clause, which dialect {dialect!r} does not provide. "
-        "Supported: postgresql, mysql, sqlite."
+        "Supported: postgresql, mysql, mariadb, sqlite."
     )

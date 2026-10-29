@@ -105,7 +105,7 @@ def deliver_dead_letters(
             subscribers.discard(job.subscriber_id)
             logger.warning("Dead-letter callback was unregistered before it ran; leaving it owed", extra=context)
             _record(
-                partial(jobs_crud.release_dead_letter_claim, job.id, delivery_attempt=job.delivery_attempt),
+                partial(jobs_crud.release_dead_letter_claim, job),
                 session_factory,
                 context,
             )
@@ -121,8 +121,7 @@ def deliver_dead_letters(
             _record(
                 partial(
                     jobs_crud.defer_dead_letter_callback,
-                    job.id,
-                    delivery_attempt=job.delivery_attempt,
+                    job,
                     retry_at=retry_at,
                     error=f"{type(error).__name__}: {error}",
                 ),
@@ -134,8 +133,7 @@ def deliver_dead_letters(
         _record(
             partial(
                 jobs_crud.mark_dead_letter_notified,
-                job.id,
-                delivery_attempt=job.delivery_attempt,
+                job,
                 now=clock.now(),
             ),
             session_factory,

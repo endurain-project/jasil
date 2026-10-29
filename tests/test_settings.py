@@ -1,11 +1,13 @@
 """Settings, correlation ids, and the config slot they are both built on."""
 
+import dataclasses
+
 import pytest
 
 import jasil.correlation as correlation
 import jasil.settings as settings
 from jasil._core.registry import ConfigSlot
-from jasil.profile import DeploymentProfile
+from jasil.profile import DeploymentProfile, JobWorkerMode
 
 
 class TestConfigSlot:
@@ -116,6 +118,21 @@ class TestCapabilityUriResolution:
         assert resolved.resolved_realtime_uri == "redis://hints:6379"
 
 
+class TestProfileValues:
+    """Every rule compares by identity, so a plain string must not slip through as a profile nobody matches."""
+
+    def test_a_profile_given_as_its_name_is_the_profile(self):
+        assert settings.JasilSettings(profile="distributed").profile is DeploymentProfile.DISTRIBUTED
+
+    def test_a_worker_mode_given_as_its_name_is_the_mode(self):
+        assert settings.JasilSettings(job_worker_mode="standalone").job_worker_mode is JobWorkerMode.STANDALONE
+
+    @pytest.mark.parametrize("field", ["profile", "job_worker_mode"])
+    def test_a_misspelt_value_is_refused(self, field):
+        with pytest.raises(ValueError, match="Valid values"):
+            settings.JasilSettings(**{field: "distributd"})
+
+
 class TestSettingsInstallation:
     def test_get_settings_returns_defaults_before_configure(self):
         """Settings are optional: a host running the local profile configures nothing."""
@@ -137,7 +154,7 @@ class TestSettingsInstallation:
 
     def test_settings_are_immutable(self):
         """Frozen so a component cannot mutate configuration another already read."""
-        with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             settings.get_settings().data_dir = "/srv/elsewhere"  # type: ignore[misc]
 
     def test_grouped_defaults_are_not_shared_between_instances(self):

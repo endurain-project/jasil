@@ -8,6 +8,7 @@ different contract:
 * the **subscriber wrapper** swallows, so one bad subscriber cannot fail a request.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -101,6 +102,17 @@ class TestJobRunner:
         assert seen[0].event_type == "activity.created"
         assert seen[0].payload == {"id": 1}
 
+    def test_the_handler_sees_the_publish_timestamp_not_the_enqueue_time(self, runner, registry, db):
+        """The envelope's ``timestamp`` is when the event was first published, whenever its job was enqueued."""
+        seen = []
+        registry.register("activity.created", "s", seen.append)
+        event = replace(new_event("activity.created", {"id": 1}, source="test"), timestamp="2025-12-31T23:59:00+00:00")
+        jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        assert seen[0].timestamp == "2025-12-31T23:59:00+00:00"
+
     def test_a_successful_run_completes_the_job(self, runner, registry, db):
         registry.register("activity.created", "s", lambda _e: None)
         self._enqueue(db)
@@ -130,6 +142,27 @@ class TestJobRunner:
         runner.run_once()
 
         assert stored_job(db).status == jobs_crud.STATUS_DEAD_LETTER
+
+    @pytest.mark.parametrize(
+        ("error", "recorded"),
+        [
+            (AssertionError(), "AssertionError: "),
+            (KeyError("x"), "KeyError: 'x'"),
+            (RuntimeError("down"), "RuntimeError: down"),
+        ],
+    )
+    def test_the_recorded_error_names_its_type(self, runner, registry, db, error, recorded):
+        """``str(AssertionError())`` is empty: a dead letter would carry no reason at all."""
+
+        def _raise(_event):
+            raise error
+
+        registry.register("activity.created", "s", _raise)
+        self._enqueue(db, max_attempts=1)
+
+        runner.run_once()
+
+        assert stored_job(db).last_error == recorded
 
     def test_a_job_with_no_registered_handler_fails_rather_than_vanishing(self, runner, db):
         """A subscriber removed from the code while jobs are still queued must

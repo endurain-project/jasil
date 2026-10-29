@@ -33,6 +33,19 @@ orm.map_models()
 
 
 @pytest.fixture(autouse=True)
+def _no_cloud_metadata():
+    """Keep boto3 off the EC2 instance-metadata endpoint.
+
+    A client built without credentials probes ``169.254.169.254`` for them, a real network call that also
+    costs seconds per client. A private ``MonkeyPatch``, so a test's own ``monkeypatch`` is still created,
+    and undone, in the order its fixtures ask for it.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_process_state():
     """Clear the process-wide config slots so tests cannot leak into each other.
 

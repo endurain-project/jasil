@@ -356,6 +356,13 @@ class TestRecorderIntegration:
 
         assert recorder.tracked[0][2] is None
 
+    def test_an_envelope_that_cannot_be_serialized_is_not_recorded_as_published(self, bus, recorder):
+        """The row would stay ``published`` with nothing on the stream to move it on."""
+        with pytest.raises(TypeError):
+            bus.publish(new_event("order.created", {"when": object()}, source="api"))
+
+        assert recorder.published == []
+
     def test_a_failure_reaches_the_recorder(self, bus, recorder):
         event = new_event("order.created", {}, source="api")
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))

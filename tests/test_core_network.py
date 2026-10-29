@@ -96,6 +96,9 @@ class TestNonPublicAddresses:
             pytest.param("240.0.0.1", id="reserved"),
             pytest.param(IPV6_LOOPBACK, id="ipv6-loopback"),
             pytest.param("fc00::1", id="ipv6-unique-local"),
+            pytest.param("100.100.100.200", id="shared-address-space-cloud-metadata"),
+            pytest.param("100.64.0.1", id="shared-address-space"),
+            pytest.param("fec0::1", id="ipv6-site-local"),
         ],
     )
     def test_a_non_public_address_is_refused(self, resolve, ip):
@@ -228,7 +231,11 @@ class TestAllowlist:
         assert caplog.records == []
 
 
-@pytest.mark.parametrize("address", ["64:ff9b:1::808:808", "2001:0:4136:e378:8000:63bf:3fff:fdd2"])
+@pytest.mark.parametrize(
+    "address",
+    ["64:ff9b:1::808:808", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2002:808:808::1"],
+    ids=["nat64", "teredo", "6to4"],
+)
 def test_tunnelled_ipv6_ranges_are_not_private_for_cleartext(monkeypatch, address):
     monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
     addresses, reason = network.resolve_private_addresses("relay.internal")

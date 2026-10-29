@@ -156,7 +156,9 @@ through.
 - [ ] JASIL logs through `logging.getLogger(__name__)` and configures nothing.
       Route the `jasil.*` loggers wherever your application logs go.
 - [ ] Do not run production at `DEBUG`. The debug lines name every event
-      published and every job batch claimed.
+      published and every job batch claimed, and at `DEBUG` the `urllib3` logger
+      writes each geocoding request line, with the coordinates and, for
+      `geocode://`, the API key in its query string.
 - [ ] Do not parse or alert on log *wording* — only levels and structured fields
       are stable. See [API stability](../api-stability.md).
 - [ ] Wire `jasil.correlation.configure_provider` to your request-id middleware so

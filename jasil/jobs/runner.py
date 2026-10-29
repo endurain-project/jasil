@@ -47,7 +47,7 @@ class ClaimedJob:
             deferred claims too.
         deferrals: Earlier claims of this job the handler deferred. ``attempts -
             deferrals`` is the attempt this run is against ``max_attempts``.
-        timestamp: ISO-8601 enqueue time, used to rebuild the event envelope.
+        timestamp: The envelope's ISO-8601 publish timestamp (the enqueue time for a job from before ``rev0007``).
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
         queue: Named queue from which the job was claimed.
@@ -445,7 +445,7 @@ class JobRunner:
         with self._session_factory() as db:
             status = jobs_crud.mark_job_failed(
                 job.id,
-                str(error),
+                f"{type(error).__name__}: {error}",
                 worker_id=self._worker_id,
                 attempt=job.attempts,
                 base_seconds=self._backoff_base_seconds,
@@ -504,7 +504,7 @@ class JobRunner:
             metadata=dict(job.job_metadata) if job.job_metadata else None,
             attempts=job.attempts,
             deferrals=job.deferrals,
-            timestamp=as_utc(job.created_at).isoformat(),
+            timestamp=jobs_crud.envelope_timestamp(job),
             schema_version=job.schema_version,
             queue=job.queue,
             max_attempts=job.max_attempts,

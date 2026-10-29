@@ -56,12 +56,14 @@ def is_valid_hostname(value: str) -> bool:
 
 
 def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Return True if ``addr`` belongs to any non-routable range.
+    """Return True if ``addr`` is anything but a public unicast address.
 
     Combines every "do not dial" predicate ``ipaddress`` exposes: private
-    (RFC1918, fc00::/7), loopback, link-local, multicast, unspecified, and
-    reserved. Any of these would let an attacker pivot to internal
-    infrastructure or a cloud metadata service.
+    (RFC1918, fc00::/7), loopback, link-local, multicast, unspecified, reserved,
+    and not globally reachable. The last catches what the others leave out, such
+    as the shared address space ``100.64.0.0/10``, where one cloud serves its
+    instance metadata. Any of these would let an attacker pivot to internal
+    infrastructure or a metadata service.
     """
     # Python 3.12.0-3.12.3 call ``::ffff:8.8.8.8`` private; judge the embedded IPv4.
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
@@ -73,6 +75,9 @@ def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address)
         or addr.is_multicast
         or addr.is_unspecified
         or addr.is_reserved
+        or not addr.is_global
+        # Deprecated IPv6 site-local (fec0::/10) still routes inside a network but counts as global.
+        or (isinstance(addr, ipaddress.IPv6Address) and addr.is_site_local)
     )
 
 
@@ -152,10 +157,11 @@ def _address_rejection_reason(
 
 
 # ``is_private`` is True for these, but a gateway carries them to a public IPv4
-# host (NAT64 local-use prefix, Teredo), so they do not "stay inside the network".
+# host (NAT64 local-use prefix, Teredo, 6to4), so they do not "stay inside the network".
 _TUNNELLED_NETWORKS = (
     ipaddress.IPv6Network("64:ff9b:1::/48"),
     ipaddress.IPv6Network("2001::/32"),
+    ipaddress.IPv6Network("2002::/16"),
 )
 
 

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 import boto3
+import botocore.endpoint
 import pytest
 from botocore.awsrequest import AWSResponse
 from botocore.config import Config
@@ -1025,6 +1026,34 @@ class TestResumableUpload:
         with pytest.raises(StorageBackendUnavailableError):
             storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
 
+    def test_an_invalid_manifest_does_not_stop_the_sessions_after_it(self, storage, stub, caplog):
+        """Listing order is stable, so stopping at it would stop every later pass at the same place."""
+        second_session_id = "00000000000000000000000000000002"
+        second_manifest_key = f"{MANIFEST_ROOT}/{second_session_id}.json"
+        second_object_key = f"{PREFIX}/{AREA}/other.webp"
+        stub.add_response(
+            "list_objects_v2",
+            {
+                "Contents": [
+                    {"Key": MANIFEST_KEY, "LastModified": MODIFIED},
+                    {"Key": second_manifest_key, "LastModified": MODIFIED},
+                ],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Prefix": f"{MANIFEST_ROOT}/", "MaxKeys": 1000},
+        )
+        stub.add_response("get_object", {"Body": _body(b"not json")}, {"Bucket": BUCKET, "Key": MANIFEST_KEY})
+        _stub_manifest(stub, upload_id="upload-2", session_id=second_session_id, key="other.webp")
+        stub.add_response(
+            "abort_multipart_upload", {}, {"Bucket": BUCKET, "Key": second_object_key, "UploadId": "upload-2"}
+        )
+        stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": second_manifest_key})
+
+        with caplog.at_level("WARNING"), pytest.raises(StorageUploadSessionError):
+            storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+        assert MANIFEST_KEY in caplog.text
+
 
 class _Raw(io.BytesIO):
     """The raw body of a canned response, as botocore reads one off the wire."""
@@ -1041,7 +1070,7 @@ class TestUploadPartThroughBotocore:
     """
 
     @pytest.fixture(params=["http://s3.test", "https://s3.test"])
-    def wire(self, request):
+    def wire(self, request, monkeypatch):
         client = boto3.client(
             "s3",
             region_name="us-east-1",
@@ -1065,6 +1094,8 @@ class TestUploadPartThroughBotocore:
             return AWSResponse(request.url, 200, {"ETag": '"etag-1"'}, _Raw())
 
         client.meta.events.register("before-send.s3", answer)
+        # botocore sleeps its retry backoff; a retry still happens, it just does not wait.
+        monkeypatch.setattr(botocore.endpoint.time, "sleep", lambda _seconds: None)
         wire.storage = S3Storage(client, BUCKET, PREFIX)
         return wire
 

@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_PARTITION_DAYS_AHEAD
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
-from jasil.profile import DeploymentProfile, JobWorkerMode
+from jasil.profile import DeploymentProfile, JobWorkerMode, parse_job_worker_mode, parse_profile
 
 __all__ = [
     "AuditSettings",
@@ -82,7 +82,7 @@ class JobSettings:
             the job is abandoned to the reaper, the handler is told to stop
             (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
             released to run elsewhere. Must not be below ``lease_seconds``.
-        record_attempts: Write one ``job_attempts`` row per attempt to run a job:
+        record_attempts: Write one ``jasil_job_attempts`` row per attempt to run a job:
             which worker ran it, when, for how long, and how it ended. On by
             default; ``False`` skips every attempt write (job processing is
             unaffected) and the attempt-derived admin fields read ``None``.
@@ -385,11 +385,11 @@ class JasilSettings:
     job_worker_mode: JobWorkerMode = JobWorkerMode.IN_PROCESS
     enforce_deployment_consistency: bool = True
     data_dir: str = "data"
-    state_uri: str | None = None
+    state_uri: str | None = field(default=None, repr=False)
     storage_uri: str | None = None
-    events_uri: str | None = None
+    events_uri: str | None = field(default=None, repr=False)
     lock_uri: str | None = None
-    realtime_uri: str | None = None
+    realtime_uri: str | None = field(default=None, repr=False)
     realtime_channel: str = "jasil:realtime"
     events_stream: str = "jasil:events"
     events_group: str = "jasil"
@@ -400,6 +400,15 @@ class JasilSettings:
     mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
+
+    def __post_init__(self) -> None:
+        """Take ``profile`` and ``job_worker_mode`` as their names too, the way the parsers read them.
+
+        Raises:
+            ValueError: When either names no profile or mode.
+        """
+        object.__setattr__(self, "profile", parse_profile(self.profile))
+        object.__setattr__(self, "job_worker_mode", parse_job_worker_mode(self.job_worker_mode))
 
     def _resolve(self, name: str) -> str:
         """Return an explicit capability URI, or the profile's default.

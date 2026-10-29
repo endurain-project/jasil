@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, func, select, table, text
-from sqlalchemy.exc import DBAPIError, ProgrammingError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
 import jasil.audit as jasil_audit
@@ -147,21 +147,25 @@ class TestMigration:
         assert wanted <= set(_partitions(migrated))
 
     def test_a_row_lands_in_the_partition_of_its_day(self, migrated):
+        moment = datetime.now(UTC)  # read once: the insert and the expected name must agree on the day
         with migrated.begin() as connection:
-            _insert_row(connection, datetime.now(UTC))
+            _insert_row(connection, moment)
 
         assert _scalar(migrated, "SELECT count(*) FROM ONLY jasil_audit_log") == 0
-        assert _count(migrated, f"jasil_audit_log_p{datetime.now(UTC):%Y%m%d}") == 1
+        assert _count(migrated, f"jasil_audit_log_p{moment:%Y%m%d}") == 1
 
     def test_ensuring_partitions_is_idempotent_and_returns_the_last_day(self, migrated):
+        # The expected day is read in the same statement, so both use that transaction's now().
+        ensure = text("SELECT jasil_audit_ensure_partitions(10), (now() AT TIME ZONE 'UTC')::date + 10")
         with migrated.begin() as connection:
-            first = connection.execute(text("SELECT jasil_audit_ensure_partitions(10)")).scalar()
+            first, first_expected = connection.execute(ensure).one()
         before = _partitions(migrated)
 
         with migrated.begin() as connection:
-            second = connection.execute(text("SELECT jasil_audit_ensure_partitions(10)")).scalar()
+            second, second_expected = connection.execute(ensure).one()
 
-        assert first == second == datetime.now(UTC).date() + timedelta(days=10)
+        assert (first, second) == (first_expected, second_expected)
+        assert first == second
         assert _partitions(migrated) == before
 
     @pytest.mark.parametrize("days", [-1, 367])
@@ -467,14 +471,14 @@ class TestDropPartitions:
 class TestRoles:
     @pytest.fixture
     def roles(self, migrated):
-        try:
-            with migrated.begin() as connection:
-                for role in ROLES:
-                    connection.exec_driver_sql(f"CREATE ROLE {role} NOLOGIN")
-                for statement in jasil_audit.grants_sql(ROLES[0], ROLES[1], maintenance_role=ROLES[2]):
-                    connection.exec_driver_sql(statement)
-        except ProgrammingError:
-            pytest.skip("creating roles needs a superuser")
+        # Only a missing privilege skips; a failing GRANT is a failure.
+        if not _scalar(migrated, "SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user"):
+            pytest.skip("creating roles needs CREATEROLE or a superuser")
+        with migrated.begin() as connection:
+            for role in ROLES:
+                connection.exec_driver_sql(f"CREATE ROLE {role} NOLOGIN")
+            for statement in jasil_audit.grants_sql(ROLES[0], ROLES[1], maintenance_role=ROLES[2]):
+                connection.exec_driver_sql(statement)
         return migrated
 
     def _as(self, engine, role: str, sql: str, **params):

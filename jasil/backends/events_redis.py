@@ -41,7 +41,9 @@ if TYPE_CHECKING:
 
 _DEFAULT_STREAM = "jasil:events"
 _DEFAULT_GROUP = "jasil"
-_STREAM_MAXLEN = 10_000  # approximate cap so acked entries don't grow unbounded
+# Approximate cap on the stream's length. Redis trims the oldest entries whether or not a consumer has read
+# them, so a consumer down for long enough misses the oldest ones.
+_STREAM_MAXLEN = 10_000
 _READ_BATCH = 10
 _BLOCK_MS = 1_000  # XREADGROUP block window; bounds how quickly stop() is observed
 
@@ -118,11 +120,13 @@ class RedisStreamEventBus:
         return cls(client, stream=stream, group=group, recorder=recorder)
 
     def publish(self, event: Event) -> None:
-        # Record 'published' from the producer process before the entry is queued;
-        # the consumer records processing/completed/failed when it claims the entry.
+        # Serialized first, so an envelope that cannot be sent leaves no 'published' row behind. The row is
+        # then written before the entry is queued, because the consumer records processing/completed/failed
+        # as updates to it; a failed XADD therefore leaves it 'published', and the publisher logs the failure.
+        fields = serialize_event(event)
         if self._recorder is not None:
             self._recorder.record_published(event)
-        self._client.xadd(self._stream, serialize_event(event), maxlen=_STREAM_MAXLEN, approximate=True)
+        self._client.xadd(self._stream, fields, maxlen=_STREAM_MAXLEN, approximate=True)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
         self._handlers[event_type].append(handler)

@@ -226,6 +226,14 @@ def _check_deployment_consistency(settings: JasilSettings, sources: RuntimeSourc
     )
 
 
+def _unsupported_scheme(setting: str, uri: str) -> ValueError:
+    """Return the error for a URI no backend serves, naming its scheme only: the rest may hold a password."""
+    scheme, separator, _ = uri.partition("://")
+    if separator:
+        return ValueError(f"Unsupported {setting} scheme: {scheme!r}")
+    return ValueError(f"{setting} is not a scheme://... URI")
+
+
 def _build_state(settings: JasilSettings) -> StateProvider:
     state_uri = settings.resolved_state_uri
     scheme, _, _ = state_uri.partition("://")
@@ -233,7 +241,7 @@ def _build_state(settings: JasilSettings) -> StateProvider:
         return MemoryState()
     if scheme in ("redis", "rediss", "unix"):
         return RedisState.from_uri(state_uri)
-    raise ValueError(f"Unsupported state_uri scheme: {scheme or state_uri!r}")
+    raise _unsupported_scheme("state_uri", state_uri)
 
 
 def _build_storage(settings: JasilSettings) -> StorageProvider:
@@ -254,7 +262,7 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
         from jasil.backends.storage_s3 import S3Storage
 
         return S3Storage.from_uri(storage_uri)
-    raise ValueError(f"Unsupported storage_uri scheme: {scheme or storage_uri!r}")
+    raise _unsupported_scheme("storage_uri", storage_uri)
 
 
 def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> EventBusProvider:
@@ -268,7 +276,7 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
         return RedisStreamEventBus.from_uri(
             events_uri, stream=settings.events_stream, group=settings.events_group, recorder=recorder
         )
-    raise ValueError(f"Unsupported events_uri scheme: {scheme or events_uri!r}")
+    raise _unsupported_scheme("events_uri", events_uri)
 
 
 def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
@@ -282,7 +290,7 @@ def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
         from jasil.backends.realtime_redis import RedisRealtime
 
         return RedisRealtime.from_uri(realtime_uri, channel=settings.realtime_channel)
-    raise ValueError(f"Unsupported realtime_uri scheme: {scheme or realtime_uri!r}")
+    raise _unsupported_scheme("realtime_uri", realtime_uri)
 
 
 def _build_audit_sink(settings: JasilSettings) -> AuditSink | None:
@@ -299,7 +307,7 @@ def _build_audit_sink(settings: JasilSettings) -> AuditSink | None:
         from jasil.backends.storage_s3 import S3Storage
 
         return StorageAuditSink(S3Storage.from_uri(uri))
-    raise ValueError(f"Unsupported audit.external_sink_uri scheme: {scheme or 'missing'!r}")
+    raise _unsupported_scheme("audit.external_sink_uri", uri)
 
 
 def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
@@ -319,7 +327,7 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
         return NoopLock()
     if scheme == "postgres-advisory":
         return PgAdvisoryLock.from_main_database()
-    raise ValueError(f"Unsupported lock_uri scheme: {scheme or lock_uri!r}")
+    raise _unsupported_scheme("lock_uri", lock_uri)
 
 
 def _build_runtime_geocoding(settings: JasilSettings, source: Callable[[], GeocodingSettings]) -> ReloadingGeocoding:

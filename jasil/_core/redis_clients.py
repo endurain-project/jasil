@@ -141,7 +141,10 @@ def create_redis_client(
             socket_timeout=socket_timeout,
         )
         redis_client.ping()
-    except (RedisError, ValueError) as redis_error:
+    except ValueError:
+        # Not chained: redis-py names the part of the URI it could not parse, which may be the password.
+        raise RuntimeError(f"Unable to initialize Redis storage for {purpose}: the URI is malformed.") from None
+    except RedisError as redis_error:
         raise RuntimeError(f"Unable to initialize Redis storage for {purpose}.") from redis_error
     return redis_client
 

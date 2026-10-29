@@ -419,7 +419,7 @@ def _outbox_kwargs(event_id: str) -> dict:
         "event_id": event_id,
         "event_type": "domain.row",
         "source": "test",
-        "timestamp": T0,
+        "timestamp": T0.isoformat(),  # the envelope's ISO-8601 string, as the column stores it
         "payload": {},
         "schema_version": 1,
         "created_at": T0,
@@ -600,7 +600,7 @@ class TestPublishOnCommitIsolation:
         def _work(n: int) -> None:
             with session_factory() as session:
                 publisher.publish_on_commit("a.one", {"n": n}, source="test", db=session)
-                barrier.wait()
+                barrier.wait(timeout=5)
                 if n % 2:
                     session.rollback()
                 else:

@@ -83,6 +83,14 @@ class TestClientCreation:
 
         assert recording.created[0]["decode_responses"] is True
 
+    def test_a_malformed_url_does_not_carry_its_password_into_the_error(self):
+        """redis-py names the part it failed to parse, which here is the start of the password."""
+        with pytest.raises(RuntimeError, match="malformed") as excinfo:
+            redis_clients.create_redis_client("redis://:pa/ssword@cache:6379/0", "test")
+
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__suppress_context__
+
     def test_a_byte_oriented_caller_can_opt_out(self, recording):
         """The StateProvider contract is raw ``bytes``, not ``str``."""
         redis_clients.create_redis_client("redis://cache:6379/0", "test", decode_responses=False)

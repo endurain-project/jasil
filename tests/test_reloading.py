@@ -456,7 +456,7 @@ class TestConcurrency:
 
         def work():
             try:
-                barrier.wait()
+                barrier.wait(timeout=5)
                 for _ in range(20):
                     provider.send(MESSAGE)
             except BaseException as error:

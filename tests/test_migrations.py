@@ -9,6 +9,7 @@ is the guard for that.
 
 import threading
 import time
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -706,6 +707,27 @@ class TestRevisionSchemas:
 
         with pytest.raises(RuntimeError, match="unknown index"):
             ops.drop_index("idx_missing", table_name="jasil_event_log")
+
+
+class TestASchemaQualifiedBaseIsRefused:
+    """The migrations create JASIL's tables in the default schema; models in another one would never find them."""
+
+    @pytest.fixture
+    def host_schema(self, monkeypatch):
+        import jasil.orm
+
+        monkeypatch.setattr(jasil.orm, "get_active_base", lambda: SimpleNamespace(metadata=MetaData(schema="host")))
+
+    @pytest.mark.parametrize(
+        "run",
+        [migrations.upgrade, lambda engine: migrations.downgrade(engine, "base"), migrations.adopt_existing_schema],
+        ids=["upgrade", "downgrade", "adopt"],
+    )
+    def test_every_entry_point_refuses_it(self, engine, host_schema, run):
+        with pytest.raises(migrations.SchemaCompatibilityError, match="'host'"):
+            run(engine)
+
+        assert migrations.db_revision(engine) is None
 
 
 class _Connection:

@@ -239,7 +239,7 @@ The floor is a constant inside `jasil_audit_drop_partitions`, baked in when the 
 that is compromised, or misconfigured to a retention of one day, cannot shorten the trail below it.
 
 Changing the setting afterwards does **not** change the function. To change it, run the statement
-`jasil_audit.retention_floor_sql(days, schema=...)` returns as the role that owns the function. `schema` is required
+`jasil_audit.retention_floor_sql(floor_days, schema=...)` returns as the role that owns the function. `schema` is required
 and must be the schema the migration ran in (its `current_schema()`): the function names its schema in its body,
 so there is no default that is safe. It replaces the body only; the owner and grants stay.
 
@@ -254,7 +254,7 @@ with engine.begin() as connection:  # connected as the migrating (owner) role
 
 ## Roles and grants
 
-JASIL names no role. `jasil_audit.grants_sql(runtime_role, reader_role, maintenance_role=None, schema=None)`
+JASIL names no role. `jasil_audit.grants_sql(runtime_role, reader_role, *, maintenance_role=None, schema=None)`
 returns the statements; review them and run them as the table owner:
 
 ```python
@@ -388,7 +388,7 @@ only the database and does not compare the external copy: reconcile the sink you
 ### Verifying
 
 ```python
-report = jasil_audit.verify_checkpoints(public_key_b64, from_ts, to_ts)  # public_key_b64=None checks hashes only
+report = jasil_audit.verify_checkpoints(public_key, from_ts, to_ts)  # public_key=None checks hashes only
 for window in report.windows:
     if window.status is not jasil_audit.VerificationStatus.OK:
         jasil_audit.record_detached(

@@ -88,6 +88,9 @@ mapper_registry = Base.registry
 # The active declarative base JASIL's models are mapped onto; ``None`` until
 # ``map_models`` runs.
 _active_base: type[DeclarativeBase] | None = None
+# The base the model modules were imported against. They keep it for the life of the process, so it
+# survives :func:`reset`: a module that is already imported is not imported again for another base.
+_bound_base: type[DeclarativeBase] | None = None
 
 # Every module defining a JASIL companion model. ``map_models`` imports each, and
 # each binds its classes to the active base via ``get_active_base()``.
@@ -174,18 +177,25 @@ def map_models(base: type[DeclarativeBase] | None = None) -> None:
             it to use JASIL's own :data:`Base`.
 
     Raises:
-        RuntimeError: If called again with a different base.
+        RuntimeError: If called again with a different base, also after :func:`reset`: the model modules
+            stay bound to the base they were first imported against.
     """
-    global _active_base
+    global _active_base, _bound_base
     target = base if base is not None else Base
     if _active_base is not None:
         if _active_base is not target:
             raise RuntimeError("jasil.orm.map_models() was already called with a different base; call it once.")
         return
+    if _bound_base is not None and _bound_base is not target:
+        raise RuntimeError(
+            f"JASIL's models are already bound to {_bound_base.__qualname__} in this process and cannot be "
+            "mapped onto another base; map the same base again, or remap in a fresh process."
+        )
     _active_base = target
     try:
         for module_name in _MODEL_MODULES:
             importlib.import_module(module_name)
+            _bound_base = target
         # Resolve every mapper now so a misconfiguration fails fast at startup
         # rather than on the first query.
         target.registry.configure()
@@ -252,7 +262,9 @@ def reset() -> None:
     """Clear the mapped base and the session factory.
 
     For tests that need a clean process-wide state between cases; production code
-    configures once at startup and never resets.
+    configures once at startup and never resets. The model modules stay bound to the
+    base they were imported against, so :func:`map_models` afterwards accepts that
+    base only.
     """
     global _active_base
     _active_base = None

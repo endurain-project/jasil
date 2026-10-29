@@ -49,6 +49,8 @@ class ProcessingJob(Base):
         subscriber_id: The durable subscriber this job runs, e.g.
             ``invoice.render``.
         source: Where the originating event came from, e.g. ``api:create_order``.
+        event_timestamp: The envelope's ISO-8601 publish timestamp, handed back to the
+            subscriber; ``None`` on a job enqueued before revision ``rev0007``.
         payload: The domain payload the subscriber consumes.
         schema_version: The payload-shape version, carried from the envelope so a
             worker on a different build can upgrade or refuse it.
@@ -130,6 +132,11 @@ class ProcessingJob(Base):
         String(MAX_SOURCE_LENGTH),
         nullable=False,
         comment="Where the originating event came from, e.g. api:create_order",
+    )
+    event_timestamp: Mapped[str | None] = mapped_column(
+        String(40),
+        nullable=True,
+        comment="Envelope ISO-8601 publish timestamp; NULL on jobs enqueued before rev0007",
     )
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(), "postgresql"),

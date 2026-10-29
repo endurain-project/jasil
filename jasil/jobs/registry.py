@@ -8,6 +8,7 @@ code therefore runs subscribers in-process or out-of-process in a worker.
 """
 
 import re
+import threading
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 
@@ -71,13 +72,18 @@ def normalize_queue_selector(queues: Iterable[str] | None) -> tuple[str, ...] | 
 
 
 class JobHandlerRegistry:
-    """A process-local registry of durable subscribers."""
+    """A process-local registry of durable subscribers.
+
+    Safe to use from several threads: the runner and the relay read it on every pass, and a subscriber may
+    register after they started.
+    """
 
     def __init__(self) -> None:
         self._handlers: dict[str, JobHandler] = {}
         self._by_event_type: dict[str, list[str]] = defaultdict(list)
         self._queues: dict[str, str] = {}
         self._dead_letter: dict[str, DeadLetterCallback] = {}
+        self._lock = threading.Lock()
 
     def register(
         self,
@@ -90,6 +96,9 @@ class JobHandlerRegistry:
     ) -> None:
         """
         Register (or replace) a durable subscriber.
+
+        Registering a ``subscriber_id`` again replaces its handler, queue and callback, and moves it to
+        ``event_type`` if it was registered under another one.
 
         Args:
             event_type: The domain-event channel the subscriber reacts to.
@@ -121,14 +130,18 @@ class JobHandlerRegistry:
         check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
         check_length(subscriber_id, field="subscriber_id", limit=MAX_SUBSCRIBER_ID_LENGTH)
         validate_queue_name(queue)
-        self._handlers[subscriber_id] = handler
-        self._queues[subscriber_id] = queue
-        if on_dead_letter is None:
-            self._dead_letter.pop(subscriber_id, None)
-        else:
-            self._dead_letter[subscriber_id] = on_dead_letter
-        if subscriber_id not in self._by_event_type[event_type]:
-            self._by_event_type[event_type].append(subscriber_id)
+        with self._lock:
+            for other_type, subscribers in self._by_event_type.items():
+                if other_type != event_type and subscriber_id in subscribers:
+                    subscribers.remove(subscriber_id)
+            self._handlers[subscriber_id] = handler
+            self._queues[subscriber_id] = queue
+            if on_dead_letter is None:
+                self._dead_letter.pop(subscriber_id, None)
+            else:
+                self._dead_letter[subscriber_id] = on_dead_letter
+            if subscriber_id not in self._by_event_type[event_type]:
+                self._by_event_type[event_type].append(subscriber_id)
 
     def get(self, subscriber_id: str) -> JobHandler | None:
         """
@@ -140,15 +153,18 @@ class JobHandlerRegistry:
         Returns:
             The registered handler, or ``None`` when none is registered.
         """
-        return self._handlers.get(subscriber_id)
+        with self._lock:
+            return self._handlers.get(subscriber_id)
 
     def dead_letter_callback(self, subscriber_id: str) -> DeadLetterCallback | None:
         """Return the ``on_dead_letter`` callback of a subscriber, or ``None``."""
-        return self._dead_letter.get(subscriber_id)
+        with self._lock:
+            return self._dead_letter.get(subscriber_id)
 
     def dead_letter_subscriber_ids(self) -> frozenset[str]:
         """Return the subscriber ids registered with an ``on_dead_letter`` callback."""
-        return frozenset(self._dead_letter)
+        with self._lock:
+            return frozenset(self._dead_letter)
 
     def queue_for(self, subscriber_id: str) -> str:
         """Return the queue assigned to a registered subscriber.
@@ -160,7 +176,8 @@ class JobHandlerRegistry:
                 hidden by routing the job to another queue.
         """
         try:
-            return self._queues[subscriber_id]
+            with self._lock:
+                return self._queues[subscriber_id]
         except KeyError as error:
             raise LookupError(f"no queue registered for subscriber_id {subscriber_id!r}") from error
 
@@ -174,7 +191,8 @@ class JobHandlerRegistry:
         Returns:
             The subscriber ids, in registration order.
         """
-        return tuple(self._by_event_type.get(event_type, ()))
+        with self._lock:
+            return tuple(self._by_event_type.get(event_type, ()))
 
     def subscriber_ids(self) -> frozenset[str]:
         """
@@ -183,26 +201,30 @@ class JobHandlerRegistry:
         Returns:
             The registered durable-subscriber ids.
         """
-        return frozenset(self._handlers)
+        with self._lock:
+            return frozenset(self._handlers)
 
     def subscriber_ids_for_queues(self, queues: Iterable[str]) -> tuple[str, ...]:
         """Return registered subscriber ids assigned to the selected queues."""
         selected = normalize_queue_selector(queues)
-        if selected is None:
-            return tuple(self._handlers)
-        selected_set = frozenset(selected)
-        return tuple(subscriber_id for subscriber_id, queue in self._queues.items() if queue in selected_set)
+        with self._lock:
+            if selected is None:
+                return tuple(self._handlers)
+            selected_set = frozenset(selected)
+            return tuple(subscriber_id for subscriber_id, queue in self._queues.items() if queue in selected_set)
 
     def queue_assignments(self) -> dict[str, str]:
         """Return a copy of the ``{subscriber_id: queue}`` assignments."""
-        return dict(self._queues)
+        with self._lock:
+            return dict(self._queues)
 
     def clear(self) -> None:
         """Remove every registration (used to reset state between tests)."""
-        self._handlers.clear()
-        self._by_event_type.clear()
-        self._queues.clear()
-        self._dead_letter.clear()
+        with self._lock:
+            self._handlers.clear()
+            self._by_event_type.clear()
+            self._queues.clear()
+            self._dead_letter.clear()
 
 
 # Process-wide default registry: durable subscribers register here at startup and

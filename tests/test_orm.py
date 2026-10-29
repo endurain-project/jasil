@@ -48,6 +48,18 @@ class TestModelMapping:
         with pytest.raises(RuntimeError, match="already called with a different base"):
             orm.map_models(OtherBase)
 
+    def test_remapping_onto_another_base_after_a_reset_is_refused(self, pristine_orm):
+        """The model modules stay bound to the first base: a second one would silently get no tables."""
+
+        class OtherBase(DeclarativeBase):
+            pass
+
+        with pytest.raises(RuntimeError, match="already bound"):
+            pristine_orm.map_models(OtherBase)
+
+        assert OtherBase.metadata.tables == {}
+        assert pristine_orm.is_models_mapped() is False
+
     def test_reading_the_base_before_mapping_explains_the_fix(self, pristine_orm):
         with pytest.raises(RuntimeError, match="map_models"):
             pristine_orm.get_active_base()

@@ -541,15 +541,24 @@ class TestWorkerHeartbeat:
         assert telemetry.events == ["start", "stop"]
 
     def test_the_thread_is_a_daemon_and_beats_on_its_interval(self):
-        leases = self._Leases()
+        class Leases(self._Leases):
+            def __init__(self):
+                super().__init__()
+                self.twice = threading.Event()
+
+            def renew(self):
+                renewed = super().renew()
+                if self.calls >= 2:
+                    self.twice.set()
+                return renewed
+
+        leases = Leases()
         heartbeat = WorkerHeartbeat(leases=leases, interval_seconds=0.01)
 
         heartbeat.start()
         try:
             assert heartbeat._thread.daemon is True
-            deadline = time.monotonic() + WAIT_TIMEOUT
-            while leases.calls < 2 and time.monotonic() < deadline:
-                time.sleep(0.005)
+            assert leases.twice.wait(timeout=WAIT_TIMEOUT)
         finally:
             heartbeat.stop()
 
@@ -573,9 +582,13 @@ class TestTheRealLoop:
         renewals = []
         original = jobs_crud.renew_leases
 
+        renewed_twice = threading.Event()
+
         def counting(*args, **kwargs):
             result = original(*args, **kwargs)
             renewals.append(set(result))
+            if sum(1 for ids in renewals if ids) >= 2:
+                renewed_twice.set()
             return result
 
         monkeypatch.setattr(jobs_crud, "renew_leases", counting)
@@ -613,9 +626,7 @@ class TestTheRealLoop:
 
         thread.start()
         assert started.wait(timeout=WAIT_TIMEOUT)
-        deadline = time.monotonic() + WAIT_TIMEOUT
-        while sum(1 for ids in renewals if ids) < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
+        renewed_twice.wait(timeout=WAIT_TIMEOUT)
         stop.set()
         release.set()
         thread.join(timeout=WAIT_TIMEOUT)

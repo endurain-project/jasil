@@ -145,7 +145,7 @@ class S3Storage:
         parsed = urlparse(uri)
         bucket = parsed.netloc
         if not bucket:
-            raise ValueError(f"An s3 storage_uri is missing a bucket: {uri!r}")
+            raise ValueError("An s3 storage_uri is missing a bucket")
         params = parse_qs(parsed.query)
         try:
             client = boto3.client(
@@ -603,7 +603,7 @@ class S3Storage:
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
         removed = 0
-        first_error: Boto3Error | BotoCoreError | ClientError | None = None
+        first_error: Boto3Error | BotoCoreError | ClientError | StorageUploadSessionError | None = None
         start_after: str | None = None
         while True:
             request = {
@@ -619,7 +619,14 @@ class S3Storage:
                 if entry["LastModified"].timestamp() >= older_than_epoch:
                     continue
                 manifest_key = entry["Key"]
-                state = self._load_upload_state_by_key(manifest_key, missing_ok=True)
+                try:
+                    state = self._load_upload_state_by_key(manifest_key, missing_ok=True)
+                except StorageUploadSessionError as error:
+                    # Reported after the pass: listing order is stable, so stopping here would stop every pass here.
+                    logger.warning("Skipping invalid upload session manifest %s: %s", manifest_key, error)
+                    if first_error is None:
+                        first_error = error
+                    continue
                 if state is None:
                     continue
                 object_key = self._object_key(state.area, state.key)

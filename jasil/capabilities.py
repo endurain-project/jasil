@@ -125,9 +125,9 @@ class CapabilityReport:
 
 
 def _scheme_of(uri: str) -> str:
-    """Return a URI's scheme, or the whole value when it carries none."""
+    """Return a URI's scheme, or ``invalid`` when it carries none: the value may hold a password."""
     scheme, separator, _ = uri.partition("://")
-    return scheme if separator else uri
+    return scheme if separator else "invalid"
 
 
 def _mail_backend_of(uri: str | None, *, secure: bool) -> str:

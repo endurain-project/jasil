@@ -205,8 +205,12 @@ def upgrade(engine: "Engine", revision: str = "head") -> None:
     On a fresh database the tables are created with their final ``jasil_`` names
     directly. A 0.8 database (unprefixed names) is renamed in place by ``rev0003``,
     so **stop every process running 0.8 or earlier before running this**.
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
     """
     _require_alembic()
+    _refuse_schema_qualified_base()
     # On its own connection: inspecting begins a transaction, and Alembic only
     # commits one it began itself.
     with engine.connect() as connection:
@@ -216,8 +220,33 @@ def upgrade(engine: "Engine", revision: str = "head") -> None:
 
 
 def downgrade(engine: "Engine", revision: str) -> None:
-    """Downgrade JASIL's tables to ``revision`` (``"base"`` drops them all)."""
+    """Downgrade JASIL's tables to ``revision`` (``"base"`` drops them all).
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
+    """
+    _refuse_schema_qualified_base()
     _run(engine, "downgrade", revision)
+
+
+def _refuse_schema_qualified_base() -> None:
+    """Refuse a base whose ``MetaData`` names a schema.
+
+    The migrations create JASIL's tables, and the audit trail's PostgreSQL functions, in the connection's
+    default schema; models mapped into another one would query tables that are not there.
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
+    """
+    from jasil.orm import get_active_base
+
+    schema = get_active_base().metadata.schema
+    if schema is not None:
+        raise SchemaCompatibilityError(
+            f"JASIL's migrations create its tables in the connection's default schema, but the mapped base's "
+            f"MetaData names schema {schema!r}; map JASIL onto a base without one, and point the connection's "
+            "search_path (or default database) at the schema instead"
+        )
 
 
 def head_revision() -> str | None:
@@ -499,9 +528,11 @@ def adopt_existing_schema(engine: "Engine") -> bool:
 
     Raises:
         SchemaCompatibilityError: If no revision matches exactly; the message
-            names the closest revision and lists its differences.
+            names the closest revision and lists its differences. Also when the
+            mapped base's ``MetaData`` names a schema.
     """
     _require_alembic()
+    _refuse_schema_qualified_base()
     from alembic import command
     from alembic.runtime.migration import MigrationContext
     from sqlalchemy import inspect

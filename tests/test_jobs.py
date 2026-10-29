@@ -6,7 +6,9 @@ real (SQLite) database rather than mocking it. Time is injected everywhere, so
 nothing sleeps and lease expiry is exercised deterministically.
 """
 
+import threading
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -156,6 +158,62 @@ class TestSubscriberRegistration:
         registry.register("a.b", subscriber_id, lambda _e: None)
 
         assert registry.subscribers_for("a.b") == (subscriber_id,)
+
+    def test_re_registering_under_another_event_type_moves_the_subscriber(self):
+        """Left listed under the old type, the relay would fan its events out to the new handler."""
+        registry = JobHandlerRegistry()
+        registry.register("a.created", "sub", lambda _e: None)
+
+        registry.register("b.created", "sub", lambda _e: None)
+
+        assert (registry.subscribers_for("a.created"), registry.subscribers_for("b.created")) == ((), ("sub",))
+
+    def test_registering_while_another_thread_reads_is_safe(self):
+        """The runner reads the registry on every claim, and a subscriber may register after it started."""
+        registry = JobHandlerRegistry()
+        errors: list[Exception] = []
+        done = threading.Event()
+
+        def read() -> None:
+            while not done.is_set():
+                try:
+                    registry.subscriber_ids_for_queues(["default"])
+                except Exception as error:
+                    errors.append(error)
+                    return
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            for index in range(20_000):
+                registry.register("a.b", f"sub-{index}", lambda _e: None)
+                if errors:
+                    break
+        finally:
+            done.set()
+            reader.join(timeout=10)
+
+        assert errors == []
+
+
+class TestInsertIgnoringDuplicate:
+    """The enqueue's conflict clause, per dialect name (MySQL and MariaDB report different ones)."""
+
+    @staticmethod
+    def _session(dialect: str):
+        return SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_and_mariadb_ignore_a_duplicate_with_a_no_op_update(self, dialect):
+        from sqlalchemy.dialects import mysql
+
+        statement = jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session(dialect))
+
+        assert "ON DUPLICATE KEY UPDATE" in str(statement.compile(dialect=mysql.dialect()))
+
+    def test_an_unsupported_dialect_is_refused(self):
+        with pytest.raises(RuntimeError, match="insert-or-ignore"):
+            jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session("oracle"))
 
 
 class TestClaim:
@@ -523,7 +581,10 @@ class TestLeaseReclamation:
 
         jobs_crud.reclaim_expired_leases(now=T0 + timedelta(seconds=61), db=db)
 
-        assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_DEAD_LETTER
+        job = db.query(ProcessingJob).one()
+        assert job.status == jobs_crud.STATUS_DEAD_LETTER
+        # Every lease column is cleared, as on the other terminal paths.
+        assert (job.locked_by, job.locked_at, job.lease_expires_at) == (None, None, None)
 
     def test_a_second_pass_reclaims_nothing(self, db, event):
         """The count is rows this call changed, so a losing reaper reports zero."""

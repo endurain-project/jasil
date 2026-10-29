@@ -820,7 +820,11 @@ class TestWritableConformance:
 
 
 class TestSegmentValidationConformance:
-    @pytest.mark.parametrize("area", [".jasil-objects", ".jasil-upload-sessions"])
+    @pytest.mark.parametrize(
+        "area",
+        # Case variants too: on a case-insensitive filesystem they name the same directory.
+        [".jasil-objects", ".jasil-upload-sessions", ".JASIL-OBJECTS", ".Jasil-Upload-Sessions", ".jasil-anything"],
+    )
     def test_the_private_upload_staging_area_is_reserved(self, storage, area):
         with pytest.raises(ValueError, match="reserved"):
             storage.begin_upload(area, KEY)

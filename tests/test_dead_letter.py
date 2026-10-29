@@ -5,10 +5,11 @@ The callback is delivered at least once. A job is owed one while it is
 dead-lettered it delivers at once, and a sweep delivers what a crash left behind.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import text, update
 
 import jasil.container as container
 import jasil.jobs.crud as jobs_crud
@@ -193,7 +194,7 @@ class TestHandlerException:
         event, error = calls[0]
         assert isinstance(event, Event)
         assert (event.event_type, event.payload, event.attempt, event.is_last_attempt) == ("a.b", {"id": 1}, 2, True)
-        assert error == "handler failed"
+        assert error == "RuntimeError: handler failed"
         assert job.dead_letter_notified_at is not None
 
     def test_it_does_not_run_while_attempts_remain(self, runner, db, calls):
@@ -513,7 +514,7 @@ class TestNoCallback:
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
-        assert job.last_error == "handler failed"
+        assert job.last_error == "RuntimeError: handler failed"
         assert job.dead_letter_notified_at is None
 
     def test_no_work_is_done_when_no_subscriber_has_a_callback(self, registry, clock, session_factory):
@@ -524,13 +525,26 @@ class TestNoCallback:
         assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock, job_ids=[]) == 0
 
 
+class TestTheCallbackEnvelope:
+    def test_it_carries_the_publish_timestamp(self, db):
+        event = replace(new_event("a.b", {}, source="t"), timestamp="2025-12-31T23:59:00+00:00")
+        job = jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=1, now=T0, db=db)
+
+        assert jobs_crud.event_from_row(job).timestamp == "2025-12-31T23:59:00+00:00"
+
+    def test_a_job_enqueued_before_the_column_existed_falls_back_to_its_enqueue_time(self, db):
+        job = jobs_crud.enqueue_job(
+            new_event("a.b", {}, source="t"), "s", queue="default", max_attempts=1, now=T0, db=db
+        )
+        job.event_timestamp = None
+
+        assert jobs_crud.event_from_row(job).timestamp == T0.isoformat()
+
+
 class TestDeliveryGuards:
     def _dead(self, db):
         enqueue(db, max_attempts=1)
-        db.execute(
-            text("UPDATE jasil_processing_jobs SET status = 'dead_letter', last_error = 'x', updated_at = :t"),
-            {"t": T0},
-        )
+        db.execute(update(ProcessingJob).values(status="dead_letter", last_error="x", updated_at=T0))
         db.commit()
 
     def test_a_stale_claim_cannot_overwrite_a_newer_delivery(self, registry, clock, db, session_factory):
@@ -541,9 +555,36 @@ class TestDeliveryGuards:
             0
         ]
 
-        assert not jobs_crud.mark_dead_letter_notified(first.id, delivery_attempt=first.delivery_attempt, now=T0, db=db)
+        assert not jobs_crud.mark_dead_letter_notified(first, now=T0, db=db)
         assert stored_job(db).dead_letter_notified_at is None
-        assert jobs_crud.mark_dead_letter_notified(second.id, delivery_attempt=second.delivery_attempt, now=T0, db=db)
+        assert jobs_crud.mark_dead_letter_notified(second, now=T0, db=db)
+
+    def test_a_claim_from_before_a_replay_cannot_settle_the_next_dead_letter(
+        self, registry, clock, db, session_factory
+    ):
+        """A replay restarts the delivery count, so the count alone cannot tell the two dead letters apart."""
+        self._dead(db)
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: None)
+        stale = jobs_crud.claim_dead_letter_callbacks(["s"], now=T0, lease_seconds=300, db=db)[0]
+        assert jobs_crud.replay_dead_letter_job(stale.id, now=T0, db=db)
+        later = T0 + timedelta(minutes=1)
+        claimed = jobs_crud.claim_jobs(worker_id="w", limit=1, lease_seconds=60, now=later, db=db)[0]
+        jobs_crud.mark_job_failed(
+            claimed.id,
+            "again",
+            worker_id="w",
+            attempt=claimed.attempts,
+            base_seconds=1,
+            max_seconds=1,
+            now=later,
+            db=db,
+        )
+        fresh = jobs_crud.claim_dead_letter_callbacks(["s"], now=later, lease_seconds=300, db=db)[0]
+        assert fresh.delivery_attempt == stale.delivery_attempt
+
+        assert not jobs_crud.mark_dead_letter_notified(stale, now=later, db=db)
+        assert stored_job(db).dead_letter_notified_at is None
+        assert jobs_crud.mark_dead_letter_notified(fresh, now=later, db=db)
 
     def test_a_callback_that_always_fails_is_given_up_on(self, registry, clock, db, session_factory):
         self._dead(db)
@@ -575,7 +616,7 @@ class TestDeliveryGuards:
     def test_a_job_is_not_leased_until_its_own_callback_starts(self, registry, clock, db, session_factory):
         for _ in range(2):
             enqueue(db, max_attempts=1)
-        db.execute(text("UPDATE jasil_processing_jobs SET status = 'dead_letter', updated_at = :t"), {"t": T0})
+        db.execute(update(ProcessingJob).values(status="dead_letter", updated_at=T0))
         db.commit()
         leased_during_callback = []
 

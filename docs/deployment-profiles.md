@@ -140,6 +140,7 @@ between them, so tell JASIL how many you run:
 
 ```python
 jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
+platform = jasil.container.build_platform(jasil_settings.get_settings())
 # ValueError: JASIL's deployment wiring is inconsistent:
 #   - state_uri resolves to process-local memory, but this deployment runs
 #     multiple processes (web_workers=4 runs several API processes) that need a
@@ -199,11 +200,14 @@ for issue in check_deployment_consistency(settings):
 ```
 JASIL platform capabilities:
 Deployment profile: local (web_workers=1, job_worker_mode=in_process, multi_process=False, multi_node=False)
-  state   -> memory  (source: profile default)
-  storage -> local   (source: profile default)
-  events  -> memory  (source: profile default)
-  lock    -> noop    (source: profile default)
-  clock   -> system  (source: always the system clock)
+  state     -> memory  (source: profile default)
+  storage   -> local  (source: profile default)
+  events    -> memory  (source: profile default)
+  realtime  -> memory  (source: follows events_uri (profile default))
+  lock      -> noop  (source: profile default)
+  mail      -> disabled  (source: not configured)
+  geocoding -> disabled  (source: not configured)
+  clock     -> system  (source: always the system clock)
 ```
 
 The `source` column separates what you chose from what you inherited. A

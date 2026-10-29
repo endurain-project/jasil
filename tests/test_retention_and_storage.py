@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1567,6 +1568,67 @@ class TestRuntimeHandle:
 
 
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions enforced on the caller")
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
+class TestLocalStorageDurability:
+    """A rename is only as durable as the bytes behind it and the directory entry it writes.
+
+    Without a sync, a crash after a write returned can leave an empty or missing object on ext4 or XFS.
+    """
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+
+    @staticmethod
+    def _record(monkeypatch, published):
+        synced = []
+        real = os.fsync
+
+        def recording(descriptor):
+            synced.append((stat.S_ISDIR(os.fstat(descriptor).st_mode), published()))
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", recording)
+        return synced
+
+    @staticmethod
+    def _file_then_directory(synced) -> bool:
+        """A file synced before the name existed, then a directory synced once it did."""
+        return (False, False) in synced and (True, True) in synced[synced.index((False, False)) :]
+
+    @pytest.mark.parametrize("area", ["avatars", "plain"])
+    @pytest.mark.parametrize("write", ["save", "save_stream", "complete_upload"])
+    def test_an_object_is_synced_before_and_after_it_is_published(self, storage, monkeypatch, area, write):
+        session = storage.begin_upload(area, "1.bin") if write == "complete_upload" else None
+        part = _upload_part(storage, session, 1, b"data") if session is not None else None
+        synced = self._record(monkeypatch, lambda: storage.get(area, "1.bin") is not None)
+
+        if write == "save":
+            storage.save(area, "1.bin", b"data")
+        elif write == "save_stream":
+            storage.save_stream(area, "1.bin", io.BytesIO(b"data"))
+        else:
+            storage.complete_upload(session, [part])
+
+        assert self._file_then_directory(synced), synced
+
+    def test_an_upload_part_is_synced_before_and_after_it_is_published(self, storage, monkeypatch):
+        session = storage.begin_upload("avatars", "1.bin")
+        parts = storage._load_upload_session(session) / storage_local._UPLOAD_PARTS_DIRECTORY
+        synced = self._record(monkeypatch, lambda: (parts / "00001.part").exists())
+
+        _upload_part(storage, session, 1, b"data")
+
+        assert self._file_then_directory(synced), synced
+
+    def test_an_upload_session_is_synced_when_it_begins(self, storage, monkeypatch, tmp_path):
+        synced = self._record(monkeypatch, lambda: True)
+
+        storage.begin_upload("avatars", "1.bin")
+
+        assert (False, True) in synced and (True, True) in synced
+
+
 class TestLocalStorageFilesystemFailures:
     """Real filesystem faults, not stubs: a backend that cannot write must say so
     in provider-neutral terms and leave no half-written object behind."""

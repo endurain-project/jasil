@@ -31,7 +31,7 @@ how long it took, and why it failed:
 
 | Status | Meaning |
 |---|---|
-| `published` | Written, dispatch not finished. |
+| `published` | Written, dispatch not finished. On the Redis bus a row that stays `published` can also be an `XADD` that failed after the row was written; the publisher logs that failure. |
 | `queued` | Handed to the durable job queue (terminal here; execution is tracked in `jasil_processing_jobs` and `jasil_job_attempts`). |
 | `processing` | A consumer picked it up. |
 | `completed` | Handlers succeeded. |
@@ -221,6 +221,17 @@ migrate" into a clear message at boot rather than a confusing query error later.
     (13 or newer) it also partitions the log by day, installs the append-only triggers and creates the two
     `SECURITY DEFINER` functions, so run it as the role that should own them. Processes of the previous release
     are unaffected. Details in [Audit trail → Upgrading](audit.md#upgrading).
+
+!!! note "Revision `rev0007` (0.14): the publish timestamp on jobs"
+    Adds the nullable `jasil_processing_jobs.event_timestamp`, so a durable subscriber's envelope carries the
+    event's publish `timestamp` rather than the time its job was enqueued. Jobs written before it, or by a
+    previous-release process during a rollout, have none and keep the enqueue time.
+
+!!! note "One schema: the connection's default"
+    The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
+    `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`, because the models would then look
+    for the tables somewhere else; point the connection's `search_path` (or default database) at the schema
+    you want instead.
 
 !!! note "It will not touch your tables"
     JASIL's migrations use their own version table, `jasil_alembic_version`, so

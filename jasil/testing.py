@@ -1,10 +1,11 @@
 """Test helpers for applications that embed JASIL.
 
-JASIL installs several things process-wide — settings, a correlation provider, a
-session factory, the active platform, memoized Redis clients, the durable
-subscriber registry — and a test suite has to put every one of them back between
-cases or state leaks from one test into the next. This module is the shared
-version of the fixture every host would otherwise write.
+JASIL installs several things process-wide — settings, a correlation provider, the
+active platform, memoized Redis clients, the durable subscriber registry, the
+audit state — and a test suite has to put every one of them back between cases or
+state leaks from one test into the next. This module is the shared version of the
+fixture every host would otherwise write. The ORM mapping and the session factory
+are configured once for the whole suite and left in place.
 
 Nothing here is imported by the library itself, and nothing here needs an
 optional extra::
@@ -330,11 +331,12 @@ def reset_all() -> None:
     fixture teardown; leaving any one of them set is how a passing test starts
     depending on the one before it.
 
-    **The declarative base is deliberately left alone.** JASIL's model modules
-    capture it at import time, so clearing it would strand every model already
-    imported — and a test module that imports one at module scope cannot re-import
-    it. Map once for the whole session and leave it mapped. Call
-    :func:`jasil.orm.reset` yourself only if you genuinely need to remap.
+    **The declarative base and the session factory are deliberately left alone.**
+    JASIL's model modules capture the base at import time, so they cannot be mapped
+    onto another one in the same process; map once for the whole session and leave
+    it mapped. The session factory usually belongs to a session-wide database
+    fixture, so a suite that swaps engines between tests calls
+    :func:`jasil.orm.configure_sessionmaker` itself.
 
     Does not close the platform: call :meth:`jasil.container.Platform.close`
     first if this process opened real connections.

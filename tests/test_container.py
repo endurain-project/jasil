@@ -5,6 +5,7 @@ running on process-local memory across replicas, or failing to start. Redis is
 faked at the client boundary so no server is needed.
 """
 
+import dataclasses
 import logging
 
 import fakeredis
@@ -343,7 +344,10 @@ class TestRealtimeResolution:
 
         assert stopped == [True]
 
-    def test_close_joins_a_started_redis_subscriber(self, tmp_path):
+    def test_close_joins_a_started_redis_subscriber(self, tmp_path, monkeypatch):
+        import jasil.backends.realtime_redis as realtime_redis
+
+        monkeypatch.setattr(realtime_redis, "_POLL_TIMEOUT_SECONDS", 0.02)  # how long stop waits for the poll
         server = fakeredis.FakeServer()
         realtime = RedisRealtime(fakeredis.FakeStrictRedis(server=server, decode_responses=True))
         base = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -362,6 +366,58 @@ class TestRealtimeResolution:
         platform.close()
 
         assert not thread.is_alive()
+
+
+class TestAUriIsNeverEchoed:
+    """A Redis URI carries its password; a malformed one must not end up in an error or a log line."""
+
+    SECRET = "S3CRETPW"
+
+    @pytest.mark.parametrize(
+        ("build", "setting"),
+        [
+            (container._build_state, "state_uri"),
+            (container._build_storage, "storage_uri"),
+            (container._build_events, "events_uri"),
+            (container._build_realtime, "realtime_uri"),
+            (container._build_lock, "lock_uri"),
+        ],
+    )
+    @pytest.mark.parametrize("uri", ["redis:/:S3CRETPW@cache:6379/0", "mysql://:S3CRETPW@db/x"])
+    def test_an_unsupported_uri_is_refused_without_its_secret(self, build, setting, uri):
+        arguments = (_settings(**{setting: uri}),) + ((None,) if build is container._build_events else ())
+
+        with pytest.raises(ValueError, match=setting) as excinfo:
+            build(*arguments)
+
+        assert self.SECRET not in str(excinfo.value)
+
+    def test_the_audit_sink_uri_is_not_echoed_either(self):
+        audit = settings.AuditSettings(external_sink_uri="ftp:/user:S3CRETPW@host")
+
+        with pytest.raises(ValueError, match="external_sink_uri") as excinfo:
+            container._build_audit_sink(_settings(audit=audit))
+
+        assert self.SECRET not in str(excinfo.value)
+
+    def test_the_settings_repr_hides_the_redis_uris(self):
+        rendered = repr(
+            _settings(
+                state_uri="redis://:S3CRETPW@c/0",
+                events_uri="redis://:S3CRETPW@c/1",
+                realtime_uri="redis://:S3CRETPW@c/2",
+            )
+        )
+
+        assert self.SECRET not in rendered
+
+    def test_the_startup_report_names_no_malformed_uri(self):
+        from jasil.capabilities import build_capability_report
+
+        report = build_capability_report(_settings(state_uri="redis:/:S3CRETPW@cache:6379/0")).render()
+
+        assert self.SECRET not in report
+        assert "state" in report
 
 
 class TestBuildPlatform:
@@ -398,7 +454,7 @@ class TestBuildPlatform:
         """It is shared process-wide; a mutation would be visible everywhere."""
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
 
-        with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             platform.state = MemoryState()  # type: ignore[misc]
 
     def test_a_distributed_profile_without_uris_fails_fast(self):

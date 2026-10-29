@@ -140,8 +140,11 @@ db.commit()  # whoever owns the transaction
 Details worth knowing: the envelope (and ambient request id) is captured when you
 publish, not when you commit; publishing starts the session's transaction if none
 is active; "outermost" means the session's outermost transaction, so a session
-joined to an external transaction (`join_transaction_mode="create_savepoint"`)
-dispatches on its own commit; an event published from a subscriber during
+joined to an external transaction (`Session(bind=connection)` over a connection
+that already has one open, in any `join_transaction_mode`) dispatches when the
+session commits, before the external transaction does: if that one then rolls
+back, the event has already gone out. Publish on a session that owns its
+transaction when that matters; an event published from a subscriber during
 dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op.
 Only synchronous `Session` objects are supported; anything else (an `AsyncSession`,
 a `scoped_session` proxy) raises `TypeError`.
