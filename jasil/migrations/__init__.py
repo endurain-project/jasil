@@ -315,8 +315,9 @@ def _adoption_include_object(tables: frozenset[str]) -> Any:
             if name in _POSTGRES_GIN_INDEXES.values():
                 return False
             if reflected and compare_to is None:
-                # Additional non-unique indexes do not change JASIL's write contract.
-                return False
+                # An additional non-unique index does not change JASIL's write contract; a unique one refuses
+                # writes JASIL makes, so it is reported.
+                return bool(getattr(obj, "unique", False))
         return True
 
     return include_object
@@ -329,6 +330,77 @@ def _primary_key_differences(inspector: Any, metadata: Any, table_names: frozens
         actual = inspector.get_pk_constraint(table_name).get("constrained_columns") or []
         if actual != expected:
             differences.append(f"{table_name}: expected primary key {expected!r}, found {actual!r}")
+    return differences
+
+
+def _server_default_differences(inspector: Any, metadata: Any, table_names: frozenset[str]) -> list[str]:
+    """Name each NOT NULL column whose database default is missing.
+
+    A writer of the previous release omits the columns a newer revision added and relies on that default, so
+    its absence breaks the rolling deploy. Only presence is compared: how a database spells a default (quoting,
+    casts, ``now()`` or ``CURRENT_TIMESTAMP``) differs by dialect and driver.
+    """
+    differences = []
+    for table_name in sorted(table_names):
+        reflected = {column["name"]: column for column in inspector.get_columns(table_name)}
+        for column in metadata.tables[table_name].columns:
+            if column.server_default is None or column.nullable:
+                continue
+            found = reflected.get(column.name)
+            if found is not None and found.get("default") is None:
+                differences.append(f"{table_name}.{column.name}: missing server default")
+    return differences
+
+
+def _check_constraint_differences(inspector: Any, metadata: Any, table_names: frozenset[str]) -> list[str]:
+    """Name each CHECK constraint the schema lacks, by name; their expressions differ by dialect too."""
+    from sqlalchemy import CheckConstraint
+
+    differences: list[str] = []
+    for table_name in sorted(table_names):
+        expected = {
+            constraint.name
+            for constraint in metadata.tables[table_name].constraints
+            if isinstance(constraint, CheckConstraint) and isinstance(constraint.name, str)
+        }
+        if not expected:
+            continue
+        present = {constraint["name"] for constraint in inspector.get_check_constraints(table_name)}
+        differences.extend(f"{table_name}: missing check constraint {name!r}" for name in sorted(expected - present))
+    return differences
+
+
+def _postgres_audit_differences(connection: Any) -> list[str]:
+    """Name what a PostgreSQL audit log built by ``rev0006`` has and this one lacks.
+
+    ``create_all`` builds a plain table, and ``upgrade`` after adoption would never add the partitions, the
+    append-only triggers or the retention functions.
+    """
+    if connection.dialect.name != "postgresql":
+        return []
+    from sqlalchemy import text
+
+    from jasil.audit import _postgres as audit_pg
+
+    table = audit_pg.LOG
+    differences = []
+    kind = connection.execute(text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:name)"), {"name": table})
+    if kind.scalar() != "p":
+        differences.append(f"{table}: not partitioned")
+    triggers = set(
+        connection.execute(
+            text("SELECT tgname FROM pg_trigger WHERE tgrelid = to_regclass(:name) AND NOT tgisinternal"),
+            {"name": table},
+        ).scalars()
+    )
+    differences.extend(
+        f"{table}: missing trigger {name!r}"
+        for name in (f"{table}_no_update_delete", f"{table}_no_truncate")
+        if name not in triggers
+    )
+    for signature in (f"{audit_pg.ENSURE_FUNCTION}(integer)", f"{audit_pg.DROP_FUNCTION}(timestamptz)"):
+        if connection.execute(text("SELECT to_regprocedure(:signature)"), {"signature": signature}).scalar() is None:
+            differences.append(f"{table}: missing function {signature!r}")
     return differences
 
 
@@ -518,8 +590,12 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
         if difference[0] != "remove_table"
     ]
     detailed.extend(_primary_key_differences(inspector, restricted, common))
+    detailed.extend(_server_default_differences(inspector, restricted, common))
+    detailed.extend(_check_constraint_differences(inspector, restricted, common))
     for table_name in common & _POSTGRES_GIN_INDEXES.keys():
         detailed.extend(_postgres_gin_differences(connection, inspector, table_name))
+    if "jasil_audit_log" in common:
+        detailed.extend(_postgres_audit_differences(connection))
     return differences + detailed, count + len(detailed)
 
 

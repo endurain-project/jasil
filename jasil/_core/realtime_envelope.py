@@ -94,7 +94,7 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
     envelope = {"v": ENVELOPE_VERSION, "key": key, "hint": hint}
     try:
         encoded = json.dumps(envelope, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode()
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         raise ValueError(f"hint is not JSON-serialisable: {error}") from None
     if len(encoded) > max_bytes:
         raise ValueError(f"realtime hint envelope is {len(encoded)} bytes, over the {max_bytes}-byte cap")
@@ -113,7 +113,7 @@ def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
     """
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):  # nesting past the parser's depth is not a JSON error
         logger.warning("Ignoring a realtime hint that is not valid JSON")
         return None
     if not isinstance(envelope, dict):
@@ -145,7 +145,7 @@ def _encodes(hint: dict) -> bool:
     # drop both here so no handler sees a hint no backend could send.
     try:
         json.dumps(hint, ensure_ascii=False, allow_nan=False).encode()
-    except (UnicodeEncodeError, ValueError):
+    except (UnicodeEncodeError, ValueError, RecursionError):
         return False
     return True
 

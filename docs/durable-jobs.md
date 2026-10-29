@@ -165,28 +165,36 @@ expired on the last attempt, or the reaper recovered a worker that died.
 `error` is the stored last failure reason (`str | None`); for an exception it is
 `"<ExceptionType>: <message>"`, so it names the failure even when the message is empty.
 
-* **At least once.** Delivery is recorded in `dead_letter_notified_at` only after the
-  callback returns. A crash, or a callback that raises, leaves the callback owed and a
-  later reaper pass calls it again, after a backoff that starts at 60 seconds and
-  doubles per failure up to an hour. Each delivery first claims the job with a
-  5-minute lease, so a worker and a reaper (or two reapers) do not run it together.
-  The count and the last failure are kept in `dead_letter_attempts` and
-  `dead_letter_callback_error`. **Make the callback idempotent.**
-* **After the transition, outside the handler.** It runs in the worker or reaper
-  process, after the dead-letter is committed and in no session of the failed handler.
-  An exception from it is logged and swallowed; the job stays `dead_letter`.
-* **It runs inline.** The worker (or reaper) waits for it, after the failure has been
-  logged, so keep it short and give any network call its own timeout. A callback that
-  outlasts its 5-minute lease may be started a second time by another process.
+* **At least once, within bounds.** Delivery is recorded in `dead_letter_notified_at`
+  only after the callback returns. A crash, or a callback that raises, leaves the
+  callback owed and a later sweep calls it again, after a backoff that starts at 60
+  seconds and doubles per failure up to an hour. Each delivery first claims the job
+  with a 5-minute lease, so two sweeps do not run it together. The count and the last
+  failure are kept in `dead_letter_attempts` and `dead_letter_callback_error`. Two
+  limits bound the retries: after 10 deliveries that raised, the callback is given up
+  on, and the sweep only picks up jobs dead-lettered in the last 7 days, so a callback
+  added to a subscriber later does not fire for its old history and one owed while no
+  process registered it for a week is not called. Either way the job keeps
+  `dead_letter_notified_at` NULL, so a query for owed notifications still finds it.
+  **Make the callback idempotent.**
+* **In the scheduled sweep, never in the worker.** The sweep that
+  `schedule_job_maintenance` runs every 60 seconds delivers it, so it arrives within
+  about a minute of the dead letter, after the dead-letter is committed and in no
+  session of the failed handler. The worker never waits for a callback, so a slow or
+  hung one cannot hold a worker or the leases of the jobs behind it. An exception from
+  it is logged and swallowed; the job stays `dead_letter`.
+* **Keep it short.** The sweep runs callbacks one at a time and waits for each, so
+  give any network call its own timeout. A callback that outlasts its 5-minute lease
+  may be started a second time by another process.
 * **Check your own state.** A handler that finishes after its lease was taken still
   writes its result, but the job stays `dead_letter`. The callback may then run for
   work that succeeded, so read the app's record before overwriting it.
 * **Replay.** `replay_dead_letter_job` clears the record, and the callback runs
   again only if the job dead-letters again.
-* **Register it where the reaper runs.** The callback lives in the process-local
+* **Register it where the maintenance runs.** The callback lives in the process-local
   registry. A process that did not register it never delivers or consumes the
   notification, so register subscribers, callbacks included, in every process that
-  runs a worker or the reaper. A job whose subscriber has no callback in the process
+  runs `schedule_job_maintenance`. A job whose subscriber has no callback in the process
   doing the sweep is skipped without a log line.
 * **Dead letters before this feature** are not called back; the migration marks them
   as delivered.
@@ -256,6 +264,12 @@ downstream outage would all retry at the same instant and stampede the recoverin
 dependency.
 
 Once `attempts` reaches `max_attempts`, the job becomes `dead_letter`.
+
+A handler that raises `SystemExit`, `KeyboardInterrupt` or a cancellation is a
+failure too, recorded like any other, but the exception is then re-raised: the
+jobs still waiting in that batch go back to `pending` and the worker stops, with an
+`ERROR` log line. Nothing restarts an in-process worker, so do not use these to end
+a job.
 
 Only real attempts count. A run the handler [deferred](#deferring-a-job) with
 `DeferJob` is neither a failure nor an attempt: `jasil_processing_jobs.attempts`

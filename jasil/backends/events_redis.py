@@ -136,8 +136,10 @@ class RedisStreamEventBus:
         if self._thread is not None:
             return
         self._ensure_group()
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="event-bus-consumer", daemon=True)
+        # A fresh event per thread: a thread a timed-out stop left running keeps the one already set, so a
+        # restart cannot revive it beside the new consumer.
+        stop = self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(stop,), name="event-bus-consumer", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -152,9 +154,9 @@ class RedisStreamEventBus:
             if "BUSYGROUP" not in str(error):  # any error other than "group already exists" is real
                 raise
 
-    def _run(self) -> None:
+    def _run(self, stop: threading.Event) -> None:
         group_missing = False
-        while not self._stop.is_set():
+        while not stop.is_set():
             try:
                 if group_missing:
                     self._ensure_group()
@@ -165,7 +167,7 @@ class RedisStreamEventBus:
                 # stream, so every read fails until the group is created again.
                 group_missing = isinstance(error, redis_clients.ResponseError) and str(error).startswith("NOGROUP")
                 logger.error("Event bus consumer poll failed", exc_info=error)
-                self._stop.wait(timeout=1.0)
+                stop.wait(timeout=1.0)
 
     def _poll_once(self) -> None:
         response = self._client.xreadgroup(
@@ -189,8 +191,12 @@ class RedisStreamEventBus:
         except Exception as error:  # a poisoned entry or handler must not kill the consumer thread
             logger.error("Event handling failed for stream entry %s", entry_id, exc_info=error)
         # Acked whatever the handlers did: nothing reads a claimed entry again, so a pending one would only grow
-        # the pending-entries list. Durable jobs are the path that retries.
-        self._client.xack(self._stream, self._group, entry_id)
+        # the pending-entries list. Durable jobs are the path that retries. A failed ack only leaves this entry
+        # pending; it must not end the poll, or the rest of the batch, already read, would never be handled.
+        try:
+            self._client.xack(self._stream, self._group, entry_id)
+        except redis_clients.RedisError as error:
+            logger.error("Event bus could not ack stream entry %s; it stays pending", entry_id, exc_info=error)
 
 
 def _call_each(handlers: list[Callable[[Event], None]], event: Event) -> None:

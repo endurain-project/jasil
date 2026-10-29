@@ -63,16 +63,18 @@ fields.
 | `enabled` | `False` | Route events through the outbox instead of the bus. |
 | `lease_seconds` | `300` | How long a worker may go **silent** before the reaper may reclaim the jobs it holds. A running worker renews its leases on every heartbeat, so this is not a cap on handler runtime. At least three `heartbeat_interval_seconds`. |
 | `max_runtime_seconds` | `1800` | The longest a single handler is kept leased. Past it the job is abandoned to the reaper, the handler is signalled (`jasil.jobs.lease_lost`), and the rest of the batch is released. Not below `lease_seconds`. |
-| `batch_size` | `20` | Maximum rows claimed or relayed per pass. |
-| `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
-| `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
+| `batch_size` | `20` | Maximum rows claimed or relayed per pass, 1 to 1000. |
+| `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. At least 0. |
+| `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. Not below `backoff_base_seconds`. |
 | `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`; a later `retry_at` is clamped to it (jitter included). |
-| `max_deferrals` | `100` | Deferrals a job may take. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
-| `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
+| `max_deferrals` | `100` | Deferrals a job may take, at least 0. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
+| `poll_interval_seconds` | `5.0` | Idle wait between empty polls; greater than zero. |
 | `record_attempts` | `True` | Write one `jasil_job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
-| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
-| `max_attempts` | `5` | Attempts before a job is dead-lettered. |
+| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. Greater than zero. |
+| `max_attempts` | `5` | Attempts before a job is dead-lettered; at least 1. |
 | `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. A job's history goes after the job row itself is pruned; pending, claimed and dead-lettered jobs keep theirs. `<= 0` disables. |
+
+Every range above is checked when the object is built, so a value the pipeline cannot honour raises `ValueError` where you configure JASIL, not when a worker starts.
 
 ### `EventLogSettings`
 

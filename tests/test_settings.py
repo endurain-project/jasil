@@ -173,6 +173,64 @@ class TestSettingsInstallation:
         assert defaults.event_log.enabled is False
 
 
+class TestJobSettingsValidation:
+    """Values the job pipeline cannot honour fail where the host configures JASIL, not when a worker starts."""
+
+    def test_the_defaults_are_valid(self):
+        settings.JobSettings()
+
+    @pytest.mark.parametrize(
+        ("values", "message"),
+        [
+            pytest.param({"batch_size": 0}, r"jobs\.batch_size must be at least 1", id="no-batch"),
+            pytest.param({"batch_size": 1001}, r"jobs\.batch_size must be at most 1000", id="huge-batch"),
+            pytest.param(
+                {"poll_interval_seconds": 0}, r"poll_interval_seconds must be greater than zero", id="hot-poll"
+            ),
+            pytest.param({"max_attempts": 0}, r"jobs\.max_attempts must be at least 1", id="no-attempts"),
+            pytest.param({"backoff_base_seconds": -1}, r"backoff_base_seconds must be at least 0", id="negative-base"),
+            pytest.param(
+                {"backoff_base_seconds": 120, "backoff_max_seconds": 60},
+                r"backoff_max_seconds \(60\) must not be below jobs\.backoff_base_seconds \(120\)",
+                id="ceiling-below-base",
+            ),
+            pytest.param({"defer_max_seconds": -1}, r"defer_max_seconds must be at least 0", id="negative-defer"),
+            pytest.param({"max_deferrals": -1}, r"max_deferrals must be at least 0", id="negative-deferrals"),
+            pytest.param(
+                {"lease_seconds": 44, "heartbeat_interval_seconds": 15},
+                r"at least three heartbeat intervals \(45 s",
+                id="lease-below-three-beats",
+            ),
+            pytest.param(
+                {"max_runtime_seconds": 299},
+                r"max_runtime_seconds \(299\) must not be below jobs.lease_seconds \(300\)",
+                id="cap-below-lease",
+            ),
+            pytest.param(
+                {"heartbeat_interval_seconds": 0},
+                r"heartbeat_interval_seconds must be greater than zero",
+                id="no-interval",
+            ),
+        ],
+    )
+    def test_a_value_the_pipeline_cannot_honour_is_refused(self, values, message):
+        with pytest.raises(ValueError, match=message):
+            settings.JobSettings(**values)
+
+    def test_the_bounds_themselves_are_accepted(self):
+        settings.JobSettings(
+            batch_size=1000,
+            max_attempts=1,
+            backoff_base_seconds=0,
+            backoff_max_seconds=0,
+            defer_max_seconds=0,
+            max_deferrals=0,
+            lease_seconds=45,
+            heartbeat_interval_seconds=15,
+            max_runtime_seconds=45,
+        )
+
+
 class TestCorrelationId:
     def test_there_is_no_correlation_id_by_default(self):
         assert correlation.get_correlation_id() is None

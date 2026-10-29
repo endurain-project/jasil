@@ -82,6 +82,44 @@ class TestJobRunner:
     def test_an_empty_queue_processes_nothing(self, runner):
         assert runner.run_once() == 0
 
+    @pytest.mark.parametrize("exit_signal", [SystemExit(3), KeyboardInterrupt()])
+    def test_a_handler_that_exits_is_recorded_failed_and_the_exit_goes_on(self, runner, registry, db, exit_signal):
+        """The process is going down, but the job must not sit claimed and unexplained until its lease expires."""
+
+        def leave(_event):
+            raise exit_signal
+
+        registry.register("activity.created", "s", leave)
+        self._enqueue(db)
+
+        with pytest.raises(type(exit_signal)):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_PENDING
+        assert job.last_error.startswith(type(exit_signal).__name__)
+        assert job.locked_by is None
+
+    def test_the_jobs_waiting_behind_an_exiting_handler_go_back_to_the_queue(self, runner, registry, db):
+        ran = []
+
+        def leave(event):
+            ran.append(event.event_id)
+            raise SystemExit(3)
+
+        registry.register("activity.created", "s", leave)
+        self._enqueue(db)
+        self._enqueue(db)
+
+        with pytest.raises(SystemExit):
+            runner.run_once()
+
+        db.rollback()
+        jobs = db.query(ProcessingJob).all()
+        assert len(ran) == 1
+        waiting = [job for job in jobs if job.event_id != ran[0]]
+        assert [(job.status, job.locked_by, job.attempts) for job in waiting] == [(jobs_crud.STATUS_PENDING, None, 0)]
+
     def test_a_due_job_runs_its_handler(self, runner, registry, db):
         seen = []
         registry.register("activity.created", "s", seen.append)

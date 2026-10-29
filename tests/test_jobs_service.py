@@ -94,32 +94,6 @@ class TestBuildRunner:
         assert runner.leases._max_runtime_seconds == 500
         assert runner.leases._lease_seconds == 90
 
-    @pytest.mark.parametrize(
-        ("jobs", "message"),
-        [
-            pytest.param(
-                {"lease_seconds": 44, "heartbeat_interval_seconds": 15},
-                r"at least three heartbeat intervals \(45 s",
-                id="lease-below-three-beats",
-            ),
-            pytest.param(
-                {"max_runtime_seconds": 299},
-                r"max_runtime_seconds \(299\) must not be below jobs.lease_seconds \(300\)",
-                id="cap-below-lease",
-            ),
-            pytest.param(
-                {"heartbeat_interval_seconds": 0},
-                r"heartbeat_interval_seconds must be greater than zero",
-                id="no-interval",
-            ),
-        ],
-    )
-    def test_timings_that_cannot_keep_a_lease_alive_are_refused(self, platform, session_factory, jobs, message):
-        settings.configure(settings.JasilSettings(jobs=settings.JobSettings(**jobs)))
-
-        with pytest.raises(ValueError, match=message):
-            jobs_service.build_runner()
-
     def test_a_lease_of_exactly_three_beats_is_accepted(self, platform, session_factory):
         settings.configure(
             settings.JasilSettings(jobs=settings.JobSettings(lease_seconds=45, heartbeat_interval_seconds=15))

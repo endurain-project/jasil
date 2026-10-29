@@ -156,14 +156,32 @@ class TestSharedClients:
         assert len(recording.created) == 2
 
 
-class TestShutdown:
-    def test_closing_releases_and_forgets_every_client(self, recording):
-        client = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+class TestReferences:
+    """A shared client is closed when the last platform using it lets go, never under another one."""
 
-        redis_clients.close_shared_clients()
+    KEY = ("redis://cache:6379/0", True)
 
+    def test_a_client_is_closed_only_when_its_last_user_releases_it(self, recording):
+        client = redis_clients.get_shared_client("redis://cache:6379/0", purpose="state")
+        assert redis_clients.get_shared_client("redis://cache:6379/0", purpose="bus") is client
+
+        redis_clients.release_shared_clients([self.KEY])
+        assert client.closed is False
+
+        redis_clients.release_shared_clients([self.KEY])
         assert client.closed is True
         assert redis_clients._shared_clients == {}
+
+    def test_releasing_a_client_already_gone_is_a_no_op(self, recording):
+        client = redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+        redis_clients.release_shared_clients([self.KEY])
+
+        redis_clients.release_shared_clients([self.KEY])
+
+        assert client.closed is True
+
+    def test_releasing_nothing_is_a_no_op(self):
+        redis_clients.release_shared_clients([])
 
     def test_a_client_that_will_not_close_is_dropped_anyway(self, recording, caplog):
         """Shutdown runs while something else is already going wrong; it cannot raise."""
@@ -171,20 +189,18 @@ class TestShutdown:
         client.close_error = RuntimeError("socket already gone")
 
         with caplog.at_level("WARNING"):
-            redis_clients.close_shared_clients()
+            redis_clients.release_shared_clients([self.KEY])
 
         assert "Failed to close the shared redis client" in caplog.text
         assert redis_clients._shared_clients == {}
 
-    def test_closing_twice_is_a_no_op(self, recording):
-        """``Platform.close`` is documented as safe to call more than once."""
-        redis_clients.get_shared_client("redis://cache:6379/0", purpose="test")
+    def test_acquisitions_are_recorded_only_inside_the_tracker(self, recording):
+        redis_clients.get_shared_client("redis://cache:6379/1", purpose="outside")
+        with redis_clients.track_acquisitions() as acquired:
+            redis_clients.get_shared_client("redis://cache:6379/0", purpose="state")
+            redis_clients.get_shared_client("redis://cache:6379/0", purpose="raw", decode_responses=False)
 
-        redis_clients.close_shared_clients()
-        redis_clients.close_shared_clients()
-
-    def test_closing_with_nothing_open_is_a_no_op(self):
-        redis_clients.close_shared_clients()
+        assert acquired == [self.KEY, ("redis://cache:6379/0", False)]
 
     def test_resetting_discards_without_closing(self, recording):
         """For tests holding an injected fake, where closing would break the fixture."""

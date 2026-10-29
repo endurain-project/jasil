@@ -101,6 +101,9 @@ class Platform:
             processes holding client connections need to); :meth:`close` stops it.
     """
 
+    # The shared Redis clients this platform's backends took, which :meth:`close` gives back. Set by
+    # ``build_platform``; a platform assembled by hand took none through it and releases none.
+
     profile: DeploymentProfile
     state: StateProvider
     storage: StorageProvider
@@ -112,9 +115,10 @@ class Platform:
     mail: MailProvider = field(default_factory=NullMail)
     realtime: RealtimeProvider = field(default_factory=InProcessRealtime)
     audit_sink: AuditSink | None = None
+    _shared_redis: list[redis_clients.ClientKey] = field(default_factory=list, repr=False, compare=False)
 
     def close(self) -> None:
-        """Release what the platform owns: the bus consumer, the realtime subscriber and the Redis clients.
+        """Release what the platform owns: the bus consumer, the realtime subscriber and its Redis clients.
 
         Call once on shutdown, after the host has stopped producing events. Only
         the capabilities that hold something beyond the process are affected —
@@ -122,7 +126,9 @@ class Platform:
 
         Two things it deliberately does *not* stop, because the platform does not
         own them: the durable-job worker and its scheduled maintenance (see
-        ``jasil.jobs.service.stop_job_worker``), and the database engine.
+        ``jasil.jobs.service.stop_job_worker``), and the database engine. A Redis
+        client another platform in the process still uses stays open until that
+        one closes too.
 
         Safe to call more than once, and never raises: a failure to shut a
         connection down must not mask whatever prompted the shutdown.
@@ -132,7 +138,9 @@ class Platform:
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
         self.realtime.stop()  # the provider contract: never raises
-        redis_clients.close_shared_clients()
+        # Taken out first, so a second close has nothing left to give back.
+        shared, self._shared_redis[:] = list(self._shared_redis), []
+        redis_clients.release_shared_clients(shared)
 
 
 def build_platform(
@@ -182,25 +190,33 @@ def build_platform(
     geocoding = (
         _build_runtime_geocoding(settings, sources.geocoding) if sources.geocoding else _build_geocoding(settings)
     )
-    try:
-        return Platform(
-            profile=profile,
-            state=_build_state(settings),
-            storage=_build_storage(settings),
-            events=_build_events(settings, recorder),
-            lock=_build_lock(settings),
-            clock=clock,
-            geocoding=geocoding,
-            mail=mail,
-            recorder=recorder,
-            realtime=_build_realtime(settings),
-            audit_sink=_build_audit_sink(settings),
-        )
-    except Exception:
-        # No Platform exists to close, so release the Redis clients a backend
-        # that did build has already opened.
-        redis_clients.close_shared_clients()
-        raise
+    with redis_clients.track_acquisitions() as shared_redis:
+        try:
+            state = _build_state(settings)
+            storage = _build_storage(settings)
+            events = _build_events(settings, recorder)
+            lock = _build_lock(settings)
+            realtime = _build_realtime(settings)
+            audit_sink = _build_audit_sink(settings)
+        except Exception:
+            # No Platform exists to close, so give back the Redis clients the backends that did build took,
+            # and only those: another platform in the process may be using the same clients.
+            redis_clients.release_shared_clients(shared_redis)
+            raise
+    return Platform(
+        profile=profile,
+        state=state,
+        storage=storage,
+        events=events,
+        lock=lock,
+        clock=clock,
+        geocoding=geocoding,
+        mail=mail,
+        recorder=recorder,
+        realtime=realtime,
+        audit_sink=audit_sink,
+        _shared_redis=shared_redis,
+    )
 
 
 def _check_deployment_consistency(settings: JasilSettings, sources: RuntimeSources | None = None) -> None:

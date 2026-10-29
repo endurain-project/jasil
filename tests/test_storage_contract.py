@@ -897,6 +897,30 @@ class TestSegmentValidationConformance:
         with pytest.raises(ValueError, match="escapes base directory"):
             call(arguments["area"], arguments["key"], *extra)
 
+    @pytest.mark.parametrize("bad", ["a\x00b", "line\nbreak", "tab\there", "del\x7f"])
+    @pytest.mark.parametrize("field", ["area", "key"])
+    @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "exists", "delete", "url"])
+    def test_a_control_character_is_refused_by_every_backend(self, storage, bad, field, operation):
+        """S3 cannot list or batch-delete such a key, and a local path cannot hold a NUL."""
+        arguments = {"area": "avatars", "key": "42.webp", field: bad}
+        call = getattr(storage, operation)
+        extra = (b"x",) if operation == "save" else (_ReadOnceSource(b"x"),) if operation == "save_stream" else ()
+
+        with pytest.raises(ValueError, match="control character"):
+            call(arguments["area"], arguments["key"], *extra)
+
+    def test_a_key_longer_than_object_storage_allows_is_refused_by_every_backend(self, storage):
+        """S3 refuses a key over 1024 bytes; local disk must refuse it too, or the two contracts differ."""
+        too_long = "é" * 513  # 1026 bytes in UTF-8
+
+        with pytest.raises(ValueError, match="1024 bytes"):
+            storage.save(AREA, too_long, b"x")
+
+    def test_a_key_at_the_limit_is_accepted(self, storage):
+        at_limit = "/".join(["k" * 200] * 5)[:1000]
+
+        assert storage.save(AREA, at_limit, b"x") == at_limit
+
     @pytest.mark.parametrize("field", ["area", "key"])
     @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "open_stream", "exists", "delete", "url"])
     def test_an_empty_segment_is_refused(self, storage, field, operation):

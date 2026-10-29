@@ -62,7 +62,10 @@ inlining it.
 
 Identifiers *are* bounded, because they are indexed columns: `event_type` is
 capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
-Going over raises at `new_event` rather than failing at the write.
+Going over raises at `new_event` rather than failing at the write. The functions
+tied to your commit (`publish_committing`, `publish_on_commit` and their batch
+forms) raise it before committing or staging anything, on the durable and the
+best-effort route alike; `publish` logs and swallows it with every other failure.
 
 ## Publishing
 
@@ -138,7 +141,8 @@ db.commit()  # whoever owns the transaction
   wait for the outermost commit. Dispatch failures are logged and swallowed.
 
 Details worth knowing: the envelope (and ambient request id) is captured when you
-publish, not when you commit; publishing starts the session's transaction if none
+publish, not when you commit, including a copy of the payload, so changing the dict
+afterwards does not change the event; publishing starts the session's transaction if none
 is active; "outermost" means the session's outermost transaction, so a session
 joined to an external transaction (`Session(bind=connection)` over a connection
 that already has one open, in any `join_transaction_mode`) dispatches when the

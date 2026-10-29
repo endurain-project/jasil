@@ -336,7 +336,8 @@ class TestPlatformClose:
 
         assert stopped == [True]
 
-    def test_it_closes_the_shared_redis_clients(self, tmp_path, monkeypatch):
+    def test_it_leaves_open_a_shared_redis_client_it_did_not_take(self, tmp_path, monkeypatch):
+        """Another platform in the process may still be using it."""
         closed = []
 
         class Client:
@@ -349,8 +350,9 @@ class TestPlatformClose:
 
         platform.close()
 
-        assert closed == [True]
-        assert redis_clients._shared_clients == {}
+        assert closed == []
+        assert list(redis_clients._shared_clients) == [("redis://c:6379/0", True)]
+        redis_clients.reset_shared_clients()
 
     def test_a_bus_that_fails_to_stop_does_not_break_shutdown(self, tmp_path, monkeypatch, caplog):
         """Shutdown must not mask whatever prompted it."""
@@ -375,7 +377,7 @@ class TestPlatformClose:
         redis_clients.get_shared_client("redis://c:6379/0", purpose="test")
 
         with caplog.at_level("WARNING"):
-            redis_clients.close_shared_clients()
+            redis_clients.release_shared_clients([("redis://c:6379/0", True)])
 
         assert redis_clients._shared_clients == {}
         assert "Failed to close the shared redis client" in caplog.text

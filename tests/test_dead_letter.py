@@ -1,8 +1,9 @@
 """The dead-letter hook: attempt counts on the event, and ``on_dead_letter`` delivery.
 
 The callback is delivered at least once. A job is owed one while it is
-``dead_letter`` with ``dead_letter_notified_at`` NULL; the process that
-dead-lettered it delivers at once, and a sweep delivers what a crash left behind.
+``dead_letter`` with ``dead_letter_notified_at`` NULL, and the scheduled sweep
+delivers it: never the worker, so a slow callback cannot hold a worker or the
+leases of the jobs waiting behind it.
 """
 
 from dataclasses import replace
@@ -103,6 +104,11 @@ def fail_until_dead(runner, clock, db, attempts):
     return stored_job(db)
 
 
+def sweep(runner) -> int:
+    """Run the scheduled delivery once, as ``deliver_dead_letters_scheduled`` does."""
+    return deliver_dead_letters(registry=runner._registry, session_factory=runner._session_factory, clock=runner._clock)
+
+
 class TestAttemptCounts:
     def test_a_durable_handler_sees_a_one_based_attempt_and_the_ceiling(self, runner, registry, clock, db):
         seen = []
@@ -184,12 +190,37 @@ class TestRegistration:
         assert registry.dead_letter_subscriber_ids() == frozenset()
 
 
+class TestTheWorkerNeverRunsTheCallback:
+    def test_a_dead_letter_is_left_owed_for_the_sweep(self, runner, db, calls):
+        enqueue(db, max_attempts=1)
+
+        runner.run_once()
+
+        assert calls == []
+        assert stored_job(db).dead_letter_notified_at is None
+        assert sweep(runner) == 1
+        assert len(calls) == 1
+
+    def test_a_callback_that_never_returns_cannot_hold_the_rest_of_the_batch(self, runner, registry, db):
+        ran = []
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda _e, _r: pytest.fail("ran in the worker"))
+        registry.register("c.d", "t", lambda event: ran.append(event.event_type))
+        enqueue(db, max_attempts=1)
+        jobs_crud.enqueue_job(new_event("c.d", {}, source="test"), "t", max_attempts=1, now=T0, db=db)
+
+        assert runner.run_once() == 2
+
+        assert ran == ["c.d"]
+
+
 class TestHandlerException:
     def test_the_callback_runs_once_when_the_last_attempt_raises(self, runner, clock, db, calls):
         enqueue(db, max_attempts=2)
+        fail_until_dead(runner, clock, db, 2)
 
-        job = fail_until_dead(runner, clock, db, 2)
+        sweep(runner)
 
+        job = stored_job(db)
         assert len(calls) == 1
         event, error = calls[0]
         assert isinstance(event, Event)
@@ -223,8 +254,9 @@ class TestHandlerException:
 
         registry.register("a.b", "s", _boom, on_dead_letter=callback)
         enqueue(db, max_attempts=1)
-
         runner.run_once()
+
+        sweep(runner)
 
         assert seen == [jobs_crud.STATUS_DEAD_LETTER]
 
@@ -388,6 +420,7 @@ class TestCallbackRaising:
 
         with caplog.at_level("ERROR"):
             assert runner.run_once() == 1
+            sweep(runner)
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
@@ -397,6 +430,7 @@ class TestCallbackRaising:
     def test_it_is_retried_after_a_growing_backoff_not_on_every_pass(self, runner, clock, db, failing):
         enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         assert len(failing) == 1
 
         clock.advance(RETRY_BASE_SECONDS - 1)
@@ -418,6 +452,7 @@ class TestCallbackRaising:
     def test_the_failure_is_stored_and_the_dead_letter_time_is_kept(self, runner, clock, db, failing):
         enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         dead_at = stored_job(db).updated_at
         clock.advance(RETRY_BASE_SECONDS + 1)
 
@@ -441,6 +476,7 @@ class TestCallbackRaising:
         __import__("logging").getLogger("jasil.jobs.runner").addHandler(spy)
         try:
             runner.run_once()
+            sweep(runner)
         finally:
             __import__("logging").getLogger("jasil.jobs.runner").removeHandler(spy)
 
@@ -453,8 +489,9 @@ class TestCallbackRaising:
         event = new_event("a.b", {}, source="t")
         jobs_crud.enqueue_job(event, "bad", max_attempts=1, now=T0, db=db)
         jobs_crud.enqueue_job(event, "good", max_attempts=1, now=T0, db=db)
-
         runner.run_once()
+
+        sweep(runner)
 
         assert done == [event.event_id]
 
@@ -488,6 +525,7 @@ class TestReplay:
     ):
         job = enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         assert len(calls) == 1
 
         assert jobs_crud.replay_dead_letter_job(job.id, now=clock.now(), db=db)
@@ -499,6 +537,7 @@ class TestReplay:
         assert len(calls) == 1  # replaying does not call it
 
         runner.run_once()
+        sweep(runner)
         assert len(calls) == 2
         assert stored_job(db).dead_letter_notified_at is not None
 

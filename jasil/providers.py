@@ -333,8 +333,9 @@ class StorageProvider(
     persist objects.
 
     ``expires_in`` is **best-effort, and the one place the backends genuinely
-    differ**: ``s3://`` returns a presigned URL that honours expiry and response
-    header overrides, while ``local://`` returns a plain path for the host's own
+    differ**: ``s3://`` returns a presigned URL that honours expiry (1 second to 7
+    days, ``ValueError`` otherwise) and response header overrides, while
+    ``local://`` returns a plain path for the host's own
     web server and cannot enforce any of them. Do not rely on these controls
     unless you know the deployment uses object storage; on local disk they are
     host policy. The local backend logs a warning the first time it is handed a

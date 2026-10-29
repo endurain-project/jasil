@@ -108,11 +108,12 @@ class JobHandlerRegistry:
             on_dead_letter: Optional ``callback(event, error)`` run after a job of
                 this subscriber has become ``dead_letter``, whether its last
                 attempt raised, its lease expired, or the reaper recovered it.
-                It runs in the worker or reaper process, outside any handler
-                session, after the transition is committed; an exception from it
-                is logged and never undoes the dead-letter. Delivery is
-                **at least once**: it is repeated after a crash or a failure, so
-                the callback must be idempotent. ``event.retry_count`` and
+                The scheduled sweep (``schedule_job_maintenance``) runs it, never
+                the worker, outside any handler session, after the transition is
+                committed; an exception from it is logged and never undoes the
+                dead-letter. Delivery is **at least once**: it is repeated after a
+                crash or a failure, up to 10 deliveries and for jobs dead-lettered
+                in the last 7 days, so the callback must be idempotent. ``event.retry_count`` and
                 ``event.max_attempts`` describe the final attempt. A replay does
                 not call it again until the job dead-letters again. Registering
                 again without it removes an earlier callback, as the handler is

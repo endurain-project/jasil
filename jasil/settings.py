@@ -33,7 +33,7 @@ is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_PARTITION_DAYS_AHEAD
+from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_JOB_BATCH_SIZE, MAX_PARTITION_DAYS_AHEAD
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode, parse_job_worker_mode, parse_profile
@@ -70,14 +70,15 @@ class JobSettings:
             heartbeat, so this is *not* a cap on handler runtime (see
             ``max_runtime_seconds``). Must be at least three
             ``heartbeat_interval_seconds``.
-        batch_size: Maximum rows claimed or relayed per pass.
-        backoff_base_seconds: First retry delay; doubles per attempt.
-        backoff_max_seconds: Ceiling for the exponential backoff.
+        batch_size: Maximum rows claimed or relayed per pass, 1 to 1000.
+        backoff_base_seconds: First retry delay; doubles per attempt. At least 0.
+        backoff_max_seconds: Ceiling for the exponential backoff; not below
+            ``backoff_base_seconds``.
         defer_max_seconds: Furthest ahead a handler may defer itself with
             ``DeferJob``; a later ``retry_at`` is clamped to it.
         max_deferrals: Deferrals a job may take before a further ``DeferJob``
             is treated as an ordinary failure.
-        poll_interval_seconds: Idle wait between empty polls.
+        poll_interval_seconds: Idle wait between empty polls; greater than zero.
         max_runtime_seconds: The longest a single handler is kept leased. Past it
             the job is abandoned to the reaper, the handler is told to stop
             (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
@@ -88,7 +89,8 @@ class JobSettings:
             unaffected) and the attempt-derived admin fields read ``None``.
         heartbeat_interval_seconds: Interval between worker heartbeats, each of
             which renews held leases and refreshes the worker-registry row.
-        max_attempts: Attempts before a job is dead-lettered.
+            Greater than zero.
+        max_attempts: Attempts before a job is dead-lettered; at least 1.
         retention_days: Age at which relayed outbox rows, completed jobs, their
             attempt history, and stopped and stale worker rows are pruned. A job
             that is pending, claimed or dead-lettered keeps its whole history.
@@ -108,6 +110,51 @@ class JobSettings:
     heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
     retention_days: int = 30
+
+    def __post_init__(self) -> None:
+        """Reject values the job pipeline cannot honour, where the host configures JASIL.
+
+        The timing rules keep a lease alive: one heartbeat renews leases and proves the worker alive, so the
+        lease has to outlast several missed beats, and a handler has to be allowed at least one lease.
+        ``lease_seconds >= 3 * heartbeat_interval_seconds`` is also the threshold
+        ``jasil.admin.get_workers_summary`` uses to call a worker stale, so a worker is flagged stale no later
+        than its leases start expiring.
+
+        Raises:
+            ValueError: When a numeric setting is out of range, or the timings cannot keep a lease alive.
+        """
+        for name in ("poll_interval_seconds", "heartbeat_interval_seconds"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"jobs.{name} must be greater than zero, not {getattr(self, name)}")
+        minimums = {
+            "batch_size": 1,
+            "max_attempts": 1,
+            "backoff_base_seconds": 0,
+            "defer_max_seconds": 0,
+            "max_deferrals": 0,
+        }
+        for name, minimum in minimums.items():
+            if getattr(self, name) < minimum:
+                raise ValueError(f"jobs.{name} must be at least {minimum}, not {getattr(self, name)}")
+        if self.batch_size > MAX_JOB_BATCH_SIZE:
+            raise ValueError(f"jobs.batch_size must be at most {MAX_JOB_BATCH_SIZE}, not {self.batch_size}")
+        if self.backoff_max_seconds < self.backoff_base_seconds:
+            raise ValueError(
+                f"jobs.backoff_max_seconds ({self.backoff_max_seconds}) must not be below "
+                f"jobs.backoff_base_seconds ({self.backoff_base_seconds})"
+            )
+        floor = 3 * self.heartbeat_interval_seconds
+        if self.lease_seconds < floor:
+            raise ValueError(
+                f"jobs.lease_seconds ({self.lease_seconds}) must be at least three heartbeat intervals "
+                f"({floor:g} s, from jobs.heartbeat_interval_seconds={self.heartbeat_interval_seconds:g}): "
+                "a worker is renewed on its heartbeat, and two missed beats must not expire a lease"
+            )
+        if self.max_runtime_seconds < self.lease_seconds:
+            raise ValueError(
+                f"jobs.max_runtime_seconds ({self.max_runtime_seconds}) must not be below "
+                f"jobs.lease_seconds ({self.lease_seconds})"
+            )
 
 
 @dataclass(frozen=True)

@@ -130,6 +130,22 @@ class TestEnvelope:
             assert realtime_envelope.decode(raw) is None
         assert "Ignoring" in caplog.text
 
+    def test_a_payload_nested_past_the_parsers_depth_decodes_to_nothing(self, caplog):
+        """Anyone who can publish on the channel could otherwise drop every subscriber's connection."""
+        with caplog.at_level(logging.WARNING):
+            assert realtime_envelope.decode(b"[" * 100_000) is None
+        assert "Ignoring" in caplog.text
+
+    def test_a_hint_nested_past_the_encoders_depth_is_a_value_error(self):
+        hint: dict = {}
+        level = hint
+        for _ in range(100_000):
+            level["a"] = {}
+            level = level["a"]
+
+        with pytest.raises(ValueError, match="JSON"):
+            realtime_envelope.encode("k", hint)
+
     @pytest.mark.parametrize("user_id", [7, 0, -3, 10**300])
     def test_a_version_1_envelope_decodes_with_the_user_id_as_the_key(self, user_id):
         raw = json.dumps({"v": 1, "user_id": user_id, "hint": {"a": 1}})

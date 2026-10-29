@@ -224,6 +224,15 @@ class TestSave:
         storage.save(AREA, KEY, b"bytes")
 
 
+class TestKeyLength:
+    def test_a_composed_key_over_1024_bytes_is_refused_before_any_request(self, storage, stub):
+        """The prefix and area count toward S3's limit too; refusing it is a ValueError, not an outage."""
+        key = "k" * (1024 - len(f"{PREFIX}/{AREA}/") + 1)
+
+        with pytest.raises(ValueError, match="1024 bytes"):
+            storage.save(AREA, key, b"x")
+
+
 class TestCreate:
     def test_it_writes_only_if_no_object_is_there(self, storage, stub):
         stub.add_response(
@@ -1572,6 +1581,25 @@ class TestUrl:
         long = storage.url(AREA, KEY, expires_in=86_400)
 
         assert short != long
+
+    @pytest.mark.parametrize("expires_in", [0, -5, 604_801])
+    def test_an_expiry_signature_version_4_cannot_honour_is_refused(self, storage, expires_in):
+        with pytest.raises(ValueError, match="expires_in"):
+            storage.url(AREA, KEY, expires_in=expires_in)
+
+    def test_the_longest_expiry_signature_version_4_allows_is_accepted(self, storage):
+        assert storage.url(AREA, KEY, expires_in=604_800)
+
+    @pytest.mark.parametrize("uri", ["s3://blobs?region=eu-west-1", "s3://blobs?endpoint_url=https://s3.example.test"])
+    def test_a_uri_built_client_signs_with_signature_version_4(self, uri, monkeypatch):
+        """SigV2 query auth cannot fetch SSE-KMS objects and is refused by SigV4-only stores."""
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        url = S3Storage.from_uri(uri).url(AREA, KEY)
+
+        assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
 
     def test_download_headers_are_pinned_in_the_signature(self, storage):
         url = storage.url(

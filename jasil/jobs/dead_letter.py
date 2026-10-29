@@ -1,10 +1,10 @@
 """Delivery of the ``on_dead_letter`` callbacks of durable subscribers.
 
 A callback is owed for every job that is ``dead_letter`` while
-``processing_jobs.dead_letter_notified_at`` is NULL. It is delivered twice over: at
-once by the process that dead-lettered the job (the worker after a failed last
-attempt, the reaper after a lease expiry), and by a sweep that picks up whatever a
-crash left behind. A delivery first claims the job with a compare-and-set lease, one job at a time
+``processing_jobs.dead_letter_notified_at`` is NULL. The scheduled sweep
+(``jasil.jobs.service.deliver_dead_letters_scheduled``) delivers it, never the worker that dead-lettered the
+job: a callback that ran there would hold the worker, and the leases of the jobs waiting behind it in its
+batch, for as long as the callback took. A delivery first claims the job with a compare-and-set lease, one job at a time
 so that each lease starts when its own callback does, and the marker is written
 only after the callback returns, so delivery is at least once and a callback has
 to be idempotent. The outcome is written only while that claim is still the live
@@ -27,8 +27,8 @@ from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
 
-#: How long a claimed delivery holds off every other process. The callback runs
-#: inline, so this is the longest one is expected to take: past it a second process
+#: How long a claimed delivery holds off every other process. The sweep waits for the callback, so this is
+#: the longest one is expected to take: past it a second process
 #: may start the callback again while the first is still running.
 CLAIM_LEASE_SECONDS = 300
 

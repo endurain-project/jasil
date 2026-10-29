@@ -30,6 +30,9 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.profile import DeploymentProfile, JobWorkerMode
 
+#: Taken before the autouse fixture replaces it, for the tests of client ownership.
+REAL_GET_SHARED_CLIENT = redis_clients.get_shared_client
+
 
 @pytest.fixture(autouse=True)
 def fake_redis(monkeypatch):
@@ -326,14 +329,14 @@ class TestRealtimeResolution:
         assert isinstance(realtime, RedisRealtime)
         assert realtime._channel == "tenant-a:realtime"
 
-    def test_a_failed_build_releases_the_shared_clients(self, tmp_path, monkeypatch):
-        closed = []
-        monkeypatch.setattr(container.redis_clients, "close_shared_clients", lambda: closed.append(True))
+    def test_a_failed_build_releases_the_shared_clients_it_took(self, tmp_path, monkeypatch):
+        released = []
+        monkeypatch.setattr(container.redis_clients, "release_shared_clients", lambda keys: released.append(keys))
 
         with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
             container.build_platform(_settings(data_dir=str(tmp_path), realtime_uri="nats://bus"))
 
-        assert closed == [True]
+        assert len(released) == 1
 
     def test_close_stops_the_provider(self, tmp_path, monkeypatch):
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -767,3 +770,59 @@ class TestMailResolution:
 
     def test_the_password_is_not_in_the_settings_repr(self):
         assert "hunter2" not in repr(settings.MailSettings(username="u", password="hunter2"))
+
+
+class TestRedisClientOwnership:
+    """Several platforms in one process share Redis clients; each releases only what it took."""
+
+    @pytest.fixture
+    def clients(self, monkeypatch):
+        """Real shared-client bookkeeping over fakeredis connections that record being closed."""
+        created: dict[str, fakeredis.FakeStrictRedis] = {}
+
+        def create(uri, purpose, *, decode_responses=True):
+            client = fakeredis.FakeStrictRedis(decode_responses=decode_responses)
+            client.closed = False
+            client.close = lambda: setattr(client, "closed", True)
+            created[f"{uri}|{decode_responses}"] = client
+            return client
+
+        monkeypatch.setattr(redis_clients, "get_shared_client", REAL_GET_SHARED_CLIENT)
+        monkeypatch.setattr(redis_clients, "create_redis_client", create)
+        return created
+
+    @staticmethod
+    def _build(tmp_path, **extra):
+        return container.build_platform(
+            _settings(
+                state_uri="redis://cache:6379/0", events_uri="redis://cache:6379/1", data_dir=str(tmp_path), **extra
+            )
+        )
+
+    def test_closing_one_platform_leaves_the_clients_another_still_uses(self, tmp_path, clients):
+        first, second = self._build(tmp_path), self._build(tmp_path)
+
+        first.close()
+
+        assert clients and not any(client.closed for client in clients.values())
+        second.close()
+        assert all(client.closed for client in clients.values())
+
+    def test_closing_a_platform_twice_releases_its_clients_once(self, tmp_path, clients):
+        first, second = self._build(tmp_path), self._build(tmp_path)
+
+        first.close()
+        first.close()
+
+        assert not any(client.closed for client in clients.values())
+        second.close()
+
+    def test_a_failed_build_releases_only_what_it_took(self, tmp_path, clients):
+        running = self._build(tmp_path)
+
+        with pytest.raises(ValueError, match="external_sink_uri"):
+            self._build(tmp_path, audit=settings.AuditSettings(external_sink_uri="ftp://example.test/x"))
+
+        assert not any(client.closed for client in clients.values())
+        running.close()
+        assert all(client.closed for client in clients.values())

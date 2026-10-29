@@ -32,9 +32,11 @@ whenever configuration is.
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
-  cannot exhaust memory, and under a 30-second deadline checked between reads, so
-  one dripping its reply cannot hold the caller for longer than that plus one read
-  timeout.
+  cannot exhaust memory. The request, headers and body, runs under a 30-second
+  deadline: a watchdog shuts its sockets down when it passes, which ends a blocked
+  read, so an upstream dripping its reply a byte at a time cannot hold the caller
+  past it. Name resolution and the connect are outside it: each connect attempt is
+  bounded by the 10-second timeout, and resolution by the system resolver.
 - Failures are logged by exception type and status code only. The `requests`
   error message embeds the request URL, and one supported service carries its
   API key in that URL's query string.
@@ -99,7 +101,8 @@ pair.
 
 - Both segments are validated before any filesystem or client access: empty,
   absolute, dot-component, parent-traversing, repeated-separator,
-  trailing-separator, and backslash-bearing values raise `ValueError`. The check
+  trailing-separator, backslash-bearing, control-character-bearing and over-1024-byte
+  values raise `ValueError`. The check
   is pure and shared, so **both** backends enforce one canonical slash-delimited
   grammar. Without it, local paths normalize aliases such as `.` and `a//b`
   while S3 preserves them as distinct literal keys. An area is exactly one

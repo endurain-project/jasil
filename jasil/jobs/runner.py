@@ -21,7 +21,7 @@ import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
-from jasil.jobs.dead_letter import deliver_after_reap, deliver_dead_letters
+from jasil.jobs.dead_letter import deliver_after_reap
 from jasil.jobs.defer import DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
@@ -92,7 +92,6 @@ class JobRunner:
     ) -> None:
         self._record_attempts = record_attempts
         self._registry = registry
-        self._dead_lettered: set[str] = set()
         self._clock = clock
         self._session_factory = session_factory
         self._worker_id = worker_id
@@ -199,6 +198,10 @@ class JobRunner:
                         exc_info=error,
                         extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                     )
+        except BaseException:
+            # The worker is stopping: the jobs still waiting go back to the queue for another worker.
+            self._leases.release_waiting()
+            raise
         finally:
             self._leases.clear()
         return len(snapshots)
@@ -307,19 +310,8 @@ class JobRunner:
             # After the outcome is written, so the heartbeat keeps renewing the
             # lease through the completion write.
             self._leases.finish(job.id)
-        if job.id in self._dead_lettered:
-            self._dead_lettered.discard(job.id)
-            # After the failure is logged and the lease released, so a slow callback
-            # cannot hide the failure or keep the lease keeper tracking a finished job.
-            try:
-                deliver_dead_letters(
-                    registry=self._registry,
-                    session_factory=self._session_factory,
-                    clock=self._clock,
-                    job_ids=[job.id],
-                )
-            except Exception as delivery_error:
-                logger.error("Dead-letter callbacks could not be delivered", exc_info=delivery_error)
+        # A job this dead-lettered owes its ``on_dead_letter`` callback to the scheduled sweep, never to this
+        # worker: run here, a slow callback would hold the worker and the leases of the jobs behind it.
         return lost_claim or lost.is_set()
 
     def _mark_started(self, job: ClaimedJob) -> None:
@@ -356,6 +348,17 @@ class JobRunner:
         except Exception as error:
             self._leases.finalize(job.id)
             return self._fail(job, error, duration_ms=self._elapsed_ms(began))
+        except BaseException as error:
+            # SystemExit, KeyboardInterrupt, a cancellation: the worker stops, but the attempt is recorded first,
+            # rather than left claimed and unexplained until its lease expires.
+            self._leases.finalize(job.id)
+            try:
+                self._fail(job, error, duration_ms=self._elapsed_ms(began))
+            except Exception as record_error:
+                logger.error(
+                    "Durable job failure could not be recorded", exc_info=record_error, extra=self._context(job)
+                )
+            raise
         self._leases.finalize(job.id)
         duration_ms = self._elapsed_ms(began)
         now = self._clock.now()
@@ -439,7 +442,7 @@ class JobRunner:
         )
         return False
 
-    def _fail(self, job: ClaimedJob, error: Exception, *, duration_ms: int | None = None) -> bool:
+    def _fail(self, job: ClaimedJob, error: BaseException, *, duration_ms: int | None = None) -> bool:
         """Record a failure; True when the claim was no longer owned."""
         now = self._clock.now()
         with self._session_factory() as db:
@@ -474,9 +477,6 @@ class JobRunner:
                 "duration_ms": duration_ms,
             },
         )
-        if status == jobs_crud.STATUS_DEAD_LETTER:
-            # Delivered by ``_run_job`` once the lease is released.
-            self._dead_lettered.add(job.id)
         return False
 
     def _event_from(self, job: ClaimedJob) -> Event:

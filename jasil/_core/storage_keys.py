@@ -15,8 +15,18 @@ UPLOAD_STAGING_AREA = ".jasil-upload-sessions"
 # Every area under this prefix is JASIL's, compared case-insensitively: on a case-insensitive filesystem
 # ``.JASIL-OBJECTS`` is the same directory as ``.jasil-objects``.
 _RESERVED_AREA_PREFIX = ".jasil-"
+#: The longest object key S3 accepts, in UTF-8 bytes; local disk is held to it too so both refuse the same keys.
+MAX_KEY_BYTES = 1024
 
-__all__ = ["OBJECT_STORAGE_AREA", "UPLOAD_STAGING_AREA", "check_area", "check_listing_prefix", "check_segment"]
+__all__ = [
+    "MAX_KEY_BYTES",
+    "OBJECT_STORAGE_AREA",
+    "UPLOAD_STAGING_AREA",
+    "check_area",
+    "check_key_length",
+    "check_listing_prefix",
+    "check_segment",
+]
 
 
 def check_area(area: str) -> None:
@@ -46,14 +56,30 @@ def check_segment(value: str, label: str) -> None:
 
     Raises:
         ValueError: When the segment is empty, absolute, contains a ``..``
-            component, or is not a canonical slash-delimited path.
+            component or a control character, is not a canonical slash-delimited
+            path, or is longer than :data:`MAX_KEY_BYTES` in UTF-8.
     """
     if not value:
         # An empty segment collapses the address onto the container itself, so
         # ``save("", "")`` would target the storage root.
         raise ValueError(f"Storage {label} must not be empty")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        # S3 cannot list or batch-delete such a key (XML 1.0 has no way to carry most of them), and a local
+        # path cannot hold a NUL.
+        raise ValueError(f"Storage {label} must not contain a control character: {value!r}")
+    check_key_length(value, label)
     normalized_parts = value.replace("\\", "/").split("/")
     if value.startswith(("/", "\\")) or ".." in normalized_parts:
         raise ValueError(f"Storage {label} escapes base directory: {value!r}")
     if "\\" in value or any(part in {"", "."} for part in normalized_parts):
         raise ValueError(f"Storage {label} must be a canonical slash-delimited path: {value!r}")
+
+
+def check_key_length(value: str, label: str) -> None:
+    """Reject a value longer than :data:`MAX_KEY_BYTES` in UTF-8.
+
+    Raises:
+        ValueError: When ``value`` is too long.
+    """
+    if len(value.encode("utf-8")) > MAX_KEY_BYTES:
+        raise ValueError(f"Storage {label} must be at most {MAX_KEY_BYTES} bytes in UTF-8")

@@ -13,6 +13,7 @@ the bottom, where it is the subject.
 """
 
 import json
+import logging
 import threading
 
 import fakeredis
@@ -214,6 +215,32 @@ class TestDispatch:
         assert seen == [0, 1, 2]
 
 
+class TestAckFailure:
+    def test_a_failed_ack_does_not_strand_the_rest_of_the_batch(self, bus, client, monkeypatch, caplog):
+        """The batch is read with ``>``, so an entry skipped here is never read again."""
+        seen = []
+        bus.subscribe("order.created", lambda event: seen.append(event.payload["id"]))
+        for index in range(3):
+            bus.publish(new_event("order.created", {"id": index}, source="api"))
+        acks = []
+        real_xack = client.xack
+
+        def flaky_xack(stream, group, entry_id):
+            acks.append(entry_id)
+            if len(acks) == 1:
+                raise redis.exceptions.ConnectionError("blip")
+            return real_xack(stream, group, entry_id)
+
+        monkeypatch.setattr(client, "xack", flaky_xack)
+
+        with caplog.at_level(logging.ERROR):
+            bus._poll_once()
+
+        assert seen == [0, 1, 2]
+        assert len(acks) == 3
+        assert "ack" in caplog.text
+
+
 class TestFailureIsolation:
     def test_a_raising_handler_does_not_kill_the_consumer(self, bus):
         """One poisoned entry must not take the whole replica's bus down."""
@@ -290,7 +317,7 @@ class TestFailureIsolation:
 
         monkeypatch.setattr(bus._stop, "wait", _wait)
 
-        bus._run()
+        bus._run(bus._stop)
 
         assert len(waits) == 1  # one failed poll, then the group is back and the event delivered
 
@@ -308,7 +335,7 @@ class TestFailureIsolation:
         monkeypatch.setattr(bus._stop, "wait", lambda timeout=None: None)
 
         with caplog.at_level("ERROR"):
-            bus._run()
+            bus._run(bus._stop)
 
         assert len(polls) == 2
         assert "consumer poll failed" in caplog.text
@@ -404,6 +431,23 @@ class TestConsumerLifecycle:
 
         assert not thread.is_alive()
         assert bus._thread is None
+
+    def test_a_restart_after_a_stop_that_timed_out_leaves_the_old_thread_stopped(self, bus):
+        """A handler outlasting the stop timeout keeps its thread alive; restarting must not revive that loop."""
+        bus.start()
+        old_thread, old_stop = bus._thread, bus._stop
+        # What a timed-out stop leaves: the thread forgotten, its stop event set, the thread perhaps still running.
+        bus._thread = None
+        old_stop.set()
+
+        bus.start()
+        try:
+            assert old_stop.is_set()
+            old_thread.join(timeout=5)
+            assert not old_thread.is_alive()
+            assert bus._thread is not old_thread and bus._thread.is_alive()
+        finally:
+            bus.stop()
 
     def test_stopping_a_bus_that_never_started_is_a_no_op(self, bus):
         """``Platform.close`` calls this unconditionally."""

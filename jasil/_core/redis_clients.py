@@ -14,12 +14,19 @@ distinct ``(uri, decode_responses)`` pair: in the common case (a single Redis UR
 configured) the keyed state and the event bus share a single
 ``decode_responses=True`` client, while the byte-oriented ``StateProvider`` gets
 its own ``decode_responses=False`` client.
+
+Each acquisition is a reference. Several platforms can live in one process and borrow the same client, so a
+platform gives back only the references it took (:func:`release_shared_clients`, with the keys
+:func:`track_acquisitions` collected while it was built), and a client is closed when its last reference goes.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -149,8 +156,24 @@ def create_redis_client(
     return redis_client
 
 
-_shared_clients: dict[tuple[str, bool], Redis] = {}
+ClientKey = tuple[str, bool]
+"""A shared client's identity: its ``(storage_uri, decode_responses)``."""
+
+_shared_clients: dict[ClientKey, Redis] = {}
+_references: dict[ClientKey, int] = {}
 _shared_clients_lock = threading.Lock()
+_acquired: ContextVar[list[ClientKey] | None] = ContextVar("jasil_redis_acquired", default=None)
+
+
+@contextmanager
+def track_acquisitions() -> Generator[list[ClientKey]]:
+    """Collect the key of every shared client acquired in this context, one entry per reference."""
+    acquired: list[ClientKey] = []
+    token = _acquired.set(acquired)
+    try:
+        yield acquired
+    finally:
+        _acquired.reset(token)
 
 
 def get_shared_client(
@@ -164,7 +187,9 @@ def get_shared_client(
 
     The platform Redis backends resolve their connection through here so the
     process opens *one* client per distinct ``(storage_uri, decode_responses)``
-    pair instead of one per consumer.
+    pair instead of one per consumer. Every call takes a reference, recorded by
+    an enclosing :func:`track_acquisitions`, for :func:`release_shared_clients`
+    to give back.
 
     Args:
         storage_uri: Redis storage URI selecting the server.
@@ -183,28 +208,42 @@ def get_shared_client(
         if client is None:
             client = create_redis_client(storage_uri, purpose, decode_responses=decode_responses)
             _shared_clients[client_key] = client
-        return client
+        _references[client_key] = _references.get(client_key, 0) + 1
+    acquired = _acquired.get()
+    if acquired is not None:
+        acquired.append(client_key)
+    return client
 
 
-def close_shared_clients() -> None:
-    """
-    Close every memoized client's connections, then discard them.
+def release_shared_clients(keys: Iterable[ClientKey]) -> None:
+    """Give back one reference per key, closing and forgetting a client whose last reference goes.
 
-    Called from :meth:`jasil.container.Platform.close` so a process that shuts a
-    platform down does not leave sockets open. A client that fails to close is
-    logged and dropped anyway: shutdown must not raise.
+    A key whose client is already gone is skipped, so releasing twice cannot take another user's reference
+    with it. A client that fails to close is logged and dropped anyway: shutdown must not raise.
+
+    Args:
+        keys: The keys of the references to give back, as :func:`track_acquisitions` collected them.
 
     Returns:
         None.
     """
+    closing: list[tuple[ClientKey, Redis]] = []
     with _shared_clients_lock:
-        for (uri, _decode), client in _shared_clients.items():
-            try:
-                client.close()
-            except Exception as error:
-                scheme, _, _ = uri.partition("://")
-                logger.warning("Failed to close the shared %s client: %r", scheme or "redis", error)
-        _shared_clients.clear()
+        for key in keys:
+            count = _references.get(key, 0)
+            if count <= 0:
+                continue
+            if count > 1:
+                _references[key] = count - 1
+                continue
+            del _references[key]
+            closing.append((key, _shared_clients.pop(key)))
+    for (uri, _decode), client in closing:
+        try:
+            client.close()
+        except Exception as error:
+            scheme, _, _ = uri.partition("://")
+            logger.warning("Failed to close the shared %s client: %r", scheme or "redis", error)
 
 
 def reset_shared_clients() -> None:
@@ -213,10 +252,11 @@ def reset_shared_clients() -> None:
 
     For tests that inject a fake client, where closing would be meaningless or
     would break a fixture still holding it. Production shutdown wants
-    :func:`close_shared_clients`.
+    :func:`release_shared_clients`.
 
     Raises:
         None.
     """
     with _shared_clients_lock:
         _shared_clients.clear()
+        _references.clear()

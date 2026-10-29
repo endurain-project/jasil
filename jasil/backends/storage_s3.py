@@ -23,7 +23,13 @@ from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_listing_prefix, check_segment
+from jasil._core.storage_keys import (
+    UPLOAD_STAGING_AREA,
+    check_area,
+    check_key_length,
+    check_listing_prefix,
+    check_segment,
+)
 from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
@@ -45,6 +51,8 @@ _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _INVALID_RANGE_CODES = frozenset({"416", "InvalidRange", "RequestedRangeNotSatisfiable"})
 _MISSING_UPLOAD_CODES = frozenset({"404", "NoSuchUpload", "NotFound"})
 _OBJECT_EXISTS_CODES = frozenset({"412", "PreconditionFailed"})
+#: The longest expiry a Signature Version 4 presigned URL can carry: seven days.
+_MAX_URL_EXPIRY_SECONDS = 7 * 24 * 3600
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
@@ -153,7 +161,9 @@ class S3Storage:
                 "s3",
                 region_name=params.get("region", [None])[0],
                 endpoint_url=params.get("endpoint_url", [None])[0],
-                config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+                # SigV4, which presigned URLs do not default to: SigV2 query auth cannot fetch SSE-KMS objects
+                # and is refused by stores that speak only SigV4.
+                config=Config(retries={"max_attempts": 3, "mode": "standard"}, signature_version="s3v4"),
             )
         except BotoCoreError as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
@@ -165,7 +175,10 @@ class S3Storage:
         # local backend rejects it, and one contract has to hold on both.
         check_area(area)
         check_segment(key, "key")
-        return "/".join(part for part in (self._prefix, area, key) if part)
+        object_key = "/".join(part for part in (self._prefix, area, key) if part)
+        # The prefix and area count toward S3's limit as well; refused here it is the caller's error, not an outage.
+        check_key_length(object_key, "object key (prefix, area and key)")
+        return object_key
 
     def _validate_upload_session(self, session: UploadSession) -> str:
         try:
@@ -880,6 +893,8 @@ class S3Storage:
         download_as: str | None = None,
         content_type: str | None = None,
     ) -> str:
+        if not 1 <= expires_in <= _MAX_URL_EXPIRY_SECONDS:
+            raise ValueError(f"expires_in must be between 1 and {_MAX_URL_EXPIRY_SECONDS} seconds, not {expires_in}")
         params = {"Bucket": self._bucket, "Key": self._object_key(area, key)}
         if download_as is not None:
             params["ResponseContentDisposition"] = _content_disposition(download_as)

@@ -14,7 +14,19 @@ from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
 
 from jasil import migrations
 from jasil.audit import _postgres as audit_pg
@@ -614,6 +626,67 @@ class TestAdoptExistingSchema:
 
         assert migrations.adopt_existing_schema(engine) is True
         assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_a_missing_server_default_is_rejected(self, engine, mapped_base):
+        """A previous-release writer omits the newer columns and relies on their database default."""
+        metadata = _copied_jasil_metadata(mapped_base)
+        metadata.tables["jasil_processing_jobs"].c.queue.server_default = None
+        metadata.create_all(engine)
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError, match=r"jasil_processing_jobs\.queue: missing server default"
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_check_constraint_is_rejected(self, engine, mapped_base):
+        if engine.dialect.name == "sqlite":  # SQLite cannot drop a constraint, so build the table without it
+            metadata = _copied_jasil_metadata(mapped_base)
+            table = metadata.tables["jasil_instance"]
+            table.constraints.remove(next(item for item in table.constraints if isinstance(item, CheckConstraint)))
+            metadata.create_all(engine)
+        else:  # the migrated schema, which otherwise matches head on every dialect
+            migrations.upgrade(engine)
+            _drop_version_table(engine)
+            drop = "DROP CHECK" if engine.dialect.name == "mysql" else "DROP CONSTRAINT"
+            with engine.begin() as connection:
+                connection.exec_driver_sql(f"ALTER TABLE jasil_instance {drop} ck_jasil_instance_single")
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError,
+            match=r"jasil_instance: missing check constraint 'ck_jasil_instance_single'",
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_an_additional_unique_index_is_rejected(self, engine):
+        """It refuses writes JASIL makes: here, a second subscriber's job for the same event."""
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE UNIQUE INDEX uq_host_outbox_type ON jasil_event_outbox (event_type)")
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"unexpected index 'uq_host_outbox_type'"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_plain_postgresql_audit_log_is_rejected(self, engine, mapped_base):
+        """``create_all`` builds no partitions, triggers or functions, and ``upgrade`` would never add them."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL partitions the audit log")
+        mapped_base.metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError) as caught:
+            migrations.adopt_existing_schema(engine)
+
+        message = str(caught.value)
+        assert "jasil_audit_log: not partitioned" in message
+        assert "missing trigger 'jasil_audit_log_no_update_delete'" in message
+        assert "missing function 'jasil_audit_drop_partitions(timestamptz)'" in message
+        assert migrations.db_revision(engine) is None
 
     def test_an_existing_head_revision_is_not_restamped(self, engine):
         migrations.upgrade(engine)

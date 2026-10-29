@@ -615,6 +615,54 @@ class TestPublishOnCommitIsolation:
         assert sorted(e.payload["n"] for e in platform.events.published) == [0, 2]
 
 
+class TestIdentifiersAreValidatedOnEveryRoute:
+    """An identifier too long for its column raises before the commit, whether or not durable jobs are on."""
+
+    # The registry refuses an oversize event type, so only the source can be oversize on the durable route.
+    @pytest.mark.parametrize(("field", "durable"), [("event_type", False), ("source", False), ("source", True)])
+    def test_publish_many_committing_raises_before_committing(self, platform, db, durable, field):
+        if durable:
+            _enable_durable_jobs()
+            jobs_registry.registry.register("activity.deleted", "s", lambda _e: None)
+        arguments = {"event_type": "activity.deleted", "source": "test", field: "a" * 300}
+        committed = []
+
+        with pytest.raises(ValueError, match=field):
+            publisher.publish_many_committing(
+                arguments["event_type"],
+                [{"id": 1}],
+                source=arguments["source"],
+                db=db,
+                commit=lambda: committed.append(True),
+            )
+
+        assert committed == []
+        assert platform.events.published == []
+
+    @pytest.mark.parametrize("field", ["event_type", "source"])
+    def test_publish_on_commit_raises_on_the_bus_route_too(self, platform, db, field):
+        arguments = {"event_type": "activity.created", "source": "test", field: "a" * 300}
+
+        with pytest.raises(ValueError, match=field):
+            publisher.publish_on_commit(arguments["event_type"], {}, source=arguments["source"], db=db)
+        db.commit()
+
+        assert platform.events.published == []
+
+
+class TestPublishOnCommitCapturesThePayload:
+    def test_a_payload_changed_after_publishing_is_dispatched_as_it_was(self, platform, db):
+        """The event is minted when it is published; the commit may come much later."""
+        payload = {"id": 1, "tags": ["a"]}
+        publisher.publish_on_commit("activity.created", payload, source="test", db=db)
+        payload["id"] = 2
+        payload["tags"].append("b")
+
+        db.commit()
+
+        assert [event.payload for event in platform.events.published] == [{"id": 1, "tags": ["a"]}]
+
+
 class TestPublishCommittingStillOwnsItsCommit:
     def test_it_does_not_register_session_listeners(self, platform, db):
         publisher.publish_committing("activity.created", {}, source="test", db=db, commit=lambda: None)

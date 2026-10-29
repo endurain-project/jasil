@@ -17,7 +17,7 @@ Connections. Publishing borrows the process-wide shared client. The subscriber
 holds its connection for as long as it runs, so it opens a **dedicated** client
 instead of checking one out of the shared pool: a pool bounded with
 ``max_connections`` would otherwise lose a slot for the life of the process,
-and :func:`~jasil._core.redis_clients.close_shared_clients` would cut the
+and closing the shared client when its platform is released would cut the
 subscription from under the thread. The dedicated client is closed on every
 reconnect and on :meth:`RedisRealtime.stop`.
 

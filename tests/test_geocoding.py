@@ -15,13 +15,16 @@ No DNS and no HTTP happen here: `getaddrinfo` is monkeypatched and `responses`
 intercepts the requests.
 """
 
+import contextlib
 import itertools
 import socket
+import threading
 
 import pytest
 import responses
 
 import jasil._core.network as network
+import jasil.backends.geocoding_http as geocoding_http
 from jasil.backends.geocoding_http import (
     _MAX_RESPONSE_BYTES,
     HttpGeocoding,
@@ -450,6 +453,64 @@ class TestTheTransferHasADeadline:
             assert HttpGeocoding("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1) is None
 
         assert "TimeoutError" in caplog.text
+
+
+class TestTheWatchdog:
+    """A read timeout restarts on every byte, so only shutting the socket down bounds a dripping upstream."""
+
+    @pytest.fixture
+    def blocked_read(self):
+        """A socket with a thread blocked reading it, and the event set when that read returns."""
+        ours, theirs = socket.socketpair()
+        released = threading.Event()
+
+        def read():
+            with contextlib.suppress(OSError):
+                ours.recv(1)
+            released.set()
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        yield ours, released
+        ours.close()
+        theirs.close()
+        reader.join(timeout=5)
+
+    def test_expiring_releases_a_blocked_read(self, blocked_read):
+        sock, released = blocked_read
+        deadline = geocoding_http._Deadline()
+        deadline.watch(sock)
+
+        deadline.expire()
+
+        assert released.wait(5)
+
+    def test_a_socket_opened_after_the_deadline_is_shut_down_at_once(self, blocked_read):
+        """A slow connect hands its socket over only after the deadline has passed."""
+        sock, released = blocked_read
+        deadline = geocoding_http._Deadline()
+        deadline.expire()
+
+        deadline.watch(sock)
+
+        assert released.wait(5)
+
+    def test_an_upstream_that_never_answers_is_cut_off_at_the_deadline(self, monkeypatch, caplog):
+        """Headers come before the body loop, so a deadline checked between body reads never sees them."""
+        ours, theirs = socket.socketpair()
+        monkeypatch.setattr(geocoding_http, "_DEADLINE_SECONDS", 0)
+        # Without the watchdog the read would only end at this timeout, as a ReadTimeout.
+        monkeypatch.setattr(geocoding_http, "_TIMEOUT_SECONDS", 2)
+        monkeypatch.setattr("urllib3.util.connection.create_connection", lambda *args, **kwargs: ours)
+        try:
+            with caplog.at_level("ERROR"):
+                assert HttpGeocoding("nominatim", "http://geo.test/reverse").reverse(38.7, -9.1) is None
+        finally:
+            ours.close()
+            theirs.close()
+
+        assert "Reverse-geocoding via nominatim failed" in caplog.text
+        assert "Timeout" not in caplog.text
 
 
 class TestThrottling:

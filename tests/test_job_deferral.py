@@ -15,6 +15,7 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
 from jasil.events import new_event
 from jasil.jobs import DeferJob
+from jasil.jobs.dead_letter import deliver_dead_letters
 from jasil.jobs.models import JobAttempt, ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -229,6 +230,7 @@ class TestDeferralBound:
         assert callbacks == []
         clock.advance(1)
         runner.run_once()
+        deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock)
 
         assert _job(db).status == "dead_letter"
         assert len(callbacks) == 1
@@ -394,6 +396,7 @@ class TestDeferralAccounting:
         for _ in range(3):
             runner.run_once()
             clock.advance(1000)
+        deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock)
 
         assert [(e.retry_count, e.max_attempts, e.deferral_count) for e in events] == [(1, 1, 2)]
 

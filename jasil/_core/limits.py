@@ -29,6 +29,7 @@ __all__ = [
     "MAX_AUDIT_RETENTION_DAYS",
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_IP_ADDRESS_LENGTH",
+    "MAX_JOB_BATCH_SIZE",
     "MAX_PARTITION_DAYS_AHEAD",
     "MAX_REQUEST_ID_LENGTH",
     "MAX_STORED_ERROR_LENGTH",
@@ -125,6 +126,10 @@ MAX_REQUEST_ID_LENGTH = 100
 MAX_USER_AGENT_LENGTH = 512
 #: Longest textual IPv6 address, including an IPv4-mapped suffix.
 MAX_IP_ADDRESS_LENGTH = 45
+
+#: Most jobs a worker claims, or outbox rows the relay takes, in one pass: ``jobs.batch_size`` is validated
+#: against it. A claim binds every id it selected in one ``IN (...)``, and pruning deletes in batches this size.
+MAX_JOB_BATCH_SIZE = 1000
 
 #: How many days of audit partitions may be created ahead: ``audit.partition_days_ahead`` is validated
 #: against it, and ``jasil_audit_ensure_partitions`` refuses more.

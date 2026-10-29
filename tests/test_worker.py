@@ -119,6 +119,17 @@ class TestRunWorker:
 
         assert "Durable job worker iteration failed" in caplog.text
 
+    def test_an_exit_from_an_iteration_ends_the_loop_loudly(self, caplog):
+        """A worker that silently stops leaves the queue unattended with nothing in the log to say why."""
+        stop = threading.Event()
+        runner = ScriptedRunner([SystemExit(3), 1], stop)
+
+        with caplog.at_level("ERROR"), pytest.raises(SystemExit):
+            run_worker(runner, poll_interval_seconds=0, stop=stop)
+
+        assert runner.calls == 1
+        assert "Durable job worker stopped by SystemExit" in caplog.text
+
     def test_a_failed_iteration_counts_as_empty(self, caplog):
         """It must back off rather than spin on a database that is still down."""
         stop = RecordingEvent()

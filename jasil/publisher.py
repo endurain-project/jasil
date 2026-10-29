@@ -30,6 +30,7 @@ lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
 """
 
+import copy
 import logging
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -42,7 +43,15 @@ import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil._core.after_commit import run_after_commit
-from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
+from jasil._core.limits import check_length
+from jasil.events import (
+    INITIAL_SCHEMA_VERSION,
+    MAX_EVENT_TYPE_LENGTH,
+    MAX_SOURCE_LENGTH,
+    META_REQUEST_ID,
+    Event,
+    new_event,
+)
 from jasil.providers import EventRecorder
 from jasil.settings import get_settings
 
@@ -117,6 +126,19 @@ def _publish_on_bus(
 
 def _no_metadata(_payload: dict) -> dict | None:
     return None
+
+
+def _check_identifiers(event_type: str, source: str) -> None:
+    """Refuse an ``event_type`` or ``source`` too long for its column, before any route is taken.
+
+    The durable route stages before committing and so raises; checked here, the best-effort route raises the
+    same way instead of logging the failure after the commit.
+
+    Raises:
+        ValueError: When either is longer than its column.
+    """
+    check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
+    check_length(source, field="source", limit=MAX_SOURCE_LENGTH)
 
 
 def _dispatch_event(event: Event) -> None:
@@ -235,6 +257,10 @@ def publish_committing(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
     publish_many_committing(
         event_type,
@@ -286,7 +312,12 @@ def publish_many_committing(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
+    _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if db is not None and _durable_delivery_enabled(event_type):
         # Atomic path: stage every outbox row inside the caller's transaction.
@@ -347,6 +378,10 @@ def publish_on_commit(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
     publish_many_on_commit(
         event_type,
@@ -384,6 +419,11 @@ def publish_many_on_commit(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``db`` is ``None``, or ``event_type`` or ``source`` is longer than its column, on
+            either route and before anything is staged.
+        TypeError: When ``db`` is not a synchronous ``Session``.
     """
     if db is None:
         raise ValueError("publish_on_commit/publish_many_on_commit require the producer's session as `db`")
@@ -393,13 +433,15 @@ def publish_many_on_commit(
         )
     if not payloads:
         return
+    _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if _durable_delivery_enabled(event_type):
         _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
         return
     for payload in payloads:
         try:
-            event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+            # A copy: the event is the one published now, whatever the caller does to the dict before committing.
+            event = _mint(event_type, copy.deepcopy(payload), source, metadata_of(payload), schema_version)
             run_after_commit(db, partial(_dispatch_event, event))
         except Exception as err:
             logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)

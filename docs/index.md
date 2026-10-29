@@ -121,7 +121,8 @@ jasil_lifecycle.shutdown()
 ```
 
 It stops the durable-job worker, then releases the platform — the event-bus
-consumer thread and the shared Redis clients — and unpublishes it. That order
+consumer thread and the shared Redis clients it took, each closed once no other
+platform in the process still uses it — and unpublishes it. That order
 matters: the worker runs subscribers, and a subscriber that publishes needs the
 bus still up. It never raises, and it is safe to call when nothing was started.
 

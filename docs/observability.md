@@ -271,12 +271,17 @@ row changes.
 
 `adopt_existing_schema()` is only for a database where JASIL's tables already
 exist but `jasil_alembic_version` does not record a revision. It compares their
-columns, types, nullability, primary keys, unique constraints, and required
-indexes with the schema of the installed migration head. If that does not match
+columns, types, nullability, primary keys, unique constraints, required indexes,
+named `CHECK` constraints, and the presence of a database default on every
+`NOT NULL` column that has one (a previous release's writers rely on it), with the
+schema of the installed migration head. If that does not match
 exactly, it tries each earlier revision's schema, newest first, and records the
 first exact match (the newest, if two describe the same schema). It returns
 `True` only when this call recorded a revision. PostgreSQL adoption also
-requires the metadata GIN index and its PostgreSQL-specific definition.
+requires the metadata GIN index and its PostgreSQL-specific definition, and an
+audit log partitioned with its append-only triggers and both `jasil_audit_*`
+functions, as `rev0006` builds it: one made by `create_all` is refused, because
+`upgrade()` would never add them afterwards.
 
 Adopting an older revision leaves the database behind head, so always call
 `upgrade()` next: it applies the revisions after the recorded one. That is how a
@@ -287,13 +292,14 @@ shape) catches up without copying JASIL's DDL into its own history.
 An empty database is left unversioned for `upgrade()` to create. A schema that
 matches no revision raises `SchemaCompatibilityError` without changing it or
 recording a revision; the message names the closest revision and lists its
-differences. Unexpected tables and columns are incompatible; additional ordinary
-non-unique indexes are allowed because they do not change JASIL's write
-contract. JASIL never repairs an incompatible schema automatically.
+differences. Unexpected tables, columns and unique indexes are incompatible;
+additional ordinary non-unique indexes are allowed because they do not change
+JASIL's write contract. JASIL never repairs an incompatible schema automatically.
 
 !!! note "Tables your host created itself"
     Create them in exactly the shape of a revision JASIL ships (same columns,
-    types, nullability, primary keys, unique constraints and index names), at
+    types, nullability, database defaults, primary keys, unique constraints,
+    `CHECK` constraint and index names), at
     that revision or at head. If your host evolved them differently, migrate
     them to a shipped revision's shape in your own history first; adoption never
     guesses and there is no public way to stamp an arbitrary revision. A host

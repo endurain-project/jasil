@@ -356,7 +356,9 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
     Area, key, source, destination, and deletion-prefix values are validated
     before backend I/O. Addresses must be canonical slash-delimited paths: an
     absolute path, a `.` or `..` component, a repeated or trailing separator,
-    or any backslash raises `ValueError`. Dots inside a component, such as
+    or any backslash raises `ValueError`, and so does a control character or a
+    value over 1024 bytes in UTF-8, S3's key limit (on S3 the bucket prefix and
+    area count toward it too). Dots inside a component, such as
     `.metadata.json`, remain valid. Keys are expected to be server-generated,
     but a stray value must never escape or alias another address. Local storage
     also rejects object addresses that traverse symbolic links and omits symlink
@@ -366,7 +368,9 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 !!! danger "URL controls are honoured by S3 only"
     In addition to the plain-area key/descendant limitation above, this is a
     delivery-contract difference between the backends. `s3://` returns a
-    presigned URL that honours `expires_in`, `download_as`, and `content_type`.
+    presigned URL (Signature Version 4) that honours `expires_in`, `download_as`,
+    and `content_type`; `expires_in` must be between 1 second and 7 days, the
+    longest a Signature Version 4 URL can live, or `url` raises `ValueError`.
     `download_as` pins an `attachment` content disposition, so an untrusted
     object is downloaded rather than rendered inline. `local://` returns a plain
     path for **your** web server to serve and cannot enforce any of those controls

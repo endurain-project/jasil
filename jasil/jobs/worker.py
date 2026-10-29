@@ -195,7 +195,8 @@ def run_worker(
 
     Loops immediately while a batch found work (to drain a backlog) and waits
     ``poll_interval_seconds`` when the queue was empty. A failed iteration is
-    logged and the loop continues.
+    logged and the loop continues; a ``BaseException`` (``SystemExit``,
+    ``KeyboardInterrupt``, a cancellation) is logged and ends it.
 
     Args:
         runner: The job runner to drive.
@@ -217,6 +218,11 @@ def run_worker(
             except Exception as error:
                 logger.error("Durable job worker iteration failed", exc_info=error)
                 processed = 0
+            except BaseException as error:
+                # SystemExit, KeyboardInterrupt or a cancellation from a handler ends the worker, as it asks to;
+                # nothing restarts it, so it must not go quietly.
+                logger.error("Durable job worker stopped by %s", type(error).__name__, exc_info=error)
+                raise
             if processed == 0:
                 stop.wait(poll_interval_seconds)
     finally:

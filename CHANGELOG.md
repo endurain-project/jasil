@@ -13,6 +13,9 @@ What counts as a breaking change — and what does not — is defined in [API st
 1. Stop passing `ttl_seconds=0` (or a negative value) to `StateProvider.set`, `set_if_absent` or `incr`: pass `None` for no expiry. `delete_prefix("")` is refused too.
 2. If anything recovers stuck entries from the Redis event stream with `XPENDING` / `XAUTOCLAIM`, drop it: a failed entry is now acked, and durable jobs are the retrying path.
 3. If you run JASIL's revisions from your own Alembic history, set `transaction_per_migration=True` in your `env.py`: on PostgreSQL `rev0002` and `rev0004` commit before building their indexes concurrently.
+4. Check your `JobSettings`: every field is validated when the object is built (see **Changed**), so a value the pipeline cannot honour now raises where you configure JASIL instead of when a worker starts, or not at all.
+5. Register `on_dead_letter` callbacks in the process that runs `schedule_job_maintenance`: the scheduled sweep is now the only thing that calls them.
+6. Storage areas, keys and prefixes with a control character or longer than 1024 UTF-8 bytes are refused, and an S3 `url` / `serve` with `expires_in` outside 1 second to 7 days raises `ValueError`.
 
 ### Added
 
@@ -41,6 +44,13 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `jasil.orm.map_models` refuses, after `reset()`, a different base from the one JASIL's models were first imported against, instead of mapping no tables into it.
 - `jasil.migrations.upgrade` commits each revision on its own and holds its PostgreSQL migration lock for the session, and on PostgreSQL `rev0002` and `rev0004` build their `jasil_processing_jobs` indexes `CONCURRENTLY`: the previous release's workers keep claiming jobs during an upgrade instead of waiting for the whole run. A run that fails resumes from the last committed revision, including one interrupted in an index build.
 - `jasil.migrations.verify_schema_current` accepts a revision this release does not ship, which only a newer JASIL records, with a warning: a previous-release replica restarting during a rolling deploy starts instead of refusing. A database behind head or unversioned still raises.
+- **BREAKING: `JobSettings` validates every field when it is built.** `batch_size` is 1 to 1000, `poll_interval_seconds` and `heartbeat_interval_seconds` are greater than zero, `max_attempts` is at least 1, `backoff_base_seconds`, `defer_max_seconds` and `max_deferrals` are at least 0, and `backoff_max_seconds` is not below `backoff_base_seconds`; the lease and runtime rules that `build_runner` used to check are checked here too. A zero poll interval made an idle worker poll the database in a hot loop.
+- **BREAKING: `on_dead_letter` callbacks run only in the scheduled sweep**, every 60 seconds, never in the worker that dead-lettered the job: a slow or hung callback held the worker and the leases of the jobs behind it in its batch. The delivery limits (10 deliveries, jobs dead-lettered in the last 7 days) are documented.
+- **BREAKING: storage refuses a control character in an area, key or prefix, and one longer than 1024 UTF-8 bytes**, on both backends (on S3 the bucket prefix and area count toward the limit). S3 refused them as an outage; local disk stored keys S3 could not.
+- **BREAKING: `adopt_existing_schema` refuses more.** A `NOT NULL` column missing its database default, a missing named `CHECK` constraint, an unexpected unique index, and, on PostgreSQL, an audit log without its partitions, append-only triggers or functions: each breaks a guarantee `upgrade()` would not restore.
+- `publish_committing`, `publish_on_commit` and their batch forms raise `ValueError` for an `event_type` or `source` longer than its column before committing or staging anything, on the best-effort route as on the durable one; the best-effort route used to commit, then log the failure and drop the event.
+- `Platform.close()`, and a failed `build_platform()`, give back only the Redis clients that platform took; a client is closed when no platform in the process uses it any more. Another platform's clients were closed under it.
+- A durable handler that raises `SystemExit`, `KeyboardInterrupt` or a cancellation has its failure recorded and the rest of its batch returned to `pending` before the exception ends the worker, which now logs it at `ERROR`; the job used to stay claimed until its lease expired.
 - [API stability](docs/api-stability.md) lists the names already exported and documented elsewhere: `jasil.deps.get_geocoding`, `jasil.orm.jasil_table_names` / `legacy_table_names`, `jasil.migrations.jasil_include_object`, `jasil.capabilities.build_capability_report` and `jasil.profile.StateBackendKind`.
 
 ### Fixed
@@ -50,7 +60,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - The Redis event-bus consumer recreates its consumer group when Redis has lost it (a restart without persistence, or a flush) instead of failing every poll until the process restarts.
 - `publish_many_committing` no longer raises after the domain commit when `metadata_for` fails on the best-effort path; that event is logged and skipped, like any other publish failure.
 - `LocalStorage.save` writes through a temporary file and an atomic rename, as `save_stream` does, so a failed overwrite leaves the previous object instead of a torn one.
-- Reverse geocoding has an overall 30-second deadline, checked between reads, on top of the per-read timeout, so an upstream dripping its reply cannot hold the caller for hours.
+- Reverse geocoding has an overall 30-second deadline on top of the per-read timeout: a watchdog shuts the request's sockets down when it passes, headers included, so an upstream dripping its reply cannot hold the caller for hours.
 - The reverse-geocoding address check refuses every address that is not globally reachable, including the shared address space `100.64.0.0/10` (where one cloud serves instance metadata) and IPv6 site-local; cleartext mail no longer counts a 6to4 (`2002::/16`) address as private.
 - A malformed capability URI is no longer echoed, password included, by the "Unsupported scheme" errors, the startup report or a Redis client error; `state_uri`, `events_uri` and `realtime_uri` are left out of the settings' `repr`.
 - `JasilSettings` takes `profile` and `job_worker_mode` as their names too (`"distributed"`), and refuses a misspelt one; a plain string used to pass every deployment check unmatched.
@@ -59,9 +69,13 @@ What counts as a breaking change — and what does not — is defined in [API st
 - The Redis event bus serializes an envelope before recording it `published`, so one that cannot be sent leaves no row behind.
 - S3 `cleanup_uploads` logs an invalid session manifest and goes on with the rest instead of stopping every pass at it.
 - `supports_skip_locked` and the durable-job enqueue recognise the `mariadb` dialect name, so a `mariadb+...` URL gets `SKIP LOCKED` and no longer fails every enqueue.
+- `publish_on_commit` dispatches the payload as it was when published: a dict changed before the commit no longer changes the event.
+- The Redis event bus logs a failed ack and goes on with the rest of the batch, which it used to abandon unread, and a restart after a `stop()` that timed out no longer revives the old consumer thread beside the new one.
+- A realtime hint nested past the JSON parser's depth is ignored instead of tearing down every subscriber's connection, and one sent that deep raises `ValueError` as documented.
+- S3 presigned URLs are signed with Signature Version 4 when JASIL builds the client: SigV2 URLs could not fetch SSE-KMS objects and are refused by SigV4-only stores.
 - S3 `upload_part` works against a plain-`http://` endpoint (it raised `AttributeError` there), botocore can now resend a part after a transient failure, and a source shorter or longer than `size` raises `ValueError` before any request is sent. The part is staged before upload, in memory up to 8 MiB and in a temporary file beyond that, so allow temporary disk for the largest part in flight.
 
-The audit trail writes nothing until the host calls the audit API, and every addition is optional. The two breaking changes are the state-backend arguments and the event buses' handling of a failed handler; see **Upgrading**.
+The audit trail writes nothing until the host calls the audit API, and every addition is optional. The breaking changes are the state-backend arguments, the event buses' handling of a failed handler, `JobSettings` validation, sweep-only dead-letter callbacks, the storage address limits and stricter adoption; see **Upgrading**.
 
 ## [0.13.0] - 2026-10-27
 
