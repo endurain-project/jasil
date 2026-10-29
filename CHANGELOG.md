@@ -12,6 +12,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 1. Stop passing `ttl_seconds=0` (or a negative value) to `StateProvider.set`, `set_if_absent` or `incr`: pass `None` for no expiry. `delete_prefix("")` is refused too.
 2. If anything recovers stuck entries from the Redis event stream with `XPENDING` / `XAUTOCLAIM`, drop it: a failed entry is now acked, and durable jobs are the retrying path.
+3. If you run JASIL's revisions from your own Alembic history, set `transaction_per_migration=True` in your `env.py`: on PostgreSQL `rev0002` and `rev0004` commit before building their indexes concurrently.
 
 ### Added
 
@@ -38,6 +39,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 - Every storage area whose name starts with `.jasil-`, in any letter case, is reserved; a case-insensitive filesystem reached the private directories under another spelling.
 - `upgrade`, `downgrade` and `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`: the migrations create JASIL's tables in the connection's default schema, where such models would not find them.
 - `jasil.orm.map_models` refuses, after `reset()`, a different base from the one JASIL's models were first imported against, instead of mapping no tables into it.
+- `jasil.migrations.upgrade` commits each revision on its own and holds its PostgreSQL migration lock for the session, and on PostgreSQL `rev0002` and `rev0004` build their `jasil_processing_jobs` indexes `CONCURRENTLY`: the previous release's workers keep claiming jobs during an upgrade instead of waiting for the whole run. A run that fails resumes from the last committed revision, including one interrupted in an index build.
+- `jasil.migrations.verify_schema_current` accepts a revision this release does not ship, which only a newer JASIL records, with a warning: a previous-release replica restarting during a rolling deploy starts instead of refusing. A database behind head or unversioned still raises.
 - [API stability](docs/api-stability.md) lists the names already exported and documented elsewhere: `jasil.deps.get_geocoding`, `jasil.orm.jasil_table_names` / `legacy_table_names`, `jasil.migrations.jasil_include_object`, `jasil.capabilities.build_capability_report` and `jasil.profile.StateBackendKind`.
 
 ### Fixed

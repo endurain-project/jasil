@@ -26,6 +26,7 @@ directly; from a host's own history ``rev0001`` first creates the unprefixed nam
 and ``rev0003`` renames them.
 """
 
+import logging
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +43,8 @@ except ImportError:  # pragma: no cover - exercised via the missing-dep guard
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "VERSION_TABLE",
@@ -123,10 +126,9 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
     """Hold a database lock for one migration run, so processes upgrading at once queue instead of colliding.
 
     The run that waited then reads the version table after the first one committed and finds nothing left
-    to do. ``env.py`` enters this inside Alembic's transaction. PostgreSQL takes a transaction lock, which
-    that run's commit releases; MySQL commits per migration, so it holds a session lock and gives it back
-    afterwards. SQLite is not locked: it serves a single process, and JASIL refuses a multi-process SQLite
-    deployment.
+    to do. Each revision commits on its own, so PostgreSQL and MySQL hold a session lock for the whole run
+    and give it back afterwards, a failed run included. SQLite is not locked: it serves a single process,
+    and JASIL refuses a multi-process SQLite deployment.
 
     Raises:
         RuntimeError: When MySQL does not grant the lock.
@@ -135,8 +137,17 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
 
     dialect = connection.dialect.name
     if dialect == "postgresql":
-        connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": _RUN_LOCK})
-        yield
+        connection.execute(text("SELECT pg_advisory_lock(hashtext(:name))"), {"name": _RUN_LOCK})
+        try:
+            yield
+        except BaseException:
+            # A failure can leave the connection in an aborted transaction, where the unlock would fail too. On
+            # success a transaction still open is the caller's (adoption stamps inside one) and is left to it.
+            if connection.in_transaction():
+                connection.rollback()
+            raise
+        finally:
+            connection.execute(text("SELECT pg_advisory_unlock(hashtext(:name))"), {"name": _RUN_LOCK})
     elif dialect in ("mysql", "mariadb"):
         if connection.execute(text("SELECT GET_LOCK(:name, -1)"), {"name": _RUN_LOCK}).scalar() != 1:
             raise RuntimeError("MySQL did not grant the JASIL migration lock")
@@ -575,16 +586,31 @@ def adopt_existing_schema(engine: "Engine") -> bool:
 
 
 def verify_schema_current(engine: "Engine") -> None:
-    """Raise if the database is not migrated to the packaged head revision.
+    """Raise if the database is not migrated at least to the packaged head revision.
 
     A fail-fast startup check: call it after configuring the engine to catch a
-    forgotten upgrade before the first query does.
+    forgotten upgrade before the first query does. A revision this package does not
+    ship can only have been recorded by a newer JASIL, whose revisions stay
+    compatible with the previous release during a rolling deploy, so it passes with
+    a warning rather than stopping the previous release from starting.
 
     Raises:
-        RuntimeError: If the recorded revision differs from the packaged head.
+        RuntimeError: If no revision is recorded, or the recorded one precedes the packaged head.
     """
-    head = head_revision()
+    _require_alembic()
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(_config())
+    head = script.get_current_head()
     current = db_revision(engine)
+    if current is not None and current != head and current not in {s.revision for s in script.walk_revisions()}:
+        logger.warning(
+            "JASIL database revision %r is newer than this release's head %r; running against it as a rolling "
+            "deploy does",
+            current,
+            head,
+        )
+        return
     if current != head:
         raise RuntimeError(
             "JASIL database schema is out of date "

@@ -7,6 +7,7 @@ difference would only surface in production. ``test_the_migration_matches_the_mo
 is the guard for that.
 """
 
+import logging
 import threading
 import time
 from types import SimpleNamespace
@@ -343,6 +344,97 @@ class TestDeadLetterNotified:
         assert {"dead_letter_notified_at", "dead_letter_notify_after", "dead_letter_attempts"} <= columns
 
 
+class TestRevisionTransactions:
+    """Each revision commits on its own, so no lock one takes is held through the next."""
+
+    @pytest.fixture
+    def failing_build(self, monkeypatch):
+        """Make the named index builds fail, as an interrupted ``CREATE INDEX CONCURRENTLY`` would."""
+        from jasil.migrations import _online
+
+        def fail(names, where="create_index"):
+            original = getattr(_online, where)
+
+            def build(name, *args, **kwargs):
+                if name in names:
+                    raise RuntimeError(f"build of {name} interrupted")
+                return original(name, *args, **kwargs)
+
+            monkeypatch.setattr(_online, where, build)
+            return lambda: monkeypatch.setattr(_online, where, original)
+
+        return fail
+
+    def test_a_failed_revision_keeps_the_ones_before_it(self, engine, failing_build):
+        failing_build({"idx_jasil_processing_jobs_dead_letter"})
+
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == "rev0003"
+
+    def test_an_upgrade_that_failed_in_an_index_build_is_resumed(self, engine, failing_build):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL commits a revision's changes before building its index")
+        restore = failing_build({"idx_jasil_processing_jobs_dead_letter"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
+        assert "dead_letter_notified_at" in columns  # committed before the build
+        assert migrations.db_revision(engine) == "rev0003"
+        restore()
+
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert _index_validity(engine, "idx_jasil_processing_jobs_dead_letter") is True
+
+    def test_an_index_a_failed_build_left_invalid_is_rebuilt(self, engine, failing_build):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL leaves an invalid index behind")
+        restore = failing_build({"idx_jasil_processing_jobs_dead_letter"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        restore()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_jasil_processing_jobs_dead_letter ON jasil_processing_jobs "
+                    "(status, dead_letter_notified_at, dead_letter_notify_after)"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE pg_index SET indisvalid = false "
+                    "WHERE indexrelid = 'idx_jasil_processing_jobs_dead_letter'::regclass"
+                )
+            )
+
+        migrations.upgrade(engine)
+
+        assert _index_validity(engine, "idx_jasil_processing_jobs_dead_letter") is True
+
+    def test_the_jobs_table_indexes_are_built_concurrently_on_postgresql(self, engine):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("CONCURRENTLY is PostgreSQL's")
+
+        migrations.upgrade(engine)
+
+        for name in (
+            "idx_jasil_processing_jobs_queue_claim",
+            "idx_jasil_processing_jobs_worker_claim",
+            "idx_jasil_processing_jobs_dead_letter",
+        ):
+            assert _index_validity(engine, name) is True
+
+
+def _index_validity(engine, name: str) -> bool | None:
+    with engine.connect() as connection:
+        return connection.execute(
+            text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"), {"name": name}
+        ).scalar()
+
+
 class TestOfflineSql:
     @pytest.mark.parametrize("span", ["rev0002:rev0003", "base:rev0003"])
     def test_the_prefix_rename_can_be_rendered_as_sql(self, span):
@@ -360,6 +452,21 @@ class TestOfflineSql:
         sql = config.output_buffer.getvalue()
         assert "RENAME TO jasil_event_log" in sql
         assert 'RENAME CONSTRAINT "uq_processing_jobs_event_subscriber"' in sql
+
+    def test_the_jobs_table_indexes_render_outside_the_revision_transaction(self):
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+
+        command.upgrade(config, "rev0003:rev0005", sql=True)
+
+        sql = config.output_buffer.getvalue()
+        build = sql.index("CREATE INDEX CONCURRENTLY idx_jasil_processing_jobs_dead_letter")
+        assert sql.rindex("COMMIT", 0, build) > sql.rindex("ADD COLUMN dead_letter_notified_at", 0, build)
 
 
 class TestAdoptExistingSchema:
@@ -667,6 +774,23 @@ class TestSchemaVerification:
 
         migrations.verify_schema_current(engine)
 
+    def test_a_database_behind_head_is_reported(self, engine):
+        migrations.upgrade(engine, "rev0005")
+
+        with pytest.raises(RuntimeError, match="'rev0005'"):
+            migrations.verify_schema_current(engine)
+
+    def test_a_database_a_newer_release_migrated_passes_with_a_warning(self, engine, caplog):
+        """During a rolling deploy the previous release restarts against the schema the next one migrated."""
+        migrations.upgrade(engine)
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE jasil_alembic_version SET version_num = 'rev9999'"))
+
+        with caplog.at_level(logging.WARNING, logger="jasil.migrations"):
+            migrations.verify_schema_current(engine)
+
+        assert "rev9999" in caplog.text
+
 
 class TestHostIsolation:
     def test_host_tables_are_out_of_scope(self):
@@ -742,15 +866,35 @@ class _Connection:
         self.statements.append(str(statement))
         return type("Result", (), {"scalar": lambda _self: self._acquired})()
 
+    def in_transaction(self) -> bool:
+        return True
+
+    def rollback(self) -> None:
+        self.statements.append("ROLLBACK")
+
 
 class TestOneRunAtATime:
     """Processes that upgrade at once (replicas starting together) must queue, not collide."""
 
-    def test_postgresql_takes_a_transaction_lock_that_its_commit_releases(self):
+    def test_postgresql_holds_a_session_lock_across_the_revision_commits(self):
+        """Each revision commits on its own, so a transaction lock would be gone after the first one."""
         connection = _Connection("postgresql")
 
         with migrations._one_run_at_a_time(connection):
-            assert connection.statements == ["SELECT pg_advisory_xact_lock(hashtext(:name))"]
+            assert connection.statements == ["SELECT pg_advisory_lock(hashtext(:name))"]
+
+        # A transaction still open is the caller's: adoption stamps inside one and commits it itself.
+        assert connection.statements[-1] == "SELECT pg_advisory_unlock(hashtext(:name))"
+        assert "ROLLBACK" not in connection.statements
+
+    def test_postgresql_releases_the_lock_after_a_failed_run(self):
+        connection = _Connection("postgresql")
+
+        with pytest.raises(RuntimeError, match="boom"), migrations._one_run_at_a_time(connection):
+            raise RuntimeError("boom")
+
+        # The failed transaction is ended first, or the unlock could not run in it.
+        assert connection.statements[-2:] == ["ROLLBACK", "SELECT pg_advisory_unlock(hashtext(:name))"]
 
     @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
     def test_mysql_holds_a_session_lock_and_releases_it_even_when_the_run_fails(self, dialect):

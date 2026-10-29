@@ -206,15 +206,18 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 
 | Function | Use |
 |---|---|
-| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
+| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. Each revision commits on its own, and on PostgreSQL the indexes on `jasil_processing_jobs` are built `CONCURRENTLY`, so the previous release's workers keep claiming jobs while it runs. If a run fails, run it again: it resumes from the last revision that committed, and finishes or rebuilds an interrupted index build. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
 | `adopt_existing_schema(engine)` | Validate and adopt unversioned JASIL tables at head or an earlier revision. |
 | `head_revision()` | The newest revision shipped in this package. |
 | `db_revision(engine)` | What the database currently records. |
-| `verify_schema_current(engine)` | Raise unless the database is at head. |
+| `verify_schema_current(engine)` | Raise unless the database is at head or at a revision a newer release recorded. |
 
 `verify_schema_current` is a useful fail-fast at startup — it turns "forgot to
 migrate" into a clear message at boot rather than a confusing query error later.
+A revision this release does not ship was recorded by a newer JASIL, so during a
+rolling deploy a restarting replica of the previous release logs a warning and
+starts instead of refusing.
 
 !!! note "Revision `rev0006` (0.14): the audit trail"
     Adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On PostgreSQL
@@ -312,6 +315,11 @@ fresh database with the `jasil_` names directly. Run from your own history,
 `rev0001` creates the unprefixed tables and `rev0003` renames them, so a table of
 yours called `event_log` (or another old name) still collides on a fresh
 install. Create JASIL's tables with `upgrade()` first if that applies to you.
+
+Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev0002`
+and `rev0004` commit their other changes before building their
+`jasil_processing_jobs` indexes `CONCURRENTLY`; inside one transaction for the whole
+run, that commit would also commit every revision before them.
 
 ## Retention
 

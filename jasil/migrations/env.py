@@ -4,6 +4,9 @@ Driven programmatically by :mod:`jasil.migrations` (an active connection is
 passed via ``config.attributes["connection"]``), but also supports the standard
 offline/online CLI paths. Migrations are scoped to JASIL's own tables and use a
 dedicated version table so they never collide with the host's Alembic history.
+Each revision runs in its own transaction, so the locks one takes are released
+before the next starts, and a revision may commit early to build an index
+concurrently (see :mod:`jasil.migrations._online`).
 """
 
 from alembic import context
@@ -21,6 +24,7 @@ def _configure(**kwargs) -> None:
         include_object=jasil_include_object,
         render_as_batch=True,
         compare_type=True,
+        transaction_per_migration=True,
         **kwargs,
     )
 
