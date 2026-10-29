@@ -371,14 +371,23 @@ class TestFailOpen:
         assert jasil_audit.get_audit_health()["write_failures"] == 1
         assert "hunter2" not in caplog.text
 
-    def test_a_missing_session_factory_does_not_raise(self, change, audit_env, monkeypatch):
+    def test_a_missing_session_factory_does_not_raise(self, change, audit_env, session_factory):
         import jasil.orm as jasil_orm
 
         jasil_orm._session_factory.reset()
 
         jasil_audit.record_detached(change, outcome=Outcome.SUCCESS, details={"fields": []})
 
+        jasil_orm.configure_sessionmaker(session_factory)
         assert jasil_audit.get_audit_health()["write_failures"] == 1
+
+    def test_health_reads_the_database_so_it_needs_one(self, audit_env):
+        import jasil.orm as jasil_orm
+
+        jasil_orm._session_factory.reset()
+
+        with pytest.raises(RuntimeError):
+            jasil_audit.get_audit_health()
 
     def test_health_starts_clean(self, audit_env):
         assert jasil_audit.get_audit_health() == {

@@ -28,6 +28,7 @@ __all__ = [
     "MAX_AUDIT_NAME_LENGTH",
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_IP_ADDRESS_LENGTH",
+    "MAX_PARTITION_DAYS_AHEAD",
     "MAX_REQUEST_ID_LENGTH",
     "MAX_STORED_ERROR_LENGTH",
     "MAX_USER_AGENT_LENGTH",
@@ -123,3 +124,7 @@ MAX_REQUEST_ID_LENGTH = 100
 MAX_USER_AGENT_LENGTH = 512
 #: Longest textual IPv6 address, including an IPv4-mapped suffix.
 MAX_IP_ADDRESS_LENGTH = 45
+
+#: How many days of audit partitions may be created ahead: ``audit.partition_days_ahead`` is validated
+#: against it, and ``jasil_audit_ensure_partitions`` refuses more.
+MAX_PARTITION_DAYS_AHEAD = 366

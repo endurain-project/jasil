@@ -167,6 +167,17 @@ class TestMigration:
         with pytest.raises(DBAPIError, match="between 0 and 366"), migrated.begin() as connection:
             connection.execute(text("SELECT jasil_audit_ensure_partitions(:d)"), {"d": days})
 
+    def test_a_table_squatting_a_partition_name_is_refused(self, migrated):
+        squatted = f"jasil_audit_log_p{datetime.now(UTC).date() + timedelta(days=8):%Y%m%d}"
+        with migrated.begin() as connection:
+            connection.execute(text(f"CREATE TABLE {squatted} (id integer)"))
+        try:
+            with pytest.raises(DBAPIError, match="is not a partition"), migrated.begin() as connection:
+                connection.execute(text("SELECT jasil_audit_ensure_partitions(8)"))
+        finally:
+            with migrated.begin() as connection:
+                connection.execute(text(f"DROP TABLE {squatted}"))
+
     def test_a_temporary_table_cannot_shadow_the_catalog_for_the_partition_horizon(self, migrated):
         with migrated.begin() as connection:
             _shadow_catalog(connection, "jasil_audit_log_p29991231")
@@ -377,6 +388,33 @@ class TestDropPartitions:
 
         assert f"jasil_audit_log_p{today - timedelta(days=100):%Y%m%d}" not in _partitions(engine)
         assert _scalar(engine, "SELECT count(*) FROM jasil_audit_log WHERE action_id = 'audit.retention.prune'") == 1
+
+    def test_an_application_clock_ahead_of_the_database_still_prunes_at_the_floor(self, aged, action):
+        engine, today = aged
+        clock = jasil_testing.FixedClock()
+        clock.moment = datetime.now(UTC) + timedelta(hours=2)
+        retention_at_the_floor = jasil_settings.AuditSettings(retention_days=30, retention_floor_days=30)
+        jasil_testing.install_test_platform(
+            ".", clock=clock, settings=jasil_settings.JasilSettings(audit=retention_at_the_floor)
+        )
+        # A checkpoint sealed just behind the fast clock, so the newest one allows a prune up to 30 days back.
+        start = datetime.fromtimestamp(clock.moment.timestamp() // 900 * 900 - 1800, UTC)
+        with sessionmaker(bind=engine)() as db:
+            db.add(
+                AuditCheckpoint(
+                    window_start=start,
+                    window_end=start + timedelta(minutes=15),
+                    row_count=0,
+                    hash="0" * 64,
+                    retention_days=30,
+                    legal_hold=False,
+                )
+            )
+            db.commit()
+
+        jasil_audit.run_audit_maintenance()
+
+        assert f"jasil_audit_log_p{today - timedelta(days=99):%Y%m%d}" not in _partitions(engine)
 
     def test_legal_hold_keeps_the_partitions(self, aged, action):
         engine, today = aged

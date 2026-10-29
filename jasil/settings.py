@@ -33,6 +33,7 @@ is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from jasil._core.limits import MAX_PARTITION_DAYS_AHEAD
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode
@@ -144,7 +145,7 @@ class AuditSettings:
         legal_hold: Suspend all pruning.
         partition_days_ahead: How many days of daily partitions the maintenance keeps created
             ahead of today (PostgreSQL). A row whose day has no partition is rejected, so this is
-            the margin by which maintenance may stop running. Must be at least 1.
+            the margin by which maintenance may stop running. Must be between 1 and 366.
         checkpoint_window_minutes: Length of one tamper-evidence window. Must be at least 1 and divide a
             day (1440 minutes) evenly, so that no window straddles two daily partitions.
         checkpoint_grace_minutes: How long past its end a window waits before it is sealed, so a
@@ -190,6 +191,10 @@ class AuditSettings:
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
                 raise ValueError(f"audit.{name} must be at least {minimum}, not {getattr(self, name)}")
+        if self.partition_days_ahead > MAX_PARTITION_DAYS_AHEAD:
+            raise ValueError(
+                f"audit.partition_days_ahead must be at most {MAX_PARTITION_DAYS_AHEAD}, not {self.partition_days_ahead}"
+            )
         if 1440 % self.checkpoint_window_minutes:
             raise ValueError(
                 f"audit.checkpoint_window_minutes ({self.checkpoint_window_minutes}) must divide a day (1440) evenly"

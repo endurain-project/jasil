@@ -56,11 +56,13 @@ def grants_sql(
         The statements, in the order to run them.
 
     Raises:
-        ValueError: When a role name is empty, or the runtime and reader roles are the same (which would
-            make the trail readable by the process it audits).
+        ValueError: When a role name is empty, or the reader role is also the runtime or the maintenance role
+            (which would make the trail readable by the process it audits, or writable by its reader).
     """
     if runtime_role == reader_role:
         raise ValueError("the runtime and reader roles must differ, or the application can read the trail it writes")
+    if maintenance_role == reader_role:
+        raise ValueError("the maintenance and reader roles must differ, or the reader can insert rows and checkpoints")
     log, actions, checkpoints, instance = (_qualified(schema, table) for table in _TABLES)
     functions = {
         name: f"{_qualified(schema, name)}({arguments})"
@@ -102,7 +104,7 @@ def grants_sql(
     return statements
 
 
-def retention_floor_sql(floor_days: int, *, schema: str = "public") -> str:
+def retention_floor_sql(floor_days: int, *, schema: str) -> str:
     """
     Return the statement that changes the retention floor of ``jasil_audit_drop_partitions``.
 
@@ -112,7 +114,8 @@ def retention_floor_sql(floor_days: int, *, schema: str = "public") -> str:
 
     Args:
         floor_days: The youngest age, in days, the function will let a cutoff reach. At least 1.
-        schema: Schema holding the audit tables.
+        schema: Schema holding the audit tables, as migration ``rev0006`` found it (``current_schema()``
+            when it ran). Required: the function body names its schema, so there is no safe default.
 
     Returns:
         A ``CREATE OR REPLACE FUNCTION`` statement.

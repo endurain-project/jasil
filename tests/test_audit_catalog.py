@@ -293,6 +293,7 @@ class TestSettings:
         [
             ({"retention_floor_days": 0}, "retention_floor_days must be at least 1"),
             ({"partition_days_ahead": 0}, "partition_days_ahead must be at least 1"),
+            ({"partition_days_ahead": 367}, "partition_days_ahead must be at most 366"),
             ({"checkpoint_window_minutes": 0}, "checkpoint_window_minutes must be at least 1"),
             ({"checkpoint_window_minutes": 7}, "must divide"),
             ({"checkpoint_grace_minutes": -1}, "checkpoint_grace_minutes must be at least 0"),

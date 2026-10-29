@@ -4,8 +4,9 @@ Like :mod:`jasil.admin`, nothing here accepts a session: each call opens a short
 host cannot hand it the transaction a request is in the middle of. Authentication and authorization are
 the host's — the host application exposes no read route; only the observability product reads the trail.
 
-Pages are keyset-paginated over ``(occurred_at, id)``, newest first, never by offset. Every listing is
-bounded in time (24 hours by default) so PostgreSQL can prune partitions.
+Pages are keyset-paginated over ``(occurred_at, id)``, newest first, never by offset. Every listing and
+summary is bounded in time, 24 hours by default and :data:`MAX_WINDOW` at most, so PostgreSQL prunes
+partitions and no call scans the whole trail.
 
 An asynchronous route must run these through its framework's thread-pool helper; they use synchronous
 sessions.
@@ -33,6 +34,8 @@ from jasil.audit.schema import (
 __all__ = ["get_entry", "list_catalog", "list_entries", "summary", "verify_checkpoints"]
 
 DEFAULT_WINDOW = timedelta(hours=24)
+#: The longest time range one listing or summary may cover.
+MAX_WINDOW = timedelta(days=31)
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 500
 TOP_ACTIONS = 10
@@ -46,7 +49,7 @@ def list_entries(
 
     Args:
         filters: What to match; see :class:`~jasil.audit.schema.AuditFilters`. The time range defaults to
-            the 24 hours before ``to_ts``, which defaults to now.
+            the 24 hours before ``to_ts``, which defaults to now, and may cover at most 31 days.
         cursor: The previous page's ``next_cursor``, or ``None`` for the first page.
         limit: Entries per page, 1 to 500.
 
@@ -54,7 +57,8 @@ def list_entries(
         The page and the cursor of the next one (``None`` after the last).
 
     Raises:
-        ValueError: When ``limit`` is out of range or ``cursor`` is not one this function returned.
+        ValueError: When ``limit`` is out of range, ``from_ts`` is after ``to_ts``, the range is longer than
+            31 days, or ``cursor`` is not one this function returned.
         RuntimeError: When ``jasil.orm.configure_sessionmaker`` has not run.
     """
     from jasil.audit.models import AuditLog
@@ -64,6 +68,10 @@ def list_entries(
     filters = filters or AuditFilters()
     to_ts = as_utc(filters.to_ts) if filters.to_ts is not None else service.now()
     from_ts = as_utc(filters.from_ts) if filters.from_ts is not None else to_ts - DEFAULT_WINDOW
+    if from_ts > to_ts:
+        raise ValueError(f"from_ts ({from_ts.isoformat()}) is after to_ts ({to_ts.isoformat()})")
+    if to_ts - from_ts > MAX_WINDOW:
+        raise ValueError(f"the time range may cover at most {MAX_WINDOW.days} days; page through longer ones")
 
     conditions: list[ColumnElement[bool]] = [AuditLog.occurred_at >= from_ts, AuditLog.occurred_at <= to_ts]
     for column, values in (
@@ -134,19 +142,20 @@ def summary(hours: int = 24) -> AuditSummary:
     Count entries over a look-back window.
 
     Args:
-        hours: The window, ending now.
+        hours: The window, ending now: 1 to 744 (31 days).
 
     Returns:
         Counts by category, outcome and severity, and the most frequent actions.
 
     Raises:
-        ValueError: When ``hours`` is below 1.
+        ValueError: When ``hours`` is out of range.
         RuntimeError: When ``jasil.orm.configure_sessionmaker`` has not run.
     """
     from jasil.audit.models import AuditLog
 
-    if hours < 1:
-        raise ValueError("hours must be at least 1")
+    longest = int(MAX_WINDOW.total_seconds() // 3600)
+    if not 1 <= hours <= longest:
+        raise ValueError(f"hours must be between 1 and {longest}, not {hours}")
     until = service.now()
     window = [AuditLog.occurred_at >= until - timedelta(hours=hours), AuditLog.occurred_at <= until]
 

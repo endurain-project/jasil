@@ -154,6 +154,10 @@ def upgrade() -> None:
         ),
         sa.Column("retention_days", sa.Integer, nullable=True, comment="Retention last seen"),
         sa.Column("legal_hold", sa.Boolean, nullable=True, comment="Legal hold last seen"),
+        sa.Column("furthest_partition_date", sa.Date, nullable=True, comment="Last day with a partition"),
+        sa.Column(
+            "last_checkpoint_at", sa.DateTime(timezone=True), nullable=True, comment="End of the latest sealed window"
+        ),
         sa.CheckConstraint("id = 1", name=f"ck_{_INSTANCE}_single"),
     )
 

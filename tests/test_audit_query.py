@@ -122,8 +122,16 @@ class TestFilters:
 
         assert "now" in self._ids()
 
-    def test_an_empty_range_lists_nothing(self):
-        assert self._ids(from_ts=T0, to_ts=T0 - timedelta(hours=1)) == []
+    def test_an_inverted_range_is_refused(self):
+        with pytest.raises(ValueError, match="from_ts"):
+            self._ids(from_ts=T0, to_ts=T0 - timedelta(hours=1))
+
+    def test_a_range_longer_than_the_maximum_is_refused(self):
+        with pytest.raises(ValueError, match="31 days"):
+            self._ids(from_ts=T0 - timedelta(days=31, seconds=1), to_ts=T0)
+
+    def test_a_range_of_exactly_the_maximum_is_accepted(self):
+        assert self._ids(from_ts=T0 - timedelta(days=31), to_ts=T0) == ["r2", "r1", None]
 
 
 class TestPagination:
@@ -221,9 +229,10 @@ class TestSummary:
         assert jasil_audit.summary(hours=48).total == 1
         assert jasil_audit.summary(hours=24).total == 0
 
-    def test_a_window_below_one_hour_is_refused(self):
+    @pytest.mark.parametrize("hours", [0, 31 * 24 + 1, 10**9])
+    def test_a_window_out_of_range_is_refused(self, hours):
         with pytest.raises(ValueError, match="hours"):
-            jasil_audit.summary(hours=0)
+            jasil_audit.summary(hours=hours)
 
 
 class TestCatalogListing:

@@ -10,6 +10,8 @@ unlisted ``pg_temp`` would be searched first) and qualify every object, so a cal
 by shadowing a name with a temporary table.
 """
 
+from jasil._core.limits import MAX_PARTITION_DAYS_AHEAD
+
 __all__ = [
     "drop_partitions_function",
     "ensure_partitions_function",
@@ -56,6 +58,7 @@ def _render(template: str, schema: str, **extra: str) -> str:
         "ENSURE": ENSURE_FUNCTION,
         "DROP": DROP_FUNCTION,
         "PART_PATTERN": partition_name_pattern,
+        "MAX_DAYS_AHEAD": str(MAX_PARTITION_DAYS_AHEAD),
         **extra,
     }
     for name, value in values.items():
@@ -84,14 +87,16 @@ DECLARE
     today date := (now() AT TIME ZONE 'UTC')::date;
     day date;
     part text;
+    existing regclass;
 BEGIN
-    IF days_ahead < 0 OR days_ahead > 366 THEN
-        RAISE EXCEPTION '@ENSURE@: days_ahead must be between 0 and 366, not %', days_ahead;
+    IF days_ahead < 0 OR days_ahead > @MAX_DAYS_AHEAD@ THEN
+        RAISE EXCEPTION '@ENSURE@: days_ahead must be between 0 and @MAX_DAYS_AHEAD@, not %', days_ahead;
     END IF;
     PERFORM pg_advisory_xact_lock(hashtext('@ENSURE@'));
     FOR day IN SELECT d::date FROM generate_series(today - 1, today + days_ahead, interval '1 day') AS d LOOP
         part := '@LOG@_p' || to_char(day, 'YYYYMMDD');
-        IF to_regclass(format('%I.%I', @SCHEMA_LIT@, part)) IS NULL THEN
+        existing := to_regclass(format('%I.%I', @SCHEMA_LIT@, part));
+        IF existing IS NULL THEN
             EXECUTE format(
                 'CREATE TABLE %I.%I PARTITION OF %I.@LOG@ FOR VALUES FROM (%L) TO (%L)',
                 @SCHEMA_LIT@, part, @SCHEMA_LIT@,
@@ -100,6 +105,12 @@ BEGIN
                 'CREATE TRIGGER @LOG@_no_truncate BEFORE TRUNCATE ON %I.%I '
                 'FOR EACH STATEMENT EXECUTE FUNCTION %I.@FORBID@()',
                 @SCHEMA_LIT@, part, @SCHEMA_LIT@);
+        ELSIF NOT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_inherits i
+            WHERE i.inhrelid = existing AND i.inhparent = to_regclass(format('%I.%I', @SCHEMA_LIT@, '@LOG@'))
+        ) THEN
+            -- Another table holds the name, so the day would have no partition and every row for it would fail.
+            RAISE EXCEPTION '@ENSURE@: %.% exists but is not a partition of @LOG@', @SCHEMA_LIT@, part;
         END IF;
     END LOOP;
     RETURN (

@@ -84,6 +84,10 @@ class TestGrants:
         with pytest.raises(ValueError, match="must differ"):
             jasil_audit.grants_sql("same", "same")
 
+    def test_the_maintenance_and_reader_roles_must_differ(self):
+        with pytest.raises(ValueError, match="must differ"):
+            jasil_audit.grants_sql("app_rt", "app_ro", maintenance_role="app_ro")
+
     def test_an_empty_role_is_refused(self):
         with pytest.raises(ValueError, match="must not be empty"):
             jasil_audit.grants_sql("", "ro")
@@ -91,11 +95,15 @@ class TestGrants:
 
 class TestRetentionFloor:
     def test_it_bakes_the_floor_into_the_function(self):
-        statement = jasil_audit.retention_floor_sql(45)
+        statement = jasil_audit.retention_floor_sql(45, schema="public")
 
         assert statement.startswith("CREATE OR REPLACE FUNCTION")
         assert "floor_days constant integer := 45;" in statement
         assert '"public".jasil_audit_drop_partitions' in statement
+
+    def test_the_schema_has_no_default(self):
+        with pytest.raises(TypeError, match="schema"):
+            jasil_audit.retention_floor_sql(30)
 
     def test_it_follows_the_schema(self):
         assert '"audit".jasil_audit_drop_partitions' in jasil_audit.retention_floor_sql(30, schema="audit")
@@ -103,10 +111,10 @@ class TestRetentionFloor:
     @pytest.mark.parametrize("floor_days", [0, -3])
     def test_a_floor_below_one_day_is_refused(self, floor_days):
         with pytest.raises(ValueError, match="at least 1"):
-            jasil_audit.retention_floor_sql(floor_days)
+            jasil_audit.retention_floor_sql(floor_days, schema="public")
 
     def test_the_function_is_security_definer_with_a_pinned_search_path(self):
-        statement = jasil_audit.retention_floor_sql(30)
+        statement = jasil_audit.retention_floor_sql(30, schema="public")
 
         assert "SECURITY DEFINER" in statement
         assert "SET search_path = pg_catalog" in statement

@@ -39,6 +39,7 @@ from jasil._core.limits import (
     check_length,
     fit_length,
 )
+from jasil._core.timestamps import as_utc
 from jasil._core.uuid7 import uuid7
 from jasil.audit.catalog import AuditAction, Outcome, get_catalog
 from jasil.audit.context import get_context
@@ -96,8 +97,6 @@ _instance_id: str | None = None
 _health_lock = threading.Lock()
 _write_failures = 0
 _last_failure_at: datetime | None = None
-_furthest_partition_date: date | None = None
-_last_checkpoint_at: datetime | None = None
 
 
 def stage(
@@ -228,50 +227,74 @@ def _note_failure() -> None:
 
 def get_audit_health() -> AuditHealth:
     """
-    Return the process-local health of the audit path.
+    Return the health of the audit path.
 
-    Cheap and free of I/O: the partition and checkpoint figures are those the latest
-    :func:`jasil.audit.run_audit_maintenance` in this process observed.
+    ``write_failures`` and ``last_failure_at`` count this process's detached writes. The partition and
+    checkpoint figures are what the latest :func:`jasil.audit.run_audit_maintenance` recorded in
+    ``jasil_instance``, whichever replica ran it, so every replica reports the same ones. Reads one row.
 
     Returns:
         ``write_failures``, ``last_failure_at``, ``furthest_partition_date`` and ``last_checkpoint_at``.
+
+    Raises:
+        sqlalchemy.exc.SQLAlchemyError: When ``jasil_instance`` cannot be read.
+        RuntimeError: When ``jasil.orm.configure_sessionmaker`` has not run.
     """
+    from sqlalchemy import select
+
+    from jasil.audit.models import Instance
+
+    with jasil_orm.get_sessionmaker()() as db:
+        recorded = db.execute(
+            select(Instance.furthest_partition_date, Instance.last_checkpoint_at).where(Instance.id == 1)
+        ).first()
+    furthest_partition_date, last_checkpoint_at = recorded if recorded is not None else (None, None)
     with _health_lock:
         return {
             "write_failures": _write_failures,
             "last_failure_at": _last_failure_at,
-            "furthest_partition_date": _furthest_partition_date,
-            "last_checkpoint_at": _last_checkpoint_at,
+            "furthest_partition_date": furthest_partition_date,
+            "last_checkpoint_at": as_utc(last_checkpoint_at) if last_checkpoint_at is not None else None,
         }
 
 
 def reset() -> None:
     """Forget the cached instance id, the health counters and every observer. For tests."""
-    global _instance_id, _write_failures, _last_failure_at, _furthest_partition_date, _last_checkpoint_at
+    global _instance_id, _write_failures, _last_failure_at
     _instance_id = None
     _observers.clear()
     with _health_lock:
         _write_failures = 0
         _last_failure_at = None
-        _furthest_partition_date = None
-        _last_checkpoint_at = None
 
 
 def note_maintenance(
-    *, furthest_partition_date: date | None = None, last_checkpoint_at: datetime | None = None
+    db: Session, *, furthest_partition_date: date | None = None, last_checkpoint_at: datetime | None = None
 ) -> None:
-    """Record what the latest maintenance run observed, for :func:`get_audit_health`.
+    """Record on ``jasil_instance`` what a maintenance run observed, for :func:`get_audit_health`.
+
+    The caller commits, so the figure lands with the work it describes. The row must exist
+    (:func:`ensure_instance_id`).
 
     Args:
+        db: The maintenance step's session.
         furthest_partition_date: The last day with a partition, when the run learned it.
         last_checkpoint_at: The end of the latest sealed window, when the run learned it.
     """
-    global _furthest_partition_date, _last_checkpoint_at
-    with _health_lock:
-        if furthest_partition_date is not None:
-            _furthest_partition_date = furthest_partition_date
-        if last_checkpoint_at is not None:
-            _last_checkpoint_at = last_checkpoint_at
+    from sqlalchemy import update
+
+    from jasil.audit.models import Instance
+
+    values = {
+        name: value
+        for name, value in (
+            ("furthest_partition_date", furthest_partition_date),
+            ("last_checkpoint_at", last_checkpoint_at),
+        )
+        if value is not None
+    }
+    if values:
+        db.execute(update(Instance).where(Instance.id == 1).values(**values))
 
 
 def add_observer(observer: Callable[[AuditEntry], None]) -> Callable[[], None]:

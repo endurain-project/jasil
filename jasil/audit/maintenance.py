@@ -255,11 +255,12 @@ def _ensure_partitions() -> None:
     with jasil_orm.get_sessionmaker()() as db:
         if not _partitioned(db):
             return
+        service.ensure_instance_id(service.engine_of(db))
         furthest = db.execute(
             text("SELECT jasil_audit_ensure_partitions(:days)"), {"days": get_settings().audit.partition_days_ahead}
         ).scalar_one()
+        service.note_maintenance(db, furthest_partition_date=furthest)
         db.commit()
-    service.note_maintenance(furthest_partition_date=furthest)
 
 
 def _apply_retention(now: datetime) -> None:
@@ -283,6 +284,10 @@ def _apply_retention(now: datetime) -> None:
             as_utc(newest.window_end) - timedelta(days=newest.retention_days),
         )
         if _partitioned(db):
+            # The function's floor is measured on the database's clock; an application clock ahead of it would
+            # make a cutoff at the floor look younger than the floor, and the prune be refused.
+            database_now = as_utc(db.scalar(text("SELECT now()")))
+            cutoff = min(cutoff, database_now - timedelta(days=settings.retention_floor_days))
             dropped = db.execute(text("SELECT jasil_audit_drop_partitions(:cutoff)"), {"cutoff": cutoff}).scalar_one()
             db.commit()
             if dropped:

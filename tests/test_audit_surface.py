@@ -60,21 +60,25 @@ class TestPublicSurface:
 
 
 class TestHealthSeam:
-    def test_maintenance_figures_are_remembered_and_none_does_not_erase_them(self):
-        audit_service.note_maintenance(furthest_partition_date=date(2026, 1, 8))
-        audit_service.note_maintenance(last_checkpoint_at=datetime(2026, 1, 1, tzinfo=UTC))
-        audit_service.note_maintenance()
+    def test_maintenance_figures_are_recorded_and_none_does_not_erase_them(self, audit_env, session_factory):
+        with session_factory() as db:
+            audit_service.note_maintenance(db, furthest_partition_date=date(2026, 1, 8))
+            audit_service.note_maintenance(db, last_checkpoint_at=datetime(2026, 1, 1, tzinfo=UTC))
+            audit_service.note_maintenance(db)
+            db.commit()
 
         health = jasil_audit.get_audit_health()
         assert health["furthest_partition_date"] == date(2026, 1, 8)
         assert health["last_checkpoint_at"] == datetime(2026, 1, 1, tzinfo=UTC)
 
-    def test_reset_forgets_them(self):
-        audit_service.note_maintenance(furthest_partition_date=date(2026, 1, 8))
+    def test_another_process_reads_the_recorded_figures(self, audit_env, session_factory):
+        with session_factory() as db:
+            audit_service.note_maintenance(db, furthest_partition_date=date(2026, 1, 8))
+            db.commit()
 
-        jasil_audit.reset()
+        jasil_audit.reset()  # what a replica that never ran maintenance remembers: nothing
 
-        assert jasil_audit.get_audit_health()["furthest_partition_date"] is None
+        assert jasil_audit.get_audit_health()["furthest_partition_date"] == date(2026, 1, 8)
 
     def test_removing_an_observer_twice_is_harmless(self):
         remove = audit_service.add_observer(lambda entry: None)

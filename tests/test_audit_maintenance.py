@@ -428,6 +428,14 @@ class TestRun:
 
         assert len(_rows(session_factory, AuditActionRecord)) == 6
 
+    def test_every_replica_reports_the_latest_run(self, actions, audit_env, session_factory):
+        _write(audit_env, actions[0], T0 - timedelta(minutes=30))
+        jasil_audit.run_audit_maintenance()
+
+        jasil_audit.reset()  # a replica that did not win the lock
+
+        assert jasil_audit.get_audit_health()["last_checkpoint_at"] == datetime(2026, 1, 1, 11, 45, tzinfo=UTC)
+
     def test_partition_management_is_skipped_off_postgresql(self, audit_env, session_factory):
         jasil_audit.run_audit_maintenance()
 

@@ -168,6 +168,19 @@ class TestSealing:
 
         assert trail.seal(10) == 2
 
+    def test_a_changed_window_size_rejoins_its_grid(self, audit_env, trail):
+        trail.write(3)
+        assert trail.seal(20) == 1  # 12:00-12:15
+        audit_env.configure(checkpoint_window_minutes=60, checkpoint_grace_minutes=0)
+        trail.write(200)
+
+        trail.seal(300)
+
+        bounds = [(cp.window_start.replace(tzinfo=UTC), cp.window_end.replace(tzinfo=UTC)) for cp in trail.all()]
+        assert bounds[1] == (at(15), at(60))  # shortened to the next hour, so no window straddles midnight
+        assert all(start.minute == 0 and end - start == timedelta(hours=1) for start, end in bounds[2:])
+        assert trail.verify(end=300).ok
+
     def test_a_checkpoint_records_the_retention_it_was_sealed_under(self, audit_env, trail):
         audit_env.configure(retention_days=45, legal_hold=True)
         trail.write(3)

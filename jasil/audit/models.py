@@ -1,9 +1,9 @@
 """Audit-trail models — the append-only log, its catalog, its checkpoints and the instance id."""
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, DateTime, Index, Integer, String
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import false, func
@@ -222,6 +222,9 @@ class Instance(Base):
         created_at: When the id was generated.
         retention_days: The ``audit.retention_days`` last seen by maintenance, to detect a change.
         legal_hold: The ``audit.legal_hold`` last seen by maintenance, to detect a change.
+        furthest_partition_date: The last day with a partition, as the latest maintenance run found it
+            (PostgreSQL), so every replica's :func:`jasil.audit.get_audit_health` reports it.
+        last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run left it.
     """
 
     __tablename__ = "jasil_instance"
@@ -236,3 +239,9 @@ class Instance(Base):
     )
     retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="Retention last seen")
     legal_hold: Mapped[bool | None] = mapped_column(Boolean, nullable=True, comment="Legal hold last seen")
+    furthest_partition_date: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="Last day with a partition"
+    )
+    last_checkpoint_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="End of the latest sealed window"
+    )

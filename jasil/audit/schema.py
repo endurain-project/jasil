@@ -94,7 +94,8 @@ class AuditFilters(BaseModel):
     The filters :func:`jasil.audit.list_entries` accepts. Every one narrows; none is required.
 
     The time range is always bounded: ``to_ts`` defaults to now and ``from_ts`` to 24 hours before
-    ``to_ts``, so the database can prune partitions.
+    ``to_ts``, and :func:`jasil.audit.list_entries` refuses a range longer than 31 days, so the database
+    can prune partitions.
 
     Attributes:
         action_ids: Match any of these action ids.
@@ -259,14 +260,15 @@ class VerificationReport(BaseModel):
 
 class AuditHealth(TypedDict):
     """
-    Process-local health of the audit path, from :func:`jasil.audit.get_audit_health`.
+    Health of the audit path, from :func:`jasil.audit.get_audit_health`.
 
     Attributes:
-        write_failures: Detached writes that failed since the process started.
+        write_failures: Detached writes that failed since this process started.
         last_failure_at: When the latest of them failed.
-        furthest_partition_date: The last day with a partition, as of the latest maintenance run
-            (PostgreSQL only; ``None`` before the first run or elsewhere).
-        last_checkpoint_at: The end of the latest sealed window, as of the latest maintenance run.
+        furthest_partition_date: The last day with a partition, as the latest maintenance run on any
+            replica recorded it (PostgreSQL only; ``None`` before the first run or elsewhere).
+        last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run on any
+            replica recorded it.
     """
 
     write_failures: int

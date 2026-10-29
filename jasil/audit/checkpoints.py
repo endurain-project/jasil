@@ -217,6 +217,17 @@ def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
     return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
 
+def _window_end(start: datetime, window: timedelta) -> datetime:
+    """Return the end of the window starting at ``start``: the next multiple of ``window`` since the epoch.
+
+    A window that starts on the grid is ``window`` long. After ``checkpoint_window_minutes`` changes, the
+    first window is shortened to rejoin the new grid, which divides a day, so no window straddles two daily
+    partitions.
+    """
+    span = window.total_seconds()
+    return datetime.fromtimestamp((as_utc(start).timestamp() // span + 1) * span, UTC)
+
+
 def seal_pending_windows(now: datetime | None = None) -> int:
     """
     Seal every window that has passed its grace period.
@@ -260,8 +271,10 @@ def seal_pending_windows(now: datetime | None = None) -> int:
             prev_hash = None
         instance_id = service.ensure_instance_id(service.engine_of(db))
 
-    while written < MAX_WINDOWS_PER_RUN and start + window + grace <= now:
-        end = start + window
+    while written < MAX_WINDOWS_PER_RUN:
+        end = _window_end(start, window)
+        if end + grace > now:
+            break
         with sessionmaker() as db:
             digest = _digest(db, start, end, prev_hash)
         checkpoint = AuditCheckpoint(
@@ -278,11 +291,10 @@ def seal_pending_windows(now: datetime | None = None) -> int:
             sink.write_once(_sink_name(start), _sink_payload(checkpoint, instance_id))
         with sessionmaker() as db:
             db.add(checkpoint)
+            service.note_maintenance(db, last_checkpoint_at=end)
             db.commit()
         written += 1
         start, prev_hash = end, digest.hash
-    if written:
-        service.note_maintenance(last_checkpoint_at=start)
     return written
 
 

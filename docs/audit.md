@@ -104,9 +104,10 @@ with it.
 
 `record_detached` can only report a failure by logging and counting. Read the counter with
 `jasil_audit.get_audit_health()` (`write_failures`, `last_failure_at`, `furthest_partition_date`,
-`last_checkpoint_at`) and alert on it: a trail that has silently stopped recording is worse than none. The call
-does no I/O; the partition and checkpoint figures are those the latest maintenance run in the same process
-observed.
+`last_checkpoint_at`) and alert on it: a trail that has silently stopped recording is worse than none.
+`write_failures` and `last_failure_at` count this process's writes. The partition and checkpoint figures are what
+the latest maintenance run recorded in `jasil_instance`, on whichever replica won its lock, so every replica reports
+the same ones. The call reads that one row, so it raises when the database cannot be read.
 
 ### What goes in `details`
 
@@ -234,14 +235,15 @@ The floor is a constant inside `jasil_audit_drop_partitions`, baked in when the 
 that is compromised, or misconfigured to a retention of one day, cannot shorten the trail below it.
 
 Changing the setting afterwards does **not** change the function. To change it, run the statement
-`jasil_audit.retention_floor_sql(days, schema="public")` returns as the role that owns the function. It replaces
-the body only; the owner and grants stay.
+`jasil_audit.retention_floor_sql(days, schema=...)` returns as the role that owns the function. `schema` is required
+and must be the schema the migration ran in (its `current_schema()`): the function names its schema in its body,
+so there is no default that is safe. It replaces the body only; the owner and grants stay.
 
 ```python
 import sqlalchemy as sa
 
 with engine.begin() as connection:  # connected as the migrating (owner) role
-    connection.execute(sa.text(jasil_audit.retention_floor_sql(90)))
+    connection.execute(sa.text(jasil_audit.retention_floor_sql(90, schema="public")))
 ```
 
 (Use `sa.text` or `psql`: the statement contains `%`, which a raw driver call would read as a placeholder.)
@@ -262,7 +264,9 @@ for statement in jasil_audit.grants_sql("app_runtime", "app_observability", main
 | **Reader** (the observability product) | `SELECT` on all four tables | Write anything; execute either function |
 | **Maintenance** (optional) | `SELECT`, `INSERT` on the log; `SELECT`, `INSERT` on the checkpoints; `SELECT`, `INSERT`, `UPDATE` on the catalog and the instance row; `EXECUTE` on both functions | Update or delete a log row |
 
-Every statement first revokes whatever the role held on these tables, so running the list converges.
+Every statement first revokes whatever the role held on these tables, so running the list converges. The reader
+must differ from the runtime and the maintenance roles (`ValueError` otherwise): it would otherwise be able to write
+rows or checkpoints, or the application to read the trail it writes.
 
 **Sealing a checkpoint means reading the log**, so the process that runs `run_audit_maintenance()` needs `SELECT`
 on it. If that is the application's own role, the application can read the trail it writes. Either accept that, or
@@ -355,7 +359,7 @@ a fingerprint of the public key. After a rotation, verify each period with the k
 | URI | Backend | Notes |
 |---|---|---|
 | `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. |
-| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `PutObject` but not delete or overwrite. Needs `jasil[s3]`. |
+| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject`, `PutObject` and `ListBucket` on the prefix but not delete or overwrite: the sink reads a checkpoint's key before writing it, and without `ListBucket` S3 answers a missing key with `403` instead of `404`, which fails every seal. Needs `jasil[s3]`. |
 
 The contract (`jasil.providers.AuditSink.write_once`) is that an object is never replaced: identical bytes are a
 no-op, different bytes raise `AuditSinkConflictError`. The sink is written **before** the database row, so if it
@@ -463,7 +467,9 @@ while page.next_cursor is not None:
 Filters: `action_ids`, `categories`, `severities`, `outcomes`, `actor_id`, `actor_type`, `target_type`, `target_id`,
 `target_owner_id`, `request_id`, `event_id`, `source`, `from_ts`, `to_ts` (both inclusive). Pagination is keyset
 over `(occurred_at, id)`, never offset. The time range is **always bounded** so partition pruning applies: it
-defaults to the 24 hours before `to_ts`, which defaults to now. `limit` is 1 to 500.
+defaults to the 24 hours before `to_ts`, which defaults to now, and may cover at most 31 days (`summary(hours)`
+takes 1 to 744); an inverted or longer range raises `ValueError`, so read a longer period one range at a time.
+`limit` is 1 to 500.
 
 ## Testing
 
