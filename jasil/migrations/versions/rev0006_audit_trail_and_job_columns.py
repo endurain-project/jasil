@@ -1,4 +1,9 @@
-"""Add the audit trail: ``jasil_audit_log``, its catalog, its checkpoints and ``jasil_instance``.
+"""0.14: the audit trail, the publish timestamp on jobs, and an index for the jobs dashboard.
+
+Adds ``jasil_audit_log``, its catalog, its checkpoints and ``jasil_instance``; the nullable
+``jasil_processing_jobs.event_timestamp``, the envelope's publish timestamp, which a job written without it
+replaces with its ``created_at``; and an index on ``jasil_processing_jobs.created_at``, which the jobs
+dashboard filters its window on.
 
 ``jasil_audit_log`` is append-only. On PostgreSQL it is range-partitioned by ``occurred_at`` (one
 partition per UTC day), triggers reject ``UPDATE``, ``DELETE`` and ``TRUNCATE``, and two ``SECURITY
@@ -8,8 +13,10 @@ the function from ``AuditSettings.retention_floor_days`` as it is when this revi
 afterwards with ``jasil.audit.retention_floor_sql``. On other databases the log is a plain table with the
 same columns.
 
-Needs PostgreSQL 13 or newer. Run it as the role that should own the table and the functions. Nothing
-else reads or writes the new tables, so processes of the previous release are unaffected.
+Needs PostgreSQL 13 or newer. Run it as the role that should own the table and the functions. Processes
+of the previous release are unaffected: nothing else reads or writes the new tables, they write jobs without
+the nullable column, and on PostgreSQL the index is built ``CONCURRENTLY``, after the rest of the revision
+has committed, so their workers keep claiming jobs while it builds.
 
 Revision ID: rev0006
 Revises: rev0005
@@ -23,6 +30,7 @@ from alembic import context, op
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jasil.audit import _postgres as pg
+from jasil.migrations import _online as online
 from jasil.migrations._names import PREFIX
 from jasil.settings import get_settings
 
@@ -35,11 +43,30 @@ _LOG = f"{PREFIX}audit_log"
 _ACTIONS = f"{PREFIX}audit_actions"
 _CHECKPOINTS = f"{PREFIX}audit_checkpoints"
 _INSTANCE = f"{PREFIX}instance"
+_JOBS = f"{PREFIX}processing_jobs"
+_JOBS_CREATED_INDEX = "idx_jasil_processing_jobs_created"
 
 _JSON = sa.JSON().with_variant(JSONB(), "postgresql")
 
 
 def upgrade() -> None:
+    if not online.resumed(_JOBS, "event_timestamp"):
+        _add_audit_trail()
+        op.add_column(
+            _JOBS,
+            sa.Column(
+                "event_timestamp",
+                sa.String(40),
+                nullable=True,
+                comment="Envelope ISO-8601 publish timestamp; NULL on jobs enqueued before rev0006",
+            ),
+        )
+    # Last: on PostgreSQL the build first commits the work above, so it can run without blocking the
+    # previous release's workers.
+    online.create_index(_JOBS_CREATED_INDEX, _JOBS, ["created_at"])
+
+
+def _add_audit_trail() -> None:
     bind = op.get_bind()
     postgresql = bind.dialect.name == "postgresql"
 
@@ -188,6 +215,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     postgresql = bind.dialect.name == "postgresql"
     schema = _target_schema() if postgresql else None
+
+    op.drop_index(_JOBS_CREATED_INDEX, table_name=_JOBS)
+    op.drop_column(_JOBS, "event_timestamp")
 
     # Dropping the log drops its partitions and triggers with it.
     op.drop_table(_INSTANCE)

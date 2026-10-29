@@ -1204,7 +1204,7 @@ class DeadLetterJob:
 
 
 def envelope_timestamp(row: ProcessingJob) -> str:
-    """Return the publish timestamp a job's envelope carries; a job from before ``rev0007`` has its enqueue time."""
+    """Return the publish timestamp a job's envelope carries; a job from before ``rev0006`` has its enqueue time."""
     return row.event_timestamp or as_utc(row.created_at).isoformat()
 
 

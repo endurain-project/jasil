@@ -509,6 +509,15 @@ class TestOfflineAuditTrail:
 
         assert '"audit_home".jasil_audit_ensure_partitions' in sql
 
+    def test_the_jobs_index_is_built_after_the_rest_commits(self):
+        """The audit trail and the new column commit first, so the concurrent build blocks no worker."""
+        sql = self._render("rev0005:rev0006", "schema=audit_home")
+
+        build = sql.index("CREATE INDEX CONCURRENTLY idx_jasil_processing_jobs_created")
+        committed = sql.rindex("COMMIT", 0, build)
+        assert committed > sql.index("ADD COLUMN event_timestamp")
+        assert committed > sql.index("CREATE TABLE jasil_audit_log")
+
     def test_without_a_schema_it_says_how_to_give_one(self):
         with pytest.raises(RuntimeError, match="-x schema="):
             self._render("rev0005:rev0006")

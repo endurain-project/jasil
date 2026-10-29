@@ -46,7 +46,7 @@ class ClaimedJob:
             deferred claims too.
         deferrals: Earlier claims of this job the handler deferred. ``attempts -
             deferrals`` is the attempt this run is against ``max_attempts``.
-        timestamp: The envelope's ISO-8601 publish timestamp (the enqueue time for a job from before ``rev0007``).
+        timestamp: The envelope's ISO-8601 publish timestamp (the enqueue time for a job from before ``rev0006``).
         schema_version: The payload-shape version carried from the envelope, so
             the handler can upgrade or refuse a payload written by another build.
         queue: Named queue from which the job was claimed.

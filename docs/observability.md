@@ -219,20 +219,18 @@ A revision this release does not ship was recorded by a newer JASIL, so during a
 rolling deploy a restarting replica of the previous release logs a warning and
 starts instead of refusing.
 
-!!! note "Revision `rev0006` (0.14): the audit trail"
-    Adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On PostgreSQL
-    (13 or newer) it also partitions the log by day, installs the append-only triggers and creates the two
-    `SECURITY DEFINER` functions, so run it as the role that should own them. Processes of the previous release
-    are unaffected. Details in [Audit trail → Upgrading](audit.md#upgrading).
+!!! note "Revision `rev0006` (0.14): the audit trail, and two changes to jobs"
+    - Adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On
+      PostgreSQL (13 or newer) it also partitions the log by day, installs the append-only triggers and creates
+      the two `SECURITY DEFINER` functions, so run it as the role that should own them. Details in
+      [Audit trail → Upgrading](audit.md#upgrading).
+    - Adds the nullable `jasil_processing_jobs.event_timestamp`, so a durable subscriber's envelope carries the
+      event's publish `timestamp` rather than the time its job was enqueued. Jobs written before it, or by a
+      previous-release process during a rollout, have none and keep the enqueue time.
+    - Indexes `jasil_processing_jobs.created_at`, which `get_jobs_summary` filters its window on. On
+      PostgreSQL the index is built `CONCURRENTLY`, after the rest of the revision has committed.
 
-!!! note "Revision `rev0007` (0.14): the publish timestamp on jobs"
-    Adds the nullable `jasil_processing_jobs.event_timestamp`, so a durable subscriber's envelope carries the
-    event's publish `timestamp` rather than the time its job was enqueued. Jobs written before it, or by a
-    previous-release process during a rollout, have none and keep the enqueue time.
-
-!!! note "Revision `rev0008` (0.14): the jobs dashboard's window"
-    Indexes `jasil_processing_jobs.created_at`, which `get_jobs_summary` filters its window on. On PostgreSQL
-    the index is built `CONCURRENTLY`, so workers of the previous release keep running while it builds.
+    Processes of the previous release are unaffected and keep running while it applies.
 
 !!! note "One schema: the connection's default"
     The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
@@ -326,8 +324,8 @@ fresh database with the `jasil_` names directly. Run from your own history,
 yours called `event_log` (or another old name) still collides on a fresh
 install. Create JASIL's tables with `upgrade()` first if that applies to you.
 
-Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev0002`
-and `rev0004` commit their other changes before building their
+Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev0002`,
+`rev0004` and `rev0006` commit their other changes before building their
 `jasil_processing_jobs` indexes `CONCURRENTLY`; inside one transaction for the whole
 run, that commit would also commit every revision before them.
 
