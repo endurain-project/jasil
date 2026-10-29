@@ -58,7 +58,7 @@ class TestParseProfile:
     def test_a_typo_raises_rather_than_defaulting(self):
         """Defaulting a typo to ``local`` would silently disable the shared-state
         fail-fast on a distributed deployment."""
-        with pytest.raises(ValueError, match="Invalid DEPLOYMENT_PROFILE 'distributd'"):
+        with pytest.raises(ValueError, match="Invalid deployment profile 'distributd'"):
             parse_profile("distributd")
 
     def test_the_error_lists_the_valid_values(self):

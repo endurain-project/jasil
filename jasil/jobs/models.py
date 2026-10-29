@@ -424,10 +424,11 @@ class EventOutbox(Base):
     One row per published event, staged for durable per-subscriber delivery.
 
     A producer writes the event here as it persists its domain change so the
-    event can be delivered durably. Delivery is best-effort at the seam (the
-    ingestion path commits per-CRUD, so the outbox write is not atomic with the
-    domain change); the domain row is the source of truth and each subscriber's
-    reconciliation net recovers anything a crash drops before this row is written.
+    event can be delivered durably. The publisher stages the row in the
+    producer's own transaction, so the domain change and the event commit
+    together; a row written and committed on its own is not atomic with the
+    domain change, and each subscriber's reconciliation net recovers anything a
+    crash drops before it is written.
     The relay reads unrelayed rows and fans each out into one ``processing_jobs``
     row per durable subscriber, then stamps ``relayed_at``. Because the fan-out is
     idempotent (jobs dedup on ``event_id + subscriber_id``), re-relaying a row is

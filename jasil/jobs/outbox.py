@@ -1,10 +1,11 @@
 """CRUD for ``event_outbox`` — the durable-delivery staging table.
 
-``add_to_outbox`` persists an event and commits it on the caller's session. Note
-that the ingestion path commits per-CRUD, so this is *not* one transaction with
-the domain change — the domain row is the source of truth and each subscriber's
-reconciliation net (backfill/sweeper) recovers anything dropped by a crash
-between the domain commit and the outbox write. ``list_unrelayed`` and
+``add_to_outbox`` persists an event on the caller's session. With
+``commit=False`` the row joins the caller's open transaction, so the domain change
+and the outbox row commit together; this is how the publisher stages durable
+events. With ``commit=True`` it is committed on its own, and a crash between that
+and the domain commit can drop the event, which each subscriber's reconciliation
+net (backfill/sweeper) then recovers. ``list_unrelayed`` and
 ``mark_relayed`` are used by the relay; combined with the idempotent job fan-out
 (dedup on ``event_id + subscriber_id``) and ``SELECT ... FOR UPDATE SKIP LOCKED``,
 that makes concurrent relayers safe and re-relaying a row harmless.
@@ -31,9 +32,9 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
     the ingestion path pass ``commit=False`` so the outbox row is only flushed and
     joins their open transaction — the domain change and the outbox row then commit
     together (atomic delivery; see :func:`jasil.publisher.publish_committing`).
-    When committed independently (the historical best-effort seam), the outbox
-    write is *not* atomic with the domain change, so a crash between them can drop
-    the event and the subscriber's reconciliation net is the safety net.
+    Committed on its own, the outbox write is *not* atomic with the domain change,
+    so a crash between them can drop the event and the subscriber's reconciliation
+    net is the safety net.
 
     Args:
         event: The event envelope to persist.

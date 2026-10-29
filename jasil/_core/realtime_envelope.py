@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 #: The envelope version this build writes.
 ENVELOPE_VERSION = 2
 
-#: The previous envelope version, still read so a rolling upgrade from 0.7 loses
-#: no hints. Drop it once no supported release writes it.
+#: The previous envelope version, written by 0.7. Still read, so the hints a 0.7
+#: process publishes during a rolling upgrade are not lost.
 LEGACY_ENVELOPE_VERSION = 1
 
 #: Cap on the length of a hint key, in characters (code points, not bytes).

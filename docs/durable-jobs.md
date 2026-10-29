@@ -196,14 +196,20 @@ A subscriber registered without `on_dead_letter` behaves exactly as before.
 ## The job state machine
 
 ```
-                 ┌──────────────── backoff ◀────────────┐
-                 ▼                                      │
-enqueue ──▶ pending ──claim──▶ claimed ──success──▶ completed
-                                  │
-                                  ├──failure, attempts left──▶ pending
-                                  ├──failure, ceiling hit───▶ dead_letter
-                                  └──lease expired──────────▶ pending | dead_letter
+enqueue ──▶ pending ──claim──▶ claimed ──success──────────────▶ completed
+              ▲                   │
+              │                   ├──failure, attempts left──▶ pending, after a backoff
+              │                   ├──deferred (DeferJob)─────▶ pending, at retry_at; not an attempt
+              │                   ├──released, never started─▶ pending at once; attempt refunded
+              │                   ├──failure, ceiling hit────▶ dead_letter
+              │                   └──lease expired───────────▶ pending | dead_letter
+              │
+              └──────── replay ◀──────── dead_letter
 ```
+
+A claim is **released** when the worker will not run it: a batch is claimed up
+front, and a worker that stops early (shutdown, a lost lease, or a run past
+`max_runtime_seconds`) returns the jobs it has not started.
 
 | Status | Meaning |
 |---|---|

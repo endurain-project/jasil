@@ -151,7 +151,7 @@ a `scoped_session` proxy) raises `TypeError`.
 
 ## Delivery routing
 
-An event takes the durable route only when **both** are true:
+An event takes the durable route only when **all three** are true:
 
 1. `jobs.enabled` is set, and
 2. at least one durable subscriber is registered for its `event_type`, and

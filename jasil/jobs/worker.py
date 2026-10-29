@@ -115,8 +115,10 @@ class WorkerHeartbeat:
 
     Each beat runs two independent steps. Lease renewal is correctness: a missed
     renewal can have a healthy handler requeued and run twice. The registry write
-    is telemetry. Neither is allowed to skip or delay the other, so each has its
-    own session and failure handling.
+    is telemetry. A failure in one never skips the other: each has its own session
+    and failure handling. They run in sequence on this thread, renewal first, so a
+    slow registry write delays the next renewal by as long as it takes; the lease
+    being at least three intervals long is what absorbs that.
     """
 
     def __init__(
