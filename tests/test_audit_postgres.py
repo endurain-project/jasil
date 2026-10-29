@@ -25,6 +25,8 @@ pytest.importorskip("alembic", reason="migrations require the 'migrations' extra
 
 ROLES = ("jasil_t_runtime", "jasil_t_reader", "jasil_t_maintenance")
 TABLES = ("jasil_audit_log", "jasil_audit_actions", "jasil_audit_checkpoints", "jasil_instance")
+# Retention prunes only what a sealed checkpoint allows; day-long windows seal months of history in one run.
+DAY_WINDOWS = jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(checkpoint_window_minutes=1440))
 FUNCTIONS = (
     "jasil_audit_drop_partitions(timestamptz)",
     "jasil_audit_ensure_partitions(integer)",
@@ -117,6 +119,18 @@ def _old_partition(connection, day: date) -> str:
     return name
 
 
+def _shadow_catalog(connection, child: str) -> None:
+    """Shadow the partition catalog with session temporary tables that list ``child`` as the only partition.
+
+    Any role may create temporary tables, and an unqualified name is looked up in ``pg_temp`` first unless
+    the ``search_path`` names it.
+    """
+    connection.execute(text("CREATE TEMP TABLE pg_inherits (inhrelid oid, inhparent oid)"))
+    connection.execute(text("CREATE TEMP TABLE pg_class (oid oid, relname name)"))
+    connection.execute(text("INSERT INTO pg_temp.pg_inherits VALUES (1, 'jasil_audit_log'::regclass)"))
+    connection.execute(text("INSERT INTO pg_temp.pg_class VALUES (1, :child)"), {"child": child})
+
+
 class TestMigration:
     def test_the_log_is_a_range_partitioned_table(self, migrated):
         assert _scalar(migrated, "SELECT relkind FROM pg_class WHERE relname = 'jasil_audit_log'") == "p"
@@ -152,6 +166,13 @@ class TestMigration:
     def test_the_horizon_is_bounded(self, migrated, days):
         with pytest.raises(DBAPIError, match="between 0 and 366"), migrated.begin() as connection:
             connection.execute(text("SELECT jasil_audit_ensure_partitions(:d)"), {"d": days})
+
+    def test_a_temporary_table_cannot_shadow_the_catalog_for_the_partition_horizon(self, migrated):
+        with migrated.begin() as connection:
+            _shadow_catalog(connection, "jasil_audit_log_p29991231")
+            furthest = connection.execute(text("SELECT jasil_audit_ensure_partitions(0)")).scalar()
+
+        assert furthest == datetime.now(UTC).date() + timedelta(days=7)
 
     def test_the_functions_are_closed_to_public(self, migrated):
         acl = _scalar(migrated, "SELECT proacl::text FROM pg_proc WHERE proname = 'jasil_audit_drop_partitions'")
@@ -317,6 +338,23 @@ class TestDropPartitions:
 
         assert identifier[14] == "7" and identifier[19] in "89ab"
 
+    def test_a_temporary_table_cannot_make_it_drop_another_table(self, aged):
+        engine, _ = aged
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE decoy_p20000101 (id integer)"))
+        try:
+            with engine.begin() as connection:
+                _shadow_catalog(connection, "decoy_p20000101")
+                dropped = connection.execute(
+                    text("SELECT jasil_audit_drop_partitions(:c)"), {"c": datetime.now(UTC) - timedelta(days=400)}
+                ).scalar()
+
+            assert dropped == 0
+            assert _scalar(engine, "SELECT to_regclass('decoy_p20000101')::text") == "decoy_p20000101"
+        finally:
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS decoy_p20000101"))
+
     def test_dropping_nothing_writes_no_row(self, aged):
         engine, _ = aged
 
@@ -333,7 +371,7 @@ class TestDropPartitions:
 
     def test_a_running_maintenance_prunes_through_the_function_never_row_by_row(self, aged, action):
         engine, today = aged
-        jasil_testing.install_test_platform(".", clock=SystemClock())
+        jasil_testing.install_test_platform(".", clock=SystemClock(), settings=DAY_WINDOWS)
 
         jasil_audit.run_audit_maintenance()
 
@@ -507,7 +545,7 @@ class TestPlainSchema:
         import jasil.audit.maintenance as maintenance
 
         maintenance._warned_plain = False
-        platform = jasil_testing.install_test_platform(".", clock=jasil_testing.FixedClock())
+        platform = jasil_testing.install_test_platform(".", clock=jasil_testing.FixedClock(), settings=DAY_WINDOWS)
         platform.clock.moment = datetime.now(UTC) - timedelta(days=100)
         jasil_audit.record_detached(action, outcome=Outcome.SUCCESS, target_id="old")
         platform.clock.moment = datetime.now(UTC)

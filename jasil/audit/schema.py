@@ -227,8 +227,8 @@ class WindowVerification(BaseModel):
         window_end: End of the window.
         status: The verdict. When several things are wrong with one window the most serious is
             reported: ``row_mismatch``, then ``bad_signature``, then ``broken_chain``.
-        pruned: The window's rows were dropped by retention, accounted for by an
-            ``audit.retention.prune`` row; only its chain link and signature could be checked.
+        pruned: The window's rows are gone where a checkpoint's signed retention allowed them to be pruned;
+            only its chain link and signature could be checked.
         expected_rows: The row count recorded when the window was sealed (``None`` for a window with
             no checkpoint).
         actual_rows: The rows found now (``None`` when the window was pruned).

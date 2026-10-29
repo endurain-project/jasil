@@ -7,7 +7,10 @@ Every ``checkpoint_window_minutes`` of ``occurred_at`` is a window. Once a windo
 ``checkpoint_grace_minutes`` past its end it is sealed: its rows are serialized canonically in
 ``(occurred_at, id)`` order, hashed together with the previous checkpoint's hash (so the checkpoints form
 a chain), optionally signed with Ed25519, stored in ``jasil_audit_checkpoints`` and, when configured,
-copied to a write-once external sink. The grace period exists because ``occurred_at`` is taken when the
+copied to a write-once external sink. Each checkpoint also records, under the same signature, the
+``retention_days`` and ``legal_hold`` in force when it was sealed: that, and not a row in the log anyone
+able to insert could forge, is what verification accepts as the reason a window's rows may be gone. The
+grace period exists because ``occurred_at`` is taken when the
 row is staged but the row is only visible once its transaction commits: sealing at the window's end
 would let a slow transaction look like a later insertion.
 
@@ -132,9 +135,19 @@ def _digest(db: Session, start: datetime, end: datetime, prev_hash: str | None) 
     return _Digest(count, hasher.hexdigest())
 
 
-def _message(start: datetime, end: datetime, digest: _Digest, prev_hash: str | None) -> bytes:
+def _message(checkpoint: Any) -> bytes:
+    """Return the bytes a checkpoint's signature covers: its window, rows, chain link and retention."""
     return "|".join(
-        (_MESSAGE_PREFIX, _iso(start), _iso(end), str(digest.row_count), digest.hash, prev_hash or "")
+        (
+            _MESSAGE_PREFIX,
+            _iso(checkpoint.window_start),
+            _iso(checkpoint.window_end),
+            str(checkpoint.row_count),
+            checkpoint.hash,
+            checkpoint.prev_hash or "",
+            str(checkpoint.retention_days),
+            "1" if checkpoint.legal_hold else "0",
+        )
     ).encode()
 
 
@@ -198,6 +211,8 @@ def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
         "prev_hash": checkpoint.prev_hash,
         "signature": checkpoint.signature,
         "key_id": checkpoint.key_id,
+        "retention_days": checkpoint.retention_days,
+        "legal_hold": checkpoint.legal_hold,
     }
     return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
@@ -249,16 +264,16 @@ def seal_pending_windows(now: datetime | None = None) -> int:
         end = start + window
         with sessionmaker() as db:
             digest = _digest(db, start, end, prev_hash)
-        signature, key_id = _sign(settings, _message(start, end, digest, prev_hash))
         checkpoint = AuditCheckpoint(
             window_start=start,
             window_end=end,
             row_count=digest.row_count,
             hash=digest.hash,
             prev_hash=prev_hash,
-            signature=signature,
-            key_id=key_id,
+            retention_days=settings.retention_days,
+            legal_hold=settings.legal_hold,
         )
+        checkpoint.signature, checkpoint.key_id = _sign(settings, _message(checkpoint))
         if sink is not None:
             sink.write_once(_sink_name(start), _sink_payload(checkpoint, instance_id))
         with sessionmaker() as db:
@@ -271,32 +286,31 @@ def seal_pending_windows(now: datetime | None = None) -> int:
     return written
 
 
-def _prune_cutoffs(db: Session) -> list[datetime]:
-    """Return the cutoff of every recorded ``audit.retention.prune`` that retention could have produced.
+def _pruning_horizon(db: Session, verifier: Any) -> datetime | None:
+    """Return the latest window end any checkpoint allows to have been pruned; ``None`` when none does.
 
-    Prune rows live in the log the checkpoints protect, so a row is believed only as far as the database
-    guard would have allowed it: its cutoff must be at least ``retention_floor_days`` older than the row.
-    Otherwise anyone able to delete a window's rows could also insert a prune row with a far-future cutoff
-    to excuse the gap.
+    A checkpoint records the retention in force when it was sealed, so ``window_end - retention_days`` is
+    as far as retention could reach under it, and retention prunes no further than the newest checkpoint
+    allows. With a key only a checkpoint whose signature verifies counts, so the retention is the one the
+    application sealed, not one whoever can write the table chose. A checkpoint sealed under legal hold, or
+    with retention off, allows nothing.
     """
-    from jasil.audit.catalog import RETENTION_PRUNE, RetentionPruneDetails
-    from jasil.audit.models import AuditLog
+    from jasil.audit.models import AuditCheckpoint
 
-    floor = timedelta(days=get_settings().audit.retention_floor_days)
-    cutoffs = []
-    for occurred_at, details in db.execute(
-        select(AuditLog.occurred_at, AuditLog.details).where(AuditLog.action_id == RETENTION_PRUNE.id)
-    ):
-        try:
-            cutoff = as_utc(RetentionPruneDetails.model_validate(details).cutoff)
-        except ValueError:
-            logger.warning("An audit.retention.prune row has unreadable details; it accounts for no window")
-            continue
-        if cutoff <= as_utc(occurred_at) - floor:
-            cutoffs.append(cutoff)
-        else:
-            logger.warning("An audit.retention.prune row claims a cutoff inside the retention floor; ignored")
-    return cutoffs
+    candidates = sorted(
+        (
+            (as_utc(checkpoint.window_end) - timedelta(days=checkpoint.retention_days), checkpoint)
+            for checkpoint in db.scalars(
+                select(AuditCheckpoint).where(AuditCheckpoint.retention_days > 0, AuditCheckpoint.legal_hold.is_(False))
+            )
+        ),
+        key=lambda candidate: candidate[0],
+        reverse=True,
+    )
+    for horizon, checkpoint in candidates:
+        if verifier is None or _signature_ok(verifier, checkpoint):
+            return horizon
+    return None
 
 
 def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetime) -> VerificationReport:
@@ -306,10 +320,10 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
     For every checkpoint whose window lies inside ``[from_ts, to_ts]`` the window's rows are read and
     hashed again and compared with the stored hash and row count, the link to the previous checkpoint is
     checked, and the signature is verified when ``public_key`` is given. A gap between two checkpoints is
-    reported as ``missing_window``. A window whose rows are gone is accepted only if an
-    ``audit.retention.prune`` row accounts for it: its cutoff is at or past the window's end and at least
-    ``audit.retention_floor_days`` older than the row itself (a row claiming less is ignored); its chain link and
-    signature are still checked, its rows cannot be.
+    reported as ``missing_window``. A window whose rows are all gone is accepted only if some checkpoint
+    allows it: one not sealed under legal hold whose ``window_end`` minus its recorded ``retention_days`` is
+    at or past the window's end, and whose signature verifies when ``public_key`` is given. Its chain link
+    and signature are still checked, its rows cannot be.
 
     The host or the observability product decides when to call this; to raise an alarm, stage or record
     ``audit.integrity.violation`` for each window that is not ``ok``.
@@ -345,7 +359,7 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
             .where(AuditCheckpoint.window_start >= start_bound, AuditCheckpoint.window_end <= end_bound)
             .order_by(AuditCheckpoint.window_start)
         ).all()
-        cutoffs = _prune_cutoffs(db)
+        horizon = _pruning_horizon(db, verifier)
 
         for checkpoint in checkpoints:
             start, end = as_utc(checkpoint.window_start), as_utc(checkpoint.window_end)
@@ -364,7 +378,8 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
                 not rows_match
                 and digest.row_count == 0
                 and checkpoint.row_count > 0
-                and any(cutoff >= end for cutoff in cutoffs)
+                and horizon is not None
+                and end <= horizon
             )
             status = VerificationStatus.OK if rows_match or pruned else VerificationStatus.ROW_MISMATCH
             if status is VerificationStatus.OK and verifier is not None and not _signature_ok(verifier, checkpoint):
@@ -397,10 +412,8 @@ def _signature_ok(verifier: Any, checkpoint: Any) -> bool:
 
     if checkpoint.signature is None:
         return False
-    digest = _Digest(checkpoint.row_count, checkpoint.hash)
-    message = _message(checkpoint.window_start, checkpoint.window_end, digest, checkpoint.prev_hash)
     try:
-        verifier.verify(base64.b64decode(checkpoint.signature, validate=True), message)
+        verifier.verify(base64.b64decode(checkpoint.signature, validate=True), _message(checkpoint))
     except (InvalidSignature, ValueError, binascii.Error):
         return False
     return True

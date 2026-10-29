@@ -168,6 +168,14 @@ class TestSealing:
 
         assert trail.seal(10) == 2
 
+    def test_a_checkpoint_records_the_retention_it_was_sealed_under(self, audit_env, trail):
+        audit_env.configure(retention_days=45, legal_hold=True)
+        trail.write(3)
+
+        trail.seal(60)
+
+        assert {(cp.retention_days, cp.legal_hold) for cp in trail.all()} == {(45, True)}
+
     def test_unsigned_checkpoints_warn_once(self, trail, caplog):
         checkpoints._unsigned_warned = False
         trail.write(3)
@@ -334,6 +342,13 @@ class TestSignatures:
 
         assert trail.statuses(public)[2] == "bad_signature"
 
+    @pytest.mark.parametrize("change", [{"retention_days": 1}, {"legal_hold": True}])
+    def test_the_signature_covers_the_recorded_retention(self, signed, change):
+        trail, public, _ = signed
+        trail.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(**change))
+
+        assert trail.statuses(public)[0] == "bad_signature"
+
     def test_without_a_public_key_signatures_are_not_checked(self, signed):
         trail, _, _ = signed
 
@@ -363,79 +378,85 @@ class TestSignatures:
             trail.seal(60)
 
 
-class TestRetentionAccounting:
-    def _prune_row(self, trail, cutoff: datetime, *, days_later: int = 2) -> None:
-        """Record a prune ``days_later`` days after the windows, as retention would; the floor is one day."""
-        trail.env.configure(retention_floor_days=1)
-        trail.env.clock.moment = at(days_later * 24 * 60)
-        jasil_audit.record_detached(
-            jasil_audit.RETENTION_PRUNE,
-            outcome=Outcome.SUCCESS,
-            details=jasil_audit.RetentionPruneDetails(cutoff=cutoff, partitions_dropped=1),
-        )
+class TestPrunedWindows:
+    """An emptied window is expected only where a checkpoint's own signed retention allowed the prune."""
 
-    def test_dropped_rows_are_expected_when_a_prune_row_accounts_for_them(self, sealed):
+    def _authorise(self, trail, minute: int, **settings) -> None:
+        """Seal on until ``minute`` under a one-day retention, as the checkpoints retention relies on would be."""
+        trail.env.configure(retention_days=1, retention_floor_days=1, **settings)
+        trail.seal(minute)
+
+    def test_windows_emptied_within_a_signed_retention_are_expected(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
-        self._prune_row(sealed, at(30))
+        self._authorise(sealed, 2 * 24 * 60)
 
-        report = sealed.verify(end=100)
+        report = sealed.verify(end=45)
 
         assert [(w.status.value, w.pruned) for w in report.windows] == [("ok", True), ("ok", False), ("ok", False)]
         assert report.windows[0].actual_rows is None
 
-    def test_dropped_rows_with_no_prune_row_are_a_mismatch(self, sealed):
+    def test_emptied_windows_no_checkpoint_allows_are_a_mismatch(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
 
         assert sealed.statuses() == ["row_mismatch", "ok", "ok"]
 
-    def test_a_prune_row_with_an_earlier_cutoff_does_not_excuse_a_later_window(self, sealed):
+    def test_a_forged_prune_row_excuses_nothing(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.target_id == "c"))
-        self._prune_row(sealed, at(15))
-
-        assert sealed.statuses(end=100)[2] == "row_mismatch"
-
-    def test_a_prune_row_claiming_a_cutoff_inside_the_floor_excuses_nothing(self, sealed, caplog):
-        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
-        # Forged: a far-future cutoff, written a minute after the windows it would excuse.
-        self._prune_row(sealed, at(10_000), days_later=0)
-
-        with caplog.at_level("WARNING"):
-            assert sealed.statuses(end=100)[0] == "row_mismatch"
-        assert "inside the retention floor" in caplog.text
-
-    def test_a_cutoff_that_only_touches_a_window_does_not_excuse_it(self, sealed):
-        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(15)))
-        self._prune_row(sealed, at(10))  # inside the first window: a partition drop would not have emptied it
-
-        assert sealed.statuses(end=100)[0] == "row_mismatch"
-
-    def test_a_pruned_window_still_has_its_chain_and_signature_checked(self, sealed):
-        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
-        self._prune_row(sealed, at(30))
-        sealed.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(prev_hash="f" * 64))
-
-        assert sealed.statuses(end=100)[0] == "broken_chain"
-
-    def test_a_prune_row_with_unreadable_details_excuses_nothing(self, sealed, caplog):
-        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
+        # Anyone who can insert into the log can write a prune row with any timestamp and cutoff.
+        forged_at = T0 + timedelta(days=365)
         sealed.execute(
             insert(AuditLog).values(
                 id=str(uuid7()),
-                occurred_at=at(3 * 24 * 60),
+                occurred_at=forged_at,
                 action_id="audit.retention.prune",
                 category="system",
                 severity="medium",
                 outcome="success",
                 actor_type="system",
                 source="worker",
-                details={"cutoff": "garbage"},
+                details={"cutoff": (forged_at - timedelta(days=60)).isoformat(), "partitions_dropped": 1},
                 details_version=1,
             )
         )
 
-        with caplog.at_level("WARNING"):
-            assert sealed.statuses(end=100)[0] == "row_mismatch"
-        assert "unreadable details" in caplog.text
+        assert sealed.statuses(end=100)[2] == "row_mismatch"
+
+    def test_a_window_younger_than_the_signed_retention_is_a_mismatch(self, sealed):
+        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(45)))
+        self._authorise(sealed, 24 * 60 + 40)  # the newest checkpoint ends at 24h30, so a day back is 00:30
+
+        report = sealed.verify(end=45)
+
+        assert [(w.status.value, w.pruned) for w in report.windows] == [
+            ("ok", True),
+            ("ok", False),
+            ("row_mismatch", False),
+        ]
+
+    def test_a_checkpoint_sealed_under_legal_hold_allows_no_prune(self, sealed):
+        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
+        self._authorise(sealed, 2 * 24 * 60, legal_hold=True)
+
+        assert sealed.statuses(end=100)[0] == "row_mismatch"
+
+    def test_a_rewritten_retention_allows_no_prune_when_signatures_are_checked(self, trail, audit_env, keys):
+        private, public = keys()
+        audit_env.configure(signing_key=private)
+        trail.write(3, target_id="a")
+        trail.seal(2 * 24 * 60)  # signed under the default 90-day retention
+        trail.execute(delete(AuditLog).where(AuditLog.occurred_at < at(15)))
+        trail.execute(update(AuditCheckpoint).values(retention_days=1))
+
+        assert trail.statuses(public, end=100)[0] == "row_mismatch"
+        assert trail.statuses(public, start=100, end=2 * 24 * 60)[0] == "bad_signature"
+        assert trail.statuses(None, end=100)[0] == "ok"  # unsigned, the chain proves only consistency
+
+    def test_a_pruned_window_still_has_its_chain_and_signature_checked(self, sealed):
+        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
+        self._authorise(sealed, 2 * 24 * 60)
+        sealed.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(prev_hash="f" * 64))
+
+        assert sealed.statuses(end=100)[0] == "broken_chain"
 
 
 class TestCanonicalForm:

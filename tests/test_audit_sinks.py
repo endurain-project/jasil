@@ -229,6 +229,7 @@ class TestSealingThroughTheSink:
         copy = json.loads((self.directory / "checkpoint-20260101T120000Z.json").read_text())
         assert copy["hash"] == stored.hash
         assert (copy["row_count"], copy["prev_hash"], copy["signature"], copy["key_id"]) == (1, None, None, None)
+        assert (copy["retention_days"], copy["legal_hold"]) == (stored.retention_days, stored.legal_hold)
         assert copy["window_start"] == "2026-01-01T12:00:00.000000+00:00"
         assert copy["instance_id"]
 

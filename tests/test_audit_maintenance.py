@@ -203,19 +203,33 @@ class TestRetention:
 
     def test_the_cutoff_follows_the_sealed_window_not_the_current_setting(self, actions, audit_env, session_factory):
         old_day = datetime(2025, 10, 3, tzinfo=UTC)
-        _write(audit_env, actions[0], old_day + timedelta(hours=6))  # inside the day the cutoff (12:00) falls in
-        audit_env.clock.moment = old_day + timedelta(days=2)
-        jasil_audit.run_audit_maintenance()  # seals day-long windows
-        audit_env.configure(checkpoint_window_minutes=15)  # the setting changes afterwards
-        audit_env.clock.moment = T0
+        _write(audit_env, actions[0], old_day + timedelta(hours=6))  # inside the day the cutoff (12:15) falls in
+        audit_env.configure(retention_days=0)
+        jasil_audit.run_audit_maintenance()  # seals day-long windows up to T0's day, pruning nothing
+        audit_env.configure(checkpoint_window_minutes=15, retention_days=90)  # the settings change afterwards
+        audit_env.clock.moment = T0 + timedelta(minutes=30)
 
         jasil_audit.run_audit_maintenance()
 
-        report = jasil_audit.verify_checkpoints(None, old_day - timedelta(days=1), old_day + timedelta(days=1))
+        report = jasil_audit.verify_checkpoints(None, old_day - timedelta(days=11), old_day + timedelta(days=1))
         assert report.ok, report.windows
-        # The 12:00 cutoff was floored to the sealed window's start (00:00), not to the new 15-minute grid.
+        # The 12:15 cutoff was floored to the sealed window's start (00:00), not to the new 15-minute grid.
         # Only the 06:00 row survives: the two older fixture rows went, and the cutoff stopped at the window start.
         assert self._targets(session_factory).count("shop.order.place") == 1
+
+    def test_it_never_prunes_past_what_the_newest_checkpoint_allows(
+        self, actions, audit_env, session_factory, monkeypatch
+    ):
+        audit_env.clock.moment = T0 - timedelta(days=50)
+        jasil_audit.run_audit_maintenance()  # seals up to 50 days ago under a 90-day retention
+        audit_env.configure(retention_days=30)
+        audit_env.clock.moment = T0
+        monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now: 1 / 0)
+
+        jasil_audit.run_audit_maintenance()
+
+        # The newest checkpoint allows only what is 90 days older than its end: nothing here yet.
+        assert self._targets(session_factory).count("shop.order.place") == 2
 
     def test_the_prune_is_recorded_before_any_row_is_deleted(self, actions, audit_env, session_factory, monkeypatch):
         seen = []
@@ -394,13 +408,18 @@ class TestRun:
             or failing != "sync_catalog"
         )
 
-    def test_a_failing_checkpoint_step_does_not_skip_retention(self, actions, audit_env, session_factory, monkeypatch):
+    def test_a_failing_checkpoint_step_holds_retention_back(
+        self, actions, audit_env, session_factory, monkeypatch, caplog
+    ):
         _write(audit_env, actions[0], T0 - timedelta(days=100))
         monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now: 1 / 0)
 
-        jasil_audit.run_audit_maintenance()
+        with caplog.at_level(logging.INFO):
+            jasil_audit.run_audit_maintenance()
 
-        assert "shop.order.place" not in {row.action_id for row in _rows(session_factory, AuditLog)}
+        # Never sealed, so never hashed: pruning it would destroy rows no checkpoint can account for.
+        assert "shop.order.place" in {row.action_id for row in _rows(session_factory, AuditLog)}
+        assert "no sealed checkpoint" in caplog.text
 
     def test_a_failing_retention_step_does_not_undo_the_others(self, actions, audit_env, session_factory, monkeypatch):
         monkeypatch.setattr(maintenance, "_apply_retention", lambda now: 1 / 0)

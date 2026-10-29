@@ -185,6 +185,10 @@ class AuditCheckpoint(Base):
         prev_hash: The previous checkpoint's hash; ``None`` for the first.
         signature: Base64 Ed25519 signature over the window and hash; ``None`` when unsigned.
         key_id: Fingerprint of the signing key; ``None`` when unsigned.
+        retention_days: ``audit.retention_days`` when the window was sealed; signed, it is what verification
+            accepts as the age past which a window may have been pruned.
+        legal_hold: ``audit.legal_hold`` when the window was sealed; a checkpoint sealed under a hold allows
+            no prune.
         created_at: When the checkpoint was written.
     """
 
@@ -201,6 +205,8 @@ class AuditCheckpoint(Base):
     prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="Previous checkpoint's hash")
     signature: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="Base64 Ed25519 signature")
     key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="Signing-key fingerprint")
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=False, comment="Retention when sealed")
+    legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, comment="Legal hold when sealed")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the checkpoint was written"
     )

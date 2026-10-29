@@ -280,13 +280,17 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
    stored in `jasil_instance`, stage `audit.retention.change` (the first run only records the baseline).
 3. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL).
 4. **Seal the checkpoints** that are due.
-5. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`: call
-   `jasil_audit_drop_partitions(now - retention_days)`, which writes the `audit.retention.prune` row itself. On other
-   dialects, `DELETE` rows older than the cutoff (floored to a checkpoint-window boundary, as a partition drop is) and write that
-   row from Python.
+5. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
+   checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
+   `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
+   is pruned. On PostgreSQL call `jasil_audit_drop_partitions(cutoff)`, which writes the `audit.retention.prune` row
+   itself. On other dialects, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
+   it, as a partition drop is) and write that row from Python.
 
 Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a catalog problem
-does not stop checkpoints. The run is idempotent and safe on every replica at once; the lock makes all but one a
+does not stop checkpoints. Retention never prunes a row that is not sealed, so while sealing fails (a bad signing
+key, a sink outage or conflict) or works off a backlog, it prunes less or nothing and the log grows; alert on
+`last_checkpoint_at`. The run is idempotent and safe on every replica at once; the lock makes all but one a
 no-op. The process needs the [maintenance grants](#roles-and-grants).
 
 ```python
@@ -318,9 +322,10 @@ only visible once its transaction commits: sealing at the end would let a slow t
 insertion. Choose a grace period longer than your longest audited transaction plus the clock skew between replicas.
 
 To seal a window, JASIL serializes its rows canonically, ordered by `(occurred_at, id)`, and computes
-`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the window
-and hash with Ed25519 (if configured), stores the checkpoint in `jasil_audit_checkpoints` (window start and end,
-row count, hash, previous hash, signature, key id), and copies it to the external sink (if configured). Empty
+`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the window,
+row count, hash, previous hash and the `retention_days` and `legal_hold` in force with Ed25519 (if configured),
+stores the checkpoint in `jasil_audit_checkpoints` (window start and end, row count, hash, previous hash, retention
+days, legal hold, signature, key id), and copies it to the external sink (if configured). Empty
 windows are sealed too, so a row inserted into one later is detected.
 
 There is deliberately **no per-row hash chain**: it would serialize every insert across replicas.
@@ -389,25 +394,31 @@ is reported as one of:
 | `broken_chain` | The checkpoint's `prev_hash` is not the previous checkpoint's hash |
 | `bad_signature` | The signature is absent, or does not verify with the key given |
 
-Dropped windows are expected **only** if an `audit.retention.prune` row accounts for them: its cutoff is at or past
-the window's end, and at least `audit.retention_floor_days` older than the prune row itself, which is the most the
-database guard would have allowed (a row claiming more is ignored, since anyone able to delete rows could insert one).
-The floor used is the *current* `audit.retention_floor_days`, not one recorded in the row, because a recorded value
-would be written by the same party the check guards against; if you raise the setting, keep it at or below the floor
-your prunes were made under, or older prunes stop being believed. Such a window is reported `ok` with `pruned=True`,
-and only its chain link and signature are checked. Otherwise
-missing rows are a `row_mismatch`.
+Dropped windows are expected **only** where a checkpoint allows them. A window whose rows are all gone is reported
+`ok` with `pruned=True` if some checkpoint not sealed under legal hold ends at least the `retention_days` it was sealed
+under after the window's end, and, when a key is given, that checkpoint's signature verifies; only the window's chain
+link and signature are then checked. Otherwise missing rows are a `row_mismatch`. The retention a checkpoint allows
+is the application's, under the application's signature: `audit.retention.prune` rows are a record of what retention
+did, not evidence, since anyone able to insert into the log could write one. A legal hold stops checkpoints sealed
+during it from allowing anything; windows that checkpoints sealed before it already allowed stay allowed. Without a
+key the recorded retention is taken as it stands, like the rest of an unsigned chain.
 
 ### What this does not do
 
 - **Nothing stops a database superuser** (or the table owner). They can disable the triggers, rewrite rows, and
   rewrite the checkpoints and the chain with them. The goal is prevention for everyone else, plus *detection with
-  evidence kept outside the database*: the signing key and the external sink are what turn "they could rewrite it
-  all" into "they could not do so undetected".
+  evidence kept outside the database*, and against the owner that evidence is the **external sink**: reconcile it
+  with `jasil_audit_checkpoints` from somewhere the database's operators do not control. A checkpoint in the sink that
+  is missing or different in the database, or an `AuditSinkConflictError` while sealing, is the sign of a rewrite.
+- **The signing key alone does not detect the owner.** The application holds the key and signs whatever the database
+  holds when it seals: if a period's checkpoints are deleted and its rows rewritten, the next maintenance run seals
+  and signs the rewritten rows, and `verify_checkpoints` reports them `ok`. The signature stops anyone *without* the
+  key from forging or altering a checkpoint, including the retention it records; only the sink keeps the original.
 - Without a signing key or a sink, the chain proves only that the rows and checkpoints are consistent with each
   other.
-- Deleting the **newest** checkpoints is not a violation the chain can show; compare `last_checkpoint_at` and the sink.
-  Deleting the **oldest** ones is reported as `broken_chain` for the first one left.
+- Deleting the **newest** checkpoints is not a violation the chain can show, and maintenance then re-seals those
+  windows from what the database holds; only the sink shows it. Deleting the **oldest** ones is reported as
+  `broken_chain` for the first one left.
 - A sealed window protects what it contained. Rows are not covered until their window is sealed, which is the window
   length plus the grace plus the maintenance interval later.
 - `occurred_at` is stamped by the application's clock. A host whose replicas disagree by more than the grace period

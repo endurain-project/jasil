@@ -7,7 +7,9 @@ yourself, or register it with :func:`schedule_audit_maintenance`. It is separate
 Retention here is not a ``DELETE``. On PostgreSQL the log is range-partitioned by day and expiry drops
 whole partitions through ``jasil_audit_drop_partitions``, which also refuses to go younger than the
 retention floor and writes its own ``audit.retention.prune`` row. Other dialects (test environments)
-``DELETE`` the rows instead and record the prune the same way.
+``DELETE`` the rows instead and record the prune the same way. Either way retention reaches no further than
+the newest sealed checkpoint allows, so it never removes rows that were never sealed, and never a window
+verification would not excuse.
 
 The process that runs this needs the maintenance grants (see :func:`jasil.audit.grants_sql`): sealing
 checkpoints means reading the log.
@@ -169,8 +171,9 @@ def run_audit_maintenance() -> None:
 
     In order: synchronize the catalog; record a change to the retention settings; create the next
     partitions (PostgreSQL); seal the checkpoints that are due; apply retention. Each step runs on its own
-    sessions and a failure in one is logged and does not skip the others. Idempotent, and a no-op while
-    another replica holds the lock or ``audit.enabled`` is false.
+    sessions and a failure in one is logged and does not skip the others. Retention prunes only what the
+    newest sealed checkpoint allows, so while sealing fails or is catching up it prunes less or nothing.
+    Idempotent, and a no-op while another replica holds the lock or ``audit.enabled`` is false.
 
     Retention is skipped while ``audit.legal_hold`` is set or ``audit.retention_days`` is ``<= 0``.
 
@@ -266,29 +269,36 @@ def _apply_retention(now: datetime) -> None:
         return
     if settings.retention_days <= 0:
         return
-    cutoff = now - timedelta(days=settings.retention_days)
+    from jasil.audit.models import AuditCheckpoint, AuditLog
+
     with jasil_orm.get_sessionmaker()() as db:
+        # Verification excuses an emptied window only where a checkpoint's own retention covers it, so the
+        # cutoff stops at what the newest checkpoint allows: rows not yet sealed are never pruned.
+        newest = db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc()).limit(1)).first()
+        if newest is None or newest.legal_hold or newest.retention_days <= 0:
+            logger.info("Audit retention: no sealed checkpoint allows a prune yet; nothing is pruned")
+            return
+        cutoff = min(
+            now - timedelta(days=settings.retention_days),
+            as_utc(newest.window_end) - timedelta(days=newest.retention_days),
+        )
         if _partitioned(db):
             dropped = db.execute(text("SELECT jasil_audit_drop_partitions(:cutoff)"), {"cutoff": cutoff}).scalar_one()
             db.commit()
             if dropped:
                 logger.info("Audit retention: dropped %d partition(s) older than %s", dropped, cutoff.isoformat())
             return
-        from jasil.audit.models import AuditCheckpoint, AuditLog
-
         # Whole checkpoint windows only, as a partition drop is, so no sealed window is left half-empty. The
         # window that matters is the one that was sealed, which a later change of the window setting may
-        # not match; only where nothing was sealed does the configured grid apply.
+        # not match. A cutoff before the first sealed window has nothing sealed behind it to prune.
         sealed = db.scalar(
             select(AuditCheckpoint.window_start).where(
                 AuditCheckpoint.window_start <= cutoff, AuditCheckpoint.window_end > cutoff
             )
         )
-        if sealed is not None:
-            cutoff = as_utc(sealed)
-        else:
-            span = timedelta(minutes=settings.checkpoint_window_minutes).total_seconds()
-            cutoff = datetime.fromtimestamp(cutoff.timestamp() // span * span, UTC)
+        if sealed is None:
+            return
+        cutoff = as_utc(sealed)
         if db.scalar(select(AuditLog.id).where(AuditLog.occurred_at < cutoff).limit(1)) is None:
             return
         # The accounting is committed before the rows go, so a stop in between leaves a record of a prune

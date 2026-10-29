@@ -5,8 +5,9 @@ PostgreSQL 13 or newer (BEFORE row triggers on partitioned tables); nothing is a
 dialect, where the audit log is a plain table.
 
 The two functions are ``SECURITY DEFINER`` so a runtime role holding no DDL rights can still create the
-next day's partition and drop an expired one. Both pin ``search_path`` to ``pg_catalog`` and qualify
-every object, so a caller cannot redirect them by shadowing a name.
+next day's partition and drop an expired one. Both pin ``search_path`` to ``pg_catalog, pg_temp`` (an
+unlisted ``pg_temp`` would be searched first) and qualify every object, so a caller cannot redirect them
+by shadowing a name with a temporary table.
 """
 
 __all__ = [
@@ -77,7 +78,7 @@ _ENSURE_TEMPLATE = """
 CREATE OR REPLACE FUNCTION @SCHEMA@.@ENSURE@(days_ahead integer) RETURNS date
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog
+SET search_path = pg_catalog, pg_temp
 AS $body$
 DECLARE
     today date := (now() AT TIME ZONE 'UTC')::date;
@@ -103,7 +104,7 @@ BEGIN
     END LOOP;
     RETURN (
         SELECT max(to_date(substring(c.relname FROM '@PART_PATTERN@'), 'YYYYMMDD'))
-        FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+        FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class c ON c.oid = i.inhrelid
         WHERE i.inhparent = to_regclass(format('%I.%I', @SCHEMA_LIT@, '@LOG@'))
     );
 END
@@ -113,7 +114,7 @@ _DROP_TEMPLATE = """
 CREATE OR REPLACE FUNCTION @SCHEMA@.@DROP@(cutoff timestamptz) RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = pg_catalog
+SET search_path = pg_catalog, pg_temp
 AS $body$
 DECLARE
     floor_days constant integer := @FLOOR_DAYS@;
@@ -130,7 +131,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('@DROP@'));
     FOR part IN
         SELECT c.relname
-        FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+        FROM pg_catalog.pg_inherits i JOIN pg_catalog.pg_class c ON c.oid = i.inhrelid
         WHERE i.inhparent = to_regclass(format('%I.%I', @SCHEMA_LIT@, '@LOG@'))
         ORDER BY c.relname
     LOOP

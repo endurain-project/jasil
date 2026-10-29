@@ -147,6 +147,8 @@ through.
       partition fails audited writes, and the runtime grants cannot seal checkpoints or apply retention.
 - [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock and a default compliance-mode retention period),
       give the bucket a default compliance-mode retention period, and verify on a schedule with `verify_checkpoints`.
+      Reconcile the sink with `jasil_audit_checkpoints` from outside the database operators' reach: against the table
+      owner the signing key alone detects nothing, because the application re-signs whatever it re-seals.
 - [ ] Do not expose a read route for the trail from the host application.
 
 ## Logging

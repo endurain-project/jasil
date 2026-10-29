@@ -131,6 +131,8 @@ def upgrade() -> None:
         sa.Column("prev_hash", sa.String(64), nullable=True, comment="Previous checkpoint's hash"),
         sa.Column("signature", sa.String(128), nullable=True, comment="Base64 Ed25519 signature"),
         sa.Column("key_id", sa.String(32), nullable=True, comment="Signing-key fingerprint"),
+        sa.Column("retention_days", sa.Integer, nullable=False, comment="Retention when sealed"),
+        sa.Column("legal_hold", sa.Boolean, nullable=False, comment="Legal hold when sealed"),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),

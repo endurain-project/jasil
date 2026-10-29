@@ -211,8 +211,10 @@ hash-chained checkpoints over fixed windows, copied to a write-once sink, make a
 (`verify_checkpoints`). An audited change and its row share a transaction, so a change cannot happen unrecorded.
 
 **Yours.** Nothing stops the table owner or a database superuser: they can disable the triggers and rewrite rows,
-checkpoints and chain together. The signing key and the external sink must therefore live outside the database
-operators' reach, and verification must run somewhere they do not control. See
+checkpoints and chain together, and if they delete a period's checkpoints the application re-seals and signs the
+rewritten rows with its own key. Against them only the external sink holds the original checkpoints. Keep the sink
+and the signing key outside the database operators' reach, and reconcile the sink with the database, and verify,
+somewhere they do not control. See
 [Audit trail → What this does not do](../audit.md#what-this-does-not-do).
 
 ## Out of scope
