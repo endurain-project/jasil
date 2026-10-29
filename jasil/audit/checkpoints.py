@@ -272,16 +272,30 @@ def seal_pending_windows(now: datetime | None = None) -> int:
 
 
 def _prune_cutoffs(db: Session) -> list[datetime]:
-    """Return the cutoff of every recorded ``audit.retention.prune``."""
+    """Return the cutoff of every recorded ``audit.retention.prune`` that retention could have produced.
+
+    Prune rows live in the log the checkpoints protect, so a row is believed only as far as the database
+    guard would have allowed it: its cutoff must be at least ``retention_floor_days`` older than the row.
+    Otherwise anyone able to delete a window's rows could also insert a prune row with a far-future cutoff
+    to excuse the gap.
+    """
     from jasil.audit.catalog import RETENTION_PRUNE, RetentionPruneDetails
     from jasil.audit.models import AuditLog
 
+    floor = timedelta(days=get_settings().audit.retention_floor_days)
     cutoffs = []
-    for details in db.scalars(select(AuditLog.details).where(AuditLog.action_id == RETENTION_PRUNE.id)):
+    for occurred_at, details in db.execute(
+        select(AuditLog.occurred_at, AuditLog.details).where(AuditLog.action_id == RETENTION_PRUNE.id)
+    ):
         try:
-            cutoffs.append(as_utc(RetentionPruneDetails.model_validate(details).cutoff))
+            cutoff = as_utc(RetentionPruneDetails.model_validate(details).cutoff)
         except ValueError:
             logger.warning("An audit.retention.prune row has unreadable details; it accounts for no window")
+            continue
+        if cutoff <= as_utc(occurred_at) - floor:
+            cutoffs.append(cutoff)
+        else:
+            logger.warning("An audit.retention.prune row claims a cutoff inside the retention floor; ignored")
     return cutoffs
 
 
@@ -293,7 +307,8 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
     hashed again and compared with the stored hash and row count, the link to the previous checkpoint is
     checked, and the signature is verified when ``public_key`` is given. A gap between two checkpoints is
     reported as ``missing_window``. A window whose rows are gone is accepted only if an
-    ``audit.retention.prune`` row with a cutoff past the window's start accounts for it; its chain link and
+    ``audit.retention.prune`` row accounts for it: its cutoff is at or past the window's end and at least
+    ``audit.retention_floor_days`` older than the row itself (a row claiming less is ignored); its chain link and
     signature are still checked, its rows cannot be.
 
     The host or the observability product decides when to call this; to raise an alarm, stage or record
@@ -349,7 +364,7 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
                 not rows_match
                 and digest.row_count == 0
                 and checkpoint.row_count > 0
-                and any(cutoff > start for cutoff in cutoffs)
+                and any(cutoff >= end for cutoff in cutoffs)
             )
             status = VerificationStatus.OK if rows_match or pruned else VerificationStatus.ROW_MISMATCH
             if status is VerificationStatus.OK and verifier is not None and not _signature_ok(verifier, checkpoint):

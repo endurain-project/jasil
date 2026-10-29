@@ -31,7 +31,8 @@ class TestFileSink:
     def test_the_file_is_read_only(self, tmp_path):
         FileAuditSink(tmp_path).write_once("a.json", b"one")
 
-        assert stat.S_IMODE(os.stat(tmp_path / "a.json").st_mode) == 0o400
+        mode = stat.S_IMODE(os.stat(tmp_path / "a.json").st_mode)
+        assert not mode & 0o222  # no write bit (Windows can only express read-only)
 
     def test_writing_the_same_bytes_again_is_a_no_op(self, tmp_path):
         sink = FileAuditSink(tmp_path)
@@ -55,13 +56,32 @@ class TestFileSink:
         with pytest.raises(ValueError, match="invalid audit sink object name"):
             FileAuditSink(tmp_path).write_once(name, b"x")
 
+    def test_a_failed_write_leaves_nothing_under_the_final_name_and_a_retry_succeeds(self, tmp_path, monkeypatch):
+        sink = FileAuditSink(tmp_path)
+        monkeypatch.setattr(os, "fsync", lambda descriptor: (_ for _ in ()).throw(OSError("disk full")))
+
+        with pytest.raises(OSError, match="disk full"):
+            sink.write_once("a.json", b"one")
+        assert list(tmp_path.iterdir()) == []  # no truncated file, no temporary leftover
+
+        monkeypatch.undo()
+        sink.write_once("a.json", b"one")
+        assert (tmp_path / "a.json").read_bytes() == b"one"
+
+    def test_no_temporary_file_is_left_behind(self, tmp_path):
+        sink = FileAuditSink(tmp_path)
+        sink.write_once("a.json", b"one")
+        sink.write_once("a.json", b"one")
+
+        assert [path.name for path in tmp_path.iterdir()] == ["a.json"]
+
     def test_it_creates_its_directory(self, tmp_path):
         FileAuditSink(tmp_path / "deep" / "er").write_once("a.json", b"x")
 
         assert (tmp_path / "deep" / "er" / "a.json").exists()
 
     def test_it_is_built_from_a_file_uri(self, tmp_path):
-        sink = FileAuditSink.from_uri(f"file://{tmp_path}/sink")
+        sink = FileAuditSink.from_uri((tmp_path / "sink").as_uri())
 
         sink.write_once("a.json", b"x")
 
@@ -114,7 +134,7 @@ class TestPlatformWiring:
         assert self._build().audit_sink is None
 
     def test_a_file_uri_selects_the_file_sink(self, tmp_path):
-        platform = self._build(external_sink_uri=f"file://{tmp_path}/sink")
+        platform = self._build(external_sink_uri=(tmp_path / "sink").as_uri())
 
         assert isinstance(platform.audit_sink, FileAuditSink)
 
@@ -136,7 +156,7 @@ class TestPlatformWiring:
             self._build(external_sink_uri="ftp://example.test/x")
 
     def test_a_disabled_audit_builds_no_sink(self, tmp_path):
-        assert self._build(enabled=False, external_sink_uri=f"file://{tmp_path}/sink").audit_sink is None
+        assert self._build(enabled=False, external_sink_uri=(tmp_path / "sink").as_uri()).audit_sink is None
         assert not (tmp_path / "sink").exists()
 
 
@@ -147,7 +167,7 @@ class TestSealingThroughTheSink:
             AuditAction("shop.order.place", Category.SYSTEM, Severity.LOW, "k", "d")
         )
         self.directory = tmp_path / "sink"
-        audit_env.configure(external_sink_uri=f"file://{self.directory}")
+        audit_env.configure(external_sink_uri=self.directory.as_uri())
         audit_env.clock.moment = T0 + timedelta(minutes=3)
         jasil_audit.record_detached(action, outcome=Outcome.SUCCESS, target_id="a")
         audit_env.clock.moment = T0 + timedelta(minutes=60)

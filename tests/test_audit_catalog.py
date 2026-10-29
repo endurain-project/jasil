@@ -9,7 +9,7 @@ import threading
 from dataclasses import FrozenInstanceError, replace
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 import jasil.audit as jasil_audit
 import jasil.settings as jasil_settings
@@ -56,6 +56,19 @@ class TestAction:
 
         with pytest.raises(ValueError, match="VersionedPayload"):
             _action(details_model=Plain)
+
+    def test_a_details_model_that_allows_extra_keys_is_refused(self):
+        class Open(VersionedPayload):
+            model_config = ConfigDict(extra="allow")
+
+        with pytest.raises(ValueError, match="extra"):
+            _action(details_model=Open)
+
+    def test_a_details_model_that_forbids_or_ignores_extra_keys_is_accepted(self):
+        class Strict(VersionedPayload):
+            model_config = ConfigDict(extra="forbid")
+
+        assert _action(details_model=Strict).details_model is Strict
 
     def test_it_defaults_to_no_details_and_not_deprecated(self):
         action = _action()
@@ -165,6 +178,26 @@ class TestContext:
         assert jasil_audit.get_context().actor_id is None
 
         jasil_audit.configure_provider(lambda: None)
+        assert jasil_audit.get_context().actor_id is None
+
+    def test_the_block_form_wins_over_an_installed_provider(self):
+        jasil_audit.configure_provider(lambda: None)  # a request-only provider: nothing in a scheduled job
+
+        with jasil_audit.audit_context(actor_type="system", source="worker") as inside:
+            assert jasil_audit.get_context() == inside
+            assert jasil_audit.get_context().actor_type is ActorType.SYSTEM
+
+        assert jasil_audit.get_context().actor_type is ActorType.ANONYMOUS
+
+    def test_the_block_form_layers_on_what_the_provider_returns(self):
+        jasil_audit.configure_provider(lambda: AuditContext(actor_id="from-provider", ip_address="10.0.0.1"))
+
+        with jasil_audit.audit_context(source="cli") as inside:
+            assert (inside.actor_id, inside.ip_address, inside.source) == ("from-provider", "10.0.0.1", Source.CLI)
+
+    def test_reset_closes_nothing_but_clears_the_override_too(self):
+        jasil_audit.reset_context()
+
         assert jasil_audit.get_context().actor_id is None
 
     def test_removing_the_provider_restores_the_contextvar(self):

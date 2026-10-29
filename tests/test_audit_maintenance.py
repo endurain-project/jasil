@@ -181,7 +181,8 @@ class TestRetention:
         assert [row.action_id for row in remaining if row.action_id.startswith("shop.")] == ["shop.order.cancel"]
         prune = next(row for row in remaining if row.action_id == "audit.retention.prune")
         assert prune.details["partitions_dropped"] == 0
-        assert prune.details["cutoff"].startswith("2025-10-03T12:00:00")
+        # 90 days before the clock (12:00), floored to the day-long checkpoint window the fixture configures.
+        assert prune.details["cutoff"].startswith("2025-10-03T00:00:00")
 
     def test_a_second_run_prunes_nothing_more(self, session_factory):
         jasil_audit.run_audit_maintenance()
@@ -190,6 +191,15 @@ class TestRetention:
         jasil_audit.run_audit_maintenance()
 
         assert len(self._targets(session_factory)) == before
+
+    def test_the_cutoff_falls_on_a_window_boundary_so_no_sealed_window_is_half_emptied(
+        self, actions, audit_env, session_factory
+    ):
+        _write(audit_env, actions[1], datetime(2025, 10, 3, 0, 0, 1, tzinfo=UTC))  # 11h59m before the raw cutoff
+
+        jasil_audit.run_audit_maintenance()
+
+        assert self._targets(session_factory).count("shop.order.cancel") == 2  # it is in the window being kept
 
     def test_a_row_exactly_at_the_cutoff_is_kept(self, actions, audit_env, session_factory):
         _write(audit_env, actions[1], T0 - timedelta(days=90))

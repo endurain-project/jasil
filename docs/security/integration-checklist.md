@@ -141,10 +141,12 @@ through.
       that can read the log, ideally not the application's.
 - [ ] Set the context (`set_context`/`audit_context`) in every entry point: with none, rows say `anonymous`/`api`.
 - [ ] Keep `details` to ids and changed field names. Never a secret, a token or a password.
-- [ ] Schedule `schedule_audit_maintenance` on every replica and alert on `get_audit_health()`
-      (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing partition fails audited writes.
-- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a bucket with Object Lock),
-      and verify on a schedule with `verify_checkpoints`.
+- [ ] Schedule `schedule_audit_maintenance` on every replica, each using a role with the
+      [maintenance grants](../audit.md#roles-and-grants) (or run it from a separate maintenance process), and alert
+      on `get_audit_health()` (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing
+      partition fails audited writes, and the runtime grants cannot seal checkpoints or apply retention.
+- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock and a default compliance-mode retention period),
+      give the bucket a default compliance-mode retention period, and verify on a schedule with `verify_checkpoints`.
 - [ ] Do not expose a read route for the trail from the host application.
 
 ## Logging

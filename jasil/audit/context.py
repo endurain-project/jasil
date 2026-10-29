@@ -108,6 +108,9 @@ class AuditContext:
 
 _context: ContextVar[AuditContext | None] = ContextVar("jasil_audit_context", default=None)
 
+# Set only by audit_context(): an explicit scope, which wins over an installed provider.
+_override: ContextVar[AuditContext | None] = ContextVar("jasil_audit_context_override", default=None)
+
 _provider: Callable[[], AuditContext | None] | None = None
 
 
@@ -126,7 +129,8 @@ def configure_provider(provider: Callable[[], AuditContext | None] | None) -> No
 def set_context(context: AuditContext | None) -> None:
     """Set the audit context for the current execution context.
 
-    Only consulted while no provider is installed via :func:`configure_provider`. Each thread and each
+    Only consulted while no provider is installed via :func:`configure_provider` and no
+    :func:`audit_context` block is open. Each thread and each
     asyncio task has its own value, so setting it in one request never leaks into another.
 
     Args:
@@ -141,6 +145,9 @@ def get_context() -> AuditContext:
     Never raises: a provider that fails is treated as "no context", because the row is still worth
     writing without it.
     """
+    override = _override.get()
+    if override is not None:
+        return override
     if _provider is not None:
         try:
             provided = _provider()
@@ -154,8 +161,9 @@ def get_context() -> AuditContext:
 def audit_context(**fields: Any) -> Generator[AuditContext]:
     """Run a block under a context built on top of the current one, restoring it afterwards.
 
-    For workers and CLI commands, which have no request middleware to set the context for them. Ignored
-    while a provider is installed, because the provider then owns the answer.
+    For workers and CLI commands, which have no request middleware to set the context for them. The
+    block's context wins over an installed provider, so a scheduled job can attribute its rows to the
+    system even in a host whose provider only knows about requests.
 
     Args:
         **fields: :class:`AuditContext` fields to override.
@@ -168,11 +176,11 @@ def audit_context(**fields: Any) -> Generator[AuditContext]:
         TypeError: When a field name is not an :class:`AuditContext` field.
     """
     context = replace(get_context(), **fields)
-    token = _context.set(context)
+    token = _override.set(context)
     try:
         yield context
     finally:
-        _context.reset(token)
+        _override.reset(token)
 
 
 def reset() -> None:
@@ -180,3 +188,4 @@ def reset() -> None:
     global _provider
     _provider = None
     _context.set(None)
+    _override.set(None)

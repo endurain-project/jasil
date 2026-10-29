@@ -275,6 +275,9 @@ def _apply_retention(now: datetime) -> None:
             return
         from jasil.audit.models import AuditLog
 
+        # Whole checkpoint windows only, as a partition drop is, so no sealed window is left half-empty.
+        span = timedelta(minutes=settings.checkpoint_window_minutes).total_seconds()
+        cutoff = datetime.fromtimestamp(cutoff.timestamp() // span * span, UTC)
         deleted = bounded_delete(AuditLog, AuditLog.occurred_at < cutoff, db=db)
         if deleted:
             with _system_context():

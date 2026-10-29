@@ -364,8 +364,10 @@ class TestSignatures:
 
 
 class TestRetentionAccounting:
-    def _prune_row(self, trail, cutoff: datetime) -> None:
-        trail.env.clock.moment = at(120)
+    def _prune_row(self, trail, cutoff: datetime, *, days_later: int = 2) -> None:
+        """Record a prune ``days_later`` days after the windows, as retention would; the floor is one day."""
+        trail.env.configure(retention_floor_days=1)
+        trail.env.clock.moment = at(days_later * 24 * 60)
         jasil_audit.record_detached(
             jasil_audit.RETENTION_PRUNE,
             outcome=Outcome.SUCCESS,
@@ -392,6 +394,21 @@ class TestRetentionAccounting:
 
         assert sealed.statuses(end=100)[2] == "row_mismatch"
 
+    def test_a_prune_row_claiming_a_cutoff_inside_the_floor_excuses_nothing(self, sealed, caplog):
+        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
+        # Forged: a far-future cutoff, written a minute after the windows it would excuse.
+        self._prune_row(sealed, at(10_000), days_later=0)
+
+        with caplog.at_level("WARNING"):
+            assert sealed.statuses(end=100)[0] == "row_mismatch"
+        assert "inside the retention floor" in caplog.text
+
+    def test_a_cutoff_that_only_touches_a_window_does_not_excuse_it(self, sealed):
+        sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(15)))
+        self._prune_row(sealed, at(10))  # inside the first window: a partition drop would not have emptied it
+
+        assert sealed.statuses(end=100)[0] == "row_mismatch"
+
     def test_a_pruned_window_still_has_its_chain_and_signature_checked(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
         self._prune_row(sealed, at(30))
@@ -404,7 +421,7 @@ class TestRetentionAccounting:
         sealed.execute(
             insert(AuditLog).values(
                 id=str(uuid7()),
-                occurred_at=at(120),
+                occurred_at=at(3 * 24 * 60),
                 action_id="audit.retention.prune",
                 category="system",
                 severity="medium",

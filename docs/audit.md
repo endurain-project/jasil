@@ -74,7 +74,7 @@ startup.
 | Session | The caller's | Its own, short-lived, committed |
 | Atomic with the change | **Yes** | No |
 | When it is wrong to use | Where the transaction rolls back or does not exist | Where the change and the row must stand or fall together |
-| On a failure | **Fails closed**: the exception propagates, the caller's transaction rolls back | **Fails open**: logged at error level, counted, never raised |
+| On a failure | **Fails closed**: the exception propagates and the caller must roll back | **Fails open**: logged at error level, counted, never raised |
 | Use for | Every successful or failed change made inside a transaction | A failed login, a denied request, a refresh-token reuse, a CLI command |
 
 `stage` adds the row with `Session.add` and nothing more. It does **not** commit, and it does not flush: the row
@@ -86,6 +86,10 @@ startup to pay that outside a request.
 
 `stage_many(db, [AuditRecord(...), ...])` validates every record before adding any, so one bad record stages
 nothing.
+
+**Let every exception from `stage` or `stage_many` propagate, and roll back.** A validation error is raised
+*before* any row is added, so a caller that catches it and commits anyway persists the change with no audit row.
+A storage error surfaces from the flush or commit, which is where the transaction fails on its own.
 
 !!! note "`publish(db=...)` commits the session"
     In durable-jobs mode `jasil.publisher.publish(..., db=db)` commits the caller's session after staging the
@@ -112,7 +116,8 @@ so a reader can tell shapes apart as the model evolves.
 
 **`details` carry ids and the names of the fields that changed. Never a secret, a token, a password, a key, or a
 value that would be one.** The row is meant to be read by operators, kept for months and copied to evidence
-storage. Keys the model does not declare are dropped, not stored. As a guard against a payload that has grown
+storage. Keys the model does not declare are dropped, not stored: `AuditAction` refuses a `details_model` that sets
+`extra="allow"`, and the default (`ignore`) and `forbid` are both accepted. As a guard against a payload that has grown
 into a data dump, a serialized payload over `audit.max_details_bytes` (4096 by default) is refused with
 `AuditDetailsError`.
 
@@ -180,7 +185,8 @@ with jasil_audit.audit_context(actor_type="system", source="worker"):
     ...
 ```
 
-With no context set the row says `anonymous`/`api`. That is wrong for anything but an unauthenticated request:
+A `with audit_context(...)` block wins over an installed provider, so a scheduled job can attribute its rows to the
+system in a host whose provider only knows about requests. With no context set the row says `anonymous`/`api`. That is wrong for anything but an unauthenticated request:
 set the context in every entry point.
 
 ## Storage
@@ -276,7 +282,8 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
 4. **Seal the checkpoints** that are due.
 5. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`: call
    `jasil_audit_drop_partitions(now - retention_days)`, which writes the `audit.retention.prune` row itself. On other
-   dialects, `DELETE` rows older than the cutoff and write that row from Python.
+   dialects, `DELETE` rows older than the cutoff (floored to a checkpoint-window boundary, as a partition drop is) and write that
+   row from Python.
 
 Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a catalog problem
 does not stop checkpoints. The run is idempotent and safe on every replica at once; the lock makes all but one a
@@ -343,14 +350,18 @@ a fingerprint of the public key. After a rotation, verify each period with the k
 | URI | Backend | Notes |
 |---|---|---|
 | `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. |
-| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode, in another account if you can, with credentials that may `PutObject` but not delete or overwrite. Needs `jasil[s3]`. |
+| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `PutObject` but not delete or overwrite. Needs `jasil[s3]`. |
 
 The contract (`jasil.providers.AuditSink.write_once`) is that an object is never replaced: identical bytes are a
 no-op, different bytes raise `AuditSinkConflictError`. The sink is written **before** the database row, so if it
 is unreachable the checkpoint is not stored and the window is retried on the next run; the external copy is never
 missing a checkpoint the database has. Sealing is deterministic (Ed25519 signatures are too), so a retry after a
-crash writes the same bytes. The S3 sink's "never replace" is a read before the write, serialized across replicas
-by the maintenance lock; Object Lock is what enforces it against everyone else.
+crash writes the same bytes. The S3 sink's "never replace" is a read of the current object before the write,
+serialized across replicas by the maintenance lock. That check covers only the current version and binds no other
+writer. Object Lock keeps a locked version from being deleted or overwritten in place, but a `PutObject` to the same
+key can still create a new current version, and a delete marker can hide the locked one; credentials without
+`PutObject` on existing keys and a default compliance-mode retention are what close that. `verify_checkpoints` reads
+only the database and does not compare the external copy: reconcile the sink yourself.
 
 ### Verifying
 
@@ -378,9 +389,11 @@ is reported as one of:
 | `broken_chain` | The checkpoint's `prev_hash` is not the previous checkpoint's hash |
 | `bad_signature` | The signature is absent, or does not verify with the key given |
 
-Dropped windows are expected **only** if an `audit.retention.prune` row with a cutoff past the window's start accounts
-for them; such a window is reported `ok` with `pruned=True`, and only its chain link and signature are checked.
-Otherwise missing rows are a `row_mismatch`.
+Dropped windows are expected **only** if an `audit.retention.prune` row accounts for them: its cutoff is at or past
+the window's end, and at least `audit.retention_floor_days` older than the prune row itself, which is the most the
+database guard would have allowed (a row claiming more is ignored, since anyone able to delete rows could insert one).
+Such a window is reported `ok` with `pruned=True`, and only its chain link and signature are checked. Otherwise
+missing rows are a `row_mismatch`.
 
 ### What this does not do
 
@@ -406,10 +419,21 @@ in `jasil.audit` and, like [`jasil.admin`](observability.md), takes no session: 
 own, so run it from a thread in an asynchronous route.
 
 ```python
-page = jasil_audit.list_entries(
-    jasil_audit.AuditFilters(actor_id="42", categories=["credential"], outcomes=["denied"]), limit=100
+from datetime import UTC, datetime
+
+filters = jasil_audit.AuditFilters(
+    actor_id="42",
+    categories=["credential"],
+    outcomes=["denied"],
+    from_ts=datetime(2026, 1, 1, tzinfo=UTC),
+    to_ts=datetime(2026, 1, 2, tzinfo=UTC),
 )
-next_page = jasil_audit.list_entries(cursor=page.next_cursor)
+page = jasil_audit.list_entries(filters, limit=100)
+
+# A cursor restores only the position, not the filters or the time bounds: pass the same filters and fix
+# from_ts/to_ts so the window does not move between pages. No cursor means no further page.
+while page.next_cursor is not None:
+    page = jasil_audit.list_entries(filters, cursor=page.next_cursor, limit=100)
 ```
 
 | Call | Returns |

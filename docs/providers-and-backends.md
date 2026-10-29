@@ -719,7 +719,7 @@ A write-once copy of the [audit checkpoints](audit.md#the-external-sink), kept o
 | Backend | URI | Notes |
 |---|---|---|
 | `FileAuditSink` | `file:///absolute/directory` | Exclusive-create, read-only files. |
-| `StorageAuditSink` | `s3://bucket/prefix` | Over the S3 storage backend; use a separate bucket with Object Lock. |
+| `StorageAuditSink` | `s3://bucket/prefix` | Over the S3 storage backend; use a separate bucket with Object Lock and a default retention period. |
 
 `write_once(name, content)` never replaces an object: the same bytes again are a no-op, different bytes raise
 `AuditSinkConflictError`.

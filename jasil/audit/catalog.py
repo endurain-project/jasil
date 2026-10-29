@@ -101,7 +101,8 @@ class AuditAction:
         description_key: Translation key for the human description, owned by the host's i18n.
         description_default: The description used when the key has no translation.
         details_model: Versioned model the row's ``details`` are validated against. It must carry ids
-            and changed field names only, never a secret or a value that would be one.
+            and changed field names only, never a secret or a value that would be one. Keys it does not
+            declare are dropped; ``extra="allow"`` is refused.
         deprecated: The action is no longer emitted. It stays in the catalog because rows with its id
             still exist.
     """
@@ -119,7 +120,7 @@ class AuditAction:
 
         Raises:
             ValueError: When ``id`` does not match :data:`ACTION_ID_PATTERN` or is too long, a
-                description is empty, or ``details_model`` is not a ``VersionedPayload``.
+                description is empty, or ``details_model`` is not a ``VersionedPayload`` or allows extra keys.
         """
         if not ACTION_ID_PATTERN.fullmatch(self.id) or len(self.id) > MAX_AUDIT_ACTION_ID_LENGTH:
             raise ValueError(
@@ -130,6 +131,11 @@ class AuditAction:
             raise ValueError(f"audit action {self.id!r} needs a description_key and a description_default")
         if not (isinstance(self.details_model, type) and issubclass(self.details_model, VersionedPayload)):
             raise ValueError(f"audit action {self.id!r}: details_model must subclass VersionedPayload")
+        if self.details_model.model_config.get("extra") == "allow":
+            raise ValueError(
+                f"audit action {self.id!r}: details_model must not set extra='allow', "
+                "which would store keys the model does not declare"
+            )
 
 
 class AuditCatalog:

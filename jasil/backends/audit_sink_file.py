@@ -1,14 +1,18 @@
 """Write-once ``AuditSink`` backed by a directory.
 
-Selected by ``audit.external_sink_uri = "file:///absolute/directory"``. Point it at a mount the
-application can write but not rewrite — an append-only volume, or a share the host copies off — for the
-copy to be worth anything; on the application's own writable disk it only guards against accidents.
+Selected by ``audit.external_sink_uri = "file:///absolute/directory"`` (``file:///C:/directory`` on Windows).
+Point it at a mount the application can write but not rewrite — an append-only volume, or a share the host
+copies off — for the copy to be worth anything; on the application's own writable disk it only guards
+against accidents.
 """
 
+import contextlib
 import os
 import re
+import tempfile
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from jasil.providers import AuditSinkConflictError
 
@@ -36,13 +40,17 @@ class FileAuditSink:
             ValueError: When the URI names a host or a relative path.
         """
         parsed = urlparse(uri)
-        path = unquote(parsed.path)
-        if parsed.netloc or not path.startswith("/"):
+        path = Path(url2pathname(parsed.path))
+        if parsed.netloc or not path.is_absolute():
             raise ValueError("a file audit sink URI must be file:///absolute/directory")
-        return cls(Path(path))
+        return cls(path)
 
     def write_once(self, name: str, content: bytes) -> None:
         """Store ``content`` as ``name``, unless that file already exists with the same bytes.
+
+        The bytes go to a temporary file first and are published under ``name`` with a hard link, which is
+        atomic and refuses an existing name. A crash or a full disk therefore leaves no truncated file under
+        the final name for a retry to trip over.
 
         Args:
             name: A flat file name.
@@ -55,13 +63,19 @@ class FileAuditSink:
         if not _NAME.fullmatch(name):
             raise ValueError(f"invalid audit sink object name: {name!r}")
         path = self._directory / name
+        descriptor, temporary = tempfile.mkstemp(dir=self._directory, prefix=".tmp-")
         try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-        except FileExistsError:
-            if path.read_bytes() != content:
-                raise AuditSinkConflictError(f"{name} already exists with different content") from None
-            return
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != content:
+                    raise AuditSinkConflictError(f"{name} already exists with different content") from None
+                return
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+        path.chmod(0o400)

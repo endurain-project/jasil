@@ -206,9 +206,17 @@ def record_detached(
             getattr(action, "id", action),
             error.errors(include_input=False, include_context=False, include_url=False),
         )
-    except Exception:
+    except Exception as error:
         _note_failure()
-        logger.exception("Audit record %r was not written", getattr(action, "id", action))
+        # Never the error text: a SQLAlchemy error carries the statement parameters, which are the row
+        # (client address, user agent, details), and the engine's hide_parameters is the host's choice.
+        cause = getattr(error, "orig", None)
+        logger.error(
+            "Audit record %r was not written: %s%s",
+            getattr(action, "id", action),
+            type(error).__name__,
+            f" ({type(cause).__name__})" if cause is not None else "",
+        )
 
 
 def _note_failure() -> None:

@@ -351,6 +351,19 @@ class TestFailOpen:
         assert jasil_audit.get_audit_health()["write_failures"] == 1
         assert "nope.nope.nope" in caplog.text
 
+    def test_a_storage_error_logs_the_type_never_the_statement_parameters(
+        self, change, db_engine, session_factory, caplog
+    ):
+        AuditLog.__table__.drop(db_engine)
+        jasil_audit.set_context(AuditContext(ip_address="203.0.113.99", user_agent="secret-agent/1.0"))
+
+        with caplog.at_level(logging.ERROR):
+            jasil_audit.record_detached(change, outcome=Outcome.FAILURE, details={"fields": ["private-field"]})
+
+        assert "OperationalError" in caplog.text or "ProgrammingError" in caplog.text
+        for leaked in ("203.0.113.99", "secret-agent", "private-field", "parameters"):
+            assert leaked not in caplog.text
+
     def test_invalid_details_are_swallowed_and_never_logged(self, change, session_factory, caplog):
         with caplog.at_level(logging.ERROR):
             jasil_audit.record_detached(change, outcome=Outcome.FAILURE, details={"fields": "hunter2"})
