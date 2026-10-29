@@ -557,6 +557,29 @@ class TestEndToEnd:
             assert db.query(AuditCheckpoint).count() == len(report.windows)
             assert db.query(AuditLog).filter(AuditLog.target_id == "a").count() == 1
 
+    def test_checkpoints_sealed_in_another_session_time_zone_verify(self, migrated, action):
+        platform = jasil_testing.install_test_platform(".", clock=jasil_testing.FixedClock())
+        clock = platform.clock
+        now = datetime.now(UTC).replace(microsecond=0)
+        clock.moment = now - timedelta(minutes=50)
+        with migrated.begin() as connection:
+            connection.execute(text("SELECT jasil_audit_ensure_partitions(1)"))
+        jasil_audit.record_detached(action, outcome=Outcome.SUCCESS, target_id="a", details=None)
+        clock.moment = now
+        berlin = create_engine(migrated.url, connect_args={"options": "-c timezone=Europe/Berlin"})
+
+        from jasil.audit import checkpoints
+
+        try:
+            jasil_orm.configure_sessionmaker(sessionmaker(bind=berlin, expire_on_commit=False))
+            assert checkpoints.seal_pending_windows() >= 1
+        finally:
+            jasil_orm.configure_sessionmaker(sessionmaker(bind=migrated, expire_on_commit=False))
+            berlin.dispose()
+        report = jasil_audit.verify_checkpoints(None, now - timedelta(hours=2), now + timedelta(hours=1))
+
+        assert report.ok, report.windows
+
     def test_a_missing_partition_fails_the_staged_write_and_counts_the_detached_one(self, migrated, action):
         clock = jasil_testing.FixedClock()
         clock.moment = datetime.now(UTC) + timedelta(days=60)

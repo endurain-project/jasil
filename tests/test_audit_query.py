@@ -1,6 +1,6 @@
 """The read-only query surface: filters, keyset pagination, the default time window, the summary."""
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -105,6 +105,12 @@ class TestFilters:
 
     def test_a_range_between_two_rows_is_empty(self):
         assert self._ids(from_ts=T0 - timedelta(minutes=39), to_ts=T0 - timedelta(minutes=31)) == []
+
+    def test_a_range_given_in_another_offset_selects_the_same_instants(self):
+        plus_five = timezone(timedelta(hours=5))
+        window = {"from_ts": T0 - timedelta(minutes=40), "to_ts": T0 - timedelta(minutes=30)}
+
+        assert self._ids(**{bound: moment.astimezone(plus_five) for bound, moment in window.items()}) == ["r2", "r1"]
 
     def test_the_default_window_is_the_last_24_hours(self, audit_env, actions):
         _write(audit_env, actions["login"], minutes_ago=24 * 60 + 1, context={"actor_id": "old"})

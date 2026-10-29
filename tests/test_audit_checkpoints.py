@@ -7,7 +7,7 @@ asserts that verification names the damage.
 
 import base64
 import itertools
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import delete, insert, select, update
@@ -536,6 +536,17 @@ class TestCanonicalForm:
         naive = checkpoints.canonical_row(self._row(occurred_at=T0.replace(tzinfo=None)))
 
         assert naive == checkpoints.canonical_row(self._row())
+
+    def test_an_offset_timestamp_is_the_same_instant_in_utc(self):
+        """A driver hands ``timestamptz`` back in the session's TimeZone; the bytes must not depend on it."""
+        berlin = T0.astimezone(timezone(timedelta(hours=1)))
+
+        assert checkpoints.canonical_row(self._row(occurred_at=berlin)) == checkpoints.canonical_row(self._row())
+        assert (
+            checkpoints._sink_name(berlin, "i")
+            == checkpoints._sink_name(T0, "i")
+            == "checkpoint-i-20260101T120000Z.json"
+        )
 
     def test_every_column_is_part_of_the_bytes(self):
         base = checkpoints.canonical_row(self._row())
