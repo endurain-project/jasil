@@ -68,6 +68,40 @@ class TestFileSink:
         sink.write_once("a.json", b"one")
         assert (tmp_path / "a.json").read_bytes() == b"one"
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
+    def test_the_directory_entry_is_synced_after_publishing(self, tmp_path, monkeypatch):
+        synced = []
+        real = os.fsync
+
+        def recording(descriptor):
+            synced.append((stat.S_ISDIR(os.fstat(descriptor).st_mode), (tmp_path / "a.json").exists()))
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", recording)
+
+        FileAuditSink(tmp_path).write_once("a.json", b"one")
+
+        assert synced == [(False, False), (True, True)]  # the file before the name exists, the directory after
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
+    def test_a_failed_directory_sync_propagates_and_the_retry_succeeds(self, tmp_path, monkeypatch):
+        sink = FileAuditSink(tmp_path)
+        real = os.fsync
+
+        def failing_on_directories(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("directory sync failed")
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", failing_on_directories)
+        with pytest.raises(OSError, match="directory sync failed"):
+            sink.write_once("a.json", b"one")
+
+        monkeypatch.undo()
+        sink.write_once("a.json", b"one")  # identical bytes are already there: succeeds, and syncs the name
+
+        assert (tmp_path / "a.json").read_bytes() == b"one"
+
     def test_no_temporary_file_is_left_behind(self, tmp_path):
         sink = FileAuditSink(tmp_path)
         sink.write_once("a.json", b"one")

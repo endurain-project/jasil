@@ -201,6 +201,60 @@ class TestRetention:
 
         assert self._targets(session_factory).count("shop.order.cancel") == 2  # it is in the window being kept
 
+    def test_the_cutoff_follows_the_sealed_window_not_the_current_setting(self, actions, audit_env, session_factory):
+        old_day = datetime(2025, 10, 3, tzinfo=UTC)
+        _write(audit_env, actions[0], old_day + timedelta(hours=6))  # inside the day the cutoff (12:00) falls in
+        audit_env.clock.moment = old_day + timedelta(days=2)
+        jasil_audit.run_audit_maintenance()  # seals day-long windows
+        audit_env.configure(checkpoint_window_minutes=15)  # the setting changes afterwards
+        audit_env.clock.moment = T0
+
+        jasil_audit.run_audit_maintenance()
+
+        report = jasil_audit.verify_checkpoints(None, old_day - timedelta(days=1), old_day + timedelta(days=1))
+        assert report.ok, report.windows
+        # The 12:00 cutoff was floored to the sealed window's start (00:00), not to the new 15-minute grid.
+        # Only the 06:00 row survives: the two older fixture rows went, and the cutoff stopped at the window start.
+        assert self._targets(session_factory).count("shop.order.place") == 1
+
+    def test_the_prune_is_recorded_before_any_row_is_deleted(self, actions, audit_env, session_factory, monkeypatch):
+        seen = []
+        real = maintenance.bounded_delete
+
+        def delete_after_checking(*args, **kwargs):
+            with session_factory() as db:
+                seen.append([r.action_id for r in db.scalars(select(AuditLog)) if r.action_id.startswith("audit.")])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(maintenance, "bounded_delete", delete_after_checking)
+
+        jasil_audit.run_audit_maintenance()
+
+        assert "audit.retention.prune" in seen[0]  # already committed when the first batch goes
+
+    def test_a_stop_after_the_deletion_still_leaves_the_prune_accounted_for(
+        self, actions, audit_env, session_factory, monkeypatch
+    ):
+        real = maintenance.bounded_delete
+
+        def delete_then_die(*args, **kwargs):
+            real(*args, **kwargs)
+            raise RuntimeError("process stopped after the last batch")
+
+        monkeypatch.setattr(maintenance, "bounded_delete", delete_then_die)
+        jasil_audit.run_audit_maintenance()  # the failing step is isolated and logged
+
+        report = jasil_audit.verify_checkpoints(None, T0 - timedelta(days=101), T0)
+        assert report.ok, report.windows
+
+    def test_nothing_to_delete_records_nothing(self, actions, audit_env, session_factory):
+        jasil_audit.run_audit_maintenance()
+        before = self._targets(session_factory).count("audit.retention.prune")
+
+        jasil_audit.run_audit_maintenance()
+
+        assert self._targets(session_factory).count("audit.retention.prune") == before
+
     def test_a_row_exactly_at_the_cutoff_is_kept(self, actions, audit_env, session_factory):
         _write(audit_env, actions[1], T0 - timedelta(days=90))
 

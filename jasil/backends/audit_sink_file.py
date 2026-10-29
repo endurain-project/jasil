@@ -64,6 +64,7 @@ class FileAuditSink:
             raise ValueError(f"invalid audit sink object name: {name!r}")
         path = self._directory / name
         descriptor, temporary = tempfile.mkstemp(dir=self._directory, prefix=".tmp-")
+        published = True
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(content)
@@ -74,8 +75,25 @@ class FileAuditSink:
             except FileExistsError:
                 if path.read_bytes() != content:
                     raise AuditSinkConflictError(f"{name} already exists with different content") from None
-                return
+                published = False  # an identical copy is there; still make sure its name is durable
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(temporary)
-        path.chmod(0o400)
+        self._sync_directory()
+        if published:
+            path.chmod(0o400)
+
+    def _sync_directory(self) -> None:
+        """Make the new directory entry durable, so a crash cannot lose a checkpoint the database then keeps.
+
+        Syncing the file does not sync the name that points to it. A failure propagates, so the checkpoint is
+        not stored and the window is retried. Windows cannot open a directory for syncing and journals the
+        metadata itself, so there it is skipped.
+        """
+        if os.name == "nt":
+            return
+        descriptor = os.open(self._directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

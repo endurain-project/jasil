@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil._core.pruning import bounded_delete
+from jasil._core.timestamps import as_utc
 from jasil.audit import checkpoints, service
 from jasil.audit.catalog import (
     CATALOG_SYNC,
@@ -273,17 +274,30 @@ def _apply_retention(now: datetime) -> None:
             if dropped:
                 logger.info("Audit retention: dropped %d partition(s) older than %s", dropped, cutoff.isoformat())
             return
-        from jasil.audit.models import AuditLog
+        from jasil.audit.models import AuditCheckpoint, AuditLog
 
-        # Whole checkpoint windows only, as a partition drop is, so no sealed window is left half-empty.
-        span = timedelta(minutes=settings.checkpoint_window_minutes).total_seconds()
-        cutoff = datetime.fromtimestamp(cutoff.timestamp() // span * span, UTC)
+        # Whole checkpoint windows only, as a partition drop is, so no sealed window is left half-empty. The
+        # window that matters is the one that was sealed, which a later change of the window setting may
+        # not match; only where nothing was sealed does the configured grid apply.
+        sealed = db.scalar(
+            select(AuditCheckpoint.window_start).where(
+                AuditCheckpoint.window_start <= cutoff, AuditCheckpoint.window_end > cutoff
+            )
+        )
+        if sealed is not None:
+            cutoff = as_utc(sealed)
+        else:
+            span = timedelta(minutes=settings.checkpoint_window_minutes).total_seconds()
+            cutoff = datetime.fromtimestamp(cutoff.timestamp() // span * span, UTC)
+        if db.scalar(select(AuditLog.id).where(AuditLog.occurred_at < cutoff).limit(1)) is None:
+            return
+        # The accounting is committed before the rows go, so a stop in between leaves a record of a prune
+        # that has not finished (harmless: the next run finishes it) and never a prune with no record.
+        with _system_context():
+            service.stage(db, RETENTION_PRUNE, details=RetentionPruneDetails(cutoff=cutoff, partitions_dropped=0))
+        db.commit()
         deleted = bounded_delete(AuditLog, AuditLog.occurred_at < cutoff, db=db)
-        if deleted:
-            with _system_context():
-                service.stage(db, RETENTION_PRUNE, details=RetentionPruneDetails(cutoff=cutoff, partitions_dropped=0))
-            db.commit()
-            logger.info("Audit retention: deleted %d row(s) older than %s", deleted, cutoff.isoformat())
+        logger.info("Audit retention: deleted %d row(s) older than %s", deleted, cutoff.isoformat())
 
 
 def schedule_audit_maintenance(scheduler: "AsyncIOScheduler", *, run_at_startup: bool = True) -> None:

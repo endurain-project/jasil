@@ -392,7 +392,10 @@ is reported as one of:
 Dropped windows are expected **only** if an `audit.retention.prune` row accounts for them: its cutoff is at or past
 the window's end, and at least `audit.retention_floor_days` older than the prune row itself, which is the most the
 database guard would have allowed (a row claiming more is ignored, since anyone able to delete rows could insert one).
-Such a window is reported `ok` with `pruned=True`, and only its chain link and signature are checked. Otherwise
+The floor used is the *current* `audit.retention_floor_days`, not one recorded in the row, because a recorded value
+would be written by the same party the check guards against; if you raise the setting, keep it at or below the floor
+your prunes were made under, or older prunes stop being believed. Such a window is reported `ok` with `pruned=True`,
+and only its chain link and signature are checked. Otherwise
 missing rows are a `row_mismatch`.
 
 ### What this does not do
@@ -420,6 +423,8 @@ own, so run it from a thread in an asynchronous route.
 
 ```python
 from datetime import UTC, datetime
+
+import jasil.audit as jasil_audit
 
 filters = jasil_audit.AuditFilters(
     actor_id="42",
