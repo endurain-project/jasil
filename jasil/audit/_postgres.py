@@ -48,7 +48,13 @@ def _render(template: str, schema: str, **extra: str) -> str:
 
     Plain substitution rather than string formatting, because the templates are PL/pgSQL full of
     ``%`` and braces, and every substituted value is a quoted identifier, a quoted literal or an integer.
+
+    Raises:
+        ValueError: When ``schema`` contains ``$``: quoting does not escape it, and inside a dollar-quoted
+            body it could end the body.
     """
+    if "$" in schema:
+        raise ValueError(f"a schema name holding the audit functions must not contain '$', not {schema!r}")
     values = {
         "SCHEMA": quote_ident(schema),
         "SCHEMA_LIT": quote_literal(schema),

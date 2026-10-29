@@ -115,9 +115,10 @@ def stage(
     The row is added with ``Session.add`` and nothing else: it is flushed whenever the session next
     flushes (autoflush, an explicit flush, or commit) and becomes durable when the caller commits, so
     the audited change and its row commit or roll back together. This never commits and never flushes
-    on its own, with one exception: the first call in a process resolves the deployment's instance id,
-    which opens a short session of its own on the same engine (call :func:`jasil.audit.sync_catalog` at
-    startup to pay that once, outside any request).
+    on its own. The first call in a process reads the deployment's instance id on ``db`` (without
+    flushing it); only a deployment's very first write, before ``jasil_instance`` holds its row, creates
+    it on a short session of its own on the same engine (call :func:`jasil.audit.sync_catalog` at startup
+    to do that outside any request).
 
     Args:
         db: The caller's session.
@@ -160,6 +161,8 @@ def stage_many(db: Session, records: Iterable[AuditRecord]) -> None:
     settings = get_settings().audit
     entries = [_prepare(record, settings) for record in records]
     for entry in entries:
+        _notify(entry)
+    for entry in entries:
         _add(db, entry, settings)
 
 
@@ -192,6 +195,7 @@ def record_detached(
     try:
         settings = get_settings().audit
         entry = _prepare(record, settings)
+        _notify(entry)
         if not settings.enabled:
             return
         with jasil_orm.get_sessionmaker()() as db:
@@ -359,7 +363,9 @@ def ensure_instance_id(engine: "Engine") -> str:
 
 def _stage(db: Session, record: AuditRecord) -> None:
     settings = get_settings().audit
-    _add(db, _prepare(record, settings), settings)
+    entry = _prepare(record, settings)
+    _notify(entry)
+    _add(db, entry, settings)
 
 
 def now() -> datetime:
@@ -370,7 +376,7 @@ def now() -> datetime:
 
 
 def _prepare(record: AuditRecord, settings: AuditSettings) -> AuditEntry:
-    """Validate ``record``, merge the ambient context and tell the observers."""
+    """Validate ``record`` and merge the ambient context."""
     action = get_catalog().resolve(record.action)
     for name, value, limit in (
         ("target_type", record.target_type, MAX_AUDIT_NAME_LENGTH),
@@ -413,9 +419,34 @@ def _prepare(record: AuditRecord, settings: AuditSettings) -> AuditEntry:
         app_name=settings.app_name,
         app_version=settings.app_version,
     )
+    return entry
+
+
+def _notify(entry: AuditEntry) -> None:
+    """Tell the observers about ``entry``, once it and every entry staged with it have validated."""
     for observer in tuple(_observers):
         observer(entry)
-    return entry
+
+
+def _instance_id_of(db: Session) -> str:
+    """Return the instance id, read on the caller's own session when the row already exists.
+
+    Reading it there (without flushing what the caller has pending) keeps a staged write on the caller's
+    connection; only a deployment's very first write, before the row exists, creates it on a session of
+    its own (:func:`ensure_instance_id`), so the id is durable whatever the caller's transaction does.
+    """
+    global _instance_id
+    if _instance_id is None:
+        from sqlalchemy import select
+
+        from jasil.audit.models import Instance
+
+        with db.no_autoflush:
+            found = db.scalar(select(Instance.instance_id).where(Instance.id == 1))
+        if found is not None:
+            _instance_id = found
+            return found
+    return ensure_instance_id(engine_of(db))
 
 
 def _add(db: Session, entry: AuditEntry, settings: AuditSettings) -> None:
@@ -424,5 +455,5 @@ def _add(db: Session, entry: AuditEntry, settings: AuditSettings) -> None:
         return
     from jasil.audit.models import AuditLog
 
-    instance_id = ensure_instance_id(engine_of(db))
+    instance_id = _instance_id_of(db)
     db.add(AuditLog(**entry.model_copy(update={"instance_id": instance_id}).model_dump()))

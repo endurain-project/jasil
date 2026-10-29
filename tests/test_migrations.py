@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect, text
 
 from jasil import migrations
+from jasil.audit import _postgres as audit_pg
 from jasil.orm import jasil_table_names, legacy_table_names
 
 pytest.importorskip("alembic", reason="migrations require the 'migrations' extra")
@@ -29,7 +30,7 @@ def engine(mapped_base, database_url):
 
 
 def _drop_everything(engine, mapped_base) -> None:
-    """Remove JASIL's tables and its Alembic version table, if present."""
+    """Remove JASIL's tables, its Alembic version table and the audit functions, if present."""
     mapped_base.metadata.drop_all(engine)
     with engine.begin() as connection:
         connection.exec_driver_sql(f"DROP TABLE IF EXISTS {migrations.VERSION_TABLE}")
@@ -37,6 +38,12 @@ def _drop_everything(engine, mapped_base) -> None:
         # only to an older revision.
         for name in sorted(legacy_table_names()):
             connection.exec_driver_sql(f"DROP TABLE IF EXISTS {name}")
+        # rev0006's PostgreSQL functions outlive the tables: left behind, they make a later
+        # test's plain ``create_all`` schema look partitioned to audit maintenance.
+        if engine.dialect.name == "postgresql":
+            schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+            for statement in audit_pg.uninstall_statements(schema):
+                connection.exec_driver_sql(statement)
 
 
 def _drop_version_table(engine) -> None:

@@ -13,7 +13,7 @@ import jasil.audit.checkpoints as checkpoints
 import jasil.container as container
 import jasil.settings as jasil_settings
 from jasil.audit import AuditAction, Category, Outcome, Severity
-from jasil.audit.models import AuditCheckpoint
+from jasil.audit.models import AuditCheckpoint, Instance
 from jasil.backends.audit_sink_file import FileAuditSink
 from jasil.backends.audit_sink_storage import AUDIT_SINK_AREA, StorageAuditSink
 from jasil.backends.storage_local import LocalStorage
@@ -33,6 +33,15 @@ class TestFileSink:
 
         mode = stat.S_IMODE(os.stat(tmp_path / "a.json").st_mode)
         assert not mode & 0o222  # no write bit (Windows can only express read-only)
+
+    def test_a_copy_left_writable_by_a_crash_is_made_read_only_by_the_retry(self, tmp_path):
+        left = tmp_path / "a.json"
+        left.write_bytes(b"one")  # published, then the process stopped before making it read-only
+        left.chmod(0o600)
+
+        FileAuditSink(tmp_path).write_once("a.json", b"one")
+
+        assert not stat.S_IMODE(os.stat(left).st_mode) & 0o222
 
     def test_writing_the_same_bytes_again_is_a_no_op(self, tmp_path):
         sink = FileAuditSink(tmp_path)
@@ -126,6 +135,11 @@ class TestFileSink:
         with pytest.raises(ValueError, match="file:///absolute/directory"):
             FileAuditSink.from_uri(uri)
 
+    @pytest.mark.parametrize("suffix", ["?mode=append", "#copies"])
+    def test_a_uri_with_a_query_or_fragment_is_refused(self, tmp_path, suffix):
+        with pytest.raises(ValueError, match="file:///absolute/directory"):
+            FileAuditSink.from_uri((tmp_path / "sink").as_uri() + suffix)
+
 
 class TestStorageSink:
     @pytest.fixture
@@ -212,21 +226,23 @@ class TestSealingThroughTheSink:
         with self.session_factory() as db:
             return list(db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start)))
 
+    def _name(self, window: str) -> str:
+        """The sink object of the window starting at ``window``: named after the deployment, then the window."""
+        with self.session_factory() as db:
+            instance_id = db.scalar(select(Instance.instance_id))
+        return f"checkpoint-{instance_id}-{window}.json"
+
     def test_every_checkpoint_is_copied_to_the_sink(self, trail):
         assert checkpoints.seal_pending_windows() == 3
 
         files = sorted(path.name for path in self.directory.iterdir())
-        assert files == [
-            "checkpoint-20260101T120000Z.json",
-            "checkpoint-20260101T121500Z.json",
-            "checkpoint-20260101T123000Z.json",
-        ]
+        assert files == [self._name("20260101T120000Z"), self._name("20260101T121500Z"), self._name("20260101T123000Z")]
 
     def test_the_copy_matches_the_stored_checkpoint(self, trail):
         checkpoints.seal_pending_windows()
 
         stored = self._stored()[0]
-        copy = json.loads((self.directory / "checkpoint-20260101T120000Z.json").read_text())
+        copy = json.loads((self.directory / self._name("20260101T120000Z")).read_text())
         assert copy["hash"] == stored.hash
         assert (copy["row_count"], copy["prev_hash"], copy["signature"], copy["key_id"]) == (1, None, None, None)
         assert (copy["retention_days"], copy["legal_hold"]) == (stored.retention_days, stored.legal_hold)
@@ -240,7 +256,7 @@ class TestSealingThroughTheSink:
 
         checkpoints.seal_pending_windows()
 
-        copy = json.loads((self.directory / "checkpoint-20260101T120000Z.json").read_text())
+        copy = json.loads((self.directory / self._name("20260101T120000Z")).read_text())
         assert copy["signature"] == self._stored()[0].signature
         assert copy["key_id"]
 
@@ -269,7 +285,7 @@ class TestSealingThroughTheSink:
         with self.session_factory() as db:
             db.delete(db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc())).first())
             db.commit()
-        target = self.directory / "checkpoint-20260101T123000Z.json"
+        target = self.directory / self._name("20260101T123000Z")
         target.chmod(0o600)
         target.write_text("{}")
 

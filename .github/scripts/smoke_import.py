@@ -43,6 +43,10 @@ EXPECTED_TABLES = {
     "jasil_event_outbox",
     "jasil_job_workers",
     "jasil_job_attempts",
+    "jasil_audit_log",
+    "jasil_audit_actions",
+    "jasil_audit_checkpoints",
+    "jasil_instance",
 }
 EXPECTED_REVISIONS = {
     "rev0001_initial.py",

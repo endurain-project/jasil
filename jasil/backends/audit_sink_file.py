@@ -31,17 +31,18 @@ class FileAuditSink:
         """Build a sink from ``file:///absolute/directory``.
 
         Args:
-            uri: A ``file://`` URI with an absolute path and no host.
+            uri: A ``file://`` URI with an absolute path and no host, query or fragment.
 
         Returns:
             The sink; the directory is created when missing.
 
         Raises:
-            ValueError: When the URI names a host or a relative path.
+            ValueError: When the URI names a host, a relative path, a query or a fragment (none of which
+                the sink would honour).
         """
         parsed = urlparse(uri)
         path = Path(url2pathname(parsed.path))
-        if parsed.netloc or not path.is_absolute():
+        if parsed.netloc or parsed.query or parsed.fragment or not path.is_absolute():
             raise ValueError("a file audit sink URI must be file:///absolute/directory")
         return cls(path)
 
@@ -64,7 +65,6 @@ class FileAuditSink:
             raise ValueError(f"invalid audit sink object name: {name!r}")
         path = self._directory / name
         descriptor, temporary = tempfile.mkstemp(dir=self._directory, prefix=".tmp-")
-        published = True
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 handle.write(content)
@@ -75,12 +75,14 @@ class FileAuditSink:
             except FileExistsError:
                 if path.read_bytes() != content:
                     raise AuditSinkConflictError(f"{name} already exists with different content") from None
-                published = False  # an identical copy is there; still make sure its name is durable
+                # An identical copy is there; still make sure its name is durable and it is read-only.
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(temporary)
         self._sync_directory()
-        if published:
+        # Also on an identical copy: one published by a run that stopped before this line is still writable.
+        # A copy that is already read-only is left alone, as it may belong to another user.
+        if path.stat().st_mode & 0o222:
             path.chmod(0o400)
 
     def _sync_directory(self) -> None:

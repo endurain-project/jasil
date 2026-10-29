@@ -140,6 +140,10 @@ class TestQuoting:
         assert "'x''; DROP TABLE y; --'" in statement
         assert '"x\'; DROP TABLE y; --"' in statement
 
+    def test_a_schema_that_could_end_the_dollar_quoted_body_is_refused(self):
+        with pytest.raises(ValueError, match=r"\$"):
+            jasil_audit.retention_floor_sql(30, schema="a$body$; DROP TABLE y; --")
+
     def test_the_trigger_statements_target_the_parent_table(self):
         statements = pg.trigger_ddl("public")
 

@@ -306,7 +306,7 @@ class TestStageMany:
         assert [(row.target_id, row.outcome) for row in _rows(db)] == [("1", "success"), ("2", "failure")]
 
     def test_one_invalid_record_stages_nothing(self, db, change):
-        with pytest.raises(ValidationError):
+        with jasil_testing.capture_audit() as captured, pytest.raises(ValidationError):
             jasil_audit.stage_many(
                 db,
                 [
@@ -316,6 +316,20 @@ class TestStageMany:
             )
 
         assert list(db.new) == []
+        assert captured.entries == []  # nothing was staged, so nothing was captured either
+
+    def test_a_known_instance_is_read_on_the_callers_session(self, db, change, monkeypatch):
+        import jasil.audit.service as audit_service
+
+        jasil_audit.stage(db, change, details={"fields": []})
+        audit_service._instance_id = None  # a new process: the row exists, the id is not cached
+        monkeypatch.setattr(
+            audit_service, "ensure_instance_id", lambda engine: pytest.fail("opened a session of its own")
+        )
+
+        jasil_audit.stage(db, change, details={"fields": []})
+
+        assert len(db.new) == 2  # read without flushing what the caller has pending
 
     def test_an_empty_batch_is_a_no_op(self, db, change):
         jasil_audit.stage_many(db, [])

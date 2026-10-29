@@ -80,12 +80,13 @@ startup.
 `stage` adds the row with `Session.add` and nothing more. It does **not** commit, and it does not flush: the row
 is flushed whenever the session next flushes (autoflush, an explicit flush, or commit), and becomes durable when
 the caller commits. A storage error therefore surfaces from that flush or commit, which is exactly where the
-caller's transaction fails. The one exception: the first audited write in a process resolves the deployment's
-[instance id](#storage) on a short session of its own on the same engine; call `jasil_audit.sync_catalog()` at
-startup to pay that outside a request.
+caller's transaction fails. The first audited write in a process reads the deployment's
+[instance id](#storage) on that same session, without flushing it. Only a deployment's very first write, before
+`jasil_instance` holds its row, creates it on a short session of its own on the same engine; call
+`jasil_audit.sync_catalog()` at startup to do that outside a request.
 
 `stage_many(db, [AuditRecord(...), ...])` validates every record before adding any, so one bad record stages
-nothing.
+nothing (and [`capture_audit`](#testing) captures nothing).
 
 **Let every exception from `stage` or `stage_many` propagate, and roll back.** A validation error is raised
 *before* any row is added, so a caller that catches it and commits anyway persists the change with no audit row.
@@ -326,11 +327,16 @@ only visible once its transaction commits: sealing at the end would let a slow t
 insertion. Choose a grace period longer than your longest audited transaction plus the clock skew between replicas.
 
 To seal a window, JASIL serializes its rows canonically, ordered by `(occurred_at, id)`, and computes
-`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the window,
-row count, hash, previous hash and the `retention_days` and `legal_hold` in force with Ed25519 (if configured),
+`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the
+deployment's instance id, the window, row count, hash, previous hash and the `retention_days` and `legal_hold` in
+force with Ed25519 (if configured),
 stores the checkpoint in `jasil_audit_checkpoints` (window start and end, row count, hash, previous hash, retention
 days, legal hold, signature, key id), and copies it to the external sink (if configured). Empty
 windows are sealed too, so a row inserted into one later is detected.
+
+A window ends on the `checkpoint_window_minutes` grid; after the setting changes, the first window is shortened to
+rejoin it. If the newest checkpoint ends after now (one inserted ahead of time, or a clock that went back), sealing
+raises on every run instead of resuming from it, until someone investigates.
 
 There is deliberately **no per-row hash chain**: it would serialize every insert across replicas.
 
@@ -358,9 +364,10 @@ a fingerprint of the public key. After a rotation, verify each period with the k
 
 | URI | Backend | Notes |
 |---|---|---|
-| `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. |
+| `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. Each copy is published with a hard link, so the directory's file system must support them; on one that does not (some network shares), every seal fails. No host, query or fragment. |
 | `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject`, `PutObject` and `ListBucket` on the prefix but not delete or overwrite: the sink reads a checkpoint's key before writing it, and without `ListBucket` S3 answers a missing key with `403` instead of `404`, which fails every seal. Needs `jasil[s3]`. |
 
+Each object is named `checkpoint-<instance id>-<window start>.json`, so deployments sharing a sink do not collide.
 The contract (`jasil.providers.AuditSink.write_once`) is that an object is never replaced: identical bytes are a
 no-op, different bytes raise `AuditSinkConflictError`. The sink is written **before** the database row, so if it
 is unreachable the checkpoint is not stored and the window is retried on the next run; the external copy is never
@@ -396,7 +403,7 @@ is reported as one of:
 | `row_mismatch` | The rows of the window are not the rows that were sealed: one was modified, deleted or inserted |
 | `missing_window` | There is a gap between two checkpoints (a checkpoint was deleted) |
 | `broken_chain` | The checkpoint's `prev_hash` is not the previous checkpoint's hash |
-| `bad_signature` | The signature is absent, or does not verify with the key given |
+| `bad_signature` | The signature is absent, or does not verify with the key given (also for a checkpoint signed for another deployment) |
 
 Dropped windows are expected **only** where a checkpoint allows them. A window whose rows are all gone is reported
 `ok` with `pruned=True` if some checkpoint not sealed under legal hold ends at least the `retention_days` it was sealed

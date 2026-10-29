@@ -16,7 +16,7 @@ import jasil.audit as jasil_audit
 import jasil.audit.checkpoints as checkpoints
 from jasil._core.uuid7 import uuid7
 from jasil.audit import AuditAction, Category, Outcome, Severity
-from jasil.audit.models import AuditCheckpoint, AuditLog
+from jasil.audit.models import AuditCheckpoint, AuditLog, Instance
 
 T0 = datetime(2026, 1, 1, 12, tzinfo=UTC)
 WINDOW = timedelta(minutes=15)
@@ -180,6 +180,23 @@ class TestSealing:
         assert bounds[1] == (at(15), at(60))  # shortened to the next hour, so no window straddles midnight
         assert all(start.minute == 0 and end - start == timedelta(hours=1) for start, end in bounds[2:])
         assert trail.verify(end=300).ok
+
+    def test_a_checkpoint_ending_after_now_stops_sealing_loudly(self, trail):
+        trail.write(3)
+        later = at(10 * 365 * 24 * 60)
+        trail.execute(
+            insert(AuditCheckpoint).values(
+                window_start=later,
+                window_end=later + WINDOW,
+                row_count=0,
+                hash="0" * 64,
+                retention_days=90,
+                legal_hold=False,
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="after now"):
+            trail.seal(60)
 
     def test_a_checkpoint_records_the_retention_it_was_sealed_under(self, audit_env, trail):
         audit_env.configure(retention_days=45, legal_hold=True)
@@ -361,6 +378,13 @@ class TestSignatures:
         trail.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(**change))
 
         assert trail.statuses(public)[0] == "bad_signature"
+
+    def test_the_signature_binds_the_checkpoint_to_its_deployment(self, signed):
+        trail, public, _ = signed
+        # Replayed into another deployment signed with the same key, or the instance id rewritten.
+        trail.execute(update(Instance).values(instance_id=str(uuid7())))
+
+        assert trail.statuses(public) == ["bad_signature"] * 3
 
     def test_without_a_public_key_signatures_are_not_checked(self, signed):
         trail, _, _ = signed

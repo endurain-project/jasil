@@ -135,11 +135,12 @@ def _digest(db: Session, start: datetime, end: datetime, prev_hash: str | None) 
     return _Digest(count, hasher.hexdigest())
 
 
-def _message(checkpoint: Any) -> bytes:
-    """Return the bytes a checkpoint's signature covers: its window, rows, chain link and retention."""
+def _message(checkpoint: Any, instance_id: str) -> bytes:
+    """Return the bytes a checkpoint's signature covers: its deployment, window, rows, chain link and retention."""
     return "|".join(
         (
             _MESSAGE_PREFIX,
+            instance_id,
             _iso(checkpoint.window_start),
             _iso(checkpoint.window_end),
             str(checkpoint.row_count),
@@ -196,8 +197,8 @@ def _sign(settings: AuditSettings, message: bytes) -> tuple[str | None, str | No
     return base64.b64encode(private_key.sign(message)).decode(), key_id
 
 
-def _sink_name(start: datetime) -> str:
-    return f"checkpoint-{as_utc(start).strftime('%Y%m%dT%H%M%SZ')}.json"
+def _sink_name(start: datetime, instance_id: str) -> str:
+    return f"checkpoint-{instance_id}-{as_utc(start).strftime('%Y%m%dT%H%M%SZ')}.json"
 
 
 def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
@@ -247,6 +248,7 @@ def seal_pending_windows(now: datetime | None = None) -> int:
     Raises:
         sqlalchemy.exc.SQLAlchemyError: On a database error.
         AuditSinkConflictError: When the sink already holds different content for a window.
+        RuntimeError: When the newest checkpoint ends after ``now``.
     """
     from jasil.audit.models import AuditCheckpoint, AuditLog
 
@@ -262,6 +264,13 @@ def seal_pending_windows(now: datetime | None = None) -> int:
         last = db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc()).limit(1)).first()
         if last is not None:
             start, prev_hash = as_utc(last.window_end), last.hash
+            if start > now:
+                # No window this clock sealed can end after it: a checkpoint inserted ahead of time, or a clock
+                # that went back. Resuming from it would silently seal nothing until that moment.
+                raise RuntimeError(
+                    f"the newest checkpoint ends at {start.isoformat()}, after now ({now.isoformat()}); "
+                    "sealing stops until it is investigated"
+                )
         else:
             first = db.scalar(select(func.min(AuditLog.occurred_at)))
             if first is None:
@@ -286,9 +295,9 @@ def seal_pending_windows(now: datetime | None = None) -> int:
             retention_days=settings.retention_days,
             legal_hold=settings.legal_hold,
         )
-        checkpoint.signature, checkpoint.key_id = _sign(settings, _message(checkpoint))
+        checkpoint.signature, checkpoint.key_id = _sign(settings, _message(checkpoint, instance_id))
         if sink is not None:
-            sink.write_once(_sink_name(start), _sink_payload(checkpoint, instance_id))
+            sink.write_once(_sink_name(start, instance_id), _sink_payload(checkpoint, instance_id))
         with sessionmaker() as db:
             db.add(checkpoint)
             service.note_maintenance(db, last_checkpoint_at=end)
@@ -298,7 +307,7 @@ def seal_pending_windows(now: datetime | None = None) -> int:
     return written
 
 
-def _pruning_horizon(db: Session, verifier: Any) -> datetime | None:
+def _pruning_horizon(db: Session, verifier: Any, instance_id: str) -> datetime | None:
     """Return the latest window end any checkpoint allows to have been pruned; ``None`` when none does.
 
     A checkpoint records the retention in force when it was sealed, so ``window_end - retention_days`` is
@@ -320,7 +329,7 @@ def _pruning_horizon(db: Session, verifier: Any) -> datetime | None:
         reverse=True,
     )
     for horizon, checkpoint in candidates:
-        if verifier is None or _signature_ok(verifier, checkpoint):
+        if verifier is None or _signature_ok(verifier, checkpoint, instance_id):
             return horizon
     return None
 
@@ -353,7 +362,7 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
         ValueError: When ``public_key`` is not a valid key.
         ImportError: When a key is given and ``cryptography`` is not installed (``jasil[audit]``).
     """
-    from jasil.audit.models import AuditCheckpoint
+    from jasil.audit.models import AuditCheckpoint, Instance
 
     verifier = _public_key(public_key) if public_key is not None else None
     start_bound, end_bound = as_utc(from_ts), as_utc(to_ts)
@@ -371,7 +380,9 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
             .where(AuditCheckpoint.window_start >= start_bound, AuditCheckpoint.window_end <= end_bound)
             .order_by(AuditCheckpoint.window_start)
         ).all()
-        horizon = _pruning_horizon(db, verifier)
+        # The deployment is part of every signature, so a checkpoint replayed from another one fails.
+        instance_id = db.scalar(select(Instance.instance_id).where(Instance.id == 1)) or ""
+        horizon = _pruning_horizon(db, verifier, instance_id)
 
         for checkpoint in checkpoints:
             start, end = as_utc(checkpoint.window_start), as_utc(checkpoint.window_end)
@@ -394,7 +405,11 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
                 and end <= horizon
             )
             status = VerificationStatus.OK if rows_match or pruned else VerificationStatus.ROW_MISMATCH
-            if status is VerificationStatus.OK and verifier is not None and not _signature_ok(verifier, checkpoint):
+            if (
+                status is VerificationStatus.OK
+                and verifier is not None
+                and not _signature_ok(verifier, checkpoint, instance_id)
+            ):
                 status = VerificationStatus.BAD_SIGNATURE
             if status is VerificationStatus.OK and checkpoint.prev_hash != expected_prev:
                 # With no predecessor in the database the first checkpoint must start the chain; one that
@@ -419,13 +434,13 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
     )
 
 
-def _signature_ok(verifier: Any, checkpoint: Any) -> bool:
+def _signature_ok(verifier: Any, checkpoint: Any, instance_id: str) -> bool:
     from cryptography.exceptions import InvalidSignature
 
     if checkpoint.signature is None:
         return False
     try:
-        verifier.verify(base64.b64decode(checkpoint.signature, validate=True), _message(checkpoint))
+        verifier.verify(base64.b64decode(checkpoint.signature, validate=True), _message(checkpoint, instance_id))
     except (InvalidSignature, ValueError, binascii.Error):
         return False
     return True
