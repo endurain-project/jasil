@@ -21,7 +21,6 @@ import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.events import Event
-from jasil.jobs.dead_letter import deliver_after_reap
 from jasil.jobs.defer import DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
@@ -275,25 +274,6 @@ class JobRunner:
             extra=self._context(job),
         )
         return False
-
-    def reap_once(self) -> int:
-        """
-        Requeue (or dead-letter) jobs whose lease expired, then run the owed
-        ``on_dead_letter`` callbacks of subscribers registered here.
-
-        Returns:
-            The number of jobs reclaimed.
-        """
-        now = self._clock.now()
-        with self._session_factory() as db:
-            reclaimed, dead_lettered = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
-        deliver_after_reap(
-            registry=self._registry,
-            session_factory=self._session_factory,
-            clock=self._clock,
-            dead_lettered=dead_lettered,
-        )
-        return reclaimed
 
     def _run_job(self, job: ClaimedJob) -> bool:
         """Run one job and record its outcome.

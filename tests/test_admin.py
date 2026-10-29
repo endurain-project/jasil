@@ -9,7 +9,7 @@ commits a session the caller handed it — because it is handed none.
 import base64
 import inspect
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,8 +19,9 @@ import jasil.event_log.crud as event_log_crud
 import jasil.jobs.crud as jobs_crud
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
+import jasil.testing as jasil_testing
 from jasil.events import new_event
-from jasil.jobs.models import JobWorker
+from jasil.jobs.models import JobWorker, ProcessingJob
 
 SUBSCRIBER = "invoice.render"
 
@@ -229,6 +230,27 @@ class TestWorkersSummary:
             jasil_admin.get_workers_summary(cursor=cursor)
 
 
+class TestTheWindowEndsAtThePlatformClock:
+    """A platform clock two days ahead puts what was written just now outside a one-day window."""
+
+    @pytest.fixture
+    def ahead(self, tmp_path, session_factory):
+        return jasil_testing.install_test_platform(
+            tmp_path, clock=jasil_testing.FixedClock(moment=datetime.now(UTC) + timedelta(days=2))
+        )
+
+    def test_for_jobs(self, ahead, db):
+        event = new_event("order.created", {}, source="api:create_order")
+        jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=datetime.now(UTC), db=db)
+
+        assert jasil_admin.get_jobs_summary(hours=24).total_jobs == 0
+
+    def test_for_the_event_log(self, ahead, db):
+        event_log_crud.record_published(new_event("order.created", {}, source="api:create_order"), db)
+
+        assert jasil_admin.get_event_log_summary(hours=24).total_events == 0
+
+
 class TestEventLogSummary:
     def test_it_reports_a_recorded_event(self, platform, db):
         event_log_crud.record_published(new_event("order.created", {}, source="api:create_order"), db)
@@ -256,7 +278,7 @@ class TestReplay:
         assert jasil_admin.replay_dead_letter_job(job_id).replayed is True
 
         db.rollback()  # the facade committed on its own session, not this one
-        assert jobs_crud.get_job(job_id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job_id).status == jobs_crud.STATUS_PENDING
 
     def test_replaying_a_job_that_is_not_dead_lettered_reports_false(self, platform, db, now):
         job_id = _dead_letter_job(db, now)

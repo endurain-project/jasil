@@ -2,7 +2,7 @@
 
 Geocoding is the only capability that dials an operator-supplied host, so it is
 the only one carrying an SSRF guard — and the guard is what most of this module
-is about. `build_reverse_endpoint` is the gate: it validates the host *once*, at
+is about. `resolve_reverse_endpoint` is the gate: it validates the host *once*, at
 composition time, and a host it rejects produces no endpoint at all, so the
 backend is never built.
 
@@ -30,7 +30,7 @@ from jasil.backends.geocoding_http import (
     HttpGeocoding,
     NullGeocoding,
     _failure_detail,
-    build_reverse_endpoint,
+    resolve_reverse_endpoint,
 )
 from jasil.providers import GeocodedPlace, GeocodingProvider
 
@@ -66,19 +66,19 @@ class TestEndpointConstruction:
     def test_a_public_host_yields_its_reverse_endpoint(self, resolves_to):
         resolves_to(PUBLIC_IP)
 
-        assert build_reverse_endpoint("nominatim.example.com", use_https=True) == (
+        assert resolve_reverse_endpoint("nominatim.example.com", use_https=True)[0] == (
             "https://nominatim.example.com/reverse"
         )
 
     def test_http_is_available_for_a_self_hosted_instance(self, resolves_to):
         resolves_to(PUBLIC_IP)
 
-        assert build_reverse_endpoint("geo.example.com", use_https=False) == "http://geo.example.com/reverse"
+        assert resolve_reverse_endpoint("geo.example.com", use_https=False)[0] == "http://geo.example.com/reverse"
 
     def test_a_port_is_preserved(self, resolves_to):
         resolves_to(PUBLIC_IP)
 
-        assert build_reverse_endpoint("geo.example.com:8080", use_https=False) == (
+        assert resolve_reverse_endpoint("geo.example.com:8080", use_https=False)[0] == (
             "http://geo.example.com:8080/reverse"
         )
 
@@ -90,7 +90,7 @@ class TestEgressValidation:
         resolves_to(PRIVATE_IP)
 
         with caplog.at_level("WARNING"):
-            assert build_reverse_endpoint("internal.example.com", use_https=True) is None
+            assert resolve_reverse_endpoint("internal.example.com", use_https=True)[0] is None
 
         assert "non-public address" in caplog.text
 
@@ -99,7 +99,7 @@ class TestEgressValidation:
         resolves_to(PRIVATE_IP)
 
         with caplog.at_level("WARNING"):
-            build_reverse_endpoint("internal.example.com", use_https=True)
+            resolve_reverse_endpoint("internal.example.com", use_https=True)[0]
 
         assert "allow-listed" in caplog.text
 
@@ -110,7 +110,7 @@ class TestEgressValidation:
         monkeypatch.setattr(network.socket, "getaddrinfo", _fail)
 
         with caplog.at_level("WARNING"):
-            assert build_reverse_endpoint("nowhere.invalid", use_https=True) is None
+            assert resolve_reverse_endpoint("nowhere.invalid", use_https=True)[0] is None
 
         assert "could not be resolved" in caplog.text
 
@@ -122,35 +122,37 @@ class TestEgressValidation:
         """Otherwise it is interpolated into the URL and redirects the request."""
         resolves_to(PUBLIC_IP)
 
-        assert build_reverse_endpoint(not_an_authority, use_https=True) is None
+        assert resolve_reverse_endpoint(not_an_authority, use_https=True)[0] is None
 
     def test_an_allow_listed_cidr_permits_a_private_instance(self, resolves_to):
         resolves_to(PRIVATE_IP)
 
-        endpoint = build_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.0.0.0/8"])
+        endpoint = resolve_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.0.0.0/8"])[0]
 
         assert endpoint == "http://internal.example.com/reverse"
 
     def test_an_allow_listed_hostname_permits_it_too(self, resolves_to):
         resolves_to(PRIVATE_IP)
 
-        endpoint = build_reverse_endpoint(
+        endpoint = resolve_reverse_endpoint(
             "internal.example.com", use_https=False, allowed_hosts=["internal.example.com"]
-        )
+        )[0]
 
         assert endpoint == "http://internal.example.com/reverse"
 
     def test_an_unrelated_allowlist_entry_does_not_help(self, resolves_to):
         resolves_to(PRIVATE_IP)
 
-        assert build_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.1.0.0/16"]) is None
+        assert (
+            resolve_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.1.0.0/16"])[0] is None
+        )
 
     def test_every_allowlist_hit_is_logged(self, resolves_to, caplog):
         """Operators must be able to review what the exception is being used for."""
         resolves_to(PRIVATE_IP)
 
         with caplog.at_level("INFO"):
-            build_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.0.0.0/8"])
+            resolve_reverse_endpoint("internal.example.com", use_https=False, allowed_hosts=["10.0.0.0/8"])[0]
 
         assert "SSRF allowlist hit" in caplog.text
         assert "reverse_geocoding" in caplog.text

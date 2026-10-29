@@ -9,12 +9,10 @@ tiny interval to prove the real loop renews while a handler is blocked.
 import contextlib
 import logging
 import threading
-import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, update
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import update
 
 import jasil.container as container
 import jasil.jobs._worker_registry as worker_registry
@@ -118,7 +116,7 @@ class TestLeaseRenewal:
             for _ in range(3):
                 clock.advance(50)  # each step is inside the lease; the total is far past it
                 runner.leases.renew()
-                reclaimed.append(runner.reap_once())
+                reclaimed.append(jobs_crud.reclaim_expired_leases(now=clock.now(), db=db))
 
         registry.register("activity.created", "s", handle)
         _enqueue(db, "s")
@@ -134,7 +132,7 @@ class TestLeaseRenewal:
 
         def handle(_event):
             clock.advance(150)
-            reclaimed.append(runner.reap_once())
+            reclaimed.append(jobs_crud.reclaim_expired_leases(now=clock.now(), db=db))
 
         registry.register("activity.created", "s", handle)
         _enqueue(db, "s")
@@ -569,16 +567,7 @@ class TestWorkerHeartbeat:
 class TestTheRealLoop:
     """A handler blocked for many intervals keeps its lease, on real threads."""
 
-    @pytest.fixture
-    def file_database(self, tmp_path, mapped_base):
-        engine = create_engine(f"sqlite:///{tmp_path / 'heartbeat.db'}")
-        mapped_base.metadata.create_all(engine)
-        factory = sessionmaker(bind=engine, expire_on_commit=False)
-        yield factory
-        mapped_base.metadata.drop_all(engine)
-        engine.dispose()
-
-    def test_leases_are_renewed_while_the_handler_is_blocked(self, file_database, monkeypatch):
+    def test_leases_are_renewed_while_the_handler_is_blocked(self, threaded_session_factory, monkeypatch):
         renewals = []
         original = jobs_crud.renew_leases
 
@@ -600,13 +589,13 @@ class TestTheRealLoop:
             assert release.wait(timeout=WAIT_TIMEOUT)
 
         registry.register("activity.created", "s", handle)
-        with file_database() as db:
+        with threaded_session_factory() as db:
             _enqueue(db, "s")
         clock = SystemClock()
         runner = JobRunner(
             registry=registry,
             clock=clock,
-            session_factory=file_database,
+            session_factory=threaded_session_factory,
             worker_id="worker-1",
             lease_seconds=LEASE,
             max_runtime_seconds=CAP,
@@ -615,7 +604,9 @@ class TestTheRealLoop:
             backoff_base_seconds=1,
             backoff_max_seconds=2,
         )
-        telemetry = WorkerTelemetry(instance_id="worker-1", clock=clock, session_factory=file_database, queues=None)
+        telemetry = WorkerTelemetry(
+            instance_id="worker-1", clock=clock, session_factory=threaded_session_factory, queues=None
+        )
         heartbeat = WorkerHeartbeat(leases=runner.leases, interval_seconds=0.01, telemetry=telemetry)
         stop = threading.Event()
         thread = threading.Thread(
@@ -633,28 +624,55 @@ class TestTheRealLoop:
 
         assert not thread.is_alive()
         assert sum(1 for ids in renewals if ids) >= 2, "the running job was renewed more than once"
-        with file_database() as db:
+        with threaded_session_factory() as db:
             assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_COMPLETED
             assert db.get(JobWorker, "worker-1").stopped_at is not None
 
 
 class TestRenewalIsSerialised:
     def test_two_threads_never_renew_at_once(self, monkeypatch):
-        """The heartbeat thread and the runner's before-turn renewal share one keeper."""
+        """The heartbeat thread and the runner's before-turn renewal share one keeper.
+
+        The first renewal holds on until every other thread has either reached the keeper's lock or, were
+        renewals not serialised, entered a renewal of its own; so the overlap is forced, not left to timing.
+        """
+        threads_count = 6
         active = peak = 0
         guard = threading.Lock()
+        arrived: set[int] = set()
+        everyone_arrived = threading.Event()
 
-        def slow_renew(job_attempts, **_kwargs):
+        def arrive():
+            with guard:
+                arrived.add(threading.get_ident())
+                if len(arrived) == threads_count:
+                    everyone_arrived.set()
+
+        class ArrivalLock:
+            """The keeper's lock, noting each thread that reaches it."""
+
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                arrive()
+                return self._lock.__enter__()
+
+            def __exit__(self, *exc_info):
+                return self._lock.__exit__(*exc_info)
+
+        def blocking_renew(job_attempts, **_kwargs):
             nonlocal active, peak
+            arrive()
             with guard:
                 active += 1
                 peak = max(peak, active)
-            time.sleep(0.02)
+            assert everyone_arrived.wait(timeout=WAIT_TIMEOUT)
             with guard:
                 active -= 1
             return set(job_attempts)
 
-        monkeypatch.setattr(jobs_crud, "renew_leases", slow_renew)
+        monkeypatch.setattr(jobs_crud, "renew_leases", blocking_renew)
         keeper = LeaseKeeper(
             session_factory=contextlib.nullcontext,
             clock=FixedClock(moment=T0),
@@ -664,8 +682,9 @@ class TestRenewalIsSerialised:
             interval_seconds=INTERVAL,
         )
         keeper.hold({"a": 1, "b": 1})
+        keeper._lock = ArrivalLock()
 
-        threads = [threading.Thread(target=keeper.renew) for _ in range(6)]
+        threads = [threading.Thread(target=keeper.renew) for _ in range(threads_count)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -691,10 +710,10 @@ class TestReleasingLeases:
 
         assert released == 1
         db.rollback()
-        job = jobs_crud.get_job(claimed["s"].id, db)
+        job = db.get(ProcessingJob, claimed["s"].id)
         assert (job.status, job.attempts, job.locked_by, job.lease_expires_at) == ("pending", 0, None, None)
         assert _naive(job.available_at) == _naive(T0 + timedelta(seconds=5))
-        assert jobs_crud.get_job(claimed["t"].id, db).status == jobs_crud.STATUS_CLAIMED
+        assert db.get(ProcessingJob, claimed["t"].id).status == jobs_crud.STATUS_CLAIMED
 
     def test_a_job_another_worker_holds_is_left_alone(self, db):
         claimed = self._claim(db, "w1", "s")
@@ -703,7 +722,7 @@ class TestReleasingLeases:
 
         assert released == 0
         db.rollback()
-        assert jobs_crud.get_job(claimed["s"].id, db).locked_by == "w1"
+        assert db.get(ProcessingJob, claimed["s"].id).locked_by == "w1"
 
     def test_a_later_claim_of_the_same_job_is_left_alone(self, db):
         """The snapshot's attempt is part of the claim: attempt 2 is not attempt 1's to release."""
@@ -714,7 +733,7 @@ class TestReleasingLeases:
 
         assert released == 0
         db.rollback()
-        assert jobs_crud.get_job(job_id, db).attempts == 1
+        assert db.get(ProcessingJob, job_id).attempts == 1
 
     def test_nothing_to_release_is_a_no_op(self, db):
         assert jobs_crud.release_leases({}, worker_id="w1", now=T0, db=db) == 0
@@ -770,7 +789,7 @@ class TestTheReaperDoesNotRequeueARenewedLease:
 
         assert reclaimed == 0
         db.rollback()
-        kept = jobs_crud.get_job(job.id, db)
+        kept = db.get(ProcessingJob, job.id)
         assert (kept.status, kept.locked_by) == (jobs_crud.STATUS_CLAIMED, "w1")
 
     def test_an_expired_lease_is_still_reclaimed(self, db):
@@ -780,7 +799,7 @@ class TestTheReaperDoesNotRequeueARenewedLease:
         reclaimed = jobs_crud.reclaim_expired_leases(now=T0 + timedelta(seconds=LEASE + 1), db=db)
 
         assert reclaimed == 1
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_PENDING
 
 
 class TestLeaseLostSignal:

@@ -159,17 +159,12 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
         yield
 
 
-def _run_on_connection(connection: Any, command_name: str, *args: Any) -> None:
+def _run(engine: "Engine", command_name: str, *args: Any) -> None:
     _require_alembic()
     from alembic import command
 
-    config = _config(connection)
-    getattr(command, command_name)(config, *args)
-
-
-def _run(engine: "Engine", command_name: str, *args: Any) -> None:
     with engine.connect() as connection:
-        _run_on_connection(connection, command_name, *args)
+        getattr(command, command_name)(_config(connection), *args)
 
 
 def _fresh_install_prefix(connection: Any, revision: str) -> str:
@@ -642,7 +637,9 @@ def adopt_existing_schema(engine: "Engine") -> bool:
         else:
             return False
 
-        closest: tuple[str, list[str], int] | None = None
+        # (weight, revision, differences) per candidate revision, newest first. One always qualifies: the head
+        # for prefixed tables, the revisions before the prefix rename for unprefixed ones.
+        mismatches: list[tuple[int, str, list[str]]] = []
         for revision, metadata in _revision_schemas():
             if not set(metadata.tables) <= candidate_names:
                 continue
@@ -651,13 +648,12 @@ def adopt_existing_schema(engine: "Engine") -> bool:
                 command.stamp(_config(connection), revision)
                 connection.commit()
                 return True
-            if closest is None or weight < closest[2]:
-                closest = (revision, differences, weight)
+            mismatches.append((weight, revision, differences))
 
-        if closest is None:
-            raise RuntimeError("JASIL has no packaged migration head")
+        # ``min`` keeps the first of equal weights: the newest revision.
+        _, closest, differences = min(mismatches, key=lambda mismatch: mismatch[0])
         raise SchemaCompatibilityError(
-            f"Cannot adopt an incompatible JASIL schema (closest revision {closest[0]}): " + "; ".join(closest[1])
+            f"Cannot adopt an incompatible JASIL schema (closest revision {closest}): " + "; ".join(differences)
         )
 
 

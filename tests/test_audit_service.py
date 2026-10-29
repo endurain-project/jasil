@@ -364,6 +364,7 @@ class TestFailOpen:
             jasil_audit.record_detached("nope.nope.nope", outcome=Outcome.FAILURE)
 
         assert jasil_audit.get_audit_health()["write_failures"] == 1
+        assert jasil_audit.get_audit_health()["last_failure_at"] == audit_env.clock.now()
         assert "nope.nope.nope" in caplog.text
 
     def test_a_storage_error_logs_the_type_never_the_statement_parameters(

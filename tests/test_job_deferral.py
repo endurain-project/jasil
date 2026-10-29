@@ -379,7 +379,7 @@ class TestDeferralAccounting:
             clock.advance(1000)
 
         db.rollback()
-        (dead,) = jobs_crud.get_jobs_summary(db).recent_dead_letter
+        (dead,) = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1)).recent_dead_letter
         assert (dead.attempts, dead.deferrals, dead.max_attempts) == (2, 1, 1)
 
     def test_a_dead_letter_callback_event_carries_the_budget_counts(self, registry, clock, session_factory, db):

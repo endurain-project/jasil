@@ -23,7 +23,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, and_, func, insert, or_, select, update
@@ -884,7 +884,8 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     Return jobs whose lease expired (a crashed worker) to a runnable state.
 
     Exhausted rows (``attempts - deferrals >= max_attempts``) are dead-lettered; the rest are
-    made ``pending`` and immediately available again.
+    made ``pending`` and immediately available again. Their ``on_dead_letter`` callbacks are owed
+    to the scheduled sweep.
 
     Args:
         now: Current instant.
@@ -893,24 +894,6 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
 
     Returns:
         The number of jobs this call reclaimed (requeued plus dead-lettered).
-    """
-    return reclaim_expired_leases_detailed(now=now, db=db, limit=limit)[0]
-
-
-def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 100) -> tuple[int, list[str]]:
-    """
-    Reclaim expired leases like :func:`reclaim_expired_leases`, and say which died.
-
-    Args:
-        now: Current instant.
-        db: Active database session.
-        limit: Maximum number of expired leases to reclaim in one pass.
-
-    Returns:
-        ``(reclaimed, dead_lettered_ids)``: the number of jobs reclaimed, and the
-        ids among the selected ones that are ``dead_letter`` after the pass (a
-        concurrent reaper's may be included; delivery claims each job with a
-        compare-and-set, so only one process runs its callback).
     """
     id_stmt = (
         select(ProcessingJob.id)
@@ -922,7 +905,7 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
     job_ids = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()
-        return 0, []
+        return 0
     # Both updates re-assert ``status = 'claimed'`` *and* the expiry. Without SKIP
     # LOCKED two reapers can select the same rows, and the loser must not
     # overwrite the requeue the winner already performed; and a worker's heartbeat
@@ -991,21 +974,8 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
         .values(outcome=OUTCOME_LEASE_EXPIRED, finished_at=now)
         .execution_options(synchronize_session=False)
     )
-    dead_ids = (
-        list(
-            db.execute(
-                select(ProcessingJob.id).where(
-                    ProcessingJob.id.in_(job_ids), ProcessingJob.status == STATUS_DEAD_LETTER
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if dead_lettered.rowcount
-        else []
-    )
     db.commit()
-    return dead_lettered.rowcount + requeued.rowcount, dead_ids
+    return dead_lettered.rowcount + requeued.rowcount
 
 
 def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
@@ -1035,23 +1005,10 @@ def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
     return {str(worker): int(count) for worker, count in rows}
 
 
-def get_job(job_id: str, db: Session) -> ProcessingJob | None:
-    """
-    Fetch a job by id.
-
-    Args:
-        job_id: The job identifier.
-        db: Active database session.
-
-    Returns:
-        The job, or ``None`` when it does not exist.
-    """
-    return db.get(ProcessingJob, job_id)
-
-
 def get_jobs_summary(
     db: Session,
     *,
+    now: datetime,
     hours: int = 24,
     dead_letter_limit: int = 50,
     record_attempts: bool = True,
@@ -1061,6 +1018,7 @@ def get_jobs_summary(
 
     Args:
         db: Active database session.
+        now: The instant the window ends at and ages are measured from.
         hours: Look-back window for the status/subscriber counts.
         dead_letter_limit: Maximum dead-letter jobs to return for inspection.
         record_attempts: Whether attempts are being recorded. When ``False`` the
@@ -1072,7 +1030,6 @@ def get_jobs_summary(
         The durable-jobs summary — window counts, per-subscriber breakdown,
         oldest pending age, and the current dead-letter queue.
     """
-    now = datetime.now(UTC)
     window_start = now - timedelta(hours=hours)
     rows = db.execute(
         select(ProcessingJob.subscriber_id, ProcessingJob.event_type, ProcessingJob.status, func.count())

@@ -5,6 +5,7 @@ import pytest
 from jasil.capabilities import (
     StateSource,
     build_capability_report,
+    check_audit_sink_consistency,
     check_deployment_consistency,
     check_job_worker_consistency,
     check_lock_consistency,
@@ -22,7 +23,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import GeocodingSettings, JasilSettings, JobSettings, MailSettings, RuntimeSources
+from jasil.settings import AuditSettings, GeocodingSettings, JasilSettings, JobSettings, MailSettings, RuntimeSources
 
 LOCAL = DeploymentProfile.LOCAL
 DISTRIBUTED = DeploymentProfile.DISTRIBUTED
@@ -584,6 +585,40 @@ class TestRulesTakeATopology:
         issues = check_storage_consistency(topology=topology, storage_uri="LOCAL://", storage_label="storage_uri")
 
         assert bool(issues) is refused
+
+    @pytest.mark.parametrize(
+        ("topology", "refused"),
+        [
+            pytest.param(_topology(), False, id="single-process"),
+            pytest.param(_topology(web_workers=4), False, id="several-processes-share-a-disk"),
+            pytest.param(_topology(DISTRIBUTED), True, id="separate-nodes"),
+        ],
+    )
+    def test_a_file_audit_sink_follows_multi_node(self, topology, refused):
+        issues = check_audit_sink_consistency(
+            topology=topology, sink_uri="FILE:///var/audit", sink_label="audit.external_sink_uri"
+        )
+
+        assert bool(issues) is refused
+        assert all("audit.external_sink_uri" in issue for issue in issues)
+
+    @pytest.mark.parametrize("uri", [None, "s3://audit-bucket/prefix"])
+    def test_no_sink_or_an_object_store_sink_is_valid_on_separate_nodes(self, uri):
+        assert check_audit_sink_consistency(topology=_topology(DISTRIBUTED), sink_uri=uri, sink_label="s") == []
+
+    def test_the_deployment_check_judges_the_sink_only_while_auditing_is_on(self):
+        def distributed(enabled):
+            return JasilSettings(
+                profile=DISTRIBUTED,
+                state_uri="redis://cache/0",
+                events_uri="redis://cache/1",
+                storage_uri="s3://bucket",
+                lock_uri="postgres-advisory://",
+                audit=AuditSettings(enabled=enabled, external_sink_uri="file:///var/audit"),
+            )
+
+        assert any("audit.external_sink_uri" in issue for issue in check_deployment_consistency(distributed(True)))
+        assert check_deployment_consistency(distributed(False)) == []
 
     @pytest.mark.parametrize(
         ("topology", "refused"),

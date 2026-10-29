@@ -36,20 +36,24 @@ class MemoryState:
         return value
 
     def get(self, key: str) -> bytes | None:
+        """Return the value under ``key``, or ``None`` when absent or expired."""
         with self._lock:
             return self._live_value(key)
 
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
+        """Store ``value`` under ``key``, expiring after ``ttl_seconds`` when given."""
         _check_ttl(ttl_seconds)
         with self._lock:
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._data[key] = (value, expiry)
 
     def delete(self, key: str) -> None:
+        """Delete ``key`` if present."""
         with self._lock:
             self._data.pop(key, None)
 
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
+        """Add ``amount`` to the stored integer; keep the existing expiry unless ``ttl_seconds`` is given."""
         _check_ttl(ttl_seconds)
         with self._lock:
             current_bytes = self._live_value(key)
@@ -65,6 +69,7 @@ class MemoryState:
             return new_value
 
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
+        """Store ``value`` only when no unexpired value exists; return True when stored."""
         _check_ttl(ttl_seconds)
         with self._lock:
             if self._live_value(key) is not None:
@@ -74,6 +79,7 @@ class MemoryState:
             return True
 
     def get_and_delete(self, key: str) -> bytes | None:
+        """Return the unexpired value under ``key`` and delete it."""
         with self._lock:
             value = self._live_value(key)
             if value is not None:
@@ -81,6 +87,7 @@ class MemoryState:
             return value
 
     def delete_prefix(self, prefix: str) -> int:
+        """Delete every key starting with ``prefix``; ``prefix`` must not be empty."""
         _check_prefix(prefix)
         with self._lock:
             matching = [key for key in self._data if key.startswith(prefix)]
@@ -89,6 +96,7 @@ class MemoryState:
             return len(matching)
 
     def iter_keys(self, prefix: str) -> Iterator[str]:
+        """Return an iterator over a snapshot of the unexpired keys starting with ``prefix``."""
         with self._lock:
             # Snapshot live matching keys under the lock; ``list(self._data)`` guards
             # against the eviction that ``_live_value`` performs while scanning.
@@ -104,6 +112,7 @@ class MemoryState:
         tiers: tuple[tuple[int, int], ...],
         counter_ttl_seconds: int,
     ) -> TieredFailureOutcome:
+        """Count one occurrence and close the gate, atomically under the instance lock."""
         now = int(time.time())
         with self._lock:
             # Already locked: return the current count without incrementing, so a

@@ -90,16 +90,20 @@ def get_jobs_summary(*, hours: int = 24, dead_letter_limit: int = 50) -> JobsSum
 
     Returns:
         Window counts, the per-subscriber breakdown, the age of the oldest
-        unfinished job, and the current dead-letter queue.
+        unfinished job, and the current dead-letter queue. The window ends at
+        the platform clock's instant.
 
     Raises:
-        RuntimeError: When ``jasil.orm.configure_sessionmaker`` has not run.
+        RuntimeError: When no platform has been published, or when
+            ``jasil.orm.configure_sessionmaker`` has not run.
     """
     import jasil.jobs.crud as jobs_crud
 
+    now = platform_runtime.get_active_platform().clock.now()
     with jasil_orm.get_sessionmaker()() as db:
         return jobs_crud.get_jobs_summary(
             db,
+            now=now,
             hours=hours,
             dead_letter_limit=dead_letter_limit,
             record_attempts=get_settings().jobs.record_attempts,
@@ -115,15 +119,18 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
 
     Returns:
         Per-event-type statistics, the not-yet-finished groups and their oldest
-        age, and the most recent failures.
+        age, and the most recent failures. The window ends at the platform
+        clock's instant.
 
     Raises:
-        RuntimeError: When ``jasil.orm.configure_sessionmaker`` has not run.
+        RuntimeError: When no platform has been published, or when
+            ``jasil.orm.configure_sessionmaker`` has not run.
     """
     import jasil.event_log.crud as event_log_crud
 
+    now = platform_runtime.get_active_platform().clock.now()
     with jasil_orm.get_sessionmaker()() as db:
-        return event_log_crud.get_event_log_summary(db, hours=hours, failure_limit=failure_limit)
+        return event_log_crud.get_event_log_summary(db, now=now, hours=hours, failure_limit=failure_limit)
 
 
 def get_workers_summary(

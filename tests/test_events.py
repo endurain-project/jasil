@@ -2,7 +2,7 @@
 
 import dataclasses
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import ClassVar
 
 import pytest
@@ -50,6 +50,18 @@ class TestNewEvent:
 
         assert parsed.tzinfo is not None
         assert parsed.utcoffset().total_seconds() == 0
+
+    def test_a_given_instant_is_the_timestamp_in_utc(self):
+        moment = datetime(2026, 1, 1, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+
+        event = new_event("activity.created", {}, source="test", now=moment)
+
+        assert event.timestamp == "2026-01-01T12:00:00+00:00"
+
+    def test_a_naive_instant_is_taken_as_utc(self):
+        event = new_event("activity.created", {}, source="test", now=datetime(2026, 1, 1, 12, 0))
+
+        assert event.timestamp == datetime(2026, 1, 1, 12, 0, tzinfo=UTC).isoformat()
 
     def test_metadata_defaults_to_an_empty_dict(self):
         event = new_event("activity.created", {}, source="test")

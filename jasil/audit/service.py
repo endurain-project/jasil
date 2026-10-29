@@ -226,7 +226,7 @@ def _note_failure() -> None:
     global _write_failures, _last_failure_at
     with _health_lock:
         _write_failures += 1
-        _last_failure_at = datetime.now(UTC)
+        _last_failure_at = now()
 
 
 def get_audit_health() -> AuditHealth:

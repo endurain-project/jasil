@@ -34,15 +34,29 @@ class ExactSizeReader:
         return self._size
 
     def readable(self) -> bool:
+        """Return True: the reader supports reading."""
         return True
 
     def seekable(self) -> bool:
+        """Return False: the source is read once, front to back."""
         return False
 
     def tell(self) -> int:
+        """Return the number of bytes read so far."""
         return self._size - self._remaining
 
     def read(self, size: int = -1) -> bytes:
+        """Read up to ``size`` bytes of the declared size from the source.
+
+        Args:
+            size: The most bytes to return; negative reads everything that remains.
+
+        Returns:
+            The bytes read, or ``b""`` once the declared size is consumed and the source is confirmed at end of file.
+
+        Raises:
+            ValueError: When the source ends before, or holds more than, the declared size.
+        """
         if self._remaining == 0:
             self.verify_complete()
             return b""

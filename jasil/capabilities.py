@@ -28,6 +28,10 @@ Five consistency rules are enforced:
   separate nodes with no shared disk. Several processes of a *local* deployment
   share one host disk, so local storage stays valid there. Validated by
   :func:`check_storage_consistency`.
+- **The audit sink** must not resolve to a local directory (``file://``) when the
+  topology is multi-node: whichever node runs maintenance would write that day's
+  checkpoint copies to its own disk, scattering them. Validated by
+  :func:`check_audit_sink_consistency`.
 - **The coordination lock** must not resolve to the in-process ``noop`` lock
   when the topology is multi-process, or every process would run every scheduled
   job. Validated by :func:`check_lock_consistency`.
@@ -41,7 +45,7 @@ Five consistency rules are enforced:
 The *clock* is always the system clock, so its default is never a fatal choice
 here.
 
-:func:`check_deployment_consistency` applies all five to a
+:func:`check_deployment_consistency` applies all six to a
 :class:`~jasil.settings.JasilSettings`, and ``jasil.container.build_platform``
 calls it at startup: an inconsistency raises unless the host sets
 ``enforce_deployment_consistency=False``, which downgrades it to a warning.
@@ -242,7 +246,7 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
     """Return every fatal wiring inconsistency in ``settings`` (empty when sound).
 
     The entry point ``build_platform`` uses: it resolves the capability URIs the
-    profile would actually build from, then applies all five rules to them.
+    profile would actually build from, then applies all six rules to them.
 
     Args:
         settings: The configuration the platform is being built from.
@@ -272,6 +276,12 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
             topology=topology,
             storage_uri=settings.resolved_storage_uri,
             storage_label="storage_uri",
+        ),
+        *check_audit_sink_consistency(
+            topology=topology,
+            # Disabled, auditing builds no sink, so there is nothing to judge.
+            sink_uri=settings.audit.external_sink_uri if settings.audit.enabled else None,
+            sink_label="audit.external_sink_uri",
         ),
         *check_lock_consistency(
             topology=topology,
@@ -360,6 +370,38 @@ def check_storage_consistency(
         f"{storage_label} resolves to the local filesystem, but "
         f"profile={topology.profile.value} runs replicas on separate nodes that do "
         f"not share a disk. Point it at object storage (s3://bucket/...)."
+    ]
+
+
+def check_audit_sink_consistency(
+    *,
+    topology: DeploymentTopology,
+    sink_uri: str | None,
+    sink_label: str,
+) -> list[str]:
+    """Return a fatal issue when a multi-node deployment copies audit checkpoints to local disk.
+
+    Under the ``distributed`` profile replicas run on separate nodes that do not
+    share a filesystem, and audit maintenance runs on whichever node takes the
+    lock, so a ``file://`` sink would leave each checkpoint copy on a different
+    node's disk. No sink, or an object-store sink, is not flagged.
+
+    Args:
+        topology: The deployment topology.
+        sink_uri: The audit external sink URI, or ``None`` when no sink is built.
+        sink_label: The setting backing the sink (for the message).
+
+    Returns:
+        A single-item issue list when misconfigured; empty otherwise.
+    """
+    if not topology.multi_node or not sink_uri:
+        return []
+    if sink_uri.partition("://")[0].strip().lower() != "file":
+        return []
+    return [
+        f"{sink_label} resolves to a local directory, but profile={topology.profile.value} runs replicas on "
+        f"separate nodes that do not share a disk, so checkpoint copies would scatter across them. Point it at "
+        f"object storage (s3://bucket/prefix)."
     ]
 
 

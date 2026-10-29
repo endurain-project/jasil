@@ -21,7 +21,7 @@ event = new_event(
 | `event_id` | UUIDv4, stable across retries — also the deduplication key. |
 | `event_type` | Dot-notation channel, owned by the publishing domain. |
 | `source` | Where it originated. |
-| `timestamp` | ISO-8601 UTC, of the first publish. |
+| `timestamp` | ISO-8601 UTC, of the first publish. The publish functions stamp the platform clock's instant; `new_event` takes it as `now` and uses the system clock without one. |
 | `payload` | Domain data, homogeneous per `event_type`. |
 | `metadata` | Correlation context. |
 | `schema_version` | Which version of the payload's shape this carries. |

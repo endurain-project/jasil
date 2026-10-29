@@ -522,6 +522,7 @@ class LocalStorage:
         return ordered, total
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
+        """Write ``data`` to a temporary file and move it over the object; ``content_type`` is ignored."""
         path = self._prepare_object(area, key)
         self._write_object_bytes(area, path, data)
         if area in self._plain_areas:
@@ -539,6 +540,7 @@ class LocalStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int:
+        """Stream ``source`` into a temporary file and move it into place; ``content_type`` is ignored."""
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Storage stream max_bytes must not be negative")
         path = self._prepare_object(area, key)
@@ -594,6 +596,7 @@ class LocalStorage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> UploadSession:
+        """Create the session directory and manifest in the upload staging root, recording ``content_type``."""
         if area in self._plain_areas:
             path = self._resolve_plain(area, key)
             self._check_plain_key_conflicts(area, key, path)
@@ -647,6 +650,7 @@ class LocalStorage:
         *,
         size: int,
     ) -> PartRef:
+        """Stage the part as a file in the session directory; the validator is a quoted SHA-256 of its bytes."""
         self._validate_upload_session(session)
         self._validate_part_number(session, part_number)
         reader = ExactSizeReader(source, size)
@@ -694,6 +698,10 @@ class LocalStorage:
         )
 
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
+        """Concatenate the staged parts into the object, checking each part's size and SHA-256.
+
+        The session is removed once the object is in place.
+        """
         session_directory = self._load_upload_session(session)
         ordered, total = self._validate_completion_parts(session, parts)
         uploaded = self._uploaded_parts(session_directory)
@@ -748,6 +756,7 @@ class LocalStorage:
         return total
 
     def abort_upload(self, session: UploadSession) -> None:
+        """Remove the session directory; return silently when it does not exist."""
         session_directory = self._validate_upload_session(session)
         if not session_directory.exists():
             return
@@ -758,6 +767,15 @@ class LocalStorage:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     def cleanup_uploads(self, *, older_than_epoch: float) -> int:
+        """Remove session directories and orphaned temporary files whose modification time is before the cutoff.
+
+        Returns:
+            The number of session directories removed.
+
+        Raises:
+            ValueError: When ``older_than_epoch`` is not finite.
+            StorageBackendUnavailableError: After the pass, when any entry could not be removed.
+        """
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
         upload_root = self._upload_root()
@@ -800,6 +818,7 @@ class LocalStorage:
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
+        """Return the object bytes read through :meth:`open_stream`, or ``None`` when it does not exist."""
         try:
             stream = self.open_stream(area, key)
         except FileNotFoundError:
@@ -815,6 +834,7 @@ class LocalStorage:
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO:
+        """Open the object file, seek to ``offset`` and return a non-seekable reader limited to ``length`` bytes."""
         validate_stream_range(offset, length)
         path = self._existing_object_path(area, key)
         if path is None:
@@ -833,6 +853,7 @@ class LocalStorage:
         return non_seekable_reader(source, length=length, translate_error=_translate_local_stream_error)
 
     def stat(self, area: str, key: str) -> ObjectStat | None:
+        """Return the file size and modification time; ``content_type`` and ``etag`` are always ``None``."""
         path = self._existing_object_path(area, key)
         if path is None:
             return None
@@ -855,6 +876,11 @@ class LocalStorage:
         content_type: str | None = None,
         expires_in: int = _DEFAULT_URL_EXPIRY_SECONDS,
     ) -> ServeFile:
+        """Return a :class:`ServeFile` for the object's path after checking the file can be opened.
+
+        ``download_as``, ``content_type`` and a non-default ``expires_in`` cannot be enforced; the first such call
+        logs a warning.
+        """
         path = self._existing_object_path(area, key)
         if path is None:
             raise FileNotFoundError(f"Storage object not found: {area}/{key}")
@@ -873,9 +899,11 @@ class LocalStorage:
         return ServeFile(path)
 
     def exists(self, area: str, key: str) -> bool:
+        """Return True when the object resolves to an existing file."""
         return self._existing_object_path(area, key) is not None
 
     def delete(self, area: str, key: str) -> None:
+        """Delete the object file and prune the directories it leaves empty; a missing object is ignored."""
         if area in self._plain_areas:
             plain_path = self._resolve_plain(area, key)
             try:
@@ -910,6 +938,7 @@ class LocalStorage:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     def delete_prefix(self, area: str, prefix: str) -> int:
+        """Delete the object at ``prefix`` and every object under ``prefix/``, one at a time."""
         check_area(area)
         check_segment(prefix, "prefix")
         if area in self._plain_areas:
@@ -923,6 +952,7 @@ class LocalStorage:
         return len(keys)
 
     def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
+        """Stream the source object into the destination through :meth:`save_stream`."""
         check_area(src_area)
         check_segment(src_key, "source key")
         check_area(dst_area)
@@ -941,6 +971,7 @@ class LocalStorage:
             self.save_stream(dst_area, dst_key, source)
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
+        """Return the keys from :meth:`iter_objects`, sorted."""
         return sorted(key for key, _ in self.iter_objects(area, prefix))
 
     def _iter_opaque_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
@@ -984,6 +1015,10 @@ class LocalStorage:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
+        """Lazily yield ``(key, modified_epoch)`` from the plain, opaque and, when enabled, legacy layouts.
+
+        Each key is yielded once; temporary files and symlinks that leave the area are skipped.
+        """
         check_area(area)
         if prefix:
             check_listing_prefix(prefix)
@@ -1060,6 +1095,7 @@ class LocalStorage:
         return objects()
 
     def check_writable(self) -> None:
+        """Create and discard a temporary file in the base directory."""
         try:
             base = self._base.resolve(strict=True)
             if not base.is_dir():
@@ -1105,6 +1141,11 @@ class LocalStorage:
         download_as: str | None = None,
         content_type: str | None = None,
     ) -> str:
+        """Return the configured URL prefix joined with the object's path relative to the base directory.
+
+        The path is built whether or not the object exists. ``expires_in``, ``download_as`` and ``content_type``
+        cannot be enforced; the first non-default value logs a warning.
+        """
         check_area(area)
         check_segment(key, "key")
         self._warn_ignored_delivery_controls(

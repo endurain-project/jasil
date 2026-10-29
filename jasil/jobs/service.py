@@ -15,8 +15,6 @@ import uuid
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
@@ -29,6 +27,8 @@ from jasil.settings import get_settings
 # ``import jasil.jobs.service`` fail until ``jasil.orm.map_models`` had run. Each
 # function imports what it needs instead.
 if TYPE_CHECKING:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
     from jasil.jobs.runner import JobRunner
     from jasil.jobs.worker import BackgroundWorker, WorkerHeartbeat
 
@@ -265,7 +265,7 @@ def relay_outbox_scheduled() -> None:
 
 
 def reap_expired_jobs_scheduled() -> None:
-    """Requeue or dead-letter jobs with expired leases, then run owed dead-letter callbacks.
+    """Requeue or dead-letter jobs with expired leases; the dead-letter sweep runs their callbacks.
 
     Runs on every replica; ``reclaim_expired_leases`` combines ``FOR UPDATE SKIP
     LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
@@ -280,7 +280,7 @@ def reap_expired_jobs_scheduled() -> None:
         # Read before reclaiming, which clears the holder: a crash should name the
         # worker, not just say that one happened.
         holders = jobs_crud.expired_lease_holders(now=now, db=db)
-        reclaimed, _ = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
+        reclaimed = jobs_crud.reclaim_expired_leases(now=now, db=db)
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.
@@ -312,7 +312,7 @@ def deliver_dead_letters_scheduled() -> None:
         logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
 
 
-def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:
+def schedule_job_maintenance(scheduler: "AsyncIOScheduler") -> None:
     """
     Register the recurring relay and reaper jobs on the scheduler.
 

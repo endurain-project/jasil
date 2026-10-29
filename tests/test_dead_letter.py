@@ -109,6 +109,14 @@ def sweep(runner) -> int:
     return deliver_dead_letters(registry=runner._registry, session_factory=runner._session_factory, clock=runner._clock)
 
 
+def reap_and_sweep(runner) -> int:
+    """Run the scheduled reaper, then the scheduled delivery, as production does; return the reaped count."""
+    with runner._session_factory() as db:
+        reclaimed = jobs_crud.reclaim_expired_leases(now=runner._clock.now(), db=db)
+    sweep(runner)
+    return reclaimed
+
+
 class TestAttemptCounts:
     def test_a_durable_handler_sees_a_one_based_attempt_and_the_ceiling(self, runner, registry, clock, db):
         seen = []
@@ -241,7 +249,7 @@ class TestHandlerException:
         runner.run_once()
         clock.advance(CLAIM_LEASE_SECONDS * 2)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert len(calls) == 1
 
@@ -267,7 +275,7 @@ class TestLeaseExpiry:
         jobs_crud.claim_jobs(worker_id="dead-worker", limit=10, lease_seconds=LEASE, now=T0, db=db)
         clock.advance(LEASE + 1)
 
-        assert runner.reap_once() == 1
+        assert reap_and_sweep(runner) == 1
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
@@ -281,7 +289,7 @@ class TestLeaseExpiry:
         jobs_crud.claim_jobs(worker_id="dead-worker", limit=10, lease_seconds=LEASE, now=T0, db=db)
         clock.advance(LEASE + 1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert calls == []
         assert stored_job(db).status == jobs_crud.STATUS_PENDING
@@ -338,7 +346,7 @@ class TestReaperRecovery:
         assert calls == []
         clock.advance(1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert [error for _e, error in calls] == ["boom"]
         assert stored_job(db).dead_letter_notified_at is not None
@@ -355,11 +363,11 @@ class TestReaperRecovery:
             )
         assert len(claimed) == 1
 
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert calls == []
 
         clock.advance(CLAIM_LEASE_SECONDS + 1)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(calls) == 1
 
     def test_only_one_of_two_claimers_wins(self, runner, registry, clock, db, calls):
@@ -392,7 +400,7 @@ class TestReaperRecovery:
         self._crash_after_commit(db, clock, runner)
         clock.advance(1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert stored_job(db).dead_letter_notified_at is None
         received = []
@@ -434,19 +442,19 @@ class TestCallbackRaising:
         assert len(failing) == 1
 
         clock.advance(RETRY_BASE_SECONDS - 1)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 1
 
         clock.advance(2)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 2
 
         clock.advance(RETRY_BASE_SECONDS + 1)  # the second wait is twice as long
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 2
 
         clock.advance(RETRY_BASE_SECONDS)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 3
 
     def test_the_failure_is_stored_and_the_dead_letter_time_is_kept(self, runner, clock, db, failing):
@@ -456,7 +464,7 @@ class TestCallbackRaising:
         dead_at = stored_job(db).updated_at
         clock.advance(RETRY_BASE_SECONDS + 1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         job = stored_job(db)
         assert job.updated_at == dead_at
@@ -533,7 +541,7 @@ class TestReplay:
         assert replayed.dead_letter_notified_at is None
         assert replayed.status == jobs_crud.STATUS_PENDING
         clock.advance(CLAIM_LEASE_SECONDS * 2)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(calls) == 1  # replaying does not call it
 
         runner.run_once()
@@ -549,7 +557,7 @@ class TestNoCallback:
 
         assert runner.run_once() == 1
         clock.advance(CLAIM_LEASE_SECONDS * 2)
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER

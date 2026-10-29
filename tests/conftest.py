@@ -16,11 +16,10 @@ import os
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
-import jasil.audit as jasil_audit
-import jasil.correlation as correlation
 import jasil.orm as orm
-import jasil.settings as settings
+import jasil.testing as jasil_testing
 
 #: In-memory SQLite by default; the CI matrix overrides it per database.
 TEST_DATABASE_URL = os.environ.get("JASIL_TEST_DATABASE_URL", "sqlite://")
@@ -47,15 +46,15 @@ def _no_cloud_metadata():
 
 @pytest.fixture(autouse=True)
 def _reset_process_state():
-    """Clear the process-wide config slots so tests cannot leak into each other.
+    """Clear every process-wide slot so tests cannot leak into each other.
 
+    The settings, correlation provider, audit state, published platform, durable
+    subscriber registry and shared Redis clients (:func:`jasil.testing.reset_all`).
     ``jasil.orm``'s declarative base is deliberately *not* reset: model modules
     capture it at import time, so the mapping has to survive the whole session.
     """
     yield
-    settings.reset()
-    correlation.reset()
-    jasil_audit.reset()
+    jasil_testing.reset_all()
 
 
 @pytest.fixture(scope="session")
@@ -98,6 +97,31 @@ def db(session_factory):
     """An open session against the test database."""
     with session_factory() as session:
         yield session
+
+
+@pytest.fixture
+def threaded_session_factory(mapped_base, database_url):
+    """A session factory for sessions on several threads at once, empty at the start of the test.
+
+    In-memory SQLite gives each thread its own empty database by default, so on SQLite every thread shares one
+    connection to a single in-memory database, which a session holds alone until it closes: the others wait
+    for it, as they would for SQLite's write lock. On a real server it is the suite's database.
+    """
+    if database_url == "sqlite://":
+        engine = create_engine(
+            database_url,
+            poolclass=QueuePool,
+            pool_size=1,
+            max_overflow=0,
+            connect_args={"check_same_thread": False},
+        )
+    else:
+        engine = create_engine(database_url)
+    mapped_base.metadata.drop_all(engine)
+    mapped_base.metadata.create_all(engine)
+    yield sessionmaker(bind=engine, expire_on_commit=False)
+    mapped_base.metadata.drop_all(engine)
+    engine.dispose()
 
 
 class AuditEnv:

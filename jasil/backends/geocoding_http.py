@@ -354,7 +354,9 @@ def _watch(deadline: _Deadline, finished: threading.Event) -> None:
         deadline.expire()
 
 
-def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()) -> str | None:
+def resolve_reverse_endpoint(
+    host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()
+) -> tuple[str | None, str | None]:
     """Validate an operator-configured host and build its reverse endpoint URL.
 
     Args:
@@ -362,18 +364,6 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
         use_https: Whether to address the host over HTTPS.
         allowed_hosts: Hostnames and CIDRs exempt from the SSRF address denylist,
             so a self-hosted instance on a private network stays reachable.
-
-    Returns:
-        The ``{scheme}://{host}/reverse`` URL, or ``None`` when the host failed
-        SSRF validation (the reason is logged).
-    """
-    return resolve_reverse_endpoint(host, use_https=use_https, allowed_hosts=allowed_hosts)[0]
-
-
-def resolve_reverse_endpoint(
-    host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()
-) -> tuple[str | None, str | None]:
-    """Like :func:`build_reverse_endpoint`, but also return why a host was refused.
 
     Returns:
         ``(url, None)`` for an accepted host, else ``(None, reason)``. The reason

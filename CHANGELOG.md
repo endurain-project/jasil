@@ -16,6 +16,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 4. Check your `JobSettings`: every field is validated when the object is built (see **Changed**), so a value the pipeline cannot honour now raises where you configure JASIL instead of when a worker starts, or not at all.
 5. Register `on_dead_letter` callbacks in the process that runs `schedule_job_maintenance`: the scheduled sweep is now the only thing that calls them.
 6. Storage areas, keys and prefixes with a control character or longer than 1024 UTF-8 bytes are refused, and an S3 `url` / `serve` with `expires_in` outside 1 second to 7 days raises `ValueError`.
+7. Under the `distributed` profile, point `audit.external_sink_uri` at `s3://`: a `file://` sink is refused there.
+8. Publish a platform before calling `jasil.admin.get_jobs_summary` or `get_event_log_summary`; both now measure their window from its clock.
 
 ### Added
 
@@ -26,6 +28,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 - **Maintenance.** `run_audit_maintenance()` and `schedule_audit_maintenance(scheduler, run_at_startup=True)`: retention-change record, partitions, checkpoints, retention, each step isolated, under its own lock. Scheduled by the host, like `jasil.retention`. It never syncs the catalog, so it can run in a process that registers only JASIL's own actions; `sync_catalog()` is called at startup by the application that registers every action.
 - **Tamper evidence.** Signed (Ed25519), hash-chained checkpoints over fixed windows with a grace period, stored in `jasil_audit_checkpoints` and optionally copied to a write-once external sink: `AuditSink` (`write_once`, `read`) / `AuditSinkConflictError` in `jasil.providers`, `Platform.audit_sink`, and the `file://` and `s3://` backends selected by `audit.external_sink_uri`. The `s3://` sink writes each checkpoint with a conditional `PutObject` (`If-None-Match: *`), so a bucket policy can deny every overwrite; a store without conditional writes fails every seal. `audit.legal_hold` binds JASIL's maintenance; the database function enforces only the retention floor (see [Retention](docs/audit.md#retention) for a hold the database enforces). Each checkpoint signs the `retention_days` and `legal_hold` in force when it was sealed: verification excuses an emptied window only where a checkpoint's signed retention covers it, and retention never prunes past what the newest sealed checkpoint allows (so never a row that was not sealed). A seal retried after a crash between the sink and the database write stores the copy the sink already holds, even when `retention_days` or `legal_hold` changed in between. New optional extra `jasil[audit]` (`cryptography`); unsigned, hash-chained checkpoints need nothing.
 - `AuditSettings` (`JasilSettings.audit`): `enabled`, `retention_days` (90), `retention_floor_days` (30), `legal_hold`, `partition_days_ahead` (7), `checkpoint_window_minutes` (15), `checkpoint_grace_minutes` (5), `signing_key`, `external_sink_uri`, `max_details_bytes` (4096), `app_name`, `app_version`. Numeric values are validated when the object is built; `retention_days` and `retention_floor_days` are at most 36500.
+- `jasil.capabilities.check_audit_sink_consistency`, applied by `check_deployment_consistency`.
+- `new_event` takes `now`, the instant to stamp; the publish functions pass the platform clock's.
 - `grants_sql(runtime_role, reader_role, *, maintenance_role=None, schema=None)` and `retention_floor_sql(floor_days, schema=...)` (the schema is required) return the SQL for the host to run.
 - `jasil.testing.capture_audit()` / `AuditCapture` (with `assert_audited`), working with `audit.enabled = False` and in both `JOBS_ENABLED` modes; `reset_all()` also resets the audit state.
 
@@ -51,6 +55,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `publish_committing`, `publish_on_commit` and their batch forms raise `ValueError` for an `event_type` or `source` longer than its column before committing or staging anything, on the best-effort route as on the durable one; the best-effort route used to commit, then log the failure and drop the event.
 - `Platform.close()`, and a failed `build_platform()`, give back only the Redis clients that platform took; a client is closed when no platform in the process uses it any more. Another platform's clients were closed under it.
 - A durable handler that raises `SystemExit`, `KeyboardInterrupt` or a cancellation has its failure recorded and the rest of its batch returned to `pending` before the exception ends the worker, which now logs it at `ERROR`; the job used to stay claimed until its lease expired.
+- **BREAKING: the `distributed` profile refuses a `file://` audit sink** while auditing is enabled. Maintenance runs on whichever node takes the lock, so the checkpoint copies scattered across nodes' disks.
+- Event timestamps and the windows of `jasil.admin.get_jobs_summary` and `get_event_log_summary` come from the platform clock instead of the system clock, as every other JASIL timestamp does; the two summaries raise `RuntimeError` when no platform is published. `get_audit_health()["last_failure_at"]` follows the platform clock too.
+- The publisher logs a failed publish by exception type, and the driver error it wraps, without the message or traceback: a SQLAlchemy error's text carries the statement parameters, which are the event's payload and metadata.
+- Removed `JobRunner.reap_once`, which no scheduled job called and which still ran dead-letter callbacks in the reaping process. The reaper is `schedule_job_maintenance`'s job. Removed the internal `jasil.jobs.crud.get_job` and `reclaim_expired_leases_detailed` and `jasil.backends.geocoding_http.build_reverse_endpoint`.
 - [API stability](docs/api-stability.md) lists the names already exported and documented elsewhere: `jasil.deps.get_geocoding`, `jasil.orm.jasil_table_names` / `legacy_table_names`, `jasil.migrations.jasil_include_object`, `jasil.capabilities.build_capability_report` and `jasil.profile.StateBackendKind`.
 
 ### Fixed
@@ -62,7 +70,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `LocalStorage.save` writes through a temporary file and an atomic rename, as `save_stream` does, so a failed overwrite leaves the previous object instead of a torn one.
 - Reverse geocoding has an overall 30-second deadline on top of the per-read timeout: a watchdog shuts the request's sockets down when it passes, headers included, so an upstream dripping its reply cannot hold the caller for hours.
 - The reverse-geocoding address check refuses every address that is not globally reachable, including the shared address space `100.64.0.0/10` (where one cloud serves instance metadata) and IPv6 site-local; cleartext mail no longer counts a 6to4 (`2002::/16`) address as private.
-- A malformed capability URI is no longer echoed, password included, by the "Unsupported scheme" errors, the startup report or a Redis client error; `state_uri`, `events_uri` and `realtime_uri` are left out of the settings' `repr`.
+- A malformed capability URI is no longer echoed, password included, by the "Unsupported scheme" errors, the startup report or a Redis client error; `state_uri`, `events_uri`, `realtime_uri`, `storage_uri` and `audit.external_sink_uri` are left out of the settings' `repr`.
+- A `MailError` raised because the mail settings source failed no longer chains the source's exception, whose text is the host's and may carry a secret from its store.
 - `JasilSettings` takes `profile` and `job_worker_mode` as their names too (`"distributed"`), and refuses a misspelt one; a plain string used to pass every deployment check unmatched.
 - `JobHandlerRegistry` is safe to use from several threads, and registering a subscriber again under another event type moves it instead of leaving it listed under both.
 - A dead-letter callback delivery claimed before a replay can no longer settle the delivery of the job's next dead letter, and the reaper's dead-letter path clears `locked_at` like every other terminal path.
@@ -75,7 +84,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - S3 presigned URLs are signed with Signature Version 4 when JASIL builds the client: SigV2 URLs could not fetch SSE-KMS objects and are refused by SigV4-only stores.
 - S3 `upload_part` works against a plain-`http://` endpoint (it raised `AttributeError` there), botocore can now resend a part after a transient failure, and a source shorter or longer than `size` raises `ValueError` before any request is sent. The part is staged before upload, in memory up to 8 MiB and in a temporary file beyond that, so allow temporary disk for the largest part in flight.
 
-The audit trail writes nothing until the host calls the audit API, and every addition is optional. The breaking changes are the state-backend arguments, the event buses' handling of a failed handler, `JobSettings` validation, sweep-only dead-letter callbacks, the storage address limits and stricter adoption; see **Upgrading**.
+The audit trail writes nothing until the host calls the audit API, and every addition is optional. The breaking changes are the state-backend arguments, the event buses' handling of a failed handler, `JobSettings` validation, sweep-only dead-letter callbacks, the storage address limits, stricter adoption and the `distributed` profile's refusal of a `file://` audit sink; see **Upgrading**.
 
 ## [0.13.0] - 2026-10-27
 

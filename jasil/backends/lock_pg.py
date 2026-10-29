@@ -56,6 +56,10 @@ class PgAdvisoryLock:
 
     @contextmanager
     def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Generator[bool]:
+        """Try ``pg_try_advisory_lock`` for ``name`` and yield whether it was taken.
+
+        The lock is released on exit, and a failed release invalidates the connection instead of raising.
+        """
         del ttl_seconds  # session advisory locks are not TTL-based
         key = advisory_key(name)
         # Autocommit: the lock belongs to the session, so no transaction needs to stay open (and sit idle,

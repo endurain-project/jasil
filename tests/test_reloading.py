@@ -7,6 +7,7 @@ credentials, and a bad configuration is logged once per change, never once per c
 
 import logging
 import threading
+import traceback
 from dataclasses import replace
 
 import pytest
@@ -308,7 +309,9 @@ class TestSourceFailure:
 
         assert not isinstance(caught.value, MailNotConfiguredError)
         assert caught.value.permanent is False
-        assert isinstance(caught.value.__cause__, RuntimeError)
+        # The source's exception is the host's and may carry a secret, so it is not chained.
+        assert caught.value.__cause__ is None
+        assert caught.value.__suppress_context__ is True
 
     def test_mail_after_a_rejection_raises_instead_of_reusing_old_credentials(self):
         source = Source(GOOD_MAIL)
@@ -498,7 +501,7 @@ class TestSecretsStayOutOfLogsAndErrors:
             mail_source.error = geo_source.error = RuntimeError(f"cannot reach store as {self.USERNAME}")
             with pytest.raises(MailError) as unavailable:
                 mail.send(MESSAGE)
-            texts.append(str(unavailable.value))
+            texts.append("".join(traceback.format_exception(unavailable.value)))
             geo.reverse(1.0, 2.0)
             mail_source.error = geo_source.error = None
             mail_source.value = replace(smtp, from_address="a@example.com")

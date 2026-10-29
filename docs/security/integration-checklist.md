@@ -20,6 +20,13 @@ through.
 - [ ] Leave `enforce_deployment_consistency` on. It refuses to build a platform
       whose wiring contradicts its topology. Turning it off downgrades those to
       warnings — reasonable on a development machine, not in production.
+- [ ] Under the `custom` profile, check the wiring yourself. `custom` is exempt
+      from the state, event bus, realtime, lock and mail rules, so
+      `enforce_deployment_consistency` does not refuse process-local memory, a
+      `noop` lock or `memory://` mail there, however many processes run.
+- [ ] Under the `distributed` profile, point `audit.external_sink_uri` at `s3://`.
+      A `file://` sink is refused there, because each node would keep its own
+      share of the checkpoint copies.
 - [ ] Read the capability report JASIL logs at `INFO` on startup and confirm each
       capability resolved to what you expected.
 

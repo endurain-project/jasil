@@ -108,6 +108,11 @@ when the deployment is multi-node, where replicas run on separate nodes with no
 shared disk. Several processes of a `local` deployment share one host disk, so
 local storage stays valid there.
 
+**Audit sink.** `audit.external_sink_uri` must not be a `file://` directory when
+the deployment is multi-node. Audit maintenance runs on whichever node takes the
+lock, so each day's checkpoint copy would land on a different node's disk. Use an
+`s3://` sink there. The rule applies only while auditing is enabled.
+
 **Coordination lock.** The lock must not resolve to the in-process `noop` lock
 when more than one process could run the same scheduled job.
 
@@ -129,6 +134,7 @@ What each shape requires:
 | Lock | `noop` or `postgres-advisory` | `postgres-advisory` | `postgres-advisory` |
 | Mail | `memory`, or SMTP | SMTP | SMTP |
 | Storage | `local` | `local` on a shared volume, or S3 | S3 |
+| Audit sink, if any | `file` or S3 | `file` or S3 | S3 |
 | Jobs database | SQLite or a server database | PostgreSQL, MySQL 8.0.1+ or MariaDB 10.6+ | the same |
 
 The middle column needs Redis whenever state or events are used. That is not a

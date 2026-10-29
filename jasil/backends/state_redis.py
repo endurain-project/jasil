@@ -106,10 +106,12 @@ class RedisState:
 
     @_translate_state_errors
     def get(self, key: str) -> bytes | None:
+        """Return the value under ``key``, or ``None`` when absent or expired."""
         return self._client.get(key)
 
     @_translate_state_errors
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
+        """Store ``value`` under ``key``, expiring after ``ttl_seconds`` when given."""
         _check_ttl(ttl_seconds)
         if ttl_seconds is not None:
             self._client.set(key, value, ex=ttl_seconds)
@@ -118,10 +120,12 @@ class RedisState:
 
     @_translate_state_errors
     def delete(self, key: str) -> None:
+        """Delete ``key`` if present."""
         self._client.delete(key)
 
     @_translate_state_errors
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
+        """Add ``amount`` with ``INCRBY``; restart the expiry only when ``ttl_seconds`` is given."""
         # INCRBY is atomic and leaves any existing TTL untouched; only (re)set
         # expiry when the caller asks for one, mirroring the memory backend.
         _check_ttl(ttl_seconds)
@@ -132,6 +136,7 @@ class RedisState:
 
     @_translate_state_errors
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
+        """Store ``value`` with ``SET NX``; return True when this call stored it."""
         _check_ttl(ttl_seconds)
         if ttl_seconds is not None:
             return bool(self._client.set(key, value, ex=ttl_seconds, nx=True))
@@ -139,10 +144,12 @@ class RedisState:
 
     @_translate_state_errors
     def get_and_delete(self, key: str) -> bytes | None:
+        """Return and delete the value with ``GETDEL``."""
         return self._client.getdel(key)
 
     @_translate_state_errors
     def delete_prefix(self, prefix: str) -> int:
+        """Delete every key starting with ``prefix``, matched literally; ``prefix`` must not be empty."""
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
         # in a caller's prefix would delete far beyond what it named.
         _check_prefix(prefix)
@@ -150,6 +157,7 @@ class RedisState:
 
     @_translate_state_errors
     def iter_keys(self, prefix: str) -> Iterator[str]:
+        """Scan the keys starting with ``prefix`` and return them as an iterator."""
         # Materialised eagerly so a mid-scan Redis failure is translated here
         # rather than leaking out of a half-consumed generator.
         pattern = f"{redis_clients.glob_escape(prefix)}*"
@@ -164,6 +172,7 @@ class RedisState:
         tiers: tuple[tuple[int, int], ...],
         counter_ttl_seconds: int,
     ) -> TieredFailureOutcome:
+        """Count one occurrence and close the gate, atomically in a Lua script."""
         script_args = [str(int(time.time())), str(counter_ttl_seconds)]
         for threshold, tier_lock_seconds in tiers:
             script_args.extend((str(threshold), str(tier_lock_seconds)))

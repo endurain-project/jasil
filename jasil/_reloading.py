@@ -36,7 +36,7 @@ class SourceUnavailableError(Exception):
 class TransientBuildError(ValueError):
     """A build failed for a reason that may pass (a DNS lookup that did not answer).
 
-    Still a ``ValueError``, so a startup build fails with it as before; a
+    Still a ``ValueError``, so a startup build fails with it; a
     reloading provider caches it only for :data:`TRANSIENT_RETRY_SECONDS`.
     """
 
@@ -107,7 +107,7 @@ class ReloadingBackend[S, B]:
                 current = self._current
             if current is not None and current.backend is not None:
                 return current
-            raise SourceUnavailableError(f"{self._label} settings could not be loaded") from error
+            raise SourceUnavailableError(f"{self._label} settings could not be loaded") from None
         with self._lock:
             self._source_failing = False
             current = self._current
@@ -170,8 +170,9 @@ class ReloadingMail:
         """
         try:
             outcome = self._backend.resolve()
-        except SourceUnavailableError as error:
-            raise MailError("Mail settings could not be loaded") from error.__cause__
+        except SourceUnavailableError:
+            # Not chained: the source's exception is the host's, and its text may carry a secret.
+            raise MailError("Mail settings could not be loaded") from None
         if outcome.transient:
             raise MailError("Mail settings could not be verified; retry")
         if outcome.backend is None:

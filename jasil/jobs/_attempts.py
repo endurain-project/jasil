@@ -154,6 +154,16 @@ def _history(db: Session, job_id: str, limit: int) -> list[JobAttemptInfo]:
 
 
 def check_limit(limit: int, *, maximum: int, name: str) -> None:
+    """Require ``limit`` to be an integer from 1 to ``maximum``.
+
+    Args:
+        limit: The value to check; a ``bool`` is rejected.
+        maximum: The largest accepted value.
+        name: The parameter name used in the error message.
+
+    Raises:
+        ValueError: When ``limit`` is not an integer in range.
+    """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
         raise ValueError(f"{name} must be an integer between 1 and {maximum}")
 

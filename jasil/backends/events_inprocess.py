@@ -35,6 +35,12 @@ class InProcessEventBus:
         self._recorder = recorder
 
     def publish(self, event: Event) -> None:
+        """Run the handlers subscribed to ``event.event_type`` inline, in subscription order.
+
+        Raises:
+            Exception: The handler's error when one handler fails, or an ``ExceptionGroup`` when several do, after
+                every handler has run.
+        """
         handlers = self._handlers.get(event.event_type, [])
         recorder = self._recorder
         if recorder is None:
@@ -46,6 +52,7 @@ class InProcessEventBus:
             _call_each(handlers, event)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
+        """Register ``handler`` for ``event_type``."""
         self._handlers[event_type].append(handler)
 
     def start(self) -> None:

@@ -147,6 +147,7 @@ def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_star
     Returns:
         None.
     """
+    # The system clock, not the platform's: APScheduler compares next_run_time with its own wall clock.
     starts_now = {"next_run_time": datetime.now(UTC)} if run_at_startup else {}
     scheduler.add_job(
         prune_expired_records,

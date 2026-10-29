@@ -353,7 +353,7 @@ class TestCompletion:
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_COMPLETED
         assert stored.completed_at is not None
 
@@ -380,13 +380,13 @@ class TestFinishingGuardedByTheLeaseHolder:
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_COMPLETED
 
     def test_a_late_worker_cannot_complete(self, db, event):
         job = self._claim_then_lose(db, event)
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is False
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "w2"
 
@@ -398,7 +398,7 @@ class TestFinishingGuardedByTheLeaseHolder:
         )
 
         assert status == ""
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "w2"
         assert stored.last_error != "boom"
@@ -414,7 +414,7 @@ class TestFinishingGuardedByTheLeaseHolder:
             )
             == ""
         )
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_COMPLETED
 
 
 class TestFailureAndBackoff:
@@ -437,7 +437,7 @@ class TestFailureAndBackoff:
         )
 
         assert status == jobs_crud.STATUS_PENDING
-        assert as_utc(jobs_crud.get_job(job.id, db).available_at) > T0
+        assert as_utc(db.get(ProcessingJob, job.id).available_at) > T0
 
     def test_the_failure_reason_is_recorded(self, db, event):
         _enqueue(event, db)
@@ -454,7 +454,7 @@ class TestFailureAndBackoff:
             db=db,
         )
 
-        assert "downstream exploded" in jobs_crud.get_job(job.id, db).last_error
+        assert "downstream exploded" in db.get(ProcessingJob, job.id).last_error
 
     def test_the_lease_is_released_on_failure(self, db, event):
         _enqueue(event, db)
@@ -471,7 +471,7 @@ class TestFailureAndBackoff:
             db=db,
         )
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.locked_by is None
         assert stored.lease_expires_at is None
 
@@ -491,7 +491,7 @@ class TestFailureAndBackoff:
         )
 
         assert status == jobs_crud.STATUS_DEAD_LETTER
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_DEAD_LETTER
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_DEAD_LETTER
 
     def test_a_dead_lettered_job_is_never_claimed_again(self, db, event):
         _enqueue(event, db, max_attempts=1)
@@ -642,7 +642,7 @@ class TestLeaseReclamation:
             )
             assert finalized == ""
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "worker-b"
         assert stored.attempts == replacement.attempts
@@ -666,7 +666,7 @@ class TestDeadLetterReplay:
         replayed = jobs_crud.replay_dead_letter_job(job.id, now=T0, db=db)
 
         assert replayed is True
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_PENDING
 
     def test_replaying_a_job_that_is_not_dead_lettered_is_refused(self, db, event):
         job = _enqueue(event, db)
@@ -839,7 +839,7 @@ class TestJobsSummary:
         return datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=1)
 
     def test_an_empty_queue_summarises_to_nothing(self, db):
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.total_jobs == 0
         assert summary.by_subscriber == []
@@ -847,14 +847,14 @@ class TestJobsSummary:
         assert summary.oldest_pending_seconds is None
 
     def test_the_window_is_reported_back(self, db):
-        assert jobs_crud.get_jobs_summary(db, hours=6).window_hours == 6
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), hours=6).window_hours == 6
 
     def test_jobs_are_counted_by_status(self, db, event, now):
         _enqueue(event, db, subscriber="a", now=now)
         _enqueue(event, db, subscriber="b", now=now)
         jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.total_jobs == 2
         assert summary.claimed == 1
@@ -865,7 +865,7 @@ class TestJobsSummary:
         _enqueue(event, db, subscriber="thumbnails.generate", now=now)
         _enqueue(event, db, subscriber="invoice.render", now=now)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert [row.subscriber_id for row in summary.by_subscriber] == ["invoice.render", "thumbnails.generate"]
         assert all(row.event_type == "activity.created" for row in summary.by_subscriber)
@@ -875,7 +875,7 @@ class TestJobsSummary:
         claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
         jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.completed == 1
         assert summary.by_subscriber[0].completed == 1
@@ -883,20 +883,20 @@ class TestJobsSummary:
     def test_jobs_outside_the_window_are_excluded(self, db, event, now):
         _enqueue(event, db, now=now - timedelta(days=2))
 
-        assert jobs_crud.get_jobs_summary(db, hours=1).total_jobs == 0
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), hours=1).total_jobs == 0
 
     def test_the_oldest_pending_age_is_reported(self, db, event, now):
         """The number that says whether the queue is keeping up."""
         _enqueue(event, db, now=now - timedelta(minutes=10))
 
-        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds > 500
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC)).oldest_pending_seconds > 500
 
     def test_a_finished_queue_has_no_pending_age(self, db, event, now):
         job = _enqueue(event, db, now=now)
         claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
         jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
-        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds is None
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC)).oldest_pending_seconds is None
 
     def test_dead_letters_are_listed_for_inspection(self, db, event, now):
         job = _enqueue(event, db, max_attempts=1, now=now)
@@ -912,7 +912,7 @@ class TestJobsSummary:
             db=db,
         )
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.dead_letter == 1
         assert [entry.id for entry in summary.recent_dead_letter] == [job.id]
@@ -933,6 +933,6 @@ class TestJobsSummary:
                 db=db,
             )
 
-        summary = jobs_crud.get_jobs_summary(db, dead_letter_limit=2)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), dead_letter_limit=2)
 
         assert len(summary.recent_dead_letter) == 2

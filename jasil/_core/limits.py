@@ -17,9 +17,7 @@ and MySQL, silent acceptance on SQLite, and — because the publish seam swallow
 delivery failures — a lost event on all three.
 
 **Every constant here is imported by the model declaring the column it bounds**,
-so a width and the code protecting it cannot drift apart. The one pair that was
-allowed to drift is what produced the bug recorded on
-:data:`MAX_HANDLER_NAME_LENGTH`.
+so a width and the code protecting it cannot drift apart.
 """
 
 __all__ = [
@@ -49,11 +47,11 @@ MAX_STORED_ERROR_LENGTH = 4000
 
 #: Width of ``event_log.handler_name``, which holds the comma-joined list of every
 #: subscriber that ran for one event — so its length grows with the subscriber
-#: count and is unbounded from the writing layer's point of view. Overflowing it
-#: made PostgreSQL reject the whole UPDATE, and because event-log writes are
-#: deliberately best-effort (swallowed by the recorder so observability never
-#: breaks processing) the failure was silent: the handlers had already run, so
-#: the work completed while the row stayed ``published`` forever.
+#: count and is unbounded from the writing layer's point of view. The list is
+#: clipped to it: an overflow would make PostgreSQL reject the whole UPDATE, and
+#: because event-log writes are best-effort (swallowed by the recorder so
+#: observability never breaks processing) the row would silently stay
+#: ``published`` after its handlers had run.
 MAX_HANDLER_NAME_LENGTH = 500
 
 #: Width of ``event_log.worker_id`` and ``processing_jobs.locked_by``. The event

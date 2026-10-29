@@ -151,3 +151,16 @@ class TestRequire:
         assert "Redis state" in message
         assert "'redis' package" in message
         assert "pip install 'jasil[redis]'" in message
+
+
+@pytest.mark.parametrize("module", ["jasil.jobs.service", "jasil.retention", "jasil.audit.maintenance"])
+def test_the_scheduling_modules_import_without_apscheduler(module: str):
+    """APScheduler is the ``jobs`` extra; these modules only name its scheduler in an annotation."""
+    result = _run(f"""
+        import sys
+        import {module}
+        print("apscheduler" in sys.modules)
+    """)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False"

@@ -12,6 +12,7 @@ Two behaviours matter most and are easy to regress:
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import Session
 
 import jasil.correlation as correlation
@@ -157,6 +158,21 @@ class TestDurableRouting:
         assert db.query(EventOutbox).count() == 0
 
 
+class TestTheEventIsStampedByThePlatformClock:
+    def test_on_the_bus(self, platform):
+        publisher.publish("activity.created", {}, source="test")
+
+        assert [event.timestamp for event in platform.events.published] == [T0.isoformat()]
+
+    def test_in_the_outbox(self, platform, db):
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        assert db.query(EventOutbox).one().timestamp == T0.isoformat()
+
+
 class TestCorrelation:
     def test_the_ambient_correlation_id_is_stamped(self, platform):
         import jasil.correlation as correlation
@@ -198,6 +214,41 @@ class TestFailuresAreSwallowed:
         monkeypatch.setattr(runtime, "_active_platform", None)
 
         publisher.publish("activity.created", {}, source="test")
+
+
+SECRET_PARAMETER = "s3cret-payload-value"
+
+
+def _statement_error(*_args, **_kwargs):
+    raise StatementError("insert failed", "INSERT INTO t VALUES (?)", {"payload": SECRET_PARAMETER}, ValueError())
+
+
+class TestFailureLogsCarryNoStatementParameters:
+    """A SQLAlchemy error's text carries the statement's parameters: the event's payload and metadata."""
+
+    def test_a_bus_failure_is_logged_by_type(self, monkeypatch, caplog):
+        bus = RecordingBus()
+        bus.publish = _statement_error
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=bus))
+
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {}, source="test")
+
+        assert "StatementError (ValueError)" in caplog.text
+        assert SECRET_PARAMETER not in caplog.text
+
+    def test_a_durable_staging_failure_is_logged_by_type(self, platform, db, monkeypatch, caplog):
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+        monkeypatch.setattr(jobs_outbox, "add_to_outbox", _statement_error)
+
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {}, source="test", db=db)
+            with pytest.raises(StatementError):
+                publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        assert caplog.text.count("StatementError (ValueError)") == 2
+        assert SECRET_PARAMETER not in caplog.text
 
 
 class TestPublishCommitting:

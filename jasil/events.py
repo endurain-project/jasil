@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from jasil._core.limits import check_length
+from jasil._core.timestamps import as_utc
 
 # --- Standard metadata key (correlation context, not domain data) ---
 #
@@ -135,6 +136,7 @@ def new_event(
     event_id: str | None = None,
     retry_count: int = 0,
     schema_version: int = INITIAL_SCHEMA_VERSION,
+    now: datetime | None = None,
 ) -> Event:
     """Mint an :class:`Event`, generating ``event_id`` and ``timestamp``.
 
@@ -147,6 +149,8 @@ def new_event(
             original id when re-publishing a retry so tracing stays stable.
         retry_count: Attempt counter (incremented on re-publish).
         schema_version: The payload-shape version this producer writes.
+        now: The instant to stamp, normally the platform clock's; a naive value is
+            taken as UTC. Defaults to the system clock.
 
     Returns:
         A frozen :class:`Event` with a fresh id and UTC timestamp.
@@ -163,7 +167,7 @@ def new_event(
         event_id=resolved_event_id,
         event_type=event_type,
         source=source,
-        timestamp=datetime.now(UTC).isoformat(),
+        timestamp=as_utc(now if now is not None else datetime.now(UTC)).isoformat(),
         payload=payload,
         metadata=metadata if metadata is not None else {},
         retry_count=retry_count,

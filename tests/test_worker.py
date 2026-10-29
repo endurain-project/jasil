@@ -15,12 +15,11 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
 import jasil.jobs._worker_registry as worker_registry
 import jasil.jobs.crud as jobs_crud
 from jasil._core.threads import STOP_JOIN_TIMEOUT_SECONDS, signal_and_join
+from jasil._core.timestamps import as_utc
 from jasil.events import new_event
 from jasil.jobs._worker_metadata import MAX_WORKER_METADATA_BYTES
 from jasil.jobs.models import JobWorker
@@ -277,18 +276,9 @@ class StepClock:
 
 
 class TestWorkerTelemetry:
-    @pytest.fixture
-    def worker_database(self, tmp_path, mapped_base):
-        engine = create_engine(f"sqlite:///{tmp_path / 'worker.db'}")
-        mapped_base.metadata.create_all(engine)
-        factory = sessionmaker(bind=engine, expire_on_commit=False)
-        yield factory
-        mapped_base.metadata.drop_all(engine)
-        engine.dispose()
-
     def test_heartbeat_advances_during_a_long_handler_and_stop_is_recorded(
         self,
-        worker_database,
+        threaded_session_factory,
         monkeypatch,
     ):
         handler_started = threading.Event()
@@ -303,7 +293,7 @@ class TestWorkerTelemetry:
             assert release_handler.wait(timeout=WAIT_TIMEOUT)
 
         registry.register("work.created", "handler", handle, queue="campaign")
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             jobs_crud.enqueue_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
@@ -315,7 +305,7 @@ class TestWorkerTelemetry:
         runner = JobRunner(
             registry=registry,
             clock=clock,
-            session_factory=worker_database,
+            session_factory=threaded_session_factory,
             worker_id="00000000-0000-4000-8000-000000000001",
             lease_seconds=60,
             max_runtime_seconds=600,
@@ -331,7 +321,7 @@ class TestWorkerTelemetry:
             telemetry=WorkerTelemetry(
                 instance_id=runner._worker_id,
                 clock=clock,
-                session_factory=worker_database,
+                session_factory=threaded_session_factory,
                 queues=runner._queues,
                 role="processor",
                 label="campaign-1",
@@ -355,7 +345,7 @@ class TestWorkerTelemetry:
         assert handler_started.wait(timeout=WAIT_TIMEOUT)
         assert heartbeat_written.wait(timeout=WAIT_TIMEOUT)
 
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             running = db.get(JobWorker, runner._worker_id)
             assert running.last_heartbeat_at > running.started_at
             assert running.queues == ["campaign"]
@@ -365,13 +355,13 @@ class TestWorkerTelemetry:
         release_handler.set()
         thread.join(timeout=WAIT_TIMEOUT)
         assert not thread.is_alive()
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             stopped = db.get(JobWorker, runner._worker_id)
             assert stopped.stopped_at is not None
 
-    def test_heartbeat_recreates_a_missing_start_record(self, worker_database):
+    def test_heartbeat_recreates_a_missing_start_record(self, threaded_session_factory):
         heartbeat_at = T0 + timedelta(seconds=5)
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             worker_registry.record_worker_heartbeat(
                 "00000000-0000-4000-8000-000000000004",
                 started_at=T0,
@@ -383,19 +373,19 @@ class TestWorkerTelemetry:
                 db=db,
             )
 
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             worker = db.get(JobWorker, "00000000-0000-4000-8000-000000000004")
             assert worker is not None
-            assert worker.last_heartbeat_at == heartbeat_at.replace(tzinfo=None)
+            assert as_utc(worker.last_heartbeat_at) == heartbeat_at
             assert worker.queues == ["campaign"]
             assert worker.worker_metadata == {"zone": "test"}
 
-    def test_stopping_an_unknown_worker_is_a_no_op(self, worker_database):
-        with worker_database() as db:
+    def test_stopping_an_unknown_worker_is_a_no_op(self, threaded_session_factory):
+        with threaded_session_factory() as db:
             worker_registry.record_worker_stop("missing", now=T0, db=db)
             assert db.get(JobWorker, "missing") is None
 
-    def test_a_heartbeat_failure_does_not_kill_job_execution(self, worker_database, monkeypatch, caplog):
+    def test_a_heartbeat_failure_does_not_kill_job_execution(self, threaded_session_factory, monkeypatch, caplog):
         heartbeat_attempted = threading.Event()
         handler_started = threading.Event()
         release_handler = threading.Event()
@@ -410,7 +400,7 @@ class TestWorkerTelemetry:
             handled.set()
 
         registry.register("work.created", "handler", handle)
-        with worker_database() as db:
+        with threaded_session_factory() as db:
             jobs_crud.enqueue_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
@@ -421,7 +411,7 @@ class TestWorkerTelemetry:
         runner = JobRunner(
             registry=registry,
             clock=clock,
-            session_factory=worker_database,
+            session_factory=threaded_session_factory,
             worker_id="00000000-0000-4000-8000-000000000002",
             lease_seconds=60,
             max_runtime_seconds=600,
@@ -436,7 +426,7 @@ class TestWorkerTelemetry:
             telemetry=WorkerTelemetry(
                 instance_id=runner._worker_id,
                 clock=clock,
-                session_factory=worker_database,
+                session_factory=threaded_session_factory,
                 queues=None,
             ),
         )
@@ -466,14 +456,14 @@ class TestWorkerTelemetry:
         assert "Durable worker heartbeat failed" in caplog.text
 
     @pytest.mark.parametrize(("field", "value"), [("role", "r" * 101), ("label", "l" * 201)])
-    def test_invalid_metadata_fails_before_a_thread_starts(self, worker_database, field, value):
+    def test_invalid_metadata_fails_before_a_thread_starts(self, threaded_session_factory, field, value):
         kwargs = {field: value}
 
         with pytest.raises(ValueError, match=field):
             WorkerTelemetry(
                 instance_id="00000000-0000-4000-8000-000000000003",
                 clock=StepClock(),
-                session_factory=worker_database,
+                session_factory=threaded_session_factory,
                 queues=None,
                 **kwargs,
             )
@@ -486,22 +476,22 @@ class TestWorkerTelemetry:
             {"value": float("nan")},
         ],
     )
-    def test_invalid_worker_metadata_fails_before_a_thread_starts(self, worker_database, metadata):
+    def test_invalid_worker_metadata_fails_before_a_thread_starts(self, threaded_session_factory, metadata):
         with pytest.raises(ValueError, match="worker metadata"):
             WorkerTelemetry(
                 instance_id="00000000-0000-4000-8000-000000000003",
                 clock=StepClock(),
-                session_factory=worker_database,
+                session_factory=threaded_session_factory,
                 queues=None,
                 metadata=metadata,
             )
 
-    def test_worker_metadata_is_deeply_detached(self, worker_database):
+    def test_worker_metadata_is_deeply_detached(self, threaded_session_factory):
         metadata = {"deployment": {"zone": "eu-1"}}
         telemetry = WorkerTelemetry(
             instance_id="00000000-0000-4000-8000-000000000003",
             clock=StepClock(),
-            session_factory=worker_database,
+            session_factory=threaded_session_factory,
             queues=None,
             metadata=metadata,
         )

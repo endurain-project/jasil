@@ -142,32 +142,6 @@ def deliver_dead_letters(
     return delivered
 
 
-def deliver_after_reap(
-    *,
-    registry: JobHandlerRegistry,
-    session_factory: Callable[[], Session],
-    clock: ClockProvider,
-    dead_lettered: list[str],
-) -> None:
-    """
-    Deliver the callbacks a lease reap owes: the jobs it just killed, then the sweep.
-
-    Never raises: the reap is already committed, and a failure here is retried by
-    the next one.
-
-    Args:
-        registry: Where the callbacks are registered.
-        session_factory: Opens short-lived sessions.
-        clock: Source of the current instant.
-        dead_lettered: Ids the reap dead-lettered.
-    """
-    for job_ids in (dead_lettered, None):
-        try:
-            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=job_ids)
-        except Exception as error:
-            logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
-
-
 def _backoff(delivery_attempt: int) -> int:
     """Seconds before a delivery that has failed ``delivery_attempt`` times is retried."""
     return min(RETRY_BASE_SECONDS * 2 ** max(0, delivery_attempt - 1), RETRY_MAX_SECONDS)

@@ -414,6 +414,16 @@ class TestAUriIsNeverEchoed:
 
         assert self.SECRET not in rendered
 
+    def test_the_settings_repr_hides_the_storage_and_audit_sink_uris(self):
+        rendered = repr(
+            _settings(
+                storage_uri="s3://bucket?endpoint_url=https://user:S3CRETPW@minio.internal",
+                audit=settings.AuditSettings(external_sink_uri="s3://sink?endpoint_url=https://u:S3CRETPW@minio"),
+            )
+        )
+
+        assert self.SECRET not in rendered
+
     def test_the_startup_report_names_no_malformed_uri(self):
         from jasil.capabilities import build_capability_report
 

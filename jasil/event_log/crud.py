@@ -18,7 +18,7 @@ portable SQL so the same code runs on PostgreSQL, MySQL and SQLite.
 """
 
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -190,6 +190,7 @@ def mark_failed(
 def get_event_log_summary(
     db: Session,
     *,
+    now: datetime,
     hours: int = 24,
     failure_limit: int = 20,
 ) -> event_log_schema.EventLogSummary:
@@ -198,13 +199,13 @@ def get_event_log_summary(
 
     Args:
         db: Active database session.
+        now: The instant the window ends at and pending ages are measured from.
         hours: Look-back window for throughput/outcome/latency stats.
         failure_limit: Maximum number of recent failures to return.
 
     Returns:
         The aggregated dashboard summary.
     """
-    now = datetime.now(UTC)
     window_start = now - timedelta(hours=hours)
     by_type = _summarize_by_type(db, window_start)
     return event_log_schema.EventLogSummary(

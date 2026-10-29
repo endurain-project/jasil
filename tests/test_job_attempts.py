@@ -175,7 +175,7 @@ class TestClaimOpensAnAttempt:
             jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=LEASE, now=T0, db=db)
 
         db.rollback()
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_PENDING
         assert _attempts(db) == []
 
 
@@ -238,7 +238,7 @@ class TestFinishingAnAttempt:
             jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db)
 
         db.rollback()
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_CLAIMED
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_CLAIMED
         assert _attempts(db, job.id)[0].outcome is None
 
     def test_nothing_is_written_when_recording_is_off(self, db):
@@ -287,7 +287,7 @@ class TestAHandlerThatOutlivesItsLease:
     def test_the_late_finish_is_recorded_as_superseded(self, runner, registry, clock, db, fails):
         def handle(_event):
             clock.advance(150)  # far past the lease, with no heartbeat to renew it
-            runner.reap_once()
+            jobs_crud.reclaim_expired_leases(now=clock.now(), db=db)
             jobs_crud.claim_jobs(worker_id="other", limit=10, lease_seconds=LEASE, now=clock.now(), db=db)
             if fails:
                 raise RuntimeError("boom")
@@ -310,7 +310,7 @@ class TestAHandlerThatOutlivesItsLease:
 
         def handle(_event):
             clock.advance(150)
-            runner.reap_once()
+            jobs_crud.reclaim_expired_leases(now=clock.now(), db=db)
 
         registry.register("activity.created", "s", handle)
         job = _enqueue(db)
@@ -481,7 +481,7 @@ class TestTheRunnerRecordsTheRun:
         def handle(_event):
             clock.advance(601)
             runner.leases.renew()  # past the cap: abandoned, no longer renewed
-            runner.reap_once()
+            jobs_crud.reclaim_expired_leases(now=clock.now(), db=db)
             jobs_crud.claim_jobs(worker_id="other", limit=10, lease_seconds=LEASE, now=clock.now(), db=db)
 
         registry.register("activity.created", "s", handle)
@@ -694,7 +694,7 @@ class TestSummariesCarryTheHistory:
                 self._finish(db, subscriber, duration_ms=duration, queue=queue)
                 del job
 
-        summary = jobs_crud.get_jobs_summary(db, hours=EVERYTHING)
+        summary = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1), hours=EVERYTHING)
 
         subscribers = {s.subscriber_id: s for s in summary.by_subscriber}
         queues = {q.queue: q for q in summary.by_queue}
@@ -751,7 +751,7 @@ class TestSummariesCarryTheHistory:
     def test_a_quiet_subscriber_reads_zero_not_none(self, db):
         _enqueue(db, "quiet")
 
-        summary = jobs_crud.get_jobs_summary(db, hours=EVERYTHING)
+        summary = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1), hours=EVERYTHING)
 
         quiet = summary.by_subscriber[0]
         assert quiet.superseded == 0
@@ -763,7 +763,7 @@ class TestSummariesCarryTheHistory:
     def test_with_recording_off_the_fields_are_none_not_zero(self, db):
         _enqueue(db, "quiet")
 
-        summary = jobs_crud.get_jobs_summary(db, hours=EVERYTHING, record_attempts=False)
+        summary = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1), hours=EVERYTHING, record_attempts=False)
 
         quiet = summary.by_subscriber[0]
         assert (quiet.superseded, quiet.avg_duration_ms, quiet.duration_buckets) == (None, None, None)
@@ -781,7 +781,7 @@ class TestSummariesCarryTheHistory:
             job.id, "boom", worker_id="w2", attempt=2, base_seconds=1, max_seconds=2, now=later, db=db
         )
 
-        summary = jobs_crud.get_jobs_summary(db, hours=EVERYTHING)
+        summary = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1), hours=EVERYTHING)
 
         assert [d.last_worker_id for d in summary.recent_dead_letter] == ["w2"]
 
@@ -792,7 +792,7 @@ class TestSummariesCarryTheHistory:
             job.id, "boom", worker_id="w1", attempt=1, base_seconds=1, max_seconds=2, now=T0, db=db
         )
 
-        summary = jobs_crud.get_jobs_summary(db, hours=EVERYTHING, record_attempts=False)
+        summary = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1), hours=EVERYTHING, record_attempts=False)
 
         assert summary.recent_dead_letter[0].last_worker_id is None
 

@@ -478,7 +478,7 @@ class TestJobRunner:
         jobs_crud.claim_jobs(worker_id="other", limit=10, lease_seconds=60, now=T0, db=db)
         clock.advance(61)
 
-        assert runner.reap_once() == 1
+        assert jobs_crud.reclaim_expired_leases(now=clock.now(), db=db) == 1
 
     def test_later_jobs_of_a_batch_get_a_fresh_lease_when_their_turn_comes(self, runner, registry, clock, db):
         leases = []

@@ -120,6 +120,7 @@ class RedisStreamEventBus:
         return cls(client, stream=stream, group=group, recorder=recorder)
 
     def publish(self, event: Event) -> None:
+        """Record the event when a recorder is set, then append it to the Redis stream."""
         # Serialized first, so an envelope that cannot be sent leaves no 'published' row behind. The row is
         # then written before the entry is queued, because the consumer records processing/completed/failed
         # as updates to it; a failed XADD therefore leaves it 'published', and the publisher logs the failure.
@@ -129,6 +130,7 @@ class RedisStreamEventBus:
         self._client.xadd(self._stream, fields, maxlen=_STREAM_MAXLEN, approximate=True)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
+        """Register ``handler`` for ``event_type`` on this process's consumer."""
         self._handlers[event_type].append(handler)
 
     def start(self) -> None:

@@ -216,7 +216,7 @@ class AuditSettings:
     checkpoint_window_minutes: int = 15
     checkpoint_grace_minutes: int = 5
     signing_key: str | None = field(default=None, repr=False)
-    external_sink_uri: str | None = None
+    external_sink_uri: str | None = field(default=None, repr=False)
     max_details_bytes: int = 4096
     app_name: str | None = None
     app_version: str | None = None
@@ -433,7 +433,7 @@ class JasilSettings:
     enforce_deployment_consistency: bool = True
     data_dir: str = "data"
     state_uri: str | None = field(default=None, repr=False)
-    storage_uri: str | None = None
+    storage_uri: str | None = field(default=None, repr=False)
     events_uri: str | None = field(default=None, repr=False)
     lock_uri: str | None = None
     realtime_uri: str | None = field(default=None, repr=False)

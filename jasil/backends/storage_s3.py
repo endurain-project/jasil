@@ -377,6 +377,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
+        """Store ``data`` with one ``PutObject``; ``content_type`` becomes the object's ``Content-Type``."""
         extra = {"ContentType": content_type} if content_type else {}
         self._client.put_object(Bucket=self._bucket, Key=self._object_key(area, key), Body=data, **extra)
         return key
@@ -423,6 +424,10 @@ class S3Storage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int:
+        """Upload ``source`` as a multipart upload, or one ``PutObject`` when it is empty.
+
+        An upload that fails is aborted, so no partial object remains.
+        """
         object_key = self._object_key(area, key)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Storage stream max_bytes must not be negative")
@@ -490,6 +495,7 @@ class S3Storage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> UploadSession:
+        """Start an S3 multipart upload and store a session manifest object that records its upload id."""
         object_key = self._object_key(area, key)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Resumable upload max_bytes must not be negative")
@@ -545,6 +551,7 @@ class S3Storage:
         *,
         size: int,
     ) -> PartRef:
+        """Stage the part in a spooled temporary file and send it with ``UploadPart``; the validator is its ETag."""
         self._validate_upload_session(session)
         self._validate_part_number(session, part_number)
         reader = ExactSizeReader(source, size)
@@ -588,6 +595,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
+        """Check the parts against those S3 lists, complete the multipart upload and delete the session manifest."""
         self._validate_upload_session(session)
         ordered, total = self._validate_completion_parts(session, parts)
         state = self._load_upload_state(session)
@@ -624,6 +632,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def abort_upload(self, session: UploadSession) -> None:
+        """Abort the multipart upload and delete the session manifest; return silently when there is no manifest."""
         state = self._load_upload_state(session, missing_ok=True)
         if state is None:
             return
@@ -646,6 +655,15 @@ class S3Storage:
 
     @_translate_s3_errors
     def cleanup_uploads(self, *, older_than_epoch: float) -> int:
+        """Abort the multipart uploads whose manifest was last modified before the cutoff, and delete the manifests.
+
+        Returns:
+            The number of sessions removed.
+
+        Raises:
+            ValueError: When ``older_than_epoch`` is not finite.
+            StorageBackendUnavailableError: After the pass, when any session could not be removed.
+        """
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
         removed = 0
@@ -702,6 +720,7 @@ class S3Storage:
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
+        """Return the object bytes read through :meth:`open_stream`, or ``None`` when it does not exist."""
         try:
             stream = self.open_stream(area, key)
         except FileNotFoundError:
@@ -718,6 +737,7 @@ class S3Storage:
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO:
+        """Open a ranged ``GetObject`` as a non-seekable reader; a range past the end of the object yields no bytes."""
         object_key = self._object_key(area, key)
         validate_stream_range(offset, length)
         if length == 0:
@@ -747,6 +767,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def stat(self, area: str, key: str) -> ObjectStat | None:
+        """Return the ``HeadObject`` size, modification time, content type and ETag."""
         try:
             response = self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
         except ClientError as error:
@@ -769,6 +790,13 @@ class S3Storage:
         content_type: str | None = None,
         expires_in: int = 3600,
     ) -> ServeRedirect:
+        """Return a :class:`ServeRedirect` to a presigned URL, after checking the object exists.
+
+        Raises:
+            FileNotFoundError: When the object does not exist.
+            ValueError: When ``expires_in`` is outside 1 second to 7 days, or ``download_as`` or
+            ``content_type`` is invalid.
+        """
         if self.stat(area, key) is None:
             raise FileNotFoundError(f"Storage object not found: {area}/{key}")
         return ServeRedirect(
@@ -783,6 +811,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def exists(self, area: str, key: str) -> bool:
+        """Return True when ``HeadObject`` finds the object."""
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
         except ClientError as error:
@@ -793,10 +822,12 @@ class S3Storage:
 
     @_translate_s3_errors
     def delete(self, area: str, key: str) -> None:
+        """Delete the object with ``DeleteObject``."""
         self._client.delete_object(Bucket=self._bucket, Key=self._object_key(area, key))
 
     @_translate_s3_errors
     def delete_prefix(self, area: str, prefix: str) -> int:
+        """Delete the object at ``prefix`` and every object listed under ``prefix/``, in batches."""
         root = self._object_key(area, prefix)
         count = 0
         try:
@@ -834,6 +865,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
+        """Copy the object server-side with the client's managed ``copy``."""
         check_segment(src_area, "source area")
         check_segment(src_key, "source key")
         check_segment(dst_area, "destination area")
@@ -856,9 +888,11 @@ class S3Storage:
             raise
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
+        """Return the keys from :meth:`iter_objects`, sorted."""
         return sorted(key for key, _ in self.iter_objects(area, prefix))
 
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
+        """Lazily yield ``(key, modified_epoch)`` from a paginated ``ListObjectsV2`` under the area and prefix."""
         check_area(area)
         if prefix:
             check_listing_prefix(prefix)
@@ -879,6 +913,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def check_writable(self) -> None:
+        """Put and delete an empty probe object under the configured prefix."""
         probe_key = "/".join(part for part in (self._prefix, ".jasil-write-probe", uuid4().hex) if part)
         self._client.put_object(Bucket=self._bucket, Key=probe_key, Body=b"")
         self._client.delete_object(Bucket=self._bucket, Key=probe_key)
@@ -893,6 +928,12 @@ class S3Storage:
         download_as: str | None = None,
         content_type: str | None = None,
     ) -> str:
+        """Return a presigned ``GetObject`` URL; the object is not checked.
+
+        Raises:
+            ValueError: When ``expires_in`` is outside 1 second to 7 days, or ``download_as`` or
+            ``content_type`` is invalid.
+        """
         if not 1 <= expires_in <= _MAX_URL_EXPIRY_SECONDS:
             raise ValueError(f"expires_in must be between 1 and {_MAX_URL_EXPIRY_SECONDS} seconds, not {expires_in}")
         params = {"Bucket": self._bucket, "Key": self._object_key(area, key)}

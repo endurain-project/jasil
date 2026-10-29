@@ -169,7 +169,7 @@ class TestWorkerIdClamping:
 
 class TestSummary:
     def test_an_empty_log_summarises_to_nothing(self, db):
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         assert summary.total_events == 0
         assert summary.by_type == []
@@ -177,7 +177,7 @@ class TestSummary:
         assert summary.recent_failures == []
 
     def test_the_window_is_reported_back(self, db):
-        assert event_log_crud.get_event_log_summary(db, hours=6).window_hours == 6
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), hours=6).window_hours == 6
 
     def test_events_are_counted_per_type_and_status(self, db):
         for _ in range(2):
@@ -187,7 +187,7 @@ class TestSummary:
         event_log_crud.mark_completed(completed.event_id, "h", 10, db)
         event_log_crud.record_published(_event("invoice.rendered"), db)
 
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         by_type = {stats.event_type: stats for stats in summary.by_type}
         assert summary.total_events == 4
@@ -201,7 +201,7 @@ class TestSummary:
         for event_type in ("zeta.happened", "alpha.happened"):
             event_log_crud.record_published(_event(event_type), db)
 
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         assert [stats.event_type for stats in summary.by_type] == ["alpha.happened", "zeta.happened"]
 
@@ -211,7 +211,7 @@ class TestSummary:
             event_log_crud.record_published(event, db)
             event_log_crud.mark_completed(event.event_id, "h", duration, db)
 
-        stats = event_log_crud.get_event_log_summary(db).by_type[0]
+        stats = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0]
 
         assert stats.avg_processing_time_ms == 20.0
         assert stats.max_processing_time_ms == 30
@@ -220,7 +220,7 @@ class TestSummary:
         """Zero would read as 'instant' rather than 'never finished'."""
         event_log_crud.record_published(_event(), db)
 
-        stats = event_log_crud.get_event_log_summary(db).by_type[0]
+        stats = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0]
 
         assert stats.avg_processing_time_ms is None
         assert stats.max_processing_time_ms is None
@@ -238,12 +238,12 @@ class TestSummary:
         )
         db.commit()
 
-        assert event_log_crud.get_event_log_summary(db, hours=1).total_events == 0
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), hours=1).total_events == 0
 
     def test_queued_events_are_counted_separately(self, db):
         event_log_crud.record_queued(_event(), db)
 
-        assert event_log_crud.get_event_log_summary(db).by_type[0].queued == 1
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0].queued == 1
 
 
 class TestPendingGroups:
@@ -251,7 +251,7 @@ class TestPendingGroups:
         event_log_crud.record_published(_event(), db)
         event_log_crud.record_published(_event(), db)
 
-        pending = event_log_crud.get_event_log_summary(db).pending
+        pending = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending
 
         assert len(pending) == 1
         assert pending[0].status == "published"
@@ -262,13 +262,13 @@ class TestPendingGroups:
         event_log_crud.record_published(event, db)
         event_log_crud.mark_completed(event.event_id, "h", 1, db)
 
-        assert event_log_crud.get_event_log_summary(db).pending == []
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending == []
 
     def test_a_queued_event_is_not_pending(self, db):
         """Durable events are terminal here; the Jobs dashboard tracks them."""
         event_log_crud.record_queued(_event(), db)
 
-        assert event_log_crud.get_event_log_summary(db).pending == []
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending == []
 
     def test_the_oldest_group_comes_first(self, db):
         """The backlog a human should look at first is the one that has waited longest."""
@@ -294,7 +294,7 @@ class TestPendingGroups:
         )
         db.commit()
 
-        pending = event_log_crud.get_event_log_summary(db).pending
+        pending = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending
 
         assert [group.event_type for group in pending] == ["old.thing", "recent.thing"]
         assert pending[0].oldest_seconds > pending[1].oldest_seconds
@@ -309,7 +309,7 @@ class TestRecentFailures:
         event_log_crud.record_published(failed, db)
         event_log_crud.mark_failed(failed.event_id, "h", "boom", 1, db)
 
-        failures = event_log_crud.get_event_log_summary(db).recent_failures
+        failures = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures
 
         assert [failure.id for failure in failures] == [failed.event_id]
 
@@ -318,7 +318,7 @@ class TestRecentFailures:
         event_log_crud.record_published(event, db)
         event_log_crud.mark_failed(event.event_id, "render_invoice", "boom", 5, db)
 
-        failure = event_log_crud.get_event_log_summary(db).recent_failures[0]
+        failure = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures[0]
 
         assert failure.error_message == "boom"
         assert failure.handler_name == "render_invoice"
@@ -330,7 +330,7 @@ class TestRecentFailures:
             event_log_crud.record_published(event, db)
             event_log_crud.mark_failed(event.event_id, "h", "boom", 1, db)
 
-        summary = event_log_crud.get_event_log_summary(db, failure_limit=2)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), failure_limit=2)
 
         assert len(summary.recent_failures) == 2
 
@@ -346,7 +346,9 @@ class TestRecentFailures:
         )
         db.commit()
 
-        assert [f.id for f in event_log_crud.get_event_log_summary(db).recent_failures] == ["dead"]
+        assert [f.id for f in event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures] == [
+            "dead"
+        ]
 
 
 class TestRecorder:

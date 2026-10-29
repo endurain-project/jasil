@@ -65,14 +65,21 @@ def _mint(
     metadata: dict | None,
     schema_version: int = INITIAL_SCHEMA_VERSION,
 ) -> Event:
-    """Build the event envelope, stamping the ambient request id for correlation."""
+    """Build the event envelope on the platform clock, stamping the ambient request id for correlation."""
     merged: dict = {}
     request_id = correlation.get_correlation_id()
     if request_id:
         merged[META_REQUEST_ID] = request_id
     if metadata:
         merged.update(metadata)
-    return new_event(event_type, payload, source=source, metadata=merged, schema_version=schema_version)
+    return new_event(
+        event_type,
+        payload,
+        source=source,
+        metadata=merged,
+        schema_version=schema_version,
+        now=platform_runtime.get_active_platform().clock.now(),
+    )
 
 
 def _stage_in_outbox(
@@ -119,9 +126,19 @@ def _publish_on_bus(
     try:
         event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, _describe(err))
         return
     _dispatch_event(event)
+
+
+def _describe(error: Exception) -> str:
+    """Name ``error``, and the driver error it wraps, by type only.
+
+    Never the text or the traceback: a SQLAlchemy error carries the statement's parameters, which are the
+    event's payload and metadata, and the engine's ``hide_parameters`` is the host's choice.
+    """
+    cause = getattr(error, "orig", None)
+    return type(error).__name__ + (f" ({type(cause).__name__})" if cause is not None else "")
 
 
 def _no_metadata(_payload: dict) -> dict | None:
@@ -147,7 +164,7 @@ def _dispatch_event(event: Event) -> None:
         platform_runtime.get_active_platform().events.publish(event)
         logger.debug("Dispatched %s (%s) on the event bus", event.event_type, event.event_id)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event.event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event.event_type, _describe(err))
 
 
 def _stage_batch(
@@ -174,8 +191,7 @@ def _stage_batch(
             "Failed to stage %d %s event(s) in the domain transaction: %s",
             len(payloads),
             event_type,
-            err,
-            exc_info=err,
+            _describe(err),
         )
         raise
 
@@ -217,7 +233,7 @@ def publish(
         else:
             _dispatch_event(event)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, _describe(err))
 
 
 def publish_committing(
@@ -444,4 +460,4 @@ def publish_many_on_commit(
             event = _mint(event_type, copy.deepcopy(payload), source, metadata_of(payload), schema_version)
             run_after_commit(db, partial(_dispatch_event, event))
         except Exception as err:
-            logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+            logger.error("Failed to publish event %s: %s", event_type, _describe(err))

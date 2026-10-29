@@ -373,7 +373,7 @@ verifiable alongside the ones the old key sealed.
 
 | URI | Backend | Notes |
 |---|---|---|
-| `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. Each copy is published with a hard link, so the directory's file system must support them; on one that does not (some network shares), every seal fails. No host, query or fragment. |
+| `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. Each copy is published with a hard link, so the directory's file system must support them; on one that does not (some network shares), every seal fails. No host, query or fragment. Refused under the `distributed` profile, whose nodes share no disk. |
 | `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject` and `PutObject` on the prefix but not delete, and a bucket policy that denies any `PutObject` without `If-None-Match: *` (the `s3:if-none-match` condition key), so no holder of the credentials can overwrite a checkpoint. The sink writes every checkpoint with that header; a store that does not support conditional writes fails every seal. Needs `jasil[s3]`. |
 
 Each object is named `checkpoint-<instance id>-<window start>.json`, so deployments sharing a sink do not collide.
