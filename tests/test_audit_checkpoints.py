@@ -14,6 +14,7 @@ from sqlalchemy import delete, insert, select, update
 
 import jasil.audit as jasil_audit
 import jasil.audit.checkpoints as checkpoints
+from jasil._core.timestamps import as_utc
 from jasil._core.uuid7 import uuid7
 from jasil.audit import AuditAction, Category, Outcome, Severity
 from jasil.audit.models import AuditCheckpoint, AuditLog, Instance
@@ -75,7 +76,7 @@ class Trail:
     def reseal(self, minute: int, *, prev_hash: str) -> None:
         """Rewrite a checkpoint the way an attacker holding the database would: consistent, but re-linked."""
         with self.session_factory() as db:
-            checkpoint = db.get(AuditCheckpoint, at(minute).replace(tzinfo=None))
+            checkpoint = db.get(AuditCheckpoint, at(minute))
             digest = checkpoints._digest(db, at(minute), at(minute) + WINDOW, prev_hash)
             checkpoint.prev_hash, checkpoint.hash = prev_hash, digest.hash
             db.commit()
@@ -114,7 +115,7 @@ class TestSealing:
 
         trail.seal(60)
 
-        assert trail.all()[0].window_start.replace(tzinfo=UTC) == at(15)
+        assert as_utc(trail.all()[0].window_start) == at(15)
 
     def test_an_empty_log_seals_nothing(self, trail):
         assert trail.seal(600) == 0
@@ -176,7 +177,7 @@ class TestSealing:
 
         trail.seal(300)
 
-        bounds = [(cp.window_start.replace(tzinfo=UTC), cp.window_end.replace(tzinfo=UTC)) for cp in trail.all()]
+        bounds = [(as_utc(cp.window_start), as_utc(cp.window_end)) for cp in trail.all()]
         assert bounds[1] == (at(15), at(60))  # shortened to the next hour, so no window straddles midnight
         assert all(start.minute == 0 and end - start == timedelta(hours=1) for start, end in bounds[2:])
         assert trail.verify(end=300).ok

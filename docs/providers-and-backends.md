@@ -207,11 +207,15 @@ code never branches by backend:
 - A part is at most 5 GiB. At completion, every part except the final one must
     be at least 5 MiB. The final part may be smaller or empty.
 - `upload_part(session, part_number, source, size=...)` reads a non-seekable
-    binary source once without materializing the part. `size` is required and
-    must exactly match the source: a short or longer source raises `ValueError`
-    and leaves the session available for a replacement upload. The caller owns
-    and closes the source. A failed attempt may have consumed it, so retry with
-    a newly opened source and the same session and part number.
+    binary source once. `size` is required and must exactly match the source: a
+    short or longer source raises `ValueError` and leaves the session available
+    for a replacement upload. The caller owns and closes the source. A failed
+    attempt may have consumed it, so retry with a newly opened source and the
+    same session and part number. Local storage writes the part straight to its
+    staging file. S3 stages it first, in memory up to 8 MiB and in a temporary
+    file (under `TMPDIR`) beyond that, so the client can checksum it and resend
+    it after a transient failure: allow temporary disk for the largest part in
+    flight.
 - `PartRef` records the part number, actual byte size, and an opaque
     `validator`. The validator may internally be a digest, an S3 ETag, or
     another backend token; callers compare or persist it but never interpret

@@ -6,6 +6,7 @@ to break them.
 """
 
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import create_engine, func, select, table, text
@@ -17,6 +18,7 @@ import jasil.orm as jasil_orm
 import jasil.settings as jasil_settings
 import jasil.testing as jasil_testing
 from jasil import migrations
+from jasil._core.timestamps import as_utc
 from jasil.audit import AuditAction, Category, Outcome, Severity
 from jasil.audit.models import AuditCheckpoint, AuditLog
 from jasil.backends.clock_system import SystemClock
@@ -261,6 +263,20 @@ class TestAppendOnly:
             _insert_row(connection, datetime.now(UTC) + timedelta(days=60))
 
 
+def _floor_spanning_a_longer_day(now: datetime) -> tuple[str, int]:
+    """Return a time zone and a floor whose span crosses a clock change that makes its days add up to more.
+
+    Across the end of summer time a calendar day is 25 hours, so ``now() - interval 'N days'`` in such a
+    zone lands an hour before ``now - N * 24h``. Two hemispheres guarantee such a span exists within a year.
+    """
+    for zone in ("Europe/Berlin", "Australia/Sydney"):
+        tz = ZoneInfo(zone)
+        for days in range(1, 367):
+            if (now - timedelta(days=days)).astimezone(tz).utcoffset() > now.astimezone(tz).utcoffset():
+                return zone, days
+    raise AssertionError("no clock change within a year in either hemisphere")
+
+
 class TestDropPartitions:
     @pytest.fixture
     def aged(self, migrated):
@@ -371,6 +387,19 @@ class TestDropPartitions:
 
         assert self._drop(engine, datetime.now(UTC) - timedelta(days=400)) == 0
         assert _scalar(engine, "SELECT count(*) FROM jasil_audit_log WHERE action_id = 'audit.retention.prune'") == 0
+
+    def test_a_cutoff_at_the_floor_is_accepted_in_any_session_time_zone(self, aged):
+        engine, _ = aged
+        zone, days = _floor_spanning_a_longer_day(datetime.now(UTC))
+        with engine.begin() as connection:
+            connection.execute(text(jasil_audit.retention_floor_sql(days, schema="public")))
+
+        with engine.begin() as connection:
+            connection.exec_driver_sql(f"SET LOCAL TIME ZONE '{zone}'")
+            floor = as_utc(connection.execute(text("SELECT now()")).scalar_one()) - timedelta(days=days)
+            dropped = connection.execute(text("SELECT jasil_audit_drop_partitions(:c)"), {"c": floor}).scalar()
+
+        assert dropped == sum(age > days for age in (100, 99, 2))
 
     def test_the_floor_can_be_changed_with_the_documented_statement(self, aged):
         engine, _ = aged

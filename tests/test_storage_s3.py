@@ -20,7 +20,9 @@ from uuid import UUID
 
 import boto3
 import pytest
-from botocore.exceptions import ClientError, ReadTimeoutError
+from botocore.awsrequest import AWSResponse
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
 
@@ -830,6 +832,19 @@ class TestResumableUpload:
         with pytest.raises(StorageSizeLimitError, match="max_part_size=3"):
             _upload_part(storage, session, 1, b"four")
 
+    def test_a_part_that_cannot_be_staged_is_provider_neutral(self, storage, stub, monkeypatch):
+        class FullDisk(io.BytesIO):
+            def write(self, data):
+                raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(storage_s3.tempfile, "SpooledTemporaryFile", lambda **_kwargs: FullDisk())
+        _stub_manifest(stub)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            _upload_part(storage, _upload_session(), 1, b"part")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
     def test_an_upload_part_failure_is_provider_neutral(self, storage, stub):
         _stub_manifest(stub)
         stub.add_client_error(
@@ -1009,6 +1024,71 @@ class TestResumableUpload:
 
         with pytest.raises(StorageBackendUnavailableError):
             storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+
+class _Raw(io.BytesIO):
+    """The raw body of a canned response, as botocore reads one off the wire."""
+
+    def stream(self, **_kwargs):
+        yield self.getvalue()
+
+
+class TestUploadPartThroughBotocore:
+    """``upload_part`` through botocore's own request pipeline, which ``Stubber`` short-circuits.
+
+    A ``before-send`` handler answers in place of the network, so the body is checksummed, signed and, on
+    a transient failure, rewound by botocore exactly as it would be against a real endpoint.
+    """
+
+    @pytest.fixture(params=["http://s3.test", "https://s3.test"])
+    def wire(self, request):
+        client = boto3.client(
+            "s3",
+            region_name="us-east-1",
+            endpoint_url=request.param,
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+        )
+        wire = type("Wire", (), {"puts": 0, "sent": [], "failures": 0})()
+
+        def answer(request, **_kwargs):
+            if request.method == "GET":
+                manifest = _manifest_body()
+                return AWSResponse(request.url, 200, {"Content-Length": str(len(manifest))}, _Raw(manifest))
+            wire.puts += 1
+            body = request.body
+            wire.sent.append(body.read() if hasattr(body, "read") else body)
+            if wire.failures:
+                wire.failures -= 1
+                raise EndpointConnectionError(endpoint_url=request.url)
+            return AWSResponse(request.url, 200, {"ETag": '"etag-1"'}, _Raw())
+
+        client.meta.events.register("before-send.s3", answer)
+        wire.storage = S3Storage(client, BUCKET, PREFIX)
+        return wire
+
+    def test_a_part_is_uploaded(self, wire):
+        part = _upload_part(wire.storage, _upload_session(), 1, b"part")
+
+        assert part == PartRef(part_number=1, size=4, validator='"etag-1"')
+        assert len(wire.sent) == 1
+
+    def test_a_transient_failure_is_retried_with_the_whole_part(self, wire):
+        wire.failures = 1
+
+        part = _upload_part(wire.storage, _upload_session(), 1, b"part")
+
+        assert part.validator == '"etag-1"'
+        assert len(wire.sent) == 2
+        assert wire.sent[0] == wire.sent[1]
+
+    @pytest.mark.parametrize(("data", "message"), [(b"par", "ended before"), (b"parts", "exceeds")])
+    def test_a_source_of_the_wrong_size_is_refused_before_anything_is_sent(self, wire, data, message):
+        with pytest.raises(ValueError, match=message):
+            _upload_part(wire.storage, _upload_session(), 1, data, size=4)
+
+        assert wire.puts == 0
 
 
 class TestGet:

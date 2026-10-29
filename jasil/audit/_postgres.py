@@ -141,7 +141,9 @@ DECLARE
     first_day date;
     last_day date;
 BEGIN
-    IF cutoff > now() - make_interval(days => floor_days) THEN
+    -- Whole 24-hour days: a days interval on a timestamptz follows the session's calendar, so across a
+    -- clock change it would move the floor by an hour against the application's own clamp.
+    IF cutoff > now() - make_interval(hours => 24 * floor_days) THEN
         RAISE EXCEPTION '@DROP@: cutoff % is inside the retention floor of % days', cutoff, floor_days
             USING ERRCODE = 'restrict_violation';
     END IF;
@@ -216,8 +218,9 @@ def ensure_partitions_function(schema: str) -> str:
 def drop_partitions_function(schema: str, floor_days: int) -> str:
     """Return ``jasil_audit_drop_partitions(cutoff)``, with ``floor_days`` baked in as the retention floor.
 
-    It refuses a cutoff younger than ``now() - floor_days``, drops only partitions that end at or before
-    the cutoff, and records the drop as an ``audit.retention.prune`` row. It never deletes rows.
+    It refuses a cutoff younger than ``now()`` minus ``floor_days`` times 24 hours, whatever the session's
+    ``TimeZone``, drops only partitions that end at or before the cutoff, and records the drop as an
+    ``audit.retention.prune`` row. It never deletes rows.
 
     Raises:
         ValueError: When ``floor_days`` is below 1.

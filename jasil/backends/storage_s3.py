@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import math
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -514,20 +515,29 @@ class S3Storage:
             staged_total = sum(part_size for number, (part_size, _) in uploaded.items() if number != part_number)
             if staged_total + size > session.max_bytes:
                 raise StorageSizeLimitError(f"Resumable upload exceeds max_bytes={session.max_bytes}")
-        try:
-            response = self._client.upload_part(
-                Bucket=self._bucket,
-                Key=object_key,
-                UploadId=state.upload_id,
-                PartNumber=part_number,
-                Body=reader,
-                ContentLength=size,
-            )
-        except ClientError as error:
-            if _error_code(error) in _MISSING_UPLOAD_CODES:
-                raise StorageUploadSessionError("Upload session is not active") from error
-            raise
-        reader.verify_complete()
+        # botocore rewinds the body to checksum it over plain HTTP and to resend it after a transient failure,
+        # which a read-once source cannot do. Staging the part also proves its size before any request is sent.
+        with tempfile.SpooledTemporaryFile(max_size=_MULTIPART_PART_BYTES) as body:
+            while chunk := reader.read(_MULTIPART_PART_BYTES):
+                try:
+                    body.write(chunk)
+                except OSError as error:
+                    raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+            reader.verify_complete()
+            body.seek(0)
+            try:
+                response = self._client.upload_part(
+                    Bucket=self._bucket,
+                    Key=object_key,
+                    UploadId=state.upload_id,
+                    PartNumber=part_number,
+                    Body=body,
+                    ContentLength=size,
+                )
+            except ClientError as error:
+                if _error_code(error) in _MISSING_UPLOAD_CODES:
+                    raise StorageUploadSessionError("Upload session is not active") from error
+                raise
         return PartRef(part_number=part_number, size=size, validator=response["ETag"])
 
     @_translate_s3_errors

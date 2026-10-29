@@ -17,6 +17,7 @@ from sqlalchemy.exc import DBAPIError
 import jasil.audit as jasil_audit
 import jasil.correlation as correlation
 import jasil.testing as jasil_testing
+from jasil._core.timestamps import as_utc
 from jasil._core.uuid7 import uuid7
 from jasil.audit import AuditAction, AuditContext, Category, Outcome, Severity
 from jasil.audit.models import AuditLog
@@ -155,7 +156,7 @@ class TestTransactionalWrite:
         jasil_audit.stage(db, change, details={"fields": []})
         db.commit()
 
-        assert _rows(db)[0].occurred_at.replace(tzinfo=UTC) == jasil_testing.DEFAULT_NOW
+        assert as_utc(_rows(db)[0].occurred_at) == jasil_testing.DEFAULT_NOW
 
     def test_the_default_outcome_is_success(self, db, change):
         jasil_audit.stage(db, change, details={"fields": []})
@@ -466,4 +467,4 @@ class TestClock:
 
         first, second = _rows(db)
         assert second.occurred_at - first.occurred_at == timedelta(hours=1)
-        assert first.occurred_at.replace(tzinfo=UTC) == datetime(2026, 1, 1, 12, tzinfo=UTC)
+        assert as_utc(first.occurred_at) == datetime(2026, 1, 1, 12, tzinfo=UTC)

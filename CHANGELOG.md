@@ -25,6 +25,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 - Migration `rev0006` adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On PostgreSQL (13 or newer) `jasil_audit_log` is range-partitioned by day, `UPDATE`, `DELETE` and `TRUNCATE` are rejected by triggers, and two `SECURITY DEFINER` functions (`jasil_audit_ensure_partitions`, `jasil_audit_drop_partitions`) manage partitions; the latter refuses a cutoff inside a retention floor baked in from `audit.retention_floor_days` when the migration runs, and drops whole partitions only. Other dialects get a plain table. Run the migration as the role that should own the table and functions; processes of the previous release neither read nor write the new tables. Downgrading drops the audit trail.
 - `Platform` has a new field `audit_sink` (default `None`).
 
+### Fixed
+
+- S3 `upload_part` works against a plain-`http://` endpoint (it raised `AttributeError` there), botocore can now resend a part after a transient failure, and a source shorter or longer than `size` raises `ValueError` before any request is sent. The part is staged before upload, in memory up to 8 MiB and in a temporary file beyond that, so allow temporary disk for the largest part in flight.
+
 No breaking changes: nothing is written until the host calls the audit API, and every addition is optional.
 
 ## [0.13.0] - 2026-10-27
