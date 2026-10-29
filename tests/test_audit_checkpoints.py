@@ -228,6 +228,15 @@ class TestVerification:
         assert report.signed is False
         assert [(w.expected_rows, w.actual_rows) for w in report.windows] == [(2, 2), (0, 0), (1, 1)]
 
+    def test_a_reversed_range_is_refused(self, sealed):
+        with pytest.raises(ValueError, match="after to_ts"):
+            sealed.verify(start=60, end=0)
+
+    def test_a_range_longer_than_a_year_is_refused(self, sealed):
+        """Every row in the range is read and hashed in one session; a longer audit is verified in parts."""
+        with pytest.raises(ValueError, match="at most 366 days"):
+            jasil_audit.verify_checkpoints(None, at(0), at(0) + timedelta(days=366, minutes=1))
+
     def test_a_modified_row_is_reported(self, sealed):
         sealed.execute(update(AuditLog).where(AuditLog.target_id == "b").values(outcome="failure"))
 

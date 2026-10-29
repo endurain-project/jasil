@@ -288,6 +288,16 @@ holds, the running job's and the waiting jobs' of its batch, on each beat, so
 `lease_seconds` is how long a worker may go **silent**, not how long a handler may
 run. See [Long-running handlers](#long-running-handlers).
 
+One reaper run reclaims up to 10 000 expired leases, in transactions of 100, so a
+crash that expires a whole batch is recovered within a minute.
+
+**Keep the hosts' clocks synchronised.** A lease's expiry is written with the
+claiming worker's clock and compared with the reaper's, which may run on another
+host. A reaper whose clock runs ahead by more than `lease_seconds` minus
+`heartbeat_interval_seconds` reclaims leases that are still being renewed, and
+the job runs twice. Run NTP, or your platform's time sync, everywhere a worker or
+the scheduler runs.
+
 ## Idempotency
 
 `(event_id, subscriber_id)` is **unique in the database**. A repeated enqueue is a
@@ -504,8 +514,8 @@ failure.
 `lease_seconds` is how long a worker may go silent. One heartbeat renews leases
 and proves the worker alive, so it must be at least **three**
 `heartbeat_interval_seconds` (two missed beats must not expire a lease), and
-`max_runtime_seconds` must not be below it; `build_runner` refuses anything else
-at startup. A worker is therefore reported stale no later than its leases start
+`max_runtime_seconds` must not be below it; `JobSettings` refuses anything else
+when it is built. A worker is therefore reported stale no later than its leases start
 expiring.
 
 A late worker finalizes with its worker id and attempt generation, so even a
@@ -526,7 +536,12 @@ twice. Three things bound that:
   operator's signal.
 - **Self-fencing.** If renewals fail for almost a whole lease (the database is
   unreachable), the handler is signalled *before* another worker can have
-  reclaimed the job.
+  reclaimed the job. Only a renewal that *fails* counts: one that hangs holds the
+  worker, which waits for it before starting each job. Give the engine a connect
+  timeout and a statement timeout (PostgreSQL `statement_timeout`; on MySQL, whose
+  `max_execution_time` covers only `SELECT`, a driver read timeout such as
+  PyMySQL's `read_timeout`) well below
+  `heartbeat_interval_seconds`, so a stalled database fails a renewal instead.
 - **A stolen lease.** If the job is found to belong to another worker, the handler
   is signalled and its result is discarded.
 

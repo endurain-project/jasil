@@ -481,6 +481,39 @@ class TestOfflineSql:
         assert sql.rindex("COMMIT", 0, build) > sql.rindex("ADD COLUMN dead_letter_notified_at", 0, build)
 
 
+class TestOfflineAuditTrail:
+    """rev0006 qualifies its functions with the target schema, which ``--sql`` cannot ask a database for."""
+
+    def _render(self, span, *x_arguments):
+        import argparse
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+        config.cmd_opts = argparse.Namespace(x=list(x_arguments))
+        command.upgrade(config, span, sql=True) if span.startswith("rev0005") else command.downgrade(
+            config, span, sql=True
+        )
+        return config.output_buffer.getvalue()
+
+    def test_the_upgrade_renders_with_the_schema_given(self):
+        sql = self._render("rev0005:rev0006", "schema=audit_home")
+
+        assert '"audit_home".jasil_audit_ensure_partitions' in sql
+
+    def test_the_downgrade_renders_with_the_schema_given(self):
+        sql = self._render("rev0006:rev0005", "schema=audit_home")
+
+        assert '"audit_home".jasil_audit_ensure_partitions' in sql
+
+    def test_without_a_schema_it_says_how_to_give_one(self):
+        with pytest.raises(RuntimeError, match="-x schema="):
+            self._render("rev0005:rev0006")
+
+
 class TestAdoptExistingSchema:
     def test_an_empty_database_is_not_stamped_and_can_be_upgraded(self, engine):
         assert migrations.adopt_existing_schema(engine) is False

@@ -6,9 +6,16 @@ from collections.abc import Iterator
 
 from jasil.providers import TieredFailureOutcome
 
+#: How often a write also drops every expired key. Expiry is otherwise lazy, on read, and a key that is never
+#: read again (a rate-limit counter for a client that left) would stay in memory for the life of the process.
+SWEEP_INTERVAL_SECONDS = 60
+
 
 class MemoryState:
     """``StateProvider`` backed by a process-local dict with per-key TTL expiry.
+
+    An expired key is dropped when it is read, and every write sweeps the expired
+    keys at most once per :data:`SWEEP_INTERVAL_SECONDS`.
 
     Correct for the ``local`` profile (single process). Not shared across
     workers/replicas — the deployment fail-fast rejects using it under a
@@ -19,6 +26,16 @@ class MemoryState:
     def __init__(self) -> None:
         self._data: dict[str, tuple[bytes, float | None]] = {}
         self._lock = threading.Lock()
+        self._next_sweep = time.monotonic() + SWEEP_INTERVAL_SECONDS
+
+    def _sweep_if_due(self) -> None:
+        """Drop every expired key, at most once per :data:`SWEEP_INTERVAL_SECONDS`; call under the lock."""
+        now = time.monotonic()
+        if now < self._next_sweep:
+            return
+        self._next_sweep = now + SWEEP_INTERVAL_SECONDS
+        for key in [key for key, (_value, expiry) in self._data.items() if expiry is not None and expiry <= now]:
+            del self._data[key]
 
     @staticmethod
     def _is_expired(expiry: float | None) -> bool:
@@ -44,6 +61,7 @@ class MemoryState:
         """Store ``value`` under ``key``, expiring after ``ttl_seconds`` when given."""
         _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._data[key] = (value, expiry)
 
@@ -56,6 +74,7 @@ class MemoryState:
         """Add ``amount`` to the stored integer; keep the existing expiry unless ``ttl_seconds`` is given."""
         _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             current_bytes = self._live_value(key)
             current = int(current_bytes.decode()) if current_bytes is not None else 0
             new_value = current + amount
@@ -72,6 +91,7 @@ class MemoryState:
         """Store ``value`` only when no unexpired value exists; return True when stored."""
         _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             if self._live_value(key) is not None:
                 return False
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
@@ -115,6 +135,7 @@ class MemoryState:
         """Count one occurrence and close the gate, atomically under the instance lock."""
         now = int(time.time())
         with self._lock:
+            self._sweep_if_due()
             # Already locked: return the current count without incrementing, so a
             # locked-out caller cannot keep inflating the counter.
             gate_bytes = self._live_value(gate_key)

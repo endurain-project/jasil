@@ -25,7 +25,7 @@ import time
 from collections.abc import Sequence
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import jasil._core.network as network
 from jasil.providers import GeocodedPlace
@@ -379,5 +379,17 @@ def resolve_reverse_endpoint(
             reason,
         )
         return None, reason
-    scheme = "https" if use_https else "http"
-    return f"{scheme}://{host}/reverse", None
+    if not use_https:
+        # Cleartext carries the coordinates unencrypted, so it is for a self-hosted instance on a private
+        # network only, as for mail.
+        reason = network.non_public_rejection_reason(urlsplit(f"//{host}").hostname or "")
+        if reason is not None:
+            logger.warning(
+                "Reverse-geocoding host %r %s, and cleartext (+http) needs a private host; reverse geocoding is "
+                "disabled. Use the https scheme for a public instance.",
+                host,
+                reason,
+            )
+            return None, reason
+        return f"http://{host}/reverse", None
+    return f"https://{host}/reverse", None

@@ -10,6 +10,8 @@ from sqlalchemy.sql import false, func
 
 from jasil._core.limits import (
     MAX_AUDIT_ACTION_ID_LENGTH,
+    MAX_AUDIT_APP_NAME_LENGTH,
+    MAX_AUDIT_APP_VERSION_LENGTH,
     MAX_AUDIT_ID_LENGTH,
     MAX_AUDIT_NAME_LENGTH,
     MAX_IP_ADDRESS_LENGTH,
@@ -133,8 +135,12 @@ class AuditLog(Base):
     instance_id: Mapped[str | None] = mapped_column(
         String(MAX_EVENT_ID_LENGTH), nullable=True, comment="Deployment id from jasil_instance"
     )
-    app_name: Mapped[str | None] = mapped_column(String(100), nullable=True, comment="Host application name")
-    app_version: Mapped[str | None] = mapped_column(String(50), nullable=True, comment="Host application version")
+    app_name: Mapped[str | None] = mapped_column(
+        String(MAX_AUDIT_APP_NAME_LENGTH), nullable=True, comment="Host application name"
+    )
+    app_version: Mapped[str | None] = mapped_column(
+        String(MAX_AUDIT_APP_VERSION_LENGTH), nullable=True, comment="Host application version"
+    )
 
 
 class AuditActionRecord(Base):

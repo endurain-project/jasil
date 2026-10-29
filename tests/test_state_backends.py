@@ -332,6 +332,29 @@ class TestMemoryBackendExpiry:
         assert outcome.newly_locked is True
         assert outcome.locked_until_epoch > locked.locked_until_epoch
 
+    def test_a_write_sweeps_keys_that_expired_unread(self, clock):
+        """Rate-limit keys are written once and never read again; left in place they would grow without bound."""
+        state = MemoryState()
+        for n in range(100):
+            state.set(f"rate:{n}", b"1", ttl_seconds=10)
+        state.set("kept", b"1")
+
+        clock["now"] += 61
+        state.set("new", b"1")
+
+        assert sorted(state._data) == ["kept", "new"]
+
+    def test_the_sweep_runs_at_most_once_a_minute(self, clock):
+        state = MemoryState()
+        clock["now"] += 61
+        state.set("first", b"1")  # sweeps an empty store, and starts the next minute
+        state.set("short", b"1", ttl_seconds=1)
+
+        clock["now"] += 2
+        state.set("second", b"1")
+
+        assert "short" in state._data
+
     def test_expired_keys_are_not_listed(self, clock):
         state = MemoryState()
         state.set("session:a", b"1", ttl_seconds=10)

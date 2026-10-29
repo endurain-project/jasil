@@ -19,7 +19,7 @@ Create Date: 2026-10-28
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
+from alembic import context, op
 from sqlalchemy.dialects.postgresql import JSONB
 
 from jasil.audit import _postgres as pg
@@ -163,15 +163,31 @@ def upgrade() -> None:
 
     if postgresql:
         audit = get_settings().audit
-        schema = bind.execute(sa.text("SELECT current_schema()")).scalar_one()
+        schema = _target_schema()
         for statement in pg.install_statements(schema, audit.retention_floor_days, audit.partition_days_ahead):
             op.execute(statement)
+
+
+def _target_schema() -> str:
+    """The schema the audit functions are created in: the connection's, or ``-x schema=`` when rendering SQL.
+
+    Raises:
+        RuntimeError: When rendering SQL without ``-x schema=``, since there is no database to ask.
+    """
+    if op.get_context().as_sql:
+        schema = context.get_x_argument(as_dictionary=True).get("schema")
+        if not schema:
+            raise RuntimeError(
+                "Rendering rev0006 as SQL needs the schema its audit functions belong to: pass -x schema=<name>"
+            )
+        return schema
+    return op.get_bind().execute(sa.text("SELECT current_schema()")).scalar_one()
 
 
 def downgrade() -> None:
     bind = op.get_bind()
     postgresql = bind.dialect.name == "postgresql"
-    schema = bind.execute(sa.text("SELECT current_schema()")).scalar_one() if postgresql else None
+    schema = _target_schema() if postgresql else None
 
     # Dropping the log drops its partitions and triggers with it.
     op.drop_table(_INSTANCE)

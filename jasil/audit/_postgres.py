@@ -7,7 +7,8 @@ dialect, where the audit log is a plain table.
 The two functions are ``SECURITY DEFINER`` so a runtime role holding no DDL rights can still create the
 next day's partition and drop an expired one. Both pin ``search_path`` to ``pg_catalog, pg_temp`` (an
 unlisted ``pg_temp`` would be searched first) and qualify every object, so a caller cannot redirect them
-by shadowing a name with a temporary table. Both wait at most ``lock_timeout`` (10 seconds) for a lock:
+by shadowing a name with a temporary table. Both pin ``TimeZone`` and ``DateStyle`` too, so the partition
+bounds they write as text and read back mean the same instant whatever the caller's session uses. Both wait at most ``lock_timeout`` (10 seconds) for a lock:
 their advisory lock is one any role that can connect may take, and the table locks they need queue the
 application's inserts behind them while they wait.
 """
@@ -94,6 +95,8 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 SET lock_timeout = '10s'
+SET TimeZone = 'UTC'
+SET DateStyle = 'ISO, YMD'
 AS $body$
 DECLARE
     today date := (now() AT TIME ZONE 'UTC')::date;
@@ -139,6 +142,8 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 SET lock_timeout = '10s'
+SET TimeZone = 'UTC'
+SET DateStyle = 'ISO, YMD'
 AS $body$
 DECLARE
     floor_days constant integer := @FLOOR_DAYS@;

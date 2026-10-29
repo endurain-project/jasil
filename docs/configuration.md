@@ -112,8 +112,8 @@ checkpoint maintenance seals a window, so an invalid key makes that maintenance 
 
 | Field | Default | Meaning |
 |---|---|---|
-| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
-| `rate_limit` | `1.0` | Maximum requests per second; `<= 0` disables throttling. |
+| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network: refused for a host that resolves to any public address), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
+| `rate_limit` | `1.0` | Maximum requests per second **per process**; `<= 0` disables throttling. Each process throttles on its own, so a deployment of N processes sends up to N times this rate: divide a provider's limit (Nominatim's public instance allows one request a second) by the number of processes that geocode. |
 | `api_key` | `None` | Required by `geocode://`. |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
 

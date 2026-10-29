@@ -13,6 +13,7 @@ from sqlalchemy import and_, case, delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from jasil._core.cursors import decode_cursor, encode_cursor
+from jasil._core.limits import check_limit
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil.jobs.models import JobAttempt, ProcessingJob
 from jasil.jobs.schema import DurationBuckets, EventJobs, JobAttemptInfo, JobDetail, WorkerAttempts
@@ -151,21 +152,6 @@ def _history(db: Session, job_id: str, limit: int) -> list[JobAttemptInfo]:
         .all()
     )
     return [JobAttemptInfo.model_validate(attempt) for attempt in attempts]
-
-
-def check_limit(limit: int, *, maximum: int, name: str) -> None:
-    """Require ``limit`` to be an integer from 1 to ``maximum``.
-
-    Args:
-        limit: The value to check; a ``bool`` is rejected.
-        maximum: The largest accepted value.
-        name: The parameter name used in the error message.
-
-    Raises:
-        ValueError: When ``limit`` is not an integer in range.
-    """
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
-        raise ValueError(f"{name} must be an integer between 1 and {maximum}")
 
 
 def get_job_detail(

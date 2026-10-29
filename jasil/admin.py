@@ -32,6 +32,7 @@ and JASIL has no notion of who is calling.
 
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil._core.limits import MAX_DASHBOARD_LIST_LIMIT, MAX_DASHBOARD_WINDOW_HOURS, check_limit
 from jasil.event_log.schema import (
     EventLogFailure,
     EventLogPending,
@@ -81,12 +82,16 @@ __all__ = [
 ]
 
 
+def _check_window(hours: int) -> None:
+    check_limit(hours, maximum=MAX_DASHBOARD_WINDOW_HOURS, name="hours")
+
+
 def get_jobs_summary(*, hours: int = 24, dead_letter_limit: int = 50) -> JobsSummary:
     """Aggregate ``processing_jobs`` into the durable-jobs dashboard payload.
 
     Args:
-        hours: Look-back window for the status and per-subscriber counts.
-        dead_letter_limit: Maximum dead-letter jobs to return for inspection.
+        hours: Look-back window for the status and per-subscriber counts, from 1 to 8784 (366 days).
+        dead_letter_limit: Maximum dead-letter jobs to return for inspection, from 0 to 500.
 
     Returns:
         Window counts, the per-subscriber breakdown, the age of the oldest
@@ -94,11 +99,14 @@ def get_jobs_summary(*, hours: int = 24, dead_letter_limit: int = 50) -> JobsSum
         the platform clock's instant.
 
     Raises:
+        ValueError: When ``hours`` or ``dead_letter_limit`` is out of range.
         RuntimeError: When no platform has been published, or when
             ``jasil.orm.configure_sessionmaker`` has not run.
     """
     import jasil.jobs.crud as jobs_crud
 
+    _check_window(hours)
+    check_limit(dead_letter_limit, minimum=0, maximum=MAX_DASHBOARD_LIST_LIMIT, name="dead_letter_limit")
     now = platform_runtime.get_active_platform().clock.now()
     with jasil_orm.get_sessionmaker()() as db:
         return jobs_crud.get_jobs_summary(
@@ -114,8 +122,8 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
     """Aggregate ``event_log`` into the observability dashboard payload.
 
     Args:
-        hours: Look-back window for the throughput, outcome, and latency stats.
-        failure_limit: Maximum recent failures to return.
+        hours: Look-back window for the throughput, outcome, and latency stats, from 1 to 8784 (366 days).
+        failure_limit: Maximum recent failures to return, from 0 to 500.
 
     Returns:
         Per-event-type statistics, the not-yet-finished groups and their oldest
@@ -123,11 +131,14 @@ def get_event_log_summary(*, hours: int = 24, failure_limit: int = 20) -> EventL
         clock's instant.
 
     Raises:
+        ValueError: When ``hours`` or ``failure_limit`` is out of range.
         RuntimeError: When no platform has been published, or when
             ``jasil.orm.configure_sessionmaker`` has not run.
     """
     import jasil.event_log.crud as event_log_crud
 
+    _check_window(hours)
+    check_limit(failure_limit, minimum=0, maximum=MAX_DASHBOARD_LIST_LIMIT, name="failure_limit")
     now = platform_runtime.get_active_platform().clock.now()
     with jasil_orm.get_sessionmaker()() as db:
         return event_log_crud.get_event_log_summary(db, now=now, hours=hours, failure_limit=failure_limit)
@@ -151,16 +162,22 @@ def get_workers_summary(
         limit: Page size from 1 through 500.
         cursor: Opaque cursor returned as ``next_cursor`` by the previous page.
         hours: Look-back window for each worker's attempt counts (attempts that
-            ended within it) and ``last_finished_at``.
+            ended within it) and ``last_finished_at``, from 1 to 8784 (366 days).
 
     Returns:
         Worker counts and retained worker-instance details. The attempt counts
         are ``None`` when this process does not record attempts, and
         ``claimed_by_stale_workers`` counts jobs waiting for the reaper behind a
         worker that stopped beating.
+
+    Raises:
+        ValueError: When ``hours`` or ``limit`` is out of range, or ``cursor`` is not one this function returned.
+        RuntimeError: When no platform has been published, or when
+            ``jasil.orm.configure_sessionmaker`` has not run.
     """
     import jasil.jobs._worker_registry as worker_registry
 
+    _check_window(hours)
     effective_stale_after = (
         stale_after_seconds if stale_after_seconds is not None else get_settings().jobs.heartbeat_interval_seconds * 3
     )

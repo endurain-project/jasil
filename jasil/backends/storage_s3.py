@@ -23,6 +23,7 @@ from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+import jasil._core.network as network
 from jasil._core.storage_keys import (
     UPLOAD_STAGING_AREA,
     check_area,
@@ -53,6 +54,10 @@ _MISSING_UPLOAD_CODES = frozenset({"404", "NoSuchUpload", "NotFound"})
 _OBJECT_EXISTS_CODES = frozenset({"412", "PreconditionFailed"})
 #: The longest expiry a Signature Version 4 presigned URL can carry: seven days.
 _MAX_URL_EXPIRY_SECONDS = 7 * 24 * 3600
+
+#: The client's socket timeouts. botocore defaults both to a minute; nothing else bounds a stalled endpoint.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 60
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
@@ -122,6 +127,25 @@ def _validate_response_content_type(content_type: str) -> None:
         raise ValueError("content_type must be non-empty and contain no line breaks")
 
 
+def _check_endpoint(endpoint_url: str) -> None:
+    """Refuse an ``endpoint_url`` that is not HTTPS, unless it is cleartext to a private host.
+
+    Request signatures, object contents and presigned URLs cross the connection, so cleartext is for an
+    S3-compatible store on the same private network only, as for mail and geocoding.
+
+    Raises:
+        ValueError: When the URL is not ``http(s)://host``, or is ``http://`` to a host that resolves to a public
+            address (or does not resolve).
+    """
+    endpoint = urlparse(endpoint_url)
+    if endpoint.scheme not in ("http", "https") or not endpoint.hostname:
+        raise ValueError("endpoint_url must be an https:// URL, or http:// to a private host")
+    if endpoint.scheme == "http":
+        reason = network.non_public_rejection_reason(endpoint.hostname)
+        if reason is not None:
+            raise ValueError(f"A cleartext http:// endpoint_url needs a private host; the host {reason}")
+
+
 class S3Storage:
     """``StorageProvider`` backed by S3-compatible object storage.
 
@@ -149,21 +173,30 @@ class S3Storage:
             A configured ``S3Storage``.
 
         Raises:
-            ValueError: When the URI has no bucket.
+            ValueError: When the URI has no bucket, or ``endpoint_url`` is not an ``https://`` URL or an
+                ``http://`` one whose host resolves only to private addresses.
         """
         parsed = urlparse(uri)
         bucket = parsed.netloc
         if not bucket:
             raise ValueError("An s3 storage_uri is missing a bucket")
         params = parse_qs(parsed.query)
+        endpoint_url = params.get("endpoint_url", [None])[0]
+        if endpoint_url is not None:
+            _check_endpoint(endpoint_url)
         try:
             client = boto3.client(
                 "s3",
                 region_name=params.get("region", [None])[0],
-                endpoint_url=params.get("endpoint_url", [None])[0],
+                endpoint_url=endpoint_url,
                 # SigV4, which presigned URLs do not default to: SigV2 query auth cannot fetch SSE-KMS objects
                 # and is refused by stores that speak only SigV4.
-                config=Config(retries={"max_attempts": 3, "mode": "standard"}, signature_version="s3v4"),
+                config=Config(
+                    retries={"max_attempts": 3, "mode": "standard"},
+                    signature_version="s3v4",
+                    connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=READ_TIMEOUT_SECONDS,
+                ),
             )
         except BotoCoreError as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error

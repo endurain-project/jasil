@@ -182,8 +182,8 @@ def build_platform(
     # of best-effort (bus-delivered) events, while the publish facade uses the
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
-    recorder = _build_event_recorder(settings)
     clock = clock if clock is not None else SystemClock()
+    recorder = _build_event_recorder(settings, clock)
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
@@ -326,14 +326,14 @@ def _build_audit_sink(settings: JasilSettings) -> AuditSink | None:
     raise _unsupported_scheme("audit.external_sink_uri", uri)
 
 
-def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
+def _build_event_recorder(settings: JasilSettings, clock: ClockProvider) -> EventRecorder | None:
     if not settings.event_log.enabled:
         return None
     # Imported lazily: the recorder pulls in the ORM/session layer, which the
     # pure providers/events modules deliberately do not depend on.
     from jasil.event_log.recorder import EventLogRecorder
 
-    return EventLogRecorder()
+    return EventLogRecorder(clock)
 
 
 def _build_lock(settings: JasilSettings) -> LockProvider:

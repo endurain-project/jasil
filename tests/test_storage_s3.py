@@ -13,6 +13,7 @@ must not masquerade as one).
 
 import io
 import json
+import socket
 from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
@@ -27,6 +28,7 @@ from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeou
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
 
+import jasil._core.network as network
 import jasil.backends.storage_s3 as storage_s3
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
@@ -186,6 +188,34 @@ class TestFromUri:
 
         assert storage._client.meta.endpoint_url == "https://minio.test"
 
+    def test_the_client_has_explicit_timeouts(self):
+        """botocore's defaults are a minute each, and nothing else bounds a stalled endpoint."""
+        config = S3Storage.from_uri("s3://my-bucket")._client.meta.config
+
+        assert (config.connect_timeout, config.read_timeout) == (
+            storage_s3.CONNECT_TIMEOUT_SECONDS,
+            storage_s3.READ_TIMEOUT_SECONDS,
+        )
+
+    def test_a_cleartext_endpoint_on_a_private_network_is_accepted(self, monkeypatch):
+        _resolve_to(monkeypatch, "10.0.0.5")
+
+        storage = S3Storage.from_uri("s3://my-bucket?endpoint_url=http://minio:9000")
+
+        assert storage._client.meta.endpoint_url == "http://minio:9000"
+
+    def test_a_cleartext_endpoint_on_the_internet_is_refused(self, monkeypatch):
+        """Request signatures, object contents and presigned URLs would cross it unencrypted."""
+        _resolve_to(monkeypatch, "93.184.216.34")
+
+        with pytest.raises(ValueError, match="private"):
+            S3Storage.from_uri("s3://my-bucket?endpoint_url=http://s3.example.com")
+
+    @pytest.mark.parametrize("endpoint", ["ftp://minio.test", "minio.test", "https://"])
+    def test_an_endpoint_that_is_not_an_http_url_is_refused(self, endpoint):
+        with pytest.raises(ValueError, match="endpoint_url"):
+            S3Storage.from_uri(f"s3://my-bucket?endpoint_url={endpoint}")
+
     def test_the_region_is_honoured(self):
         assert S3Storage.from_uri("s3://my-bucket?region=eu-west-1")._client.meta.region_name == "eu-west-1"
 
@@ -199,6 +229,13 @@ class TestFromUri:
             S3Storage.from_uri("s3://my-bucket")
 
         assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
+
+
+def _resolve_to(monkeypatch, address: str) -> None:
+    def _fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0))]
+
+    monkeypatch.setattr(network.socket, "getaddrinfo", _fake_getaddrinfo)
 
 
 class TestSave:

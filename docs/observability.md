@@ -230,6 +230,10 @@ starts instead of refusing.
     event's publish `timestamp` rather than the time its job was enqueued. Jobs written before it, or by a
     previous-release process during a rollout, have none and keep the enqueue time.
 
+!!! note "Revision `rev0008` (0.14): the jobs dashboard's window"
+    Indexes `jasil_processing_jobs.created_at`, which `get_jobs_summary` filters its window on. On PostgreSQL
+    the index is built `CONCURRENTLY`, so workers of the previous release keep running while it builds.
+
 !!! note "One schema: the connection's default"
     The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
     `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`, because the models would then look
@@ -326,6 +330,23 @@ Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev000
 and `rev0004` commit their other changes before building their
 `jasil_processing_jobs` indexes `CONCURRENTLY`; inside one transaction for the whole
 run, that commit would also commit every revision before them.
+
+To render the SQL instead of running it (`alembic upgrade --sql`), pass
+`-x schema=<name>`: on PostgreSQL `rev0006` creates its audit functions in the
+schema its tables go into, and offline there is no database to ask. Name the
+schema the connection that runs the script creates tables in.
+
+### When a migration fails
+
+On PostgreSQL and SQLite a failed revision rolls back and `upgrade()` resumes from
+it. MySQL commits each `CREATE`, `ALTER` and `DROP` on its own, so a revision that
+fails part-way leaves the statements before the failure applied and the revision
+unrecorded, and running it again fails on what already exists. Restore the
+database from the backup taken before the upgrade, or undo the failed revision's
+applied statements by hand, then run `upgrade()` again.
+
+Downgrades drop columns with `ALTER TABLE ... DROP COLUMN`, which SQLite supports
+from 3.35. Check `sqlite3.sqlite_version` before downgrading a SQLite database.
 
 ## Retention
 

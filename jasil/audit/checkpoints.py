@@ -53,6 +53,8 @@ __all__ = ["seal_pending_windows", "verify_checkpoints"]
 #: Windows sealed per maintenance run, so a long backlog (first run on an old log, or after an outage)
 #: is worked off over several runs instead of holding the lock for minutes.
 MAX_WINDOWS_PER_RUN = 1000
+#: The longest range one :func:`verify_checkpoints` call reads; every row in it is hashed in one session.
+MAX_VERIFY_RANGE = timedelta(days=366)
 
 _MESSAGE_PREFIX = "jasil-audit-checkpoint-v1"
 _FETCH_SIZE = 1000
@@ -463,19 +465,24 @@ def verify_checkpoints(
             signed with across a rotation, each checkpoint checked against the one its key id names; or
             ``None`` to check hashes and chain only.
         from_ts: Earliest window start to verify.
-        to_ts: Latest window end to verify.
+        to_ts: Latest window end to verify; at most :data:`MAX_VERIFY_RANGE` (366 days) after ``from_ts``.
 
     Returns:
         One entry per checkpoint window and per gap, oldest first.
 
     Raises:
-        ValueError: When a key is not valid, or ``public_key`` is an empty sequence.
+        ValueError: When a key is not valid, ``public_key`` is an empty sequence, ``from_ts`` is after
+            ``to_ts``, or the range is longer than :data:`MAX_VERIFY_RANGE`.
         ImportError: When a key is given and ``cryptography`` is not installed (``jasil[audit]``).
     """
     from jasil.audit.models import AuditCheckpoint, AuditLog, Instance
 
-    verifiers = _verifiers(public_key)
     start_bound, end_bound = as_utc(from_ts), as_utc(to_ts)
+    if start_bound > end_bound:
+        raise ValueError(f"from_ts ({start_bound.isoformat()}) is after to_ts ({end_bound.isoformat()})")
+    if end_bound - start_bound > MAX_VERIFY_RANGE:
+        raise ValueError(f"the range may cover at most {MAX_VERIFY_RANGE.days} days; verify a longer one in parts")
+    verifiers = _verifiers(public_key)
     results: list[WindowVerification] = []
 
     with jasil_orm.get_sessionmaker()() as db:

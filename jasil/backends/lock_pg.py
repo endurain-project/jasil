@@ -59,6 +59,8 @@ class PgAdvisoryLock:
         """Try ``pg_try_advisory_lock`` for ``name`` and yield whether it was taken.
 
         The lock is released on exit, and a failed release invalidates the connection instead of raising.
+        Losing the connection while the body runs releases the lock early without interrupting the body; it is
+        only seen, and logged, at release.
         """
         del ttl_seconds  # session advisory locks are not TTL-based
         key = advisory_key(name)
@@ -72,12 +74,28 @@ class PgAdvisoryLock:
             yield acquired
         finally:
             if acquired:
-                try:
-                    connection.execute(text("SELECT pg_advisory_unlock(CAST(:key AS bigint))"), {"key": key})
-                except Exception as error:
-                    # Never let an unlock failure mask a body exception; drop the
-                    # still-locked connection so its backend session (and the
-                    # lock) is discarded instead of returned to the pool.
-                    logger.error("Failed to release advisory lock %r", name, exc_info=error)
-                    connection.invalidate()
+                _release(connection, key, name)
             connection.close()
+
+
+def _release(connection: Any, key: int, name: str) -> None:
+    """Unlock ``key`` on ``connection``, discarding the session when the lock was lost or the unlock failed.
+
+    Either way the guarded work may have run without the lock for part of the time, so it is logged as an
+    error; it is never raised, so it cannot mask the body's own exception.
+    """
+    try:
+        released = connection.execute(text("SELECT pg_advisory_unlock(CAST(:key AS bigint))"), {"key": key}).scalar()
+    except Exception as error:
+        logger.error(
+            "Failed to release advisory lock %r; the connection may have dropped while the guarded work ran, "
+            "releasing the lock early",
+            name,
+            exc_info=error,
+        )
+        # Dropped rather than returned to the pool, so a session that still holds the lock is discarded with it.
+        connection.invalidate()
+        return
+    if not released:
+        logger.error("Advisory lock %r was no longer held when the guarded work finished", name)
+        connection.invalidate()

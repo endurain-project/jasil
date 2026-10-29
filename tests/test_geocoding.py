@@ -71,16 +71,29 @@ class TestEndpointConstruction:
         )
 
     def test_http_is_available_for_a_self_hosted_instance(self, resolves_to):
-        resolves_to(PUBLIC_IP)
+        resolves_to(PRIVATE_IP)
 
-        assert resolve_reverse_endpoint("geo.example.com", use_https=False)[0] == "http://geo.example.com/reverse"
+        endpoint = resolve_reverse_endpoint("geo.internal", use_https=False, allowed_hosts=["10.0.0.0/8"])[0]
+
+        assert endpoint == "http://geo.internal/reverse"
 
     def test_a_port_is_preserved(self, resolves_to):
         resolves_to(PUBLIC_IP)
 
-        assert resolve_reverse_endpoint("geo.example.com:8080", use_https=False)[0] == (
-            "http://geo.example.com:8080/reverse"
+        assert resolve_reverse_endpoint("geo.example.com:8080", use_https=True)[0] == (
+            "https://geo.example.com:8080/reverse"
         )
+
+    def test_http_to_a_public_host_is_refused(self, resolves_to, caplog):
+        """Cleartext would expose the coordinates on the internet; it is for a private instance only."""
+        resolves_to(PUBLIC_IP)
+
+        with caplog.at_level("WARNING"):
+            endpoint, reason = resolve_reverse_endpoint("geo.example.com:8080", use_https=False)
+
+        assert endpoint is None
+        assert reason == "resolves to a public address"
+        assert "cleartext" in caplog.text
 
 
 class TestEgressValidation:

@@ -22,9 +22,13 @@ so a width and the code protecting it cannot drift apart.
 
 __all__ = [
     "MAX_AUDIT_ACTION_ID_LENGTH",
+    "MAX_AUDIT_APP_NAME_LENGTH",
+    "MAX_AUDIT_APP_VERSION_LENGTH",
     "MAX_AUDIT_ID_LENGTH",
     "MAX_AUDIT_NAME_LENGTH",
     "MAX_AUDIT_RETENTION_DAYS",
+    "MAX_DASHBOARD_LIST_LIMIT",
+    "MAX_DASHBOARD_WINDOW_HOURS",
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_IP_ADDRESS_LENGTH",
     "MAX_JOB_BATCH_SIZE",
@@ -36,6 +40,7 @@ __all__ = [
     "MAX_WORKER_LABEL_LENGTH",
     "MAX_WORKER_ROLE_LENGTH",
     "check_length",
+    "check_limit",
     "fit_length",
 ]
 
@@ -64,6 +69,11 @@ MAX_WORKER_ID_LENGTH = 100
 #: these values are supplied directly by the host and are rejected if overlong.
 MAX_WORKER_ROLE_LENGTH = 100
 MAX_WORKER_LABEL_LENGTH = 200
+
+#: Bounds on the admin dashboards' arguments: the look-back window, and the length of the lists they return.
+#: An unbounded window reads every retained row (and overflows ``timedelta`` past about 2.7 million years).
+MAX_DASHBOARD_WINDOW_HOURS = 24 * 366
+MAX_DASHBOARD_LIST_LIMIT = 500
 
 _TRUNCATION_MARKER = "..."
 
@@ -116,6 +126,9 @@ def fit_length(value: str | None, limit: int) -> str | None:
 MAX_AUDIT_ACTION_ID_LENGTH = 100
 MAX_AUDIT_ID_LENGTH = 64
 MAX_AUDIT_NAME_LENGTH = 50
+#: Widths of ``jasil_audit_log.app_name`` and ``app_version``, stamped from the audit settings.
+MAX_AUDIT_APP_NAME_LENGTH = 100
+MAX_AUDIT_APP_VERSION_LENGTH = 50
 
 #: Widths of the audit columns copied from the request. The client controls a
 #: ``User-Agent`` and may influence a request id, so these are clipped
@@ -136,3 +149,19 @@ MAX_PARTITION_DAYS_AHEAD = 366
 #: Longest audit retention, and retention floor, in days (a century). ``audit.retention_days`` and
 #: ``audit.retention_floor_days`` are validated against it, so every cutoff stays a representable date.
 MAX_AUDIT_RETENTION_DAYS = 36_500
+
+
+def check_limit(limit: int, *, maximum: int, name: str, minimum: int = 1) -> None:
+    """Require ``limit`` to be an integer from ``minimum`` to ``maximum``.
+
+    Args:
+        limit: The value to check; a ``bool`` is rejected.
+        maximum: The largest accepted value.
+        name: The parameter name used in the error message.
+        minimum: The smallest accepted value.
+
+    Raises:
+        ValueError: When ``limit`` is not an integer in range.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not minimum <= limit <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")

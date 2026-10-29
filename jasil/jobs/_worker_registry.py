@@ -8,9 +8,9 @@ from sqlalchemy import CursorResult, and_, case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from jasil._core.cursors import decode_cursor, encode_cursor
+from jasil._core.limits import check_limit
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil._core.timestamps import age_seconds
-from jasil.jobs._attempts import check_limit
 from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.crud import STATUS_CLAIMED
 from jasil.jobs.models import JobAttempt, JobWorker, ProcessingJob

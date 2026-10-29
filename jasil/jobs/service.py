@@ -39,6 +39,10 @@ _RELAY_INTERVAL_SECONDS = 5
 _REAP_INTERVAL_SECONDS = 60
 # Bound how many outbox batches one relay pass drains before yielding.
 _MAX_RELAY_BATCHES = 100
+# Expired leases reclaimed per transaction, and how many of those one reaper run takes before yielding: a
+# crash expires every job its worker held at once.
+_REAP_BATCH_SIZE = 100
+_MAX_REAP_BATCHES = 100
 
 _RELAY_JOB_ID = "jasil_outbox_relay"
 _REAP_JOB_ID = "jasil_job_reaper"
@@ -276,11 +280,16 @@ def reap_expired_jobs_scheduled() -> None:
     platform = platform_runtime.get_active_platform()
     now = platform.clock.now()
     session_factory = jasil_orm.get_sessionmaker()
+    reclaimed = 0
     with session_factory() as db:
         # Read before reclaiming, which clears the holder: a crash should name the
         # worker, not just say that one happened.
         holders = jobs_crud.expired_lease_holders(now=now, db=db)
-        reclaimed = jobs_crud.reclaim_expired_leases(now=now, db=db)
+        for _ in range(_MAX_REAP_BATCHES):
+            batch = jobs_crud.reclaim_expired_leases(now=now, db=db, limit=_REAP_BATCH_SIZE)
+            reclaimed += batch
+            if batch < _REAP_BATCH_SIZE:
+                break
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.

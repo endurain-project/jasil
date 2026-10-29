@@ -21,6 +21,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 9. Rename any storage area that starts with `.jasil-` in any letter case, such as `.JASIL-exports`: those names are reserved.
 10. If your declarative base's `MetaData` names a `schema`, drop it: `upgrade`, `downgrade` and `adopt_existing_schema` refuse such a base.
 11. If a reverse-geocoding host resolves to the shared address space `100.64.0.0/10` or an IPv6 site-local address, add it to the SSRF allowlist; if cleartext mail goes to a 6to4 (`2002::/16`) address, use `smtps://` or a private address.
+12. Check the arguments and settings that now have limits (see **Changed**): the admin summaries' `hours` (1 to 8784) and list limits (0 to 500), `verify_checkpoints` ranges (366 days at most), and `audit.app_name` / `app_version` / `AuditContext.credential_type` lengths.
+13. Use `nominatim://` or `photon://`, not the `+http` forms, for a geocoding host on the internet, and an `https://` S3 `endpoint_url` unless the store is on your private network.
 
 ### Added
 
@@ -52,6 +54,11 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `jasil.migrations.upgrade` commits each revision on its own and holds its PostgreSQL migration lock for the session, and on PostgreSQL `rev0002` and `rev0004` build their `jasil_processing_jobs` indexes `CONCURRENTLY`: the previous release's workers keep claiming jobs during an upgrade instead of waiting for the whole run. A run that fails resumes from the last committed revision, including one interrupted in an index build.
 - `jasil.migrations.verify_schema_current` accepts a revision this release does not ship, which only a newer JASIL records, with a warning: a previous-release replica restarting during a rolling deploy starts instead of refusing. A database behind head or unversioned still raises.
 - **BREAKING: the reverse-geocoding address check refuses every address that is not globally reachable**, including the shared address space `100.64.0.0/10` (where one cloud serves instance metadata) and IPv6 site-local; cleartext mail no longer counts a 6to4 (`2002::/16`) address as private.
+- **BREAKING: more inputs are bounded.**
+  - `jasil.admin.get_jobs_summary`, `get_event_log_summary` and `get_workers_summary` take `hours` from 1 to 8784 (366 days), and the two list limits from 0 to 500. An unbounded window read every retained row, and a huge one overflowed.
+  - `verify_checkpoints` refuses a range longer than 366 days, or one whose start is after its end; verify a longer history in parts.
+  - `AuditContext.credential_type` (50 characters) and `audit.app_name` / `app_version` (100 / 50) are checked against their columns, as the ids already were, instead of failing the row's insert.
+  - `nominatim+http://` and `photon+http://` are refused for a host that resolves to a public address, as cleartext mail is. An S3 `endpoint_url` must be `https://`, or `http://` to a host that resolves only to private addresses.
 - **BREAKING: `JobSettings` validates every field when it is built.** `batch_size` is 1 to 1000, `poll_interval_seconds` and `heartbeat_interval_seconds` are greater than zero, `max_attempts` is at least 1, `backoff_base_seconds`, `defer_max_seconds` and `max_deferrals` are at least 0, and `backoff_max_seconds` is not below `backoff_base_seconds`; the lease and runtime rules that `build_runner` used to check are checked here too. A zero poll interval made an idle worker poll the database in a hot loop.
 - **BREAKING: `on_dead_letter` callbacks run only in the scheduled sweep**, every 60 seconds, never in the worker that dead-lettered the job: a slow or hung callback held the worker and the leases of the jobs behind it in its batch. The delivery limits (10 deliveries, jobs dead-lettered in the last 7 days) are documented.
 - **BREAKING: storage refuses a control character in an area, key or prefix, and one longer than 1024 UTF-8 bytes**, on both backends (on S3 the bucket prefix and area count toward the limit). S3 refused them as an outage; local disk stored keys S3 could not.
@@ -63,6 +70,9 @@ What counts as a breaking change — and what does not — is defined in [API st
 - Event timestamps and the windows of `jasil.admin.get_jobs_summary` and `get_event_log_summary` come from the platform clock instead of the system clock, as every other JASIL timestamp does; the two summaries raise `RuntimeError` when no platform is published. `get_audit_health()["last_failure_at"]` follows the platform clock too.
 - The publisher logs a failed publish by exception type, and the driver error it wraps, without the message or traceback: a SQLAlchemy error's text carries the statement parameters, which are the event's payload and metadata.
 - Removed `JobRunner.reap_once`, which no scheduled job called and which still ran dead-letter callbacks in the reaping process. The reaper is `schedule_job_maintenance`'s job. Removed the internal `jasil.jobs.crud.get_job` and `reclaim_expired_leases_detailed` and `jasil.backends.geocoding_http.build_reverse_endpoint`.
+- Migration `rev0008` indexes `jasil_processing_jobs.created_at`, which `get_jobs_summary` filters its window on; on PostgreSQL it is built `CONCURRENTLY`.
+- The S3 client waits at most 10 seconds to connect and 60 seconds for each read, instead of botocore's defaults.
+- A failing audit context provider is logged at `WARNING` by exception type; the row is still written without its context.
 - [API stability](docs/api-stability.md) lists the names already exported and documented elsewhere: `jasil.deps.get_geocoding`, `jasil.orm.jasil_table_names` / `legacy_table_names`, `jasil.migrations.jasil_include_object`, `jasil.capabilities.build_capability_report` and `jasil.profile.StateBackendKind`. It now also covers `jasil.orm.is_models_mapped` / `is_sessionmaker_configured`, `jasil.settings.is_configured`, `jasil.migrations.VERSION_TABLE`, and the `StateSource`, `CapabilityReport` and `CapabilityRow` types of `jasil.capabilities`. It states that the other exported helpers and the backend classes are not covered.
 
 ### Fixed
@@ -74,6 +84,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 - `LocalStorage.save` writes through a temporary file and an atomic rename, as `save_stream` does, so a failed overwrite leaves the previous object instead of a torn one.
 - Reverse geocoding has an overall 30-second deadline on top of the per-read timeout: a watchdog shuts the request's sockets down when it passes, headers included, so an upstream dripping its reply cannot hold the caller for hours.
 - A malformed capability URI is no longer echoed, password included, by the "Unsupported scheme" errors, the startup report or a Redis client error; `state_uri`, `events_uri`, `realtime_uri`, `storage_uri` and `audit.external_sink_uri` are left out of the settings' `repr`.
+- `jasil_event_log` timestamps (`created_at`, `processed_at`, `completed_at`) come from the platform clock in UTC instead of the database's `now()`, which on MySQL is the session time zone's local time read back as UTC. Rows written by a previous release keep the database's value.
+- The scheduled reaper reclaims expired leases in batches of 100 until none are left, up to 10 000 a run, instead of 100 a minute, so a crash that expires a whole batch is recovered within a minute.
+- `MemoryState` sweeps expired keys on a write at most once a minute; a key that expired without being read again stayed in memory for the life of the process.
+- `PgAdvisoryLock` logs at `ERROR` and discards the connection when the lock is no longer held at release, which means the connection dropped while the guarded work ran.
+- On PostgreSQL the audit partition functions pin `TimeZone` and `DateStyle`, so a partition's bounds no longer depend on the calling session's settings. A zone abbreviation such as `IST` was read back as another zone.
+- `rev0006` renders as SQL (`alembic upgrade --sql`) when given `-x schema=<name>`; it failed there, since it asked the database for its schema.
 - A `MailError` raised because the mail settings source failed no longer chains the source's exception, whose text is the host's and may carry a secret from its store.
 - `JasilSettings` takes `profile` and `job_worker_mode` as their names too (`"distributed"`), and refuses a misspelt one; a plain string used to pass every deployment check unmatched.
 - `JobHandlerRegistry` is safe to use from several threads, and registering a subscriber again under another event type moves it instead of leaving it listed under both.
@@ -87,7 +103,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 - S3 presigned URLs are signed with Signature Version 4 when JASIL builds the client: SigV2 URLs could not fetch SSE-KMS objects and are refused by SigV4-only stores.
 - S3 `upload_part` works against a plain-`http://` endpoint (it raised `AttributeError` there), botocore can now resend a part after a transient failure, and a source shorter or longer than `size` raises `ValueError` before any request is sent. The part is staged before upload, in memory up to 8 MiB and in a temporary file beyond that, so allow temporary disk for the largest part in flight.
 
-The audit trail writes nothing until the host calls the audit API, and every addition is optional. The breaking changes are the state-backend arguments, the event buses' handling of a failed handler, `JobSettings` validation, sweep-only dead-letter callbacks, the storage address limits and reserved `.jasil-` areas, stricter adoption, the refusal of a schema-qualified base, the stricter address checks for geocoding and cleartext mail, and the `distributed` profile's refusal of a `file://` audit sink; see **Upgrading**.
+The audit trail writes nothing until the host calls the audit API, and every addition is optional. The breaking changes are the state-backend arguments, the event buses' handling of a failed handler, `JobSettings` validation, sweep-only dead-letter callbacks, the storage address limits and reserved `.jasil-` areas, stricter adoption, the refusal of a schema-qualified base, the stricter address checks for geocoding and cleartext mail, the `distributed` profile's refusal of a `file://` audit sink, and the new bounds on admin, audit and cleartext-endpoint inputs; see **Upgrading**.
 
 ## [0.13.0] - 2026-10-27
 

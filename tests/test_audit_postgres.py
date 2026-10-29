@@ -168,6 +168,23 @@ class TestMigration:
         assert first == second
         assert _partitions(migrated) == before
 
+    def test_partition_bounds_ignore_the_session_date_settings(self, migrated):
+        """``IST`` written in Asia/Kolkata reads back as Israel time under the default abbreviations."""
+        day = datetime.now(UTC).date() + timedelta(days=9)
+        with migrated.begin() as connection:
+            connection.execute(text("SET LOCAL TimeZone = 'Asia/Kolkata'"))
+            connection.execute(text("SET LOCAL DateStyle = 'Postgres, DMY'"))
+            connection.execute(text("SELECT jasil_audit_ensure_partitions(9)"))
+
+        with migrated.begin() as connection:
+            connection.execute(text("SET LOCAL TimeZone = 'UTC'"))
+            bound = connection.execute(
+                text("SELECT pg_get_expr(relpartbound, oid) FROM pg_class WHERE relname = :name"),
+                {"name": f"jasil_audit_log_p{day:%Y%m%d}"},
+            ).scalar()
+
+        assert f"FROM ('{day} 00:00:00+00') TO ('{day + timedelta(days=1)} 00:00:00+00')" in bound
+
     @pytest.mark.parametrize("days", [-1, 367])
     def test_the_horizon_is_bounded(self, migrated, days):
         with pytest.raises(DBAPIError, match="between 0 and 366"), migrated.begin() as connection:

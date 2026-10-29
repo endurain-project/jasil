@@ -44,13 +44,14 @@ _STATUS_FAILED = "failed"
 _STATUS_DEAD_LETTER = "dead_letter"
 
 
-def record_published(event: Event, db: Session) -> None:
+def record_published(event: Event, db: Session, *, now: datetime) -> None:
     """
     Insert the initial ``published`` row for a freshly published event.
 
     Args:
         event: The event envelope being published.
         db: Active database session.
+        now: The platform clock's instant, stored as ``created_at``.
 
     Returns:
         None.
@@ -64,12 +65,13 @@ def record_published(event: Event, db: Session) -> None:
             event_metadata=event.metadata or None,
             status=_STATUS_PUBLISHED,
             retry_count=event.retry_count,
+            created_at=now,
         )
     )
     db.commit()
 
 
-def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
+def record_queued(event: Event, db: Session, *, now: datetime, commit: bool = True) -> None:
     """
     Insert a terminal ``queued`` row for an event handed to the durable job queue.
 
@@ -82,6 +84,7 @@ def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
     Args:
         event: The event envelope being staged for durable delivery.
         db: Active database session.
+        now: The platform clock's instant, stored as ``created_at``.
         commit: When True (default), commit immediately. When False, flush only
             so the row joins the caller's open transaction and commits or rolls
             back with it.
@@ -98,12 +101,13 @@ def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
             event_metadata=event.metadata or None,
             status=_STATUS_QUEUED,
             retry_count=event.retry_count,
+            created_at=now,
         )
     )
     commit_or_flush(db, commit)
 
 
-def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
+def mark_processing(event_id: str, worker_id: str, db: Session, *, now: datetime) -> None:
     """
     Transition an event to ``processing`` when a consumer picks it up.
 
@@ -111,6 +115,7 @@ def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
         event_id: The event_id (primary key).
         worker_id: The process/consumer handling the event.
         db: Active database session.
+        now: The platform clock's instant, stored as ``processed_at``.
 
     Returns:
         None.
@@ -121,13 +126,15 @@ def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
         .values(
             status=_STATUS_PROCESSING,
             worker_id=fit_length(worker_id, MAX_WORKER_ID_LENGTH),
-            processed_at=func.now(),
+            processed_at=now,
         )
     )
     db.commit()
 
 
-def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: int, db: Session) -> None:
+def mark_completed(
+    event_id: str, handler_name: str | None, processing_time_ms: int, db: Session, *, now: datetime
+) -> None:
     """
     Transition an event to ``completed`` after its handlers succeed.
 
@@ -136,6 +143,7 @@ def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: 
         handler_name: The subscriber(s) that processed the event.
         processing_time_ms: Handler execution time in milliseconds.
         db: Active database session.
+        now: The platform clock's instant, stored as ``completed_at``.
 
     Returns:
         None.
@@ -147,7 +155,7 @@ def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: 
             status=_STATUS_COMPLETED,
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
             processing_time_ms=processing_time_ms,
-            completed_at=func.now(),
+            completed_at=now,
         )
     )
     db.commit()
@@ -159,6 +167,8 @@ def mark_failed(
     error_message: str,
     processing_time_ms: int,
     db: Session,
+    *,
+    now: datetime,
 ) -> None:
     """
     Transition an event to ``failed`` when a handler raises.
@@ -169,6 +179,7 @@ def mark_failed(
         error_message: The failure reason (truncated for storage).
         processing_time_ms: Handler execution time in milliseconds.
         db: Active database session.
+        now: The platform clock's instant, stored as ``completed_at``.
 
     Returns:
         None.
@@ -181,7 +192,7 @@ def mark_failed(
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
             error_message=fit_length(error_message, MAX_STORED_ERROR_LENGTH),
             processing_time_ms=processing_time_ms,
-            completed_at=func.now(),
+            completed_at=now,
         )
     )
     db.commit()

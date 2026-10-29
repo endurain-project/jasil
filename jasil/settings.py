@@ -33,7 +33,13 @@ is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_JOB_BATCH_SIZE, MAX_PARTITION_DAYS_AHEAD
+from jasil._core.limits import (
+    MAX_AUDIT_APP_NAME_LENGTH,
+    MAX_AUDIT_APP_VERSION_LENGTH,
+    MAX_AUDIT_RETENTION_DAYS,
+    MAX_JOB_BATCH_SIZE,
+    MAX_PARTITION_DAYS_AHEAD,
+)
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode, parse_job_worker_mode, parse_profile
@@ -225,8 +231,9 @@ class AuditSettings:
         """Reject values the audit machinery cannot honour.
 
         Raises:
-            ValueError: When a numeric setting is out of range, or ``retention_days`` is positive
-                but below ``retention_floor_days`` (every prune would be refused by the guard).
+            ValueError: When a numeric setting is out of range, ``retention_days`` is positive
+                but below ``retention_floor_days`` (every prune would be refused by the guard), or
+                ``app_name`` / ``app_version`` is longer than its column.
         """
         minimums = {
             "retention_floor_days": 1,
@@ -250,6 +257,10 @@ class AuditSettings:
             raise ValueError(
                 f"audit.checkpoint_window_minutes ({self.checkpoint_window_minutes}) must divide a day (1440) evenly"
             )
+        for name, limit in (("app_name", MAX_AUDIT_APP_NAME_LENGTH), ("app_version", MAX_AUDIT_APP_VERSION_LENGTH)):
+            value = getattr(self, name)
+            if value is not None and len(value) > limit:
+                raise ValueError(f"audit.{name} is {len(value)} characters; the limit is {limit}")
         if 0 < self.retention_days < self.retention_floor_days:
             raise ValueError(
                 f"audit.retention_days ({self.retention_days}) must be at least audit.retention_floor_days "
@@ -271,7 +282,7 @@ class GeocodingSettings:
             :class:`NetworkSettings`). Unset disables the capability; so does
             any value that cannot be used, which is logged. Geocoding never
             fails the platform build.
-        rate_limit: Maximum requests per second; ``<= 0`` disables throttling.
+        rate_limit: Maximum requests per second, per process; ``<= 0`` disables throttling.
         api_key: API key, for the services requiring one (geocode.maps.co).
         user_agent: ``User-Agent`` sent upstream. Nominatim's usage policy
             requires an identifying value, so hosts should set their own.

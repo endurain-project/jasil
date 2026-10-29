@@ -16,6 +16,7 @@ A host that already carries this information installs a reader instead with
 :mod:`jasil.correlation`, so there is one source of truth for it.
 """
 
+import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -23,8 +24,16 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
-from jasil._core.limits import MAX_AUDIT_ID_LENGTH, MAX_IP_ADDRESS_LENGTH, MAX_USER_AGENT_LENGTH, fit_length
+from jasil._core.limits import (
+    MAX_AUDIT_ID_LENGTH,
+    MAX_AUDIT_NAME_LENGTH,
+    MAX_IP_ADDRESS_LENGTH,
+    MAX_USER_AGENT_LENGTH,
+    fit_length,
+)
 from jasil.events import MAX_EVENT_ID_LENGTH
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_USER_AGENT_LENGTH",
@@ -97,6 +106,7 @@ class AuditContext:
         object.__setattr__(self, "ip_address", fit_length(self.ip_address, MAX_IP_ADDRESS_LENGTH))
         for name, limit in (
             ("actor_id", MAX_AUDIT_ID_LENGTH),
+            ("credential_type", MAX_AUDIT_NAME_LENGTH),
             ("credential_id", MAX_AUDIT_ID_LENGTH),
             ("on_behalf_of_id", MAX_AUDIT_ID_LENGTH),
             ("event_id", MAX_EVENT_ID_LENGTH),
@@ -142,8 +152,8 @@ def set_context(context: AuditContext | None) -> None:
 def get_context() -> AuditContext:
     """Return the ambient context, or the anonymous default when there is none.
 
-    Never raises: a provider that fails is treated as "no context", because the row is still worth
-    writing without it.
+    Never raises: a provider that fails is logged at ``WARNING`` by exception type and treated as "no
+    context", because the row is still worth writing without it.
     """
     override = _override.get()
     if override is not None:
@@ -151,7 +161,11 @@ def get_context() -> AuditContext:
     if _provider is not None:
         try:
             provided = _provider()
-        except Exception:
+        except Exception as error:
+            # The type only: the host's message may name the user the context is about.
+            logger.warning(
+                "audit context provider raised %s; the row is written without its context", type(error).__name__
+            )
             provided = None
         return provided if provided is not None else AuditContext()
     return _context.get() or AuditContext()

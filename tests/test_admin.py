@@ -246,14 +246,43 @@ class TestTheWindowEndsAtThePlatformClock:
         assert jasil_admin.get_jobs_summary(hours=24).total_jobs == 0
 
     def test_for_the_event_log(self, ahead, db):
-        event_log_crud.record_published(new_event("order.created", {}, source="api:create_order"), db)
+        event_log_crud.record_published(
+            new_event("order.created", {}, source="api:create_order"), db, now=datetime.now(UTC)
+        )
 
         assert jasil_admin.get_event_log_summary(hours=24).total_events == 0
 
 
+class TestTheSummariesRefuseUnboundedArguments:
+    """An unbounded window or limit reads every retained row, or overflows ``timedelta``."""
+
+    @pytest.mark.parametrize("hours", [0, -1, 24 * 366 + 1, 10**12, True, 1.5])
+    @pytest.mark.parametrize(
+        "summary", [jasil_admin.get_jobs_summary, jasil_admin.get_event_log_summary, jasil_admin.get_workers_summary]
+    )
+    def test_the_window(self, platform, summary, hours):
+        with pytest.raises(ValueError, match="hours"):
+            summary(hours=hours)
+
+    @pytest.mark.parametrize("limit", [-1, 501, True])
+    @pytest.mark.parametrize(
+        ("summary", "name"),
+        [(jasil_admin.get_jobs_summary, "dead_letter_limit"), (jasil_admin.get_event_log_summary, "failure_limit")],
+    )
+    def test_the_list_limits(self, platform, summary, name, limit):
+        with pytest.raises(ValueError, match=name):
+            summary(**{name: limit})
+
+    def test_the_bounds_themselves_are_accepted(self, platform, db):
+        assert jasil_admin.get_jobs_summary(hours=24 * 366, dead_letter_limit=500).window_hours == 24 * 366
+        assert jasil_admin.get_event_log_summary(hours=1, failure_limit=0).recent_failures == []
+
+
 class TestEventLogSummary:
     def test_it_reports_a_recorded_event(self, platform, db):
-        event_log_crud.record_published(new_event("order.created", {}, source="api:create_order"), db)
+        event_log_crud.record_published(
+            new_event("order.created", {}, source="api:create_order"), db, now=datetime.now(UTC)
+        )
 
         summary = jasil_admin.get_event_log_summary()
 
@@ -265,8 +294,8 @@ class TestEventLogSummary:
 
     def test_the_failure_limit_is_configurable(self, platform, db):
         event = new_event("order.created", {}, source="api:create_order")
-        event_log_crud.record_published(event, db)
-        event_log_crud.mark_failed(event.event_id, "h", "boom", 5, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event.event_id, "h", "boom", 5, db, now=datetime.now(UTC))
 
         assert jasil_admin.get_event_log_summary(failure_limit=0).recent_failures == []
 

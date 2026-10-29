@@ -407,7 +407,7 @@ for window in report.windows:
         )
 ```
 
-JASIL provides the function; the host or the observability product decides when to call it. Each window in the range
+JASIL provides the function; the host or the observability product decides when to call it. One call covers at most 366 days, since it reads and hashes every row in the range; verify a longer history in consecutive ranges. Each window in the range
 is reported as one of the statuses below. A gap reaching into the range is reported even when every checkpoint inside
 the range was deleted, and rows dated before the first checkpoint are reported as one `row_mismatch` window ending
 where that checkpoint starts. Time after the newest checkpoint is not sealed yet, so it is not reported: alert on

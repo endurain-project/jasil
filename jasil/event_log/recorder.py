@@ -8,7 +8,6 @@ processing — observability is best-effort by design.
 """
 
 import logging
-import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 
@@ -17,12 +16,16 @@ from sqlalchemy.orm import Session
 import jasil.event_log.crud as event_log_crud
 import jasil.orm as jasil_orm
 from jasil.events import Event
+from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
 
 
 class EventLogRecorder:
-    """Records event lifecycle transitions to the ``event_log`` table."""
+    """Records event lifecycle transitions to the ``event_log`` table, timestamped by the platform clock."""
+
+    def __init__(self, clock: ClockProvider) -> None:
+        self._clock = clock
 
     def record_published(self, event: Event) -> None:
         """
@@ -34,7 +37,7 @@ class EventLogRecorder:
         Returns:
             None.
         """
-        self._safely("record_published", lambda db: event_log_crud.record_published(event, db))
+        self._safely("record_published", lambda db: event_log_crud.record_published(event, db, now=self._clock.now()))
 
     def record_queued(self, event: Event) -> None:
         """
@@ -46,7 +49,7 @@ class EventLogRecorder:
         Returns:
             None.
         """
-        self._safely("record_queued", lambda db: event_log_crud.record_queued(event, db))
+        self._safely("record_queued", lambda db: event_log_crud.record_queued(event, db, now=self._clock.now()))
 
     def record_queued_in(self, event: Event, db: Session) -> None:
         """
@@ -66,7 +69,7 @@ class EventLogRecorder:
         """
         try:
             with db.begin_nested():
-                event_log_crud.record_queued(event, db, commit=False)
+                event_log_crud.record_queued(event, db, now=self._clock.now(), commit=False)
         except Exception as error:  # observability must never break the producer
             logger.warning("event_log record_queued_in failed: %r", error)
 
@@ -100,23 +103,27 @@ class EventLogRecorder:
         if record_processing:
             self._safely(
                 "mark_processing",
-                lambda db: event_log_crud.mark_processing(event.event_id, worker_id, db),
+                lambda db: event_log_crud.mark_processing(event.event_id, worker_id, db, now=self._clock.now()),
             )
-        start = time.monotonic()
+        start = self._clock.monotonic()
         try:
             yield
         except Exception as error:
             error_message = str(error)
-            elapsed_ms = int((time.monotonic() - start) * 1000)
+            elapsed_ms = int((self._clock.monotonic() - start) * 1000)
             self._safely(
                 "mark_failed",
-                lambda db: event_log_crud.mark_failed(event.event_id, handler_name, error_message, elapsed_ms, db),
+                lambda db: event_log_crud.mark_failed(
+                    event.event_id, handler_name, error_message, elapsed_ms, db, now=self._clock.now()
+                ),
             )
             raise
-        elapsed_ms = int((time.monotonic() - start) * 1000)
+        elapsed_ms = int((self._clock.monotonic() - start) * 1000)
         self._safely(
             "mark_completed",
-            lambda db: event_log_crud.mark_completed(event.event_id, handler_name, elapsed_ms, db),
+            lambda db: event_log_crud.mark_completed(
+                event.event_id, handler_name, elapsed_ms, db, now=self._clock.now()
+            ),
         )
 
     def _safely(self, operation: str, write: Callable[[Session], None]) -> None:

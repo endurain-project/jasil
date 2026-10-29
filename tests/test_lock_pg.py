@@ -22,9 +22,10 @@ from jasil.providers import LockProvider
 class FakeConnection:
     """Records the SQL it is asked to run, and whether it was closed or discarded."""
 
-    def __init__(self, *, acquired: bool = True, unlock_error: Exception | None = None) -> None:
+    def __init__(self, *, acquired: bool = True, unlock_error: Exception | None = None, unlocked: bool = True) -> None:
         self._acquired = acquired
         self._unlock_error = unlock_error
+        self._unlocked = unlocked
         self.statements: list[tuple[str, dict]] = []
         self.options: dict = {}
         self.closed = False
@@ -37,8 +38,10 @@ class FakeConnection:
     def execute(self, statement, parameters=None):
         text = str(statement)
         self.statements.append((text, parameters or {}))
-        if "pg_advisory_unlock" in text and self._unlock_error is not None:
-            raise self._unlock_error
+        if "pg_advisory_unlock" in text:
+            if self._unlock_error is not None:
+                raise self._unlock_error
+            return FakeResult(self._unlocked)
         return FakeResult(self._acquired)
 
     def close(self):
@@ -204,6 +207,29 @@ class TestReleaseFailure:
             lock.try_acquire("backfill"),
         ):
             raise ValueError("the real problem")
+
+
+class TestALockLostBeforeRelease:
+    """``pg_advisory_unlock`` returning false means this session no longer held the lock."""
+
+    def test_it_is_logged_and_the_session_discarded(self, caplog):
+        connection = FakeConnection(unlocked=False)
+
+        with caplog.at_level("ERROR"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass
+
+        assert "was no longer held" in caplog.text
+        assert connection.invalidated is True
+        assert connection.closed is True
+
+    def test_a_released_lock_logs_nothing(self, caplog):
+        connection = FakeConnection()
+
+        with caplog.at_level("WARNING"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass
+
+        assert caplog.text == ""
+        assert connection.invalidated is False
 
 
 class TestFromMainDatabase:

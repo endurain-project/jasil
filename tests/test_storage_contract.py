@@ -219,6 +219,18 @@ class _ReadOnceSource(io.BytesIO):
         return False
 
 
+class _EndlessSource:
+    """Never runs out, and counts what was taken from it."""
+
+    def __init__(self) -> None:
+        self.taken = 0
+
+    def read(self, size=-1):
+        assert size >= 0, "an unbounded read of an endless source never returns"
+        self.taken += size
+        return b"x" * size
+
+
 class _OverReadingSource:
     def read(self, size=-1):
         return b"x" * (size + 1)
@@ -404,6 +416,16 @@ class TestStreamingConformance:
         with pytest.raises(StorageSizeLimitError):
             storage.save_stream(AREA, KEY, source, max_bytes=S3_PART_BYTES)
 
+        assert storage.exists(AREA, KEY) is False
+
+    def test_the_limit_stops_reading_one_byte_past_it(self, storage):
+        """A client streaming without end costs the host ``max_bytes`` plus one byte, not memory or disk."""
+        source = _EndlessSource()
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream(AREA, KEY, source, max_bytes=1000)
+
+        assert source.taken == 1001
         assert storage.exists(AREA, KEY) is False
 
     def test_a_negative_size_limit_is_refused_before_writing(self, storage):

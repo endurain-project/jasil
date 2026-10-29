@@ -346,6 +346,36 @@ class TestClaim:
         assert intake.id in {job.id for job in second}
 
 
+class TestALostClaimRace:
+    """Without SKIP LOCKED two workers can select the same pending rows; the compare-and-set picks one."""
+
+    def test_the_loser_takes_nothing_and_records_no_attempt(self, db, event, monkeypatch):
+        from sqlalchemy import update
+
+        from jasil.jobs.models import JobAttempt
+
+        job = _enqueue(event, db)
+        select_due = jobs_crud._select_due_ids
+
+        def won_by_another_worker_after_the_select(*args, **kwargs):
+            ids = select_due(*args, **kwargs)
+            db.execute(
+                update(ProcessingJob)
+                .where(ProcessingJob.id.in_(ids))
+                .values(status=jobs_crud.STATUS_CLAIMED, locked_by="winner", attempts=1)
+            )
+            return ids
+
+        monkeypatch.setattr(jobs_crud, "_select_due_ids", won_by_another_worker_after_the_select)
+
+        claimed = jobs_crud.claim_jobs(worker_id="loser", limit=10, lease_seconds=60, now=T0, db=db)
+
+        assert claimed == []
+        stored = db.get(ProcessingJob, job.id)
+        assert (stored.locked_by, stored.attempts) == ("winner", 1)
+        assert db.query(JobAttempt).filter_by(worker_id="loser").count() == 0
+
+
 class TestCompletion:
     def test_completing_marks_the_job_terminal(self, db, event):
         job = _enqueue(event, db)

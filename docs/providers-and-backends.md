@@ -84,6 +84,12 @@ small test doubles can depend on only the slice they use:
 | `LocalStorage` | `local://`, `local://<path>` | Logical objects in a private versioned filesystem layout. |
 | `S3Storage` | `s3://<bucket>` | Key prefix per area. Requires the `s3` extra. |
 
+`s3://<bucket>[/prefix]` takes two optional query parameters: `region`, and
+`endpoint_url` for an S3-compatible store (MinIO, R2, Ceph). `endpoint_url` must be
+`https://`, or `http://` to a host that resolves only to private addresses:
+request signatures, objects and presigned URLs cross that connection. The client
+waits at most 10 seconds to connect and 60 seconds for each read.
+
 ```python
 platform.storage.save("avatars", "42.webp", data)
 platform.storage.get("avatars", "42.webp")  # bytes | None
@@ -434,6 +440,12 @@ signed 64-bit key because `pg_advisory_lock` keys are `bigint`. The lock is held
 a connection in autocommit mode, so no transaction sits open (and idle) while the
 guarded work runs, and `idle_in_transaction_session_timeout` cannot end the
 session and release the lock underneath it.
+
+The lock lasts as long as that connection. If the connection drops while the
+guarded work runs (a database restart, a failover, a network cut), PostgreSQL
+releases the lock and another replica may start the same work. The body is not
+interrupted: JASIL sees the loss only when it releases the lock, and logs it at
+`ERROR`. Make the guarded work idempotent, as you would for any scheduled job.
 
 ## ClockProvider
 

@@ -239,6 +239,23 @@ class TestContext:
         with pytest.raises(ValueError, match="actor_id"):
             AuditContext(actor_id="x" * 65)
 
+    def test_an_over_long_credential_type_is_rejected(self):
+        with pytest.raises(ValueError, match="credential_type is 51 characters"):
+            AuditContext(credential_type="x" * 51)
+
+    def test_a_failing_provider_is_logged_by_type(self, caplog):
+        """Rows would otherwise be attributed to an anonymous actor with no trace of why."""
+
+        def broken() -> AuditContext:
+            raise RuntimeError("token for alice@example.com expired")
+
+        jasil_audit.configure_provider(broken)
+        with caplog.at_level("WARNING"):
+            jasil_audit.get_context()
+
+        assert "audit context provider raised RuntimeError" in caplog.text
+        assert "alice" not in caplog.text
+
     def test_the_request_id_is_not_part_of_the_context(self):
         assert "request_id" not in {field for field in AuditContext.__dataclass_fields__}
 
@@ -301,6 +318,8 @@ class TestSettings:
             ({"retention_days": 10, "retention_floor_days": 30}, "retention_days"),
             ({"retention_days": 36_501}, "retention_days must be at most 36500"),
             ({"retention_floor_days": 36_501}, "retention_floor_days must be at most 36500"),
+            ({"app_name": "x" * 101}, "app_name is 101 characters; the limit is 100"),
+            ({"app_version": "x" * 51}, "app_version is 51 characters; the limit is 50"),
         ],
     )
     def test_an_out_of_range_value_is_rejected(self, overrides, message):

@@ -91,6 +91,8 @@ class ProcessingJob(Base):
         Index("idx_jasil_processing_jobs_lease", "status", "lease_expires_at"),
         # Heartbeats and worker summaries count active leases by worker.
         Index("idx_jasil_processing_jobs_worker_claim", "status", "locked_by"),
+        # The jobs dashboard counts the jobs created within its window.
+        Index("idx_jasil_processing_jobs_created", "created_at"),
         # The on_dead_letter sweep finds the few dead letters whose callback is owed
         # without walking every retained one.
         Index(
