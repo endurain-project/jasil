@@ -28,7 +28,7 @@ import hashlib
 import importlib
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
@@ -186,6 +186,21 @@ def _public_key(public_key: str) -> Any:
         return ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(public_key, validate=True))
     except (ValueError, binascii.Error):
         raise ValueError("the public key must be the base64 of a 32-byte Ed25519 public key") from None
+
+
+def _verifiers(public_key: str | Sequence[str] | None) -> dict[str, Any]:
+    """Load the verifying keys, by the key id a checkpoint records; empty when signatures are not checked.
+
+    Raises:
+        ValueError: When a key is malformed, or a sequence of keys is empty.
+    """
+    if public_key is None:
+        return {}
+    encoded = [public_key] if isinstance(public_key, str) else list(public_key)
+    if not encoded:
+        raise ValueError("pass at least one public key, or None to check hashes and chain only")
+    loaded = [_public_key(key) for key in encoded]
+    return {_key_id(key): key for key in loaded}
 
 
 def _sign(settings: AuditSettings, message: bytes) -> tuple[str | None, str | None]:
@@ -395,13 +410,13 @@ def retention_horizon(checkpoint: Any) -> datetime | None:
     return end - timedelta(days=checkpoint.retention_days)
 
 
-def _pruning_horizon(db: Session, verifier: Any, instance_id: str) -> datetime | None:
+def _pruning_horizon(db: Session, verifiers: Mapping[str, Any], instance_id: str) -> datetime | None:
     """Return the latest window end any checkpoint allows to have been pruned; ``None`` when none does.
 
     A checkpoint records the retention in force when it was sealed, so ``window_end - retention_days`` is
     as far as retention could reach under it, and retention prunes no further than the newest checkpoint
-    allows. With a key only a checkpoint whose signature verifies counts, so the retention is the one the
-    application sealed, not one whoever can write the table chose. A checkpoint sealed under legal hold, or
+    allows. With keys only a checkpoint whose signature verifies under one of them counts, so the retention
+    is the one the application sealed, not one whoever can write the table chose. A checkpoint sealed under legal hold, or
     with retention off, allows nothing.
     """
     from jasil.audit.models import AuditCheckpoint
@@ -418,29 +433,35 @@ def _pruning_horizon(db: Session, verifier: Any, instance_id: str) -> datetime |
         reverse=True,
     )
     for horizon, checkpoint in candidates:
-        if verifier is None or _signature_ok(verifier, checkpoint, instance_id):
+        if not verifiers or _signature_ok(verifiers, checkpoint, instance_id):
             return horizon
     return None
 
 
-def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetime) -> VerificationReport:
+def verify_checkpoints(
+    public_key: str | Sequence[str] | None, from_ts: datetime, to_ts: datetime
+) -> VerificationReport:
     """
     Recompute the checkpoint windows in a range and report each as ``ok`` or what is wrong with it.
 
     For every checkpoint whose window lies inside ``[from_ts, to_ts]`` the window's rows are read and
     hashed again and compared with the stored hash and row count, the link to the previous checkpoint is
-    checked, and the signature is verified when ``public_key`` is given. A gap between two checkpoints is
-    reported as ``missing_window``. A window whose rows are all gone is accepted only if some checkpoint
-    allows it: one not sealed under legal hold whose ``window_end`` minus its recorded ``retention_days`` is
-    at or past the window's end, and whose signature verifies when ``public_key`` is given. Its chain link
-    and signature are still checked, its rows cannot be.
+    checked, and the signature is verified when keys are given. A gap between two checkpoints that reaches
+    into the range is reported as ``missing_window``, whether or not a checkpoint inside the range borders
+    it, and rows dated before the first checkpoint, which no window accounts for, as one ``row_mismatch``
+    window that ends where the first checkpoint starts. Time after the newest checkpoint is not sealed yet
+    and is not reported. A window whose rows are all gone is accepted only if some checkpoint allows it:
+    one not sealed under legal hold whose ``window_end`` minus its recorded ``retention_days`` is at or past
+    the window's end, and whose signature verifies when keys are given. Its chain link and signature are
+    still checked, its rows cannot be.
 
     The host or the observability product decides when to call this; to raise an alarm, stage or record
     ``audit.integrity.violation`` for each window that is not ``ok``.
 
     Args:
-        public_key: Base64 of the 32-byte Ed25519 public key, or ``None`` to check hashes and chain only.
-            After a key rotation verify each period with the key that signed it.
+        public_key: Base64 of a 32-byte Ed25519 public key; or a sequence of them, every key the range was
+            signed with across a rotation, each checkpoint checked against the one its key id names; or
+            ``None`` to check hashes and chain only.
         from_ts: Earliest window start to verify.
         to_ts: Latest window end to verify.
 
@@ -448,16 +469,37 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
         One entry per checkpoint window and per gap, oldest first.
 
     Raises:
-        ValueError: When ``public_key`` is not a valid key.
+        ValueError: When a key is not valid, or ``public_key`` is an empty sequence.
         ImportError: When a key is given and ``cryptography`` is not installed (``jasil[audit]``).
     """
-    from jasil.audit.models import AuditCheckpoint, Instance
+    from jasil.audit.models import AuditCheckpoint, AuditLog, Instance
 
-    verifier = _public_key(public_key) if public_key is not None else None
+    verifiers = _verifiers(public_key)
     start_bound, end_bound = as_utc(from_ts), as_utc(to_ts)
     results: list[WindowVerification] = []
 
     with jasil_orm.get_sessionmaker()() as db:
+        first = db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start).limit(1)).first()
+        if first is None:
+            return VerificationReport(ok=True, signed=bool(verifiers), windows=[])
+        first_start = as_utc(first.window_start)
+        if start_bound < first_start:
+            unsealed_end = min(first_start, end_bound)
+            orphans = db.scalar(
+                select(func.count())
+                .select_from(AuditLog)
+                .where(AuditLog.occurred_at >= start_bound, AuditLog.occurred_at < unsealed_end)
+            )
+            if orphans:
+                results.append(
+                    WindowVerification(
+                        window_start=start_bound,
+                        window_end=unsealed_end,
+                        status=VerificationStatus.ROW_MISMATCH,
+                        expected_rows=0,
+                        actual_rows=orphans,
+                    )
+                )
         previous = db.scalars(
             select(AuditCheckpoint)
             .where(AuditCheckpoint.window_start < start_bound)
@@ -471,18 +513,12 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
         ).all()
         # The deployment is part of every signature, so a checkpoint replayed from another one fails.
         instance_id = db.scalar(select(Instance.instance_id).where(Instance.id == 1)) or ""
-        horizon = _pruning_horizon(db, verifier, instance_id)
+        horizon = _pruning_horizon(db, verifiers, instance_id)
 
         for checkpoint in checkpoints:
             start, end = as_utc(checkpoint.window_start), as_utc(checkpoint.window_end)
             if previous is not None and as_utc(previous.window_end) != start:
-                results.append(
-                    WindowVerification(
-                        window_start=as_utc(previous.window_end),
-                        window_end=start,
-                        status=VerificationStatus.MISSING_WINDOW,
-                    )
-                )
+                results.append(_missing(as_utc(previous.window_end), start))
             expected_prev = previous.hash if previous is not None else None
             digest = _digest(db, start, end, checkpoint.prev_hash)
             rows_match = digest.row_count == checkpoint.row_count and digest.hash == checkpoint.hash
@@ -494,11 +530,7 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
                 and end <= horizon
             )
             status = VerificationStatus.OK if rows_match or pruned else VerificationStatus.ROW_MISMATCH
-            if (
-                status is VerificationStatus.OK
-                and verifier is not None
-                and not _signature_ok(verifier, checkpoint, instance_id)
-            ):
+            if status is VerificationStatus.OK and verifiers and not _signature_ok(verifiers, checkpoint, instance_id):
                 status = VerificationStatus.BAD_SIGNATURE
             if status is VerificationStatus.OK and checkpoint.prev_hash != expected_prev:
                 # With no predecessor in the database the first checkpoint must start the chain; one that
@@ -516,17 +548,35 @@ def verify_checkpoints(public_key: str | None, from_ts: datetime, to_ts: datetim
             )
             previous = checkpoint
 
+        if previous is not None and as_utc(previous.window_end) < end_bound:
+            # The gap after the last window checked: the checkpoints that filled it are gone, or no later
+            # checkpoint exists and the rest of the range is simply not sealed yet.
+            following = db.scalars(
+                select(AuditCheckpoint)
+                .where(AuditCheckpoint.window_start >= previous.window_end)
+                .order_by(AuditCheckpoint.window_start)
+                .limit(1)
+            ).first()
+            if following is not None and as_utc(following.window_start) != as_utc(previous.window_end):
+                results.append(_missing(as_utc(previous.window_end), as_utc(following.window_start)))
+
     return VerificationReport(
         ok=all(result.status is VerificationStatus.OK for result in results),
-        signed=verifier is not None,
+        signed=bool(verifiers),
         windows=results,
     )
 
 
-def _signature_ok(verifier: Any, checkpoint: Any, instance_id: str) -> bool:
+def _missing(start: datetime, end: datetime) -> WindowVerification:
+    return WindowVerification(window_start=start, window_end=end, status=VerificationStatus.MISSING_WINDOW)
+
+
+def _signature_ok(verifiers: Mapping[str, Any], checkpoint: Any, instance_id: str) -> bool:
+    """Whether the checkpoint's signature verifies under the key its key id names, among ``verifiers``."""
     from cryptography.exceptions import InvalidSignature
 
-    if checkpoint.signature is None:
+    verifier = verifiers.get(checkpoint.key_id) if checkpoint.key_id is not None else None
+    if checkpoint.signature is None or verifier is None:
         return False
     try:
         verifier.verify(base64.b64decode(checkpoint.signature, validate=True), _message(checkpoint, instance_id))

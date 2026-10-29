@@ -169,8 +169,10 @@ def run_audit_maintenance() -> None:
     """
     Run the audit maintenance steps once, under a lock shared by every replica.
 
-    In order: synchronize the catalog; record a change to the retention settings; create the next
-    partitions (PostgreSQL); seal the checkpoints that are due; apply retention. Each step runs on its own
+    In order: record a change to the retention settings; create the next partitions (PostgreSQL); seal the
+    checkpoints that are due; apply retention. The catalog is left to :func:`sync_catalog`, which only the
+    application that registers every action may call: a maintenance process registering fewer would
+    deprecate the rest. Each step runs on its own
     sessions and a failure in one is logged and does not skip the others. Retention prunes only what the
     newest sealed checkpoint allows, so while sealing fails or is catching up it prunes less or nothing.
     Idempotent, and a no-op while another replica holds the lock or ``audit.enabled`` is false.
@@ -190,7 +192,6 @@ def run_audit_maintenance() -> None:
             return
         now = platform.clock.now()
         steps: tuple[tuple[str, Callable[[], object]], ...] = (
-            ("catalog sync", sync_catalog),
             ("retention settings", _record_retention_change),
             ("partitions", _ensure_partitions),
             ("checkpoints", lambda: checkpoints.seal_pending_windows(now)),

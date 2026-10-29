@@ -1,7 +1,8 @@
 """Audit maintenance: catalog sync, retention, step isolation and scheduling.
 
 Maintenance is owned by JASIL but scheduled by the host, runs on every replica at once, and must never let
-one failing step starve the others (a catalog problem must not stop checkpoints from being sealed).
+one failing step starve the others (a partition problem must not stop checkpoints from being sealed). The
+catalog is the application's to publish, so maintenance never touches it.
 """
 
 import contextlib
@@ -363,9 +364,19 @@ class TestRun:
         jasil_audit.run_audit_maintenance()
 
         assert lock.names == ["jasil_audit_maintenance"]
-        assert len(_rows(session_factory, AuditActionRecord)) == 6  # catalog synced
         assert _rows(session_factory, AuditCheckpoint)  # checkpoints sealed
         assert jasil_audit.get_audit_health()["last_checkpoint_at"] is not None
+
+    def test_it_leaves_the_catalog_to_the_application_that_owns_it(self, actions, audit_env, session_factory):
+        jasil_audit.sync_catalog()
+        published = {(row.id, row.deprecated) for row in _rows(session_factory, AuditActionRecord)}
+        # A maintenance process that registered only JASIL's own actions.
+        for action in actions:
+            del jasil_audit.get_catalog()._actions[action.id]
+
+        jasil_audit.run_audit_maintenance()
+
+        assert {(row.id, row.deprecated) for row in _rows(session_factory, AuditActionRecord)} == published
 
     def test_it_does_not_take_the_retention_lock(self, audit_env):
         lock = RecordingLock()
@@ -380,7 +391,7 @@ class TestRun:
 
         jasil_audit.run_audit_maintenance()
 
-        assert _rows(session_factory, AuditActionRecord) == []
+        assert _rows(session_factory, AuditCheckpoint) == []
 
     def test_running_twice_is_idempotent(self, actions, audit_env, session_factory):
         _write(audit_env, actions[0], T0 - timedelta(minutes=40))
@@ -399,7 +410,7 @@ class TestRun:
             len(_rows(session_factory, AuditLog)),
         )
 
-    @pytest.mark.parametrize("failing", ["sync_catalog", "_record_retention_change", "_ensure_partitions"])
+    @pytest.mark.parametrize("failing", ["_record_retention_change", "_ensure_partitions"])
     def test_a_failing_step_does_not_skip_the_others(
         self, failing, actions, audit_env, session_factory, monkeypatch, caplog
     ):
@@ -415,10 +426,6 @@ class TestRun:
 
         assert "step" in caplog.text
         assert _rows(session_factory, AuditCheckpoint)  # sealing still ran
-        assert (
-            "shop.order.place" not in {r.id for r in _rows(session_factory, AuditActionRecord)}
-            or failing != "sync_catalog"
-        )
 
     def test_a_failing_checkpoint_step_holds_retention_back(
         self, actions, audit_env, session_factory, monkeypatch, caplog
@@ -434,11 +441,12 @@ class TestRun:
         assert "no sealed checkpoint" in caplog.text
 
     def test_a_failing_retention_step_does_not_undo_the_others(self, actions, audit_env, session_factory, monkeypatch):
+        _write(audit_env, actions[0], T0 - timedelta(minutes=40))
         monkeypatch.setattr(maintenance, "_apply_retention", lambda now: 1 / 0)
 
         jasil_audit.run_audit_maintenance()
 
-        assert len(_rows(session_factory, AuditActionRecord)) == 6
+        assert _rows(session_factory, AuditCheckpoint)
 
     def test_every_replica_reports_the_latest_run(self, actions, audit_env, session_factory):
         _write(audit_env, actions[0], T0 - timedelta(minutes=30))

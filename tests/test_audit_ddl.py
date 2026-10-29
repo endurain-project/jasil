@@ -151,6 +151,13 @@ class TestQuoting:
         assert "'x''; DROP TABLE y; --'" in statement
         assert '"x\'; DROP TABLE y; --"' in statement
 
+    @pytest.mark.parametrize("schema", ['"@SCHEMA_LIT@', "p@SCHEMA_LIT@", "@LOG@"])
+    def test_a_schema_naming_a_placeholder_is_quoted_and_not_substituted_again(self, schema):
+        statement = pg.drop_partitions_function(schema, 30)
+
+        assert pg.quote_ident(schema) + "." in statement
+        assert pg.quote_literal(schema) in statement
+
     def test_a_schema_that_could_end_the_dollar_quoted_body_is_refused(self):
         with pytest.raises(ValueError, match=r"\$"):
             jasil_audit.retention_floor_sql(30, schema="a$body$; DROP TABLE y; --")

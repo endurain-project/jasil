@@ -17,7 +17,6 @@ from jasil.audit import AuditAction, Category, Outcome, Severity
 from jasil.audit.models import AuditCheckpoint, Instance
 from jasil.backends.audit_sink_file import FileAuditSink
 from jasil.backends.audit_sink_storage import AUDIT_SINK_AREA, StorageAuditSink
-from jasil.backends.storage_local import LocalStorage
 from jasil.providers import AuditSink, AuditSinkConflictError
 
 T0 = datetime(2026, 1, 1, 12, tzinfo=UTC)
@@ -148,22 +147,48 @@ class TestFileSink:
             FileAuditSink.from_uri((tmp_path / "sink").as_uri() + suffix)
 
 
+class CreateOnlyStorage:
+    """The two calls the storage sink makes, with S3's conditional ``PutObject`` semantics."""
+
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str], bytes] = {}
+        self.creates: list[tuple[str, str, str | None]] = []
+
+    def create(self, area: str, key: str, data: bytes, content_type: str | None = None) -> bool:
+        self.creates.append((area, key, content_type))
+        if (area, key) in self.objects:
+            return False
+        self.objects[area, key] = data
+        return True
+
+    def get(self, area: str, key: str) -> bytes | None:
+        return self.objects.get((area, key))
+
+
 class TestStorageSink:
     @pytest.fixture
-    def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path))
+    def storage(self):
+        return CreateOnlyStorage()
 
     def test_it_stores_the_bytes_in_its_area(self, storage):
         StorageAuditSink(storage).write_once("a.json", b"one")
 
         assert storage.get(AUDIT_SINK_AREA, "a.json") == b"one"
+        assert storage.creates == [(AUDIT_SINK_AREA, "a.json", "application/json")]
 
-    def test_writing_the_same_bytes_again_does_not_write(self, storage, monkeypatch):
+    def test_writing_the_same_bytes_again_is_a_no_op(self, storage):
         sink = StorageAuditSink(storage)
         sink.write_once("a.json", b"one")
-        monkeypatch.setattr(storage, "save", lambda *args, **kwargs: pytest.fail("rewrote an existing object"))
 
         sink.write_once("a.json", b"one")
+
+        assert storage.get(AUDIT_SINK_AREA, "a.json") == b"one"
+
+    def test_the_write_is_conditional_rather_than_checked_first(self, storage, monkeypatch):
+        """A read before an unconditional write would let a racing writer replace the copy in between."""
+        monkeypatch.setattr(storage, "get", lambda *args: pytest.fail("read before writing"))
+
+        StorageAuditSink(storage).write_once("a.json", b"one")
 
     def test_different_bytes_under_a_taken_name_are_refused(self, storage):
         sink = StorageAuditSink(storage)

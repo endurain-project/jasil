@@ -224,6 +224,32 @@ class TestSave:
         storage.save(AREA, KEY, b"bytes")
 
 
+class TestCreate:
+    def test_it_writes_only_if_no_object_is_there(self, storage, stub):
+        stub.add_response(
+            "put_object",
+            {},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "Body": b"bytes", "IfNoneMatch": "*", "ContentType": "a/b"},
+        )
+
+        assert storage.create(AREA, KEY, b"bytes", content_type="a/b") is True
+
+    def test_an_object_already_there_is_reported_not_replaced(self, storage, stub):
+        stub.add_client_error("put_object", service_error_code="PreconditionFailed", http_status_code=412)
+
+        assert storage.create(AREA, KEY, b"bytes") is False
+
+    def test_a_conflicting_concurrent_write_is_a_backend_failure(self, storage, stub):
+        stub.add_client_error("put_object", service_error_code="ConditionalRequestConflict", http_status_code=409)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.create(AREA, KEY, b"bytes")
+
+    def test_an_invalid_key_is_refused_before_any_request(self, storage, stub):
+        with pytest.raises(ValueError):
+            storage.create(AREA, "../escape", b"bytes")
+
+
 class TestSaveStream:
     def test_it_completes_a_multipart_upload(self, storage, stub):
         stub.add_response(

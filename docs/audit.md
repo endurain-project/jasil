@@ -161,7 +161,8 @@ This is how the observability product describes rows without importing your code
 
 Call it at startup, after registering every action, and **only from the application that owns the catalog**: a
 process with an empty catalog would mark everything deprecated. A change is itself audited as
-`audit.catalog.sync`. It is also the first step of [maintenance](#maintenance).
+`audit.catalog.sync`. [Maintenance](#maintenance) never syncs the catalog, so it can run in a process that
+registers only JASIL's own actions.
 
 ## The ambient context
 
@@ -283,19 +284,18 @@ the runtime role as `maintenance_role` is the explicit way to choose the former.
 separate function from [`prune_expired_records`](observability.md#retention) with its own lock
 (`jasil_audit_maintenance`), so neither can block the other. Under the platform's `LockProvider`, in order:
 
-1. **Sync the catalog** (`jasil_audit_actions`).
-2. **Record a retention change**: if `audit.retention_days` or `audit.legal_hold` differs from what the last run
+1. **Record a retention change**: if `audit.retention_days` or `audit.legal_hold` differs from what the last run
    stored in `jasil_instance`, stage `audit.retention.change` (the first run only records the baseline).
-3. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL).
-4. **Seal the checkpoints** that are due.
-5. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
+2. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL).
+3. **Seal the checkpoints** that are due.
+4. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
    checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
    `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
    is pruned. On PostgreSQL call `jasil_audit_drop_partitions(cutoff)`, which writes the `audit.retention.prune` row
    itself. On other dialects, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
    it, as a partition drop is) and write that row from Python.
 
-Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a catalog problem
+Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a partition problem
 does not stop checkpoints. Retention never prunes a row that is not sealed, so while sealing fails (a bad signing
 key, a sink outage or conflict) or works off a backlog, it prunes less or nothing and the log grows; alert on
 `last_checkpoint_at`. The run is idempotent and safe on every replica at once; the lock makes all but one a
@@ -315,7 +315,11 @@ interval bounds how far behind they run.
 ### Retention
 
 `retention_days` (90) is how long a partition is kept; `<= 0` keeps everything. `legal_hold` suspends pruning
-entirely. `retention_floor_days` (30) is the database-side minimum described [above](#the-retention-floor); a
+entirely. The hold binds JASIL's maintenance, not the database: `jasil_audit_drop_partitions` refuses only a cutoff
+inside the retention floor, so any role with `EXECUTE` on it can still drop older partitions while the hold is set.
+For a hold the database enforces, revoke that right for its duration
+(`REVOKE EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz) FROM <maintenance role>`) and grant it back
+afterwards; maintenance does not call it while `legal_hold` is set. `retention_floor_days` (30) is the database-side minimum described [above](#the-retention-floor); a
 positive `retention_days` below it is a configuration error. The host maps its own deployment profiles onto
 `retention_days`; JASIL supplies only the neutral default.
 
@@ -359,7 +363,9 @@ print(base64.b64encode(public).decode())  # give this to whoever verifies
 
 Install `jasil[audit]` for `cryptography`. Without `audit.signing_key` checkpoints are still hash-chained but
 unsigned, with a warning: whoever can rewrite the rows can then recompute the chain. The key id on each checkpoint is
-a fingerprint of the public key. After a rotation, verify each period with the key that signed it.
+a fingerprint of the public key. After a rotation, pass every public key the trail was signed with, as a list:
+each checkpoint is checked against the key its key id names, and the windows retention pruned under the new key stay
+verifiable alongside the ones the old key sealed.
 
 ### The external sink
 
@@ -368,7 +374,7 @@ a fingerprint of the public key. After a rotation, verify each period with the k
 | URI | Backend | Notes |
 |---|---|---|
 | `file:///absolute/directory` | A directory | Files are created exclusively and read-only. Point it at a mount the application can write but not rewrite. Each copy is published with a hard link, so the directory's file system must support them; on one that does not (some network shares), every seal fails. No host, query or fragment. |
-| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject`, `PutObject` and `ListBucket` on the prefix but not delete or overwrite: the sink reads a checkpoint's key before writing it, and without `ListBucket` S3 answers a missing key with `403` instead of `404`, which fails every seal. Needs `jasil[s3]`. |
+| `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject` and `PutObject` on the prefix but not delete, and a bucket policy that denies any `PutObject` without `If-None-Match: *` (the `s3:if-none-match` condition key), so no holder of the credentials can overwrite a checkpoint. The sink writes every checkpoint with that header; a store that does not support conditional writes fails every seal. Needs `jasil[s3]`. |
 
 Each object is named `checkpoint-<instance id>-<window start>.json`, so deployments sharing a sink do not collide.
 The contract (`jasil.providers.AuditSink`) is that an object is never replaced: `write_once` with identical bytes
@@ -378,17 +384,18 @@ missing a checkpoint the database has. Sealing the same rows gives the same byte
 deterministic), apart from the `retention_days` and `legal_hold` taken from the settings in force. So when a retry
 after a crash between the two writes finds the window already in the sink, and those settings changed meanwhile,
 the window is resealed under the values the copy records and stored if that reproduces the copy byte for byte;
-anything else is an `AuditSinkConflictError`. The S3 sink's "never replace" is a read of the current object before the write,
-serialized across replicas by the maintenance lock. That check covers only the current version and binds no other
-writer. Object Lock keeps a locked version from being deleted or overwritten in place, but a `PutObject` to the same
-key can still create a new current version, and a delete marker can hide the locked one; credentials without
-`PutObject` on existing keys and a default compliance-mode retention are what close that. `verify_checkpoints` reads
+anything else is an `AuditSinkConflictError`. The S3 sink's "never replace" is a conditional `PutObject`
+(`If-None-Match: *`): S3 refuses it when the key holds an object, and the sink then reads that object to tell a retry
+from a conflict. Object Lock keeps a locked version from being deleted or overwritten in place, but without the
+bucket policy above a `PutObject` that omits the header could still create a new current version, and a delete
+marker can hide the locked one; the policy, credentials without delete rights and a default compliance-mode
+retention are what close that. `verify_checkpoints` reads
 only the database and does not compare the external copy: reconcile the sink yourself.
 
 ### Verifying
 
 ```python
-report = jasil_audit.verify_checkpoints(public_key, from_ts, to_ts)  # public_key=None checks hashes only
+report = jasil_audit.verify_checkpoints(public_key, from_ts, to_ts)  # a key, a list of keys, or None for hashes only
 for window in report.windows:
     if window.status is not jasil_audit.VerificationStatus.OK:
         jasil_audit.record_detached(
@@ -401,19 +408,22 @@ for window in report.windows:
 ```
 
 JASIL provides the function; the host or the observability product decides when to call it. Each window in the range
-is reported as one of:
+is reported as one of the statuses below. A gap reaching into the range is reported even when every checkpoint inside
+the range was deleted, and rows dated before the first checkpoint are reported as one `row_mismatch` window ending
+where that checkpoint starts. Time after the newest checkpoint is not sealed yet, so it is not reported: alert on
+`last_checkpoint_at` from `get_audit_health()` to catch sealing that has stopped.
 
 | Status | Meaning |
 |---|---|
-| `ok` | Rows, count, chain link and (if a key was given) signature all match |
-| `row_mismatch` | The rows of the window are not the rows that were sealed: one was modified, deleted or inserted |
+| `ok` | Rows, count, chain link and (if keys were given) signature all match |
+| `row_mismatch` | The rows of the window are not the rows that were sealed: one was modified, deleted or inserted; or rows are dated before the first checkpoint |
 | `missing_window` | There is a gap between two checkpoints (a checkpoint was deleted) |
 | `broken_chain` | The checkpoint's `prev_hash` is not the previous checkpoint's hash |
-| `bad_signature` | The signature is absent, or does not verify with the key given (also for a checkpoint signed for another deployment) |
+| `bad_signature` | The signature is absent, or does not verify with the key its key id names among the keys given (also for a checkpoint signed for another deployment) |
 
 Dropped windows are expected **only** where a checkpoint allows them. A window whose rows are all gone is reported
 `ok` with `pruned=True` if some checkpoint not sealed under legal hold ends at least the `retention_days` it was sealed
-under after the window's end, and, when a key is given, that checkpoint's signature verifies; only the window's chain
+under after the window's end, and, when keys are given, that checkpoint's signature verifies under one of them; only the window's chain
 link and signature are then checked. Otherwise missing rows are a `row_mismatch`. The retention a checkpoint allows
 is the application's, under the application's signature: `audit.retention.prune` rows are a record of what retention
 did, not evidence, since anyone able to insert into the log could write one. A legal hold stops checkpoints sealed

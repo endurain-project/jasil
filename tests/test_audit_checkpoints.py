@@ -312,6 +312,44 @@ class TestVerification:
 
         assert (report.ok, report.windows) == (True, [])
 
+    def test_checkpoints_deleted_from_the_whole_range_are_a_missing_window(self, sealed):
+        sealed.seal(200)
+        sealed.execute(
+            delete(AuditCheckpoint).where(AuditCheckpoint.window_start >= at(15), AuditCheckpoint.window_start < at(90))
+        )
+
+        report = sealed.verify(start=15, end=90)
+
+        assert [(w.window_start, w.window_end, w.status.value) for w in report.windows] == [
+            (at(15), at(90), "missing_window")
+        ]
+        assert report.ok is False
+
+    def test_checkpoints_deleted_from_the_end_of_the_range_are_a_missing_window(self, sealed):
+        sealed.seal(200)
+        sealed.execute(delete(AuditCheckpoint).where(AuditCheckpoint.window_start.in_([at(30), at(45)])))
+
+        assert sealed.statuses(start=0, end=60) == ["ok", "ok", "missing_window"]
+
+    def test_a_row_dated_before_the_first_checkpoint_is_reported(self, sealed):
+        sealed.write(-30, target_id="forged")
+
+        report = sealed.verify(start=-60, end=45)
+
+        first = report.windows[0]
+        assert (first.window_end, first.status.value, first.expected_rows, first.actual_rows) == (
+            at(0),
+            "row_mismatch",
+            0,
+            1,
+        )
+        assert report.ok is False
+
+    def test_rows_after_the_newest_checkpoint_are_not_yet_sealed(self, sealed):
+        sealed.write(50)
+
+        assert sealed.verify(start=0, end=120).ok is True
+
     def test_a_trail_with_no_checkpoints_verifies_vacuously(self, trail):
         assert trail.verify().ok is True
 
@@ -386,6 +424,27 @@ class TestSignatures:
         trail.execute(update(Instance).values(instance_id=str(uuid7())))
 
         assert trail.statuses(public) == ["bad_signature"] * 3
+
+    def test_several_keys_verify_a_trail_signed_across_a_rotation(self, signed, audit_env):
+        trail, old, keys = signed
+        new_private, new = keys()
+        audit_env.configure(signing_key=new_private)
+        trail.write(65, target_id="d")
+        trail.seal(120)
+
+        assert trail.statuses(old, end=120) == ["ok"] * 3 + ["bad_signature"] * 4
+        assert trail.verify([old, new], end=120).ok is True
+
+    def test_a_key_list_without_the_signing_key_is_a_bad_signature(self, signed):
+        trail, _, keys = signed
+
+        assert trail.statuses([keys()[1], keys()[1]]) == ["bad_signature"] * 3
+
+    def test_an_empty_key_list_is_refused(self, signed):
+        trail, _, _ = signed
+
+        with pytest.raises(ValueError, match="key"):
+            trail.verify([])
 
     def test_without_a_public_key_signatures_are_not_checked(self, signed):
         trail, _, _ = signed
@@ -494,6 +553,21 @@ class TestPrunedWindows:
         assert trail.statuses(public, end=100)[0] == "row_mismatch"
         assert trail.statuses(public, start=100, end=2 * 24 * 60)[0] == "bad_signature"
         assert trail.statuses(None, end=100)[0] == "ok"  # unsigned, the chain proves only consistency
+
+    def test_windows_pruned_after_a_key_rotation_are_expected_with_both_keys(self, trail, audit_env, keys):
+        old_private, old = keys()
+        new_private, new = keys()
+        audit_env.configure(signing_key=old_private)
+        trail.write(3, target_id="a")
+        trail.write(35, target_id="c")
+        trail.seal(60)
+        audit_env.configure(signing_key=new_private)
+        self._authorise(trail, 2 * 24 * 60)  # only checkpoints signed with the new key allow the prune
+        trail.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
+
+        report = trail.verify([old, new], end=45)
+
+        assert [(w.status.value, w.pruned) for w in report.windows] == [("ok", True), ("ok", False), ("ok", False)]
 
     def test_a_pruned_window_still_has_its_chain_and_signature_checked(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))

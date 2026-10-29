@@ -566,7 +566,7 @@ class TestEndToEnd:
         assert sorted((entry.target_id, entry.outcome) for entry in page.entries) == [("7", "denied"), ("8", "failure")]
         assert jasil_audit.summary().total == 2
 
-    def test_maintenance_creates_partitions_syncs_and_reports_the_horizon(self, migrated, action):
+    def test_maintenance_creates_partitions_and_reports_the_horizon(self, migrated, action):
         jasil_testing.install_test_platform(".", clock=SystemClock())
         with migrated.begin() as connection:
             connection.execute(text("SELECT jasil_audit_ensure_partitions(0)"))
@@ -574,6 +574,12 @@ class TestEndToEnd:
         jasil_audit.run_audit_maintenance()
 
         assert jasil_audit.get_audit_health()["furthest_partition_date"] == datetime.now(UTC).date() + timedelta(days=7)
+
+    def test_the_catalog_syncs_on_postgresql(self, migrated, action):
+        jasil_testing.install_test_platform(".", clock=SystemClock())
+
+        jasil_audit.sync_catalog()
+
         assert {entry.id for entry in jasil_audit.list_catalog()} >= {"shop.order.place", "audit.catalog.sync"}
 
     def test_checkpoints_seal_and_verify_across_partitions(self, migrated, action):

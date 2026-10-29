@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _INVALID_RANGE_CODES = frozenset({"416", "InvalidRange", "RequestedRangeNotSatisfiable"})
 _MISSING_UPLOAD_CODES = frozenset({"404", "NoSuchUpload", "NotFound"})
+_OBJECT_EXISTS_CODES = frozenset({"412", "PreconditionFailed"})
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
@@ -366,6 +367,38 @@ class S3Storage:
         extra = {"ContentType": content_type} if content_type else {}
         self._client.put_object(Bucket=self._bucket, Key=self._object_key(area, key), Body=data, **extra)
         return key
+
+    @_translate_s3_errors
+    def create(self, area: str, key: str, data: bytes, content_type: str | None = None) -> bool:
+        """Store ``data`` under ``area``/``key`` only if no object is there yet.
+
+        One conditional ``PutObject`` (``If-None-Match: *``), so no other writer can slip in between a check
+        and the write, and a bucket policy can deny every ``PutObject`` without it.
+
+        Args:
+            area: The storage area.
+            key: The key within the area.
+            data: The bytes to store.
+            content_type: The object's ``Content-Type``, if any.
+
+        Returns:
+            True when this call stored the object; False when an object was already there.
+
+        Raises:
+            ValueError: When ``area`` or ``key`` is not a valid storage address.
+            StorageBackendUnavailableError: When S3 fails, including a concurrent conditional write to the
+                same key (``409``), which a retry settles.
+        """
+        extra = {"ContentType": content_type} if content_type else {}
+        try:
+            self._client.put_object(
+                Bucket=self._bucket, Key=self._object_key(area, key), Body=data, IfNoneMatch="*", **extra
+            )
+        except ClientError as error:
+            if _error_code(error) in _OBJECT_EXISTS_CODES:
+                return False
+            raise
+        return True
 
     @_translate_s3_errors
     def save_stream(

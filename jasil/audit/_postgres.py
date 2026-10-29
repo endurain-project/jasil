@@ -12,6 +12,8 @@ their advisory lock is one any role that can connect may take, and the table loc
 application's inserts behind them while they wait.
 """
 
+import re
+
 from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_PARTITION_DAYS_AHEAD
 
 __all__ = [
@@ -33,6 +35,7 @@ ENSURE_FUNCTION = "jasil_audit_ensure_partitions"
 DROP_FUNCTION = "jasil_audit_drop_partitions"
 #: The day a partition covers is the last eight digits of its name.
 partition_name_pattern = "_p([0-9]{8})$"
+_PLACEHOLDER = re.compile(r"@([A-Z_]+)@")
 
 
 def quote_ident(name: str) -> str:
@@ -50,6 +53,8 @@ def _render(template: str, schema: str, **extra: str) -> str:
 
     Plain substitution rather than string formatting, because the templates are PL/pgSQL full of
     ``%`` and braces, and every substituted value is a quoted identifier, a quoted literal or an integer.
+    Every placeholder is replaced in one pass, so a value that itself reads ``@NAME@`` is never substituted
+    again.
 
     Raises:
         ValueError: When ``schema`` contains ``$``: quoting does not escape it, and inside a dollar-quoted
@@ -69,9 +74,7 @@ def _render(template: str, schema: str, **extra: str) -> str:
         "MAX_DAYS_AHEAD": str(MAX_PARTITION_DAYS_AHEAD),
         **extra,
     }
-    for name, value in values.items():
-        template = template.replace(f"@{name}@", value)
-    return template
+    return _PLACEHOLDER.sub(lambda match: values[match.group(1)], template)
 
 
 _FORBID_TEMPLATE = """

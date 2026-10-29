@@ -146,7 +146,8 @@ through.
       on `get_audit_health()` (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing
       partition fails audited writes, and the runtime grants cannot seal checkpoints or apply retention.
 - [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock and a default compliance-mode retention period),
-      give the bucket a default compliance-mode retention period, and verify on a schedule with `verify_checkpoints`.
+      give the bucket a default compliance-mode retention period and a policy denying any `PutObject` without
+      `If-None-Match: *`, and verify on a schedule with `verify_checkpoints`, passing every key the trail was signed with.
       Reconcile the sink with `jasil_audit_checkpoints` from outside the database operators' reach: against the table
       owner the signing key alone detects nothing, because the application re-signs whatever it re-seals.
 - [ ] Do not expose a read route for the trail from the host application.

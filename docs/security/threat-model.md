@@ -219,6 +219,12 @@ inside a floor fixed in the database, and the recommended grants give the applic
 hash-chained checkpoints over fixed windows, copied to a write-once sink, make a change by anyone else detectable
 (`verify_checkpoints`). An audited change and its row share a transaction, so a change cannot happen unrecorded.
 
+`audit.legal_hold` is enforced by JASIL's maintenance, not by the database: a role with `EXECUTE` on
+`jasil_audit_drop_partitions` can drop partitions older than the floor during a hold. Revoke that right for the hold
+when it must bind every role ([Retention](../audit.md#retention)). The S3 sink writes each checkpoint with a
+conditional `PutObject`; only a bucket policy requiring that condition stops another holder of its credentials from
+replacing one.
+
 **Yours.** Nothing stops the table owner or a database superuser: they can disable the triggers and rewrite rows,
 checkpoints and chain together, and if they delete a period's checkpoints the application re-seals and signs the
 rewritten rows with its own key. Against them only the external sink holds the original checkpoints. Keep the sink
