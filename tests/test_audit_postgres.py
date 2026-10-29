@@ -193,6 +193,12 @@ class TestMigration:
         grantees = [entry.split("=")[0] for entry in acl.strip("{}").split(",")]
         assert "" not in grantees  # an empty grantee is PUBLIC
 
+    @pytest.mark.parametrize("function", ["jasil_audit_ensure_partitions", "jasil_audit_drop_partitions"])
+    def test_the_functions_wait_for_a_lock_for_ten_seconds_at_most(self, migrated, function):
+        settings = _scalar(migrated, "SELECT proconfig::text FROM pg_proc WHERE proname = :f", f=function)
+
+        assert "lock_timeout=10s" in settings
+
     def test_the_floor_is_baked_in_from_the_settings_at_migration_time(self, engine, mapped_base):
         jasil_settings.configure(
             jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(retention_floor_days=45))

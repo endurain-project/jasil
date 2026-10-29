@@ -1,5 +1,6 @@
 """The external checkpoint sink: write-once copies kept outside the database."""
 
+import base64
 import json
 import os
 import stat
@@ -118,6 +119,12 @@ class TestFileSink:
 
         assert [path.name for path in tmp_path.iterdir()] == ["a.json"]
 
+    def test_it_reads_back_what_it_stored_and_none_for_a_missing_name(self, tmp_path):
+        sink = FileAuditSink(tmp_path)
+        sink.write_once("a.json", b"one")
+
+        assert (sink.read("a.json"), sink.read("b.json")) == (b"one", None)
+
     def test_it_creates_its_directory(self, tmp_path):
         FileAuditSink(tmp_path / "deep" / "er").write_once("a.json", b"x")
 
@@ -166,6 +173,12 @@ class TestStorageSink:
             sink.write_once("a.json", b"two")
 
         assert storage.get(AUDIT_SINK_AREA, "a.json") == b"one"
+
+    def test_it_reads_back_what_it_stored_and_none_for_a_missing_name(self, storage):
+        sink = StorageAuditSink(storage)
+        sink.write_once("a.json", b"one")
+
+        assert (sink.read("a.json"), sink.read("b.json")) == (b"one", None)
 
     def test_both_sinks_satisfy_the_provider_protocol(self, storage, tmp_path):
         assert isinstance(StorageAuditSink(storage), AuditSink)
@@ -250,8 +263,6 @@ class TestSealingThroughTheSink:
         assert copy["instance_id"]
 
     def test_a_signed_copy_carries_the_signature(self, trail):
-        import base64
-
         trail.configure(signing_key=base64.b64encode(bytes(range(32))).decode())
 
         checkpoints.seal_pending_windows()
@@ -279,6 +290,42 @@ class TestSealingThroughTheSink:
             db.commit()
 
         assert checkpoints.seal_pending_windows() == 1  # the sink already holds identical bytes
+
+    def _lose_the_newest_database_write(self) -> None:
+        """What a crash between the sink write and the database commit leaves: the copy, and no row."""
+        with self.session_factory() as db:
+            db.delete(db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc())).first())
+            db.commit()
+
+    @pytest.mark.parametrize("change", [{"legal_hold": True}, {"retention_days": 45}])
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_a_retry_under_changed_settings_adopts_the_copy_the_sink_holds(self, trail, change, signed):
+        """Retention or the hold changed before the retry; the immutable copy must not stop sealing for good."""
+        if signed:
+            trail.configure(signing_key=base64.b64encode(bytes(range(32))).decode())
+        checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+        trail.configure(**change)
+
+        assert checkpoints.seal_pending_windows() == 1
+
+        newest = self._stored()[-1]
+        copy = json.loads((self.directory / self._name("20260101T123000Z")).read_text())
+        assert (newest.retention_days, newest.legal_hold) == (90, False)
+        assert newest.signature == copy["signature"]
+        assert jasil_audit.verify_checkpoints(None, T0, T0 + timedelta(hours=1)).ok
+
+    def test_a_copy_of_other_rows_is_still_a_conflict(self, trail):
+        checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+        target = self.directory / self._name("20260101T123000Z")
+        copy = json.loads(target.read_text())
+        target.chmod(0o600)
+        target.write_text(json.dumps({**copy, "hash": "f" * 64}, sort_keys=True, separators=(",", ":")))
+
+        with pytest.raises(AuditSinkConflictError):
+            checkpoints.seal_pending_windows()
+        assert len(self._stored()) == 2
 
     def test_a_tampered_sink_object_stops_sealing_loudly(self, trail):
         checkpoints.seal_pending_windows()

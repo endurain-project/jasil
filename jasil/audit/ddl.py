@@ -113,7 +113,7 @@ def retention_floor_sql(floor_days: int, *, schema: str) -> str:
     run this statement as the role that owns the function. It keeps the function's owner and grants.
 
     Args:
-        floor_days: The youngest age, in days, the function will let a cutoff reach. At least 1.
+        floor_days: The youngest age, in days, the function will let a cutoff reach. Between 1 and 36500.
         schema: Schema holding the audit tables, as migration ``rev0006`` found it (``current_schema()``
             when it ran). Required: the function body names its schema, so there is no safe default.
 
@@ -121,6 +121,6 @@ def retention_floor_sql(floor_days: int, *, schema: str) -> str:
         A ``CREATE OR REPLACE FUNCTION`` statement.
 
     Raises:
-        ValueError: When ``floor_days`` is below 1.
+        ValueError: When ``floor_days`` is below 1 or above 36500.
     """
     return pg.drop_partitions_function(schema, floor_days).strip()

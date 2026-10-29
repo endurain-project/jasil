@@ -114,6 +114,40 @@ def _config(connection: Any = None) -> Any:
     return config
 
 
+#: Name of the database lock a migration run holds; see :func:`_one_run_at_a_time`.
+_RUN_LOCK = "jasil_migrations"
+
+
+@contextmanager
+def _one_run_at_a_time(connection: Any) -> Generator[None]:
+    """Hold a database lock for one migration run, so processes upgrading at once queue instead of colliding.
+
+    The run that waited then reads the version table after the first one committed and finds nothing left
+    to do. ``env.py`` enters this inside Alembic's transaction. PostgreSQL takes a transaction lock, which
+    that run's commit releases; MySQL commits per migration, so it holds a session lock and gives it back
+    afterwards. SQLite is not locked: it serves a single process, and JASIL refuses a multi-process SQLite
+    deployment.
+
+    Raises:
+        RuntimeError: When MySQL does not grant the lock.
+    """
+    from sqlalchemy import text
+
+    dialect = connection.dialect.name
+    if dialect == "postgresql":
+        connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:name))"), {"name": _RUN_LOCK})
+        yield
+    elif dialect in ("mysql", "mariadb"):
+        if connection.execute(text("SELECT GET_LOCK(:name, -1)"), {"name": _RUN_LOCK}).scalar() != 1:
+            raise RuntimeError("MySQL did not grant the JASIL migration lock")
+        try:
+            yield
+        finally:
+            connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": _RUN_LOCK})
+    else:
+        yield
+
+
 def _run_on_connection(connection: Any, command_name: str, *args: Any) -> None:
     _require_alembic()
     from alembic import command

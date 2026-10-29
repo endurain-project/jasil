@@ -272,7 +272,8 @@ class LocalStorage:
         except ValueError:
             return False
 
-    def _write_plain_bytes(self, area: str, path: Path, data: bytes) -> None:
+    def _write_object_bytes(self, area: str, path: Path, data: bytes) -> None:
+        """Write ``data`` to a temporary file and move it over ``path``, so a failed overwrite leaves the old bytes."""
         temporary_path = self._temporary_object_path(area, path)
         try:
             if temporary_path.parent == path.parent:
@@ -515,15 +516,10 @@ class LocalStorage:
 
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
         path = self._prepare_object(area, key)
+        self._write_object_bytes(area, path, data)
         if area in self._plain_areas:
-            self._write_plain_bytes(area, path, data)
             self._discard_replaced_object(area, key)
         else:
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(data)
-            except OSError as error:
-                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
             self._remove_legacy_object(area, key)
         return key
 

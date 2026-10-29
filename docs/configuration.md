@@ -95,8 +95,8 @@ checkpoint maintenance seals a window, so an invalid key makes that maintenance 
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `True` | Write audit rows. `False` still validates every call, then writes nothing; maintenance does nothing. |
-| `retention_days` | `90` | Age at which whole daily partitions are dropped. `<= 0` keeps every row. When positive it must be at least `retention_floor_days`. Your deployment profiles map onto this value; JASIL supplies only the neutral default. |
-| `retention_floor_days` | `30` | The youngest cutoff the database-side guard `jasil_audit_drop_partitions` accepts. **Baked into the function when migration `rev0006` runs**; changing the setting later does not change the guard (see [the retention floor](audit.md#the-retention-floor)). At least `1`. |
+| `retention_days` | `90` | Age at which whole daily partitions are dropped. `<= 0` keeps every row. When positive it must be at least `retention_floor_days`; at most `36500`. Your deployment profiles map onto this value; JASIL supplies only the neutral default. |
+| `retention_floor_days` | `30` | The youngest cutoff the database-side guard `jasil_audit_drop_partitions` accepts. **Baked into the function when migration `rev0006` runs**; changing the setting later does not change the guard (see [the retention floor](audit.md#the-retention-floor)). Between `1` and `36500`. |
 | `legal_hold` | `False` | Suspend all pruning. |
 | `partition_days_ahead` | `7` | Days of daily partitions maintenance keeps created ahead of today (PostgreSQL). A row whose day has none is rejected, so this is the margin by which maintenance may stop. Between `1` and `366`. |
 | `checkpoint_window_minutes` | `15` | Length of a tamper-evidence window. At least `1`, and it must divide a day (1440). |

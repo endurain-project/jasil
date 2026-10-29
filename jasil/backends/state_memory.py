@@ -40,6 +40,7 @@ class MemoryState:
             return self._live_value(key)
 
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
+        _check_ttl(ttl_seconds)
         with self._lock:
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._data[key] = (value, expiry)
@@ -49,6 +50,7 @@ class MemoryState:
             self._data.pop(key, None)
 
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
+        _check_ttl(ttl_seconds)
         with self._lock:
             current_bytes = self._live_value(key)
             current = int(current_bytes.decode()) if current_bytes is not None else 0
@@ -63,6 +65,7 @@ class MemoryState:
             return new_value
 
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
+        _check_ttl(ttl_seconds)
         with self._lock:
             if self._live_value(key) is not None:
                 return False
@@ -78,6 +81,7 @@ class MemoryState:
             return value
 
     def delete_prefix(self, prefix: str) -> int:
+        _check_prefix(prefix)
         with self._lock:
             matching = [key for key in self._data if key.startswith(prefix)]
             for key in matching:
@@ -127,3 +131,13 @@ class MemoryState:
                 self._data[gate_key] = (str(gate_until).encode(), time.monotonic() + lock_seconds)
                 return TieredFailureOutcome(count, gate_until, True)
             return TieredFailureOutcome(count, None, False)
+
+
+def _check_ttl(ttl_seconds: int | None) -> None:
+    if ttl_seconds is not None and ttl_seconds <= 0:
+        raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
+
+
+def _check_prefix(prefix: str) -> None:
+    if not prefix:
+        raise ValueError("delete_prefix needs a non-empty prefix")

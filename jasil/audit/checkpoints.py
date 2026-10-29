@@ -43,6 +43,7 @@ from jasil._core import optional_deps
 from jasil._core.timestamps import as_utc
 from jasil.audit import service
 from jasil.audit.schema import VerificationReport, VerificationStatus, WindowVerification
+from jasil.providers import AuditSink, AuditSinkConflictError
 from jasil.settings import AuditSettings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ MAX_WINDOWS_PER_RUN = 1000
 
 _MESSAGE_PREFIX = "jasil-audit-checkpoint-v1"
 _FETCH_SIZE = 1000
+_EARLIEST = datetime.min.replace(tzinfo=UTC)
 
 _COLUMNS = (
     "id",
@@ -218,6 +220,76 @@ def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
     return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
 
+def _sealed(checkpoint: Any, settings: AuditSettings, instance_id: str) -> Any:
+    """Sign ``checkpoint`` (when a key is configured) and return it."""
+    checkpoint.signature, checkpoint.key_id = _sign(settings, _message(checkpoint, instance_id))
+    return checkpoint
+
+
+def _recorded_retention(document: bytes | None) -> tuple[int, bool] | None:
+    """Return the ``(retention_days, legal_hold)`` a sink copy records, or ``None`` when it records none."""
+    if document is None:
+        return None
+    try:
+        fields = json.loads(document)
+    except ValueError:  # not JSON, or not UTF-8: not a copy this code wrote
+        return None
+    if not isinstance(fields, dict):
+        return None
+    retention_days, legal_hold = fields.get("retention_days"), fields.get("legal_hold")
+    if type(retention_days) is not int or type(legal_hold) is not bool:
+        return None
+    return retention_days, legal_hold
+
+
+def _copy_to_sink(sink: AuditSink, checkpoint: Any, settings: AuditSettings, instance_id: str) -> Any:
+    """Write ``checkpoint`` to the sink and return the checkpoint to store.
+
+    Sealing the same rows gives the same bytes (Ed25519 signatures are deterministic) except for the
+    ``retention_days`` and ``legal_hold`` taken from the settings in force. So when the sink already holds
+    the window, as after a crash between the sink write and the database commit, and the settings have
+    changed since, the window is resealed under the values that copy records: that checkpoint is stored
+    when it reproduces the copy byte for byte, and anything else is a conflict.
+
+    Raises:
+        AuditSinkConflictError: When the sink holds content for the window that this window does not
+            reproduce.
+    """
+    from jasil.audit.models import AuditCheckpoint
+
+    name = _sink_name(checkpoint.window_start, instance_id)
+    try:
+        sink.write_once(name, _sink_payload(checkpoint, instance_id))
+        return checkpoint
+    except AuditSinkConflictError:
+        stored = sink.read(name)
+        recorded = _recorded_retention(stored)
+        if recorded is None:
+            raise
+        resealed = _sealed(
+            AuditCheckpoint(
+                window_start=checkpoint.window_start,
+                window_end=checkpoint.window_end,
+                row_count=checkpoint.row_count,
+                hash=checkpoint.hash,
+                prev_hash=checkpoint.prev_hash,
+                retention_days=recorded[0],
+                legal_hold=recorded[1],
+            ),
+            settings,
+            instance_id,
+        )
+        if _sink_payload(resealed, instance_id) != stored:
+            raise
+        logger.warning(
+            "Audit checkpoint %s was already in the external sink under retention_days=%d, legal_hold=%s; "
+            "storing that copy",
+            name,
+            *recorded,
+        )
+        return resealed
+
+
 def _window_end(start: datetime, window: timedelta) -> datetime:
     """Return the end of the window starting at ``start``: the next multiple of ``window`` since the epoch.
 
@@ -236,8 +308,8 @@ def seal_pending_windows(now: datetime | None = None) -> int:
     Reads each window on a short session, writes it to the external sink (if configured) with no
     transaction open, then stores the checkpoint on another short session. The sink comes first: if it is
     down the checkpoint is not stored and the window is retried on the next run, so the copy outside the
-    database is never missing a checkpoint that the database has. Sealing is deterministic (the signature
-    is too), so a retry after a crash between the two writes produces the same bytes.
+    database is never missing a checkpoint that the database has. A retry after a crash between the two
+    writes stores the checkpoint the sink already holds (see :func:`_copy_to_sink`).
 
     Args:
         now: The instant to seal up to; the platform clock when omitted.
@@ -286,18 +358,21 @@ def seal_pending_windows(now: datetime | None = None) -> int:
             break
         with sessionmaker() as db:
             digest = _digest(db, start, end, prev_hash)
-        checkpoint = AuditCheckpoint(
-            window_start=start,
-            window_end=end,
-            row_count=digest.row_count,
-            hash=digest.hash,
-            prev_hash=prev_hash,
-            retention_days=settings.retention_days,
-            legal_hold=settings.legal_hold,
+        checkpoint = _sealed(
+            AuditCheckpoint(
+                window_start=start,
+                window_end=end,
+                row_count=digest.row_count,
+                hash=digest.hash,
+                prev_hash=prev_hash,
+                retention_days=settings.retention_days,
+                legal_hold=settings.legal_hold,
+            ),
+            settings,
+            instance_id,
         )
-        checkpoint.signature, checkpoint.key_id = _sign(settings, _message(checkpoint, instance_id))
         if sink is not None:
-            sink.write_once(_sink_name(start, instance_id), _sink_payload(checkpoint, instance_id))
+            checkpoint = _copy_to_sink(sink, checkpoint, settings, instance_id)
         with sessionmaker() as db:
             db.add(checkpoint)
             service.note_maintenance(db, last_checkpoint_at=end)
@@ -305,6 +380,19 @@ def seal_pending_windows(now: datetime | None = None) -> int:
         written += 1
         start, prev_hash = end, digest.hash
     return written
+
+
+def retention_horizon(checkpoint: Any) -> datetime | None:
+    """Return how far retention may have pruned under ``checkpoint``: its ``window_end - retention_days``.
+
+    ``None`` when that reaches before the first representable instant, which allows no prune. A stored
+    retention is whatever the table holds, not only what the settings accept, so it is compared as an
+    integer before any date arithmetic.
+    """
+    end = as_utc(checkpoint.window_end)
+    if checkpoint.retention_days >= (end - _EARLIEST).days:
+        return None
+    return end - timedelta(days=checkpoint.retention_days)
 
 
 def _pruning_horizon(db: Session, verifier: Any, instance_id: str) -> datetime | None:
@@ -320,10 +408,11 @@ def _pruning_horizon(db: Session, verifier: Any, instance_id: str) -> datetime |
 
     candidates = sorted(
         (
-            (as_utc(checkpoint.window_end) - timedelta(days=checkpoint.retention_days), checkpoint)
+            (horizon, checkpoint)
             for checkpoint in db.scalars(
                 select(AuditCheckpoint).where(AuditCheckpoint.retention_days > 0, AuditCheckpoint.legal_hold.is_(False))
             )
+            if (horizon := retention_horizon(checkpoint)) is not None
         ),
         key=lambda candidate: candidate[0],
         reverse=True,

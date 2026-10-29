@@ -7,10 +7,12 @@ dialect, where the audit log is a plain table.
 The two functions are ``SECURITY DEFINER`` so a runtime role holding no DDL rights can still create the
 next day's partition and drop an expired one. Both pin ``search_path`` to ``pg_catalog, pg_temp`` (an
 unlisted ``pg_temp`` would be searched first) and qualify every object, so a caller cannot redirect them
-by shadowing a name with a temporary table.
+by shadowing a name with a temporary table. Both wait at most ``lock_timeout`` (10 seconds) for a lock:
+their advisory lock is one any role that can connect may take, and the table locks they need queue the
+application's inserts behind them while they wait.
 """
 
-from jasil._core.limits import MAX_PARTITION_DAYS_AHEAD
+from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_PARTITION_DAYS_AHEAD
 
 __all__ = [
     "drop_partitions_function",
@@ -88,6 +90,7 @@ CREATE OR REPLACE FUNCTION @SCHEMA@.@ENSURE@(days_ahead integer) RETURNS date
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '10s'
 AS $body$
 DECLARE
     today date := (now() AT TIME ZONE 'UTC')::date;
@@ -132,6 +135,7 @@ CREATE OR REPLACE FUNCTION @SCHEMA@.@DROP@(cutoff timestamptz) RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '10s'
 AS $body$
 DECLARE
     floor_days constant integer := @FLOOR_DAYS@;
@@ -223,10 +227,12 @@ def drop_partitions_function(schema: str, floor_days: int) -> str:
     ``audit.retention.prune`` row. It never deletes rows.
 
     Raises:
-        ValueError: When ``floor_days`` is below 1.
+        ValueError: When ``floor_days`` is below 1 or above 36500.
     """
     if floor_days < 1:
         raise ValueError("the retention floor must be at least 1 day")
+    if floor_days > MAX_AUDIT_RETENTION_DAYS:
+        raise ValueError(f"the retention floor must be at most {MAX_AUDIT_RETENTION_DAYS} days")
     return _render(_DROP_TEMPLATE, schema, FLOOR_DAYS=str(int(floor_days)))
 
 

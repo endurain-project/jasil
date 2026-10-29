@@ -7,6 +7,8 @@ difference would only surface in production. ``test_the_migration_matches_the_mo
 is the guard for that.
 """
 
+import threading
+import time
 from typing import ClassVar
 
 import pytest
@@ -704,3 +706,99 @@ class TestRevisionSchemas:
 
         with pytest.raises(RuntimeError, match="unknown index"):
             ops.drop_index("idx_missing", table_name="jasil_event_log")
+
+
+class _Connection:
+    """Records the statements a lock helper runs; ``acquired`` is what ``GET_LOCK`` answers."""
+
+    def __init__(self, dialect: str, acquired: int | None = 1) -> None:
+        self.dialect = type("Dialect", (), {"name": dialect})()
+        self.statements: list[str] = []
+        self._acquired = acquired
+
+    def execute(self, statement, parameters=None):
+        self.statements.append(str(statement))
+        return type("Result", (), {"scalar": lambda _self: self._acquired})()
+
+
+class TestOneRunAtATime:
+    """Processes that upgrade at once (replicas starting together) must queue, not collide."""
+
+    def test_postgresql_takes_a_transaction_lock_that_its_commit_releases(self):
+        connection = _Connection("postgresql")
+
+        with migrations._one_run_at_a_time(connection):
+            assert connection.statements == ["SELECT pg_advisory_xact_lock(hashtext(:name))"]
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_holds_a_session_lock_and_releases_it_even_when_the_run_fails(self, dialect):
+        connection = _Connection(dialect)
+
+        with pytest.raises(RuntimeError, match="boom"), migrations._one_run_at_a_time(connection):
+            raise RuntimeError("boom")
+
+        assert connection.statements == ["SELECT GET_LOCK(:name, -1)", "SELECT RELEASE_LOCK(:name)"]
+
+    @pytest.mark.parametrize("answer", [0, None])
+    def test_mysql_refuses_to_run_without_the_lock(self, answer):
+        connection = _Connection("mysql", acquired=answer)
+
+        with pytest.raises(RuntimeError, match="migration lock"), migrations._one_run_at_a_time(connection):
+            pytest.fail("ran without the lock")
+
+    def test_sqlite_is_not_locked(self):
+        connection = _Connection("sqlite")
+
+        with migrations._one_run_at_a_time(connection):
+            pass
+
+        assert connection.statements == []
+
+    def test_an_upgrade_waits_for_one_already_running(self, engine):
+        if engine.dialect.name == "sqlite":
+            pytest.skip("SQLite takes a single process: JASIL refuses a multi-process SQLite deployment")
+        hold, release, waiting = _LOCK_PROBES[engine.dialect.name]
+        finished = threading.Event()
+        with engine.connect() as holder:
+            holder.execute(text(hold))
+            upgrading = threading.Thread(target=lambda: (migrations.upgrade(engine), finished.set()))
+            upgrading.start()
+            try:
+                assert _eventually(lambda: _scalar(engine, waiting) > 0), "the upgrade never waited for the lock"
+                assert not finished.is_set()
+            finally:
+                holder.execute(text(release))
+                holder.commit()
+                upgrading.join(timeout=30)
+
+        assert finished.is_set()
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+
+#: Per dialect: take the migration lock in another session, give it back, count the sessions waiting for it.
+_LOCK_PROBES = {
+    "postgresql": (
+        "SELECT pg_advisory_lock(hashtext('jasil_migrations'))",
+        "SELECT pg_advisory_unlock(hashtext('jasil_migrations'))",
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    ),
+    "mysql": (
+        "SELECT GET_LOCK('jasil_migrations', 0)",
+        "SELECT RELEASE_LOCK('jasil_migrations')",
+        "SELECT count(*) FROM information_schema.processlist WHERE state = 'User lock'",
+    ),
+}
+
+
+def _scalar(engine, sql: str):
+    with engine.connect() as connection:
+        return connection.execute(text(sql)).scalar()
+
+
+def _eventually(condition, timeout: float = 10.0) -> bool:
+    """Poll ``condition`` (a query, so the loop is paced by the database) until it holds or time runs out."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+    return True

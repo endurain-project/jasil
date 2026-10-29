@@ -17,9 +17,10 @@ class InProcessEventBus:
     """Synchronous ``EventBusProvider`` — ``publish`` runs subscribers inline.
 
     Correct for the ``local`` profile: dispatch is a direct function call in the
-    same thread, and a handler exception propagates to the caller (the scheduler
-    backfill is the safety net). ``start`` / ``stop`` are no-ops because there is
-    no background consumer.
+    same thread. Every handler runs even when one raises; the failure then
+    propagates to the caller (several together as an ``ExceptionGroup``), and the
+    scheduler backfill is the safety net. ``start`` / ``stop`` are no-ops because
+    there is no background consumer.
 
     When an :class:`~jasil.providers.EventRecorder` is injected, each
     ``publish`` records the event's lifecycle (published -> completed/failed)
@@ -37,14 +38,12 @@ class InProcessEventBus:
         handlers = self._handlers.get(event.event_type, [])
         recorder = self._recorder
         if recorder is None:
-            for handler in handlers:
-                handler(event)
+            _call_each(handlers, event)
             return
         recorder.record_published(event)
         handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
         with recorder.track(event, worker_id=_INPROCESS_WORKER, handler_name=handler_name, record_processing=False):
-            for handler in handlers:
-                handler(event)
+            _call_each(handlers, event)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
         self._handlers[event_type].append(handler)
@@ -54,3 +53,17 @@ class InProcessEventBus:
 
     def stop(self) -> None:
         """No-op — in-process dispatch needs no consumer loop."""
+
+
+def _call_each(handlers: list[Callable[[Event], None]], event: Event) -> None:
+    """Call every handler, then raise what failed: the error itself, or an ``ExceptionGroup`` of several."""
+    errors = []
+    for handler in handlers:
+        try:
+            handler(event)
+        except Exception as error:  # one subscriber must not keep the event from the others
+            errors.append(error)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise ExceptionGroup(f"{len(errors)} of {len(handlers)} handlers failed for {event.event_type}", errors)

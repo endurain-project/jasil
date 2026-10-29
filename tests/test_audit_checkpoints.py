@@ -471,6 +471,12 @@ class TestPrunedWindows:
             ("row_mismatch", False),
         ]
 
+    def test_a_retention_too_long_to_represent_allows_no_prune_instead_of_failing(self, sealed):
+        """Whoever can write the table must not be able to make verification crash rather than report."""
+        sealed.execute(update(AuditCheckpoint).values(retention_days=2_000_000_000))
+
+        assert sealed.verify().ok
+
     def test_a_checkpoint_sealed_under_legal_hold_allows_no_prune(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.occurred_at < at(30)))
         self._authorise(sealed, 2 * 24 * 60, legal_hold=True)

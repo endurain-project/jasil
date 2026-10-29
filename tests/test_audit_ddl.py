@@ -108,6 +108,10 @@ class TestRetentionFloor:
     def test_it_follows_the_schema(self):
         assert '"audit".jasil_audit_drop_partitions' in jasil_audit.retention_floor_sql(30, schema="audit")
 
+    def test_a_floor_beyond_the_longest_retention_is_refused(self):
+        with pytest.raises(ValueError, match="at most 36500"):
+            jasil_audit.retention_floor_sql(36_501, schema="public")
+
     @pytest.mark.parametrize("floor_days", [0, -3])
     def test_a_floor_below_one_day_is_refused(self, floor_days):
         with pytest.raises(ValueError, match="at least 1"):
@@ -118,6 +122,13 @@ class TestRetentionFloor:
 
         assert "SECURITY DEFINER" in statement
         assert "SET search_path = pg_catalog" in statement
+
+    @pytest.mark.parametrize(
+        "statement", [pg.ensure_partitions_function("public"), pg.drop_partitions_function("public", 30)]
+    )
+    def test_a_lock_another_session_holds_cannot_stall_the_functions(self, statement):
+        """Any role that can connect can take their advisory lock; waiting forever would hang maintenance."""
+        assert "SET lock_timeout = '10s'" in statement
 
     def test_the_partition_function_is_pinned_too(self):
         statement = pg.ensure_partitions_function("public")

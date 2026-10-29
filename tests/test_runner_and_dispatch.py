@@ -566,6 +566,28 @@ class TestInProcessBus:
         with pytest.raises(RuntimeError, match="boom"):
             bus.publish(new_event("activity.created", {}, source="test"))
 
+    def test_every_handler_runs_before_the_failure_propagates(self):
+        bus = InProcessEventBus()
+        calls = []
+        bus.subscribe("activity.created", lambda _e: calls.append("first"))
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.subscribe("activity.created", lambda _e: calls.append("third"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert calls == ["first", "third"]
+
+    def test_several_failures_propagate_together(self):
+        bus = InProcessEventBus()
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("one")))
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(ValueError("two")))
+
+        with pytest.raises(ExceptionGroup) as excinfo:
+            bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert [type(error) for error in excinfo.value.exceptions] == [RuntimeError, ValueError]
+
     def test_start_and_stop_are_no_ops(self):
         bus = InProcessEventBus()
 

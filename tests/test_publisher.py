@@ -280,6 +280,27 @@ class TestPublishManyCommitting:
 
         assert committed == [True]
 
+    def test_a_metadata_builder_failure_after_the_commit_skips_only_that_event(self, platform, db, caplog):
+        """The domain change is committed by then, so raising would tell the caller its unit of work failed."""
+
+        def _metadata(payload):
+            if payload["id"] == 1:
+                raise RuntimeError("bad metadata")
+            return None
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_committing(
+                "activity.deleted",
+                [{"id": 1}, {"id": 2}],
+                source="test",
+                metadata_for=_metadata,
+                db=db,
+                commit=db.commit,
+            )
+
+        assert [event.payload["id"] for event in platform.events.published] == [2]
+        assert "Failed to publish event activity.deleted" in caplog.text
+
     def test_the_durable_path_stages_one_outbox_row_per_payload(self, platform, db):
         _enable_durable_jobs()
         jobs_registry.registry.register("activity.deleted", "s", lambda _e: None)

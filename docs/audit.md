@@ -218,6 +218,9 @@ The migration (`rev0006`, PostgreSQL 13 or newer) builds the log differently fro
   the cutoff), and inserts its own `audit.retention.prune` row. Retention never deletes row by row. Dropping a
   partition is DDL, so the triggers do not stand in its way.
 - Both functions are closed to `PUBLIC`; [grant](#roles-and-grants) `EXECUTE` to the roles that need it.
+- Both wait at most 10 seconds for a lock (`lock_timeout`), then fail; maintenance logs the failure and
+  retries on its next run. Their advisory lock is one any role that can connect may hold, see
+  [the threat model](security/threat-model.md#tampering-with-the-audit-trail).
 
 **A row whose day has no partition is rejected**, and `stage` fails closed, so the request fails. Keep
 [maintenance](#maintenance) running; `audit.partition_days_ahead` (7 by default) is the margin by which it may
@@ -368,11 +371,14 @@ a fingerprint of the public key. After a rotation, verify each period with the k
 | `s3://bucket/prefix?region=…&endpoint_url=…` | The S3 storage backend | Use a *separate* bucket with Object Lock in compliance mode **and a default retention period** that covers how long checkpoints must live (the sink sets no per-object retention, so an unlocked default means unlocked objects); verify it before relying on it. Put it in another account if you can, with credentials that may `GetObject`, `PutObject` and `ListBucket` on the prefix but not delete or overwrite: the sink reads a checkpoint's key before writing it, and without `ListBucket` S3 answers a missing key with `403` instead of `404`, which fails every seal. Needs `jasil[s3]`. |
 
 Each object is named `checkpoint-<instance id>-<window start>.json`, so deployments sharing a sink do not collide.
-The contract (`jasil.providers.AuditSink.write_once`) is that an object is never replaced: identical bytes are a
-no-op, different bytes raise `AuditSinkConflictError`. The sink is written **before** the database row, so if it
+The contract (`jasil.providers.AuditSink`) is that an object is never replaced: `write_once` with identical bytes
+is a no-op, with different bytes it raises `AuditSinkConflictError`, and `read` returns what is stored. The sink is written **before** the database row, so if it
 is unreachable the checkpoint is not stored and the window is retried on the next run; the external copy is never
-missing a checkpoint the database has. Sealing is deterministic (Ed25519 signatures are too), so a retry after a
-crash writes the same bytes. The S3 sink's "never replace" is a read of the current object before the write,
+missing a checkpoint the database has. Sealing the same rows gives the same bytes (Ed25519 signatures are
+deterministic), apart from the `retention_days` and `legal_hold` taken from the settings in force. So when a retry
+after a crash between the two writes finds the window already in the sink, and those settings changed meanwhile,
+the window is resealed under the values the copy records and stored if that reproduces the copy byte for byte;
+anything else is an `AuditSinkConflictError`. The S3 sink's "never replace" is a read of the current object before the write,
 serialized across replicas by the maintenance lock. That check covers only the current version and binds no other
 writer. Object Lock keeps a locked version from being deleted or overwritten in place, but a `PutObject` to the same
 key can still create a new current version, and a delete marker can hide the locked one; credentials without

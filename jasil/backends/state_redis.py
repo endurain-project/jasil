@@ -60,10 +60,13 @@ return {count, 0, 0}
 def _translate_state_errors[**P, R](
     method: Callable[Concatenate["RedisState", P], R],
 ) -> Callable[Concatenate["RedisState", P], R]:
-    """Surface Redis outages from a ``RedisState`` method as a provider error.
+    """Surface Redis failures from a ``RedisState`` method as provider-neutral errors.
 
-    Keeps domain stores free of any Redis knowledge: they catch the neutral
-    ``StateBackendUnavailableError`` instead of a redis-py exception.
+    Keeps domain stores free of any Redis knowledge. A plain ``ResponseError`` is Redis refusing the command
+    for the key's value (``WRONGTYPE``, an ``INCR`` of a non-integer), so it is a ``ValueError``, as the
+    memory backend raises. Everything else, including the ``ResponseError`` subclasses redis-py uses for
+    server conditions (a read-only replica, out of memory, a missing permission), is
+    ``StateBackendUnavailableError``.
     """
 
     @functools.wraps(method)
@@ -71,6 +74,8 @@ def _translate_state_errors[**P, R](
         try:
             return method(self, *args, **kwargs)
         except redis_clients.RedisError as err:
+            if type(err) is redis_clients.ResponseError:
+                raise ValueError(f"Redis refused the state operation: {err}") from err
             raise StateBackendUnavailableError("Redis state backend is unavailable") from err
 
     return wrapper
@@ -105,7 +110,8 @@ class RedisState:
 
     @_translate_state_errors
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
-        if ttl_seconds is not None and ttl_seconds > 0:
+        _check_ttl(ttl_seconds)
+        if ttl_seconds is not None:
             self._client.set(key, value, ex=ttl_seconds)
         else:
             self._client.set(key, value)
@@ -118,14 +124,16 @@ class RedisState:
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
         # INCRBY is atomic and leaves any existing TTL untouched; only (re)set
         # expiry when the caller asks for one, mirroring the memory backend.
+        _check_ttl(ttl_seconds)
         new_value = int(self._client.incrby(key, amount))
-        if ttl_seconds is not None and ttl_seconds > 0:
+        if ttl_seconds is not None:
             self._client.expire(key, ttl_seconds)
         return new_value
 
     @_translate_state_errors
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
-        if ttl_seconds is not None and ttl_seconds > 0:
+        _check_ttl(ttl_seconds)
+        if ttl_seconds is not None:
             return bool(self._client.set(key, value, ex=ttl_seconds, nx=True))
         return bool(self._client.set(key, value, nx=True))
 
@@ -137,6 +145,7 @@ class RedisState:
     def delete_prefix(self, prefix: str) -> int:
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
         # in a caller's prefix would delete far beyond what it named.
+        _check_prefix(prefix)
         return redis_clients.delete_matching_keys(self._client, f"{redis_clients.glob_escape(prefix)}*")
 
     @_translate_state_errors
@@ -163,3 +172,13 @@ class RedisState:
         gate_until = int(result[1])
         newly_locked = bool(int(result[2]))
         return TieredFailureOutcome(count, gate_until or None, newly_locked)
+
+
+def _check_ttl(ttl_seconds: int | None) -> None:
+    if ttl_seconds is not None and ttl_seconds <= 0:
+        raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
+
+
+def _check_prefix(prefix: str) -> None:
+    if not prefix:
+        raise ValueError("delete_prefix needs a non-empty prefix")

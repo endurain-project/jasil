@@ -37,3 +37,11 @@ class StorageAuditSink:
             self._storage.save(self._area, name, content, "application/json")
         elif existing != content:
             raise AuditSinkConflictError(f"{name} already exists with different content")
+
+    def read(self, name: str) -> bytes | None:
+        """Return the object stored as ``name``, or ``None`` when there is none.
+
+        Raises:
+            StorageBackendUnavailableError: When the storage backend fails.
+        """
+        return self._storage.get(self._area, name)

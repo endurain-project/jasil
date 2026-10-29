@@ -217,29 +217,41 @@ class TestDispatch:
 class TestFailureIsolation:
     def test_a_raising_handler_does_not_kill_the_consumer(self, bus):
         """One poisoned entry must not take the whole replica's bus down."""
+        seen = []
+        bus.subscribe("order.created", lambda event: seen.append(event.payload["n"]) or 1 / event.payload["n"])
+        bus.publish(new_event("order.created", {"n": 0}, source="api"))
+        bus._poll_once()
+
+        bus.publish(new_event("order.created", {"n": 1}, source="api"))
+        bus._poll_once()
+
+        assert seen == [0, 1]
+
+    def test_every_handler_runs_when_one_raises(self, bus):
+        calls = []
+        bus.subscribe("order.created", lambda _event: calls.append("first"))
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.subscribe("order.created", lambda _event: calls.append("third"))
         bus.publish(new_event("order.created", {}, source="api"))
 
         bus._poll_once()
 
-    def test_a_failed_entry_is_left_pending(self, bus, client, caplog):
-        """At-least-once: an unacked entry is recoverable with XAUTOCLAIM.
+        assert calls == ["first", "third"]
 
-        It is *not* redelivered on its own — the consumer reads with ``>``, which
-        only returns unclaimed entries. The operator recovery path is documented
-        in providers-and-backends.md.
-        """
+    def test_a_failed_entry_is_logged_and_acked(self, bus, client, caplog):
+        """Best-effort: nothing reads a claimed entry again, so leaving it pending would only grow the PEL."""
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
         bus.publish(new_event("order.created", {}, source="api"))
 
         with caplog.at_level("ERROR"):
             bus._poll_once()
 
-        assert _pending_count(client) == 1
-        assert "leaving it pending" in caplog.text
+        assert _pending_count(client) == 0
+        assert "Event handling failed" in caplog.text
+        assert "boom" in caplog.text
 
     def test_a_second_poll_does_not_redeliver_it(self, bus):
-        """Pins the limitation the documentation warns about, so it cannot change silently."""
+        """Pins the best-effort contract: retrying is what durable jobs are for."""
         attempts = []
 
         def _always_fails(_event):
@@ -261,8 +273,26 @@ class TestFailureIsolation:
         with caplog.at_level("ERROR"):
             bus._poll_once()
 
-        assert _pending_count(client) == 1
-        assert "Event handler failed" in caplog.text
+        assert _pending_count(client) == 0
+        assert "Event handling failed" in caplog.text
+
+    def test_a_lost_consumer_group_is_recreated(self, bus, client, monkeypatch):
+        """A Redis restarted without persistence, or flushed, keeps the stream (XADD recreates it) but not the group."""
+        client.delete(STREAM)
+        bus.subscribe("order.created", lambda _event: bus._stop.set())
+        bus.publish(new_event("order.created", {}, source="api"))
+        waits = []
+
+        def _wait(timeout=None):
+            waits.append(timeout)
+            if len(waits) > 3:  # stop a consumer that never recovers, rather than hang the suite
+                bus._stop.set()
+
+        monkeypatch.setattr(bus._stop, "wait", _wait)
+
+        bus._run()
+
+        assert len(waits) == 1  # one failed poll, then the group is back and the event delivered
 
     def test_a_redis_outage_is_logged_and_retried(self, bus, monkeypatch, caplog):
         """The consumer loop must survive Redis going away and come back on its own."""

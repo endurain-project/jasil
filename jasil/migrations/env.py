@@ -8,7 +8,7 @@ dedicated version table so they never collide with the host's Alembic history.
 
 from alembic import context
 
-from jasil.migrations import VERSION_TABLE, jasil_include_object
+from jasil.migrations import VERSION_TABLE, _one_run_at_a_time, jasil_include_object
 from jasil.orm import get_active_base
 
 target_metadata = get_active_base().metadata
@@ -40,9 +40,7 @@ def run_migrations_online() -> None:
     """Run the migrations against a live connection (shared or self-built)."""
     connection = context.config.attributes.get("connection", None)
     if connection is not None:
-        _configure(connection=connection)
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_online(connection)
         return
 
     from sqlalchemy import engine_from_config, pool
@@ -53,9 +51,14 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as new_connection:
-        _configure(connection=new_connection)
-        with context.begin_transaction():
-            context.run_migrations()
+        _run_online(new_connection)
+
+
+def _run_online(connection) -> None:
+    """Run the migrations on ``connection``, one process at a time."""
+    _configure(connection=connection)
+    with context.begin_transaction(), _one_run_at_a_time(connection):
+        context.run_migrations()
 
 
 if context.is_offline_mode():

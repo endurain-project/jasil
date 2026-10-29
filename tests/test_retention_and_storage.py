@@ -517,6 +517,26 @@ class TestLocalStorage:
         assert list((tmp_path / "activity_files").glob(temporary_pattern)) == []
         assert list(storage._upload_root().glob(temporary_pattern)) == []
 
+    def test_opaque_save_is_atomic_when_replacement_fails(self, tmp_path, monkeypatch):
+        """An overwrite that fails part-way must leave the previous object, never a torn new one."""
+        storage = LocalStorage(str(tmp_path))
+        storage.save("avatars", "42.webp", b"old")
+        payload = storage._resolve("avatars", "42.webp")
+        original_replace = os.replace
+
+        def fail_replace(source, destination):
+            if Path(destination) == payload:
+                raise OSError("storage unavailable")
+            original_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("avatars", "42.webp", b"new")
+
+        assert storage.get("avatars", "42.webp") == b"old"
+        assert sorted(path.name for path in payload.parent.iterdir()) == sorted(["key", payload.name])
+
     def test_plain_area_delete_removes_plain_and_opaque_copies(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "processed/42.fit", b"plain")
@@ -1594,14 +1614,16 @@ class TestLocalStorageFilesystemFailures:
 
         assert isinstance(excinfo.value.__cause__, OSError)
 
-    def test_overwriting_a_read_only_payload_is_unavailable(self, storage, read_only):
+    def test_overwriting_in_an_unwritable_object_directory_is_unavailable(self, storage, read_only):
         storage.save("thumbnails", "1.webp", b"original")
-        read_only(storage._resolve("thumbnails", "1.webp"), 0o400)
+        object_directory = storage._resolve("thumbnails", "1.webp").parent
+        read_only(object_directory)
 
         with pytest.raises(StorageBackendUnavailableError):
             storage.save("thumbnails", "1.webp", b"replacement")
 
         assert storage.get("thumbnails", "1.webp") == b"original"
+        assert self._leftovers(object_directory) == []
 
     def test_a_stream_into_an_unwritable_object_directory_is_unavailable(self, storage, read_only):
         storage.save("thumbnails", "1.webp", b"original")

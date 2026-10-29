@@ -30,7 +30,9 @@ whenever configuration is.
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
-  cannot exhaust memory.
+  cannot exhaust memory, and under a 30-second deadline checked between reads, so
+  one dripping its reply cannot hold the caller for longer than that plus one read
+  timeout.
 - Failures are logged by exception type and status code only. The `requests`
   error message embeds the request URL, and one supported service carries its
   API key in that URL's query string.
@@ -153,8 +155,11 @@ authorization.
 ## SQL injection (CWE-89)
 
 **Not a surface.** Every query is SQLAlchemy Core or ORM with bound parameters.
-The only raw SQL in the package is the two PostgreSQL advisory-lock statements,
-which pass their key as a bound `:key` parameter. Table and column names are
+The raw SQL in the package (the advisory-lock and migration-lock statements, the
+audit maintenance calls) passes every value as a bound parameter. The audit DDL
+and `grants_sql` / `retention_floor_sql` render role and schema names into SQL,
+always as quoted identifiers or literals; a schema name holding `$` is refused,
+since it could end a dollar-quoted function body. Table and column names are
 never interpolated from input.
 
 ## Resource exhaustion (CWE-400)
@@ -166,8 +171,9 @@ never interpolated from input.
   column width.
 - The geocoding response body is capped (above).
 - Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
-  Resumable parts stream under an exact declared size rather than being buffered
-  in memory. JASIL's built-in portability limits cap parts at 5 GiB and part
+  Resumable parts are read under an exact declared size and never buffered whole
+  in memory: S3 stages a part in memory up to 8 MiB and in a temporary file
+  beyond that, so allow temporary disk for the largest part in flight. JASIL's built-in portability limits cap parts at 5 GiB and part
   numbers at 10,000. Active parts remain backend resources until completion,
   abort, or explicit `cleanup_uploads` maintenance. Parallel part calls may
   temporarily stage more than the session limit because completion is the
@@ -216,6 +222,16 @@ rewritten rows with its own key. Against them only the external sink holds the o
 and the signing key outside the database operators' reach, and reconcile the sink with the database, and verify,
 somewhere they do not control. See
 [Audit trail → What this does not do](../audit.md#what-this-does-not-do).
+
+**Yours, too: stalling maintenance.** PostgreSQL advisory locks are open to every role that can connect,
+the observability product's reader role included. Holding the key of JASIL's maintenance lock makes every
+replica skip audit maintenance; holding the partition functions' lock makes them fail after their 10-second
+`lock_timeout`. On PostgreSQL 13 and 14, where `PUBLIC` may still create tables in the `public` schema,
+anyone can also create a table under a future partition's name, which `jasil_audit_ensure_partitions` then
+refuses. Either way no new partitions are made, and once `partition_days_ahead` days pass, audited writes
+fail. Revoke `CREATE` on the audit schema from `PUBLIC` (the default from PostgreSQL 15), keep database
+logins to the roles that need them, and alert on `get_audit_health()`: a `furthest_partition_date` closer
+than `partition_days_ahead`, or a `last_checkpoint_at` falling behind, is the symptom.
 
 ## Out of scope
 

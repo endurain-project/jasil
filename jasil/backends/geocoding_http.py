@@ -42,6 +42,12 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 # Read granularity while enforcing that cap.
 _READ_CHUNK_BYTES = 8192
 
+# Overall bound on one request, checked between reads. The timeout above bounds
+# each read, so an upstream dripping one byte at a time would otherwise hold the
+# caller for as long as the size cap allows; with it, a request ends within this
+# deadline plus one read timeout.
+_DEADLINE_SECONDS = 30
+
 
 def _failure_detail(error: Exception) -> str:
     """Describe a request failure without echoing its message.
@@ -178,23 +184,27 @@ class HttpGeocoding:
             self._last_call = time.monotonic()
 
     @staticmethod
-    def _read_capped(response: "requests.Response") -> bytes:
-        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES`.
+    def _read_capped(response: "requests.Response", deadline: float) -> bytes:
+        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES` or past ``deadline``.
 
         Streamed rather than taken from ``response.content`` so an oversized body
         is abandoned partway instead of being buffered in full first.
 
         Args:
             response: The streamed response to drain.
+            deadline: The ``time.monotonic()`` value after which the transfer is abandoned.
 
         Returns:
             The body bytes.
 
         Raises:
             ValueError: When the body exceeds the cap.
+            TimeoutError: When the transfer is still running at ``deadline``.
         """
         body = bytearray()
         for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"response body still arriving after {_DEADLINE_SECONDS} seconds")
             body.extend(chunk)
             if len(body) > _MAX_RESPONSE_BYTES:
                 raise ValueError(f"response body exceeded the {_MAX_RESPONSE_BYTES}-byte limit")
@@ -217,6 +227,7 @@ class HttpGeocoding:
         # decide that someone's whereabouts are acceptable to write to their log.
         logger.debug("Reverse-geocoding via %s", self._service)
         self._throttle()
+        deadline = time.monotonic() + _DEADLINE_SECONDS
         try:
             # Imported lazily: ``requests`` is the optional `geocoding` extra, and
             # the composition root imports this module unconditionally for
@@ -233,7 +244,7 @@ class HttpGeocoding:
                 stream=True,
             ) as response:
                 response.raise_for_status()
-                return self._parse(json.loads(self._read_capped(response)))
+                return self._parse(json.loads(self._read_capped(response, deadline)))
         except Exception as error:
             logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
             return None

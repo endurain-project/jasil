@@ -206,7 +206,7 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 
 | Function | Use |
 |---|---|
-| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. |
+| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
 | `adopt_existing_schema(engine)` | Validate and adopt unversioned JASIL tables at head or an earlier revision. |
 | `head_revision()` | The newest revision shipped in this package. |

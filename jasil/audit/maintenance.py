@@ -276,13 +276,13 @@ def _apply_retention(now: datetime) -> None:
         # Verification excuses an emptied window only where a checkpoint's own retention covers it, so the
         # cutoff stops at what the newest checkpoint allows: rows not yet sealed are never pruned.
         newest = db.scalars(select(AuditCheckpoint).order_by(AuditCheckpoint.window_start.desc()).limit(1)).first()
-        if newest is None or newest.legal_hold or newest.retention_days <= 0:
+        horizon = None
+        if newest is not None and not newest.legal_hold and newest.retention_days > 0:
+            horizon = checkpoints.retention_horizon(newest)
+        if horizon is None:
             logger.info("Audit retention: no sealed checkpoint allows a prune yet; nothing is pruned")
             return
-        cutoff = min(
-            now - timedelta(days=settings.retention_days),
-            as_utc(newest.window_end) - timedelta(days=newest.retention_days),
-        )
+        cutoff = min(now - timedelta(days=settings.retention_days), horizon)
         if _partitioned(db):
             # The function's floor is measured on the database's clock; an application clock ahead of it would
             # make a cutoff at the floor look younger than the floor, and the prune be refused.

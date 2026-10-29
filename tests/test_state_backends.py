@@ -154,6 +154,42 @@ class TestProviderConformance:
         assert state.get("k") == b"value"
 
 
+class TestArgumentConformance:
+    """Arguments one backend would honour and the other misread are refused by both."""
+
+    @pytest.mark.parametrize("ttl", [0, -5])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda state, ttl: state.set("k", b"v", ttl_seconds=ttl),
+            lambda state, ttl: state.set_if_absent("k", b"v", ttl_seconds=ttl),
+            lambda state, ttl: state.incr("k", ttl_seconds=ttl),
+        ],
+        ids=["set", "set_if_absent", "incr"],
+    )
+    def test_a_ttl_that_is_not_positive_is_refused(self, state, operation, ttl):
+        """Memory read it as already expired and Redis as no expiry: a computed TTL of 0 became a permanent key."""
+        with pytest.raises(ValueError, match="ttl_seconds must be positive"):
+            operation(state, ttl)
+
+        assert state.get("k") is None
+
+    def test_an_empty_prefix_is_refused_by_delete_prefix(self, state):
+        """On Redis it would delete every key in the database, the event stream included."""
+        state.set("k", b"v")
+
+        with pytest.raises(ValueError, match="prefix"):
+            state.delete_prefix("")
+
+        assert state.get("k") == b"v"
+
+    def test_incrementing_a_value_that_is_not_an_integer_is_a_value_error(self, state):
+        state.set("k", b"abc")
+
+        with pytest.raises(ValueError):
+            state.incr("k")
+
+
 class TestTieredFailureConformance:
     """The atomic lockout both backends implement — memory under a lock, Redis in Lua."""
 
@@ -334,6 +370,24 @@ class TestRedisBackendErrorTranslation:
             failing_state.get("k")
 
         assert excinfo.value.__cause__ is not None
+
+    def test_a_key_holding_another_type_is_a_value_error_not_an_outage(self):
+        """Only a server that cannot serve is unavailable; a refused value is the caller's problem."""
+        client = fakeredis.FakeStrictRedis(decode_responses=False)
+        client.lpush("k", b"x")
+
+        with pytest.raises(ValueError, match="WRONGTYPE"):
+            RedisState(client).get("k")
+
+    def test_a_server_condition_is_still_an_outage(self):
+        from redis.exceptions import ReadOnlyError
+
+        class _Replica(fakeredis.FakeStrictRedis):
+            def set(self, *args, **kwargs):
+                raise ReadOnlyError("READONLY You can't write against a read only replica.")
+
+        with pytest.raises(StateBackendUnavailableError):
+            RedisState(_Replica(decode_responses=False)).set("k", b"v")
 
     def test_the_memory_backend_never_raises_the_provider_error(self):
         assert MemoryState().get("absent") is None

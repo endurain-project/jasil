@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import event as sqlalchemy_event
+from sqlalchemy import text
 
 import jasil.admin as jasil_admin
 import jasil.container as container
@@ -20,6 +21,7 @@ import jasil.jobs.registry as jobs_registry
 import jasil.jobs.service as jobs_service
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
+from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.events import new_event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
@@ -365,3 +367,17 @@ def test_queue_and_worker_admin_summaries_match_concurrent_claims(db, session_fa
     campaign = next(queue for queue in jobs.by_queue if queue.queue == "campaign")
     assert (campaign.pending, campaign.claimed) == (0, 10)
     assert sorted(worker.active_claimed_jobs for worker in workers.workers) == [5, 5]
+
+
+def test_a_held_advisory_lock_leaves_no_transaction_idle(db_engine):
+    """``idle_in_transaction_session_timeout`` would end the session, and the lock with it, mid-body."""
+    with PgAdvisoryLock(db_engine).try_acquire("jasil-test-idle") as acquired, db_engine.connect() as probe:
+        assert acquired
+        states = probe.execute(
+            text(
+                "SELECT state FROM pg_stat_activity "
+                "WHERE pid <> pg_backend_pid() AND query ILIKE '%pg_try_advisory_lock%'"
+            )
+        ).scalars()
+
+        assert list(states) == ["idle"]

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 import jasil.audit as jasil_audit
@@ -230,6 +230,18 @@ class TestRetention:
 
         # The newest checkpoint allows only what is 90 days older than its end: nothing here yet.
         assert self._targets(session_factory).count("shop.order.place") == 2
+
+    def test_a_checkpoint_retention_too_long_to_represent_prunes_nothing(self, audit_env, session_factory):
+        jasil_audit.run_audit_maintenance()
+        before = self._targets(session_factory)
+        with session_factory() as db:
+            db.execute(update(AuditCheckpoint).values(retention_days=2_000_000_000))
+            db.commit()
+        audit_env.clock.moment = T0 + timedelta(days=1)
+
+        maintenance._apply_retention(T0 + timedelta(days=1))
+
+        assert self._targets(session_factory) == before
 
     def test_the_prune_is_recorded_before_any_row_is_deleted(self, actions, audit_env, session_factory, monkeypatch):
         seen = []

@@ -26,6 +26,7 @@ __all__ = [
     "MAX_AUDIT_ACTION_ID_LENGTH",
     "MAX_AUDIT_ID_LENGTH",
     "MAX_AUDIT_NAME_LENGTH",
+    "MAX_AUDIT_RETENTION_DAYS",
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_IP_ADDRESS_LENGTH",
     "MAX_PARTITION_DAYS_AHEAD",
@@ -128,3 +129,7 @@ MAX_IP_ADDRESS_LENGTH = 45
 #: How many days of audit partitions may be created ahead: ``audit.partition_days_ahead`` is validated
 #: against it, and ``jasil_audit_ensure_partitions`` refuses more.
 MAX_PARTITION_DAYS_AHEAD = 366
+
+#: Longest audit retention, and retention floor, in days (a century). ``audit.retention_days`` and
+#: ``audit.retention_floor_days`` are validated against it, so every cutoff stays a representable date.
+MAX_AUDIT_RETENTION_DAYS = 36_500

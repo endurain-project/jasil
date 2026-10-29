@@ -103,12 +103,12 @@ def _publish_on_bus(
     event_type: str,
     payload: dict,
     source: str,
-    metadata: dict | None,
+    metadata_of: Callable[[dict], dict | None],
     schema_version: int,
 ) -> None:
-    """Mint and dispatch one event on the bus, logging and swallowing any failure."""
+    """Build, mint and dispatch one event on the bus, logging and swallowing any failure."""
     try:
-        event = _mint(event_type, payload, source, metadata, schema_version)
+        event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
         return
@@ -298,7 +298,7 @@ def publish_many_committing(
         # subscriber's reconciliation net recovers anything dropped).
         commit()
         for payload in payloads:
-            _publish_on_bus(event_type, payload, source, metadata_of(payload), schema_version)
+            _publish_on_bus(event_type, payload, source, metadata_of, schema_version)
 
 
 def publish_on_commit(

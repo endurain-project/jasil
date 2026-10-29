@@ -85,6 +85,19 @@ class FileAuditSink:
         if path.stat().st_mode & 0o222:
             path.chmod(0o400)
 
+    def read(self, name: str) -> bytes | None:
+        """Return the bytes stored as ``name``, or ``None`` when there is no such file.
+
+        Raises:
+            ValueError: When ``name`` is not a plain file name.
+        """
+        if not _NAME.fullmatch(name):
+            raise ValueError(f"invalid audit sink object name: {name!r}")
+        try:
+            return (self._directory / name).read_bytes()
+        except FileNotFoundError:
+            return None
+
     def _sync_directory(self) -> None:
         """Make the new directory entry durable, so a crash cannot lose a checkpoint the database then keeps.
 

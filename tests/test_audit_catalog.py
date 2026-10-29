@@ -299,6 +299,8 @@ class TestSettings:
             ({"checkpoint_grace_minutes": -1}, "checkpoint_grace_minutes must be at least 0"),
             ({"max_details_bytes": 0}, "max_details_bytes must be at least 1"),
             ({"retention_days": 10, "retention_floor_days": 30}, "retention_days"),
+            ({"retention_days": 36_501}, "retention_days must be at most 36500"),
+            ({"retention_floor_days": 36_501}, "retention_floor_days must be at most 36500"),
         ],
     )
     def test_an_out_of_range_value_is_rejected(self, overrides, message):

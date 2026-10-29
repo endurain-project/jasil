@@ -15,6 +15,7 @@ No DNS and no HTTP happen here: `getaddrinfo` is monkeypatched and `responses`
 intercepts the requests.
 """
 
+import itertools
 import socket
 
 import pytest
@@ -428,6 +429,27 @@ class TestTheResponseBodyIsCapped:
         )
 
         assert backend.reverse(38.7, -9.1) == GeocodedPlace(country="Portugal")
+
+
+class TestTheTransferHasADeadline:
+    """The request timeout bounds each read; an upstream dripping bytes must not hold the caller indefinitely."""
+
+    @responses.activate
+    def test_a_transfer_past_the_deadline_resolves_to_none(self, monkeypatch, caplog):
+        clock = itertools.count(1000, 10)  # every read of the clock is ten seconds after the last
+        monkeypatch.setattr("jasil.backends.geocoding_http.time.monotonic", lambda: next(clock))
+        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", lambda _seconds: None)
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            json={"address": {"country": "Portugal", "note": "P" * (_MAX_RESPONSE_BYTES // 2)}},
+            status=200,
+        )
+
+        with caplog.at_level("ERROR"):
+            assert HttpGeocoding("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1) is None
+
+        assert "TimeoutError" in caplog.text
 
 
 class TestThrottling:

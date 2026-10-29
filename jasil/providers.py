@@ -139,6 +139,11 @@ class StateProvider(Protocol):
     would otherwise depend on the backend: one-winner claims and single-use values
     (``set_if_absent``, ``get_and_delete``) and an escalating gate over repeated
     events (``record_tiered_failure``).
+
+    ``ttl_seconds`` is a positive number of seconds, or ``None`` for no expiry; zero or a negative
+    value raises ``ValueError``. ``delete_prefix`` needs a non-empty prefix. A value the operation
+    cannot apply to (``incr`` of a non-integer) raises ``ValueError`` on every backend; only a backend
+    that cannot serve raises :class:`StateBackendUnavailableError`.
     """
 
     def get(self, key: str) -> bytes | None: ...
@@ -392,10 +397,12 @@ class AuditSink(Protocol):
     ``write_once`` stores ``content`` under ``name`` and never replaces it: writing the same bytes again
     is a no-op (a retry after a crash), writing different bytes raises
     :class:`AuditSinkConflictError`. That is the property that makes the copy evidence: whoever can
-    rewrite the database cannot, through this interface, rewrite what was already sent.
+    rewrite the database cannot, through this interface, rewrite what was already sent. ``read`` returns
+    what is stored under ``name``, or ``None``, so a seal retried after a crash can recognise its own copy.
     """
 
     def write_once(self, name: str, content: bytes) -> None: ...
+    def read(self, name: str) -> bytes | None: ...
 
 
 @runtime_checkable

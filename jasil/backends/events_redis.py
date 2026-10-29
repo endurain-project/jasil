@@ -12,15 +12,14 @@ runs once per event across the cluster" (competing consumers), while in-process
 fan-out to all handlers of an ``event_type`` still happens on whichever replica
 claims the entry.
 
-Delivery is at-least-once: an entry is acked only after its handlers succeed, so
-a failed handler (or a malformed envelope) leaves the entry pending rather than
-dropping it. This bus is the *best-effort* delivery path and has no in-bus retry
-or reclaim of its own: an entry orphaned by a crashed consumer (which would need
-``XAUTOCLAIM``/``XPENDING`` to recover) stays pending. For at-least-once delivery
-with per-subscriber retry, backoff, dead-letter, and replay, enable durable jobs:
-publishing then routes through the transactional outbox and ``processing_jobs``
-instead of this bus, and each subscriber's own reconciliation sweep is the
-safety net.
+Delivery is best-effort, at most once per event: every handler runs even when one
+raises, the failure is logged (and recorded in the event log), and the entry is
+acked either way. Leaving it pending would not bring it back, as the consumer
+only reads entries no one has claimed. An entry claimed by a consumer that then
+crashed stays pending. For at-least-once delivery with per-subscriber retry,
+backoff, dead-letter, and replay, enable durable jobs: publishing then routes
+through the transactional outbox and ``processing_jobs`` instead of this bus,
+and each subscriber's own reconciliation sweep is the safety net.
 """
 
 import json
@@ -150,10 +149,17 @@ class RedisStreamEventBus:
                 raise
 
     def _run(self) -> None:
+        group_missing = False
         while not self._stop.is_set():
             try:
+                if group_missing:
+                    self._ensure_group()
+                    group_missing = False
                 self._poll_once()
             except redis_clients.RedisError as error:
+                # A Redis restarted without persistence, or flushed, loses the group; XADD recreates only the
+                # stream, so every read fails until the group is created again.
+                group_missing = isinstance(error, redis_clients.ResponseError) and str(error).startswith("NOGROUP")
                 logger.error("Event bus consumer poll failed", exc_info=error)
                 self._stop.wait(timeout=1.0)
 
@@ -171,16 +177,27 @@ class RedisStreamEventBus:
             event = deserialize_event(fields)
             handlers = self._handlers.get(event.event_type, [])
             if recorder is None:
-                for handler in handlers:
-                    handler(event)
+                _call_each(handlers, event)
             else:
                 handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
                 with recorder.track(event, worker_id=self._consumer, handler_name=handler_name):
-                    for handler in handlers:
-                        handler(event)
+                    _call_each(handlers, event)
         except Exception as error:  # a poisoned entry or handler must not kill the consumer thread
-            logger.error("Event handler failed for stream entry %s; leaving it pending", entry_id, exc_info=error)
-            return
-        # Ack only after success so a failure stays pending (at-least-once) for
-        # reprocessing; durable jobs provide the retry/dead-letter path.
+            logger.error("Event handling failed for stream entry %s", entry_id, exc_info=error)
+        # Acked whatever the handlers did: nothing reads a claimed entry again, so a pending one would only grow
+        # the pending-entries list. Durable jobs are the path that retries.
         self._client.xack(self._stream, self._group, entry_id)
+
+
+def _call_each(handlers: list[Callable[[Event], None]], event: Event) -> None:
+    """Call every handler, then raise what failed: the error itself, or an ``ExceptionGroup`` of several."""
+    errors = []
+    for handler in handlers:
+        try:
+            handler(event)
+        except Exception as error:  # one subscriber must not keep the event from the others
+            errors.append(error)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise ExceptionGroup(f"{len(errors)} of {len(handlers)} handlers failed for {event.event_type}", errors)

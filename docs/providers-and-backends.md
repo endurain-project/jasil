@@ -55,6 +55,12 @@ A Redis outage surfaces as `StateBackendUnavailableError`, never as a redis-py
 exception, so domain code catching it needs no knowledge of the backend. The
 memory backend never raises it.
 
+Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
+zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
+Redis it would match every key in the database), and an operation the stored
+value does not support, such as `incr` of a non-integer or, on Redis, a key that
+holds another type.
+
 ## StorageProvider
 
 Object storage addressed by a key within a named *area*. The whole-object API is
@@ -372,53 +378,30 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 | `InProcessEventBus` | `memory://` | Synchronous. `publish` runs subscribers inline. |
 | `RedisStreamEventBus` | `redis://`, `rediss://`, `unix://` | Redis Streams with a consumer group. |
 
-In-process dispatch is a direct function call, so a handler exception propagates
-to the publisher. Under Redis Streams, replicas form one consumer group, giving
-competing-consumer semantics: each derived computation runs once per event across
-the cluster, while in-process fan-out to every handler of an event type happens
-on whichever replica claims the entry.
+In-process dispatch is a direct function call. Every handler of the event runs
+even when one raises; the failure then propagates to the publisher (several
+together as an `ExceptionGroup`), which logs it. Under Redis Streams, replicas
+form one consumer group, giving competing-consumer semantics: each derived
+computation runs once per event across the cluster, while in-process fan-out to
+every handler of an event type happens on whichever replica claims the entry.
 
-Redis delivery is at-least-once — an entry is acked only after its handlers
-succeed. There is no in-bus retry or reclaim: an entry orphaned by a crashed
-consumer stays pending. For retry, backoff, dead-lettering and replay, enable
-[durable jobs](durable-jobs.md).
+Redis delivery is best-effort, at most once per event. Every handler runs even
+when one raises, the failure is logged and recorded in the event log, and the
+entry is acked either way: the consumer reads with `XREADGROUP ... >`, which
+only returns entries no one has claimed, so an entry left pending would never be
+processed and would only grow the pending-entries list. An entry claimed by a
+consumer that then crashed stays pending. If Redis loses the consumer group (a
+restart without persistence, or a flush), the consumer creates it again and
+reads the stream from its start.
 
-!!! danger "An entry the bus cannot process is stuck, not retried"
-    A handler that raises, or an entry the consumer cannot deserialize, is logged
-    and left **pending** — unacked, and never redelivered. The consumer reads
-    with `XREADGROUP ... >`, which only ever returns entries no one has claimed
-    yet, so nothing brings a claimed-but-unacked entry back. Two consequences to
-    plan for:
-
-    - the event is **not** processed, and nothing retries it; and
-    - the pending-entries list (PEL) grows without bound, while the stream itself
-      is capped at roughly 10 000 entries — so a long-pending entry is eventually
-      trimmed away underneath its own PEL record.
-
-    This is why [`best_effort`](events-and-outbox.md) swallows handler
-    exceptions: on this bus, letting one escape loses the event rather than
-    retrying it.
-
-    **Check for it.** The count is the second field of `XPENDING`:
-
-    ```console
-    $ redis-cli XPENDING jasil:events jasil
-    ```
-
-    A number that only grows is the symptom.
-
-    **Recover from it.** Claim the stuck entries onto a consumer of your own and
-    decide per entry — reprocess it, or ack it to drop it:
-
-    ```console
-    $ redis-cli XAUTOCLAIM jasil:events jasil recovery 0 0 COUNT 100
-    $ redis-cli XACK jasil:events jasil <entry-id>
-    ```
-
-    **Avoid it.** If losing an event matters, enable
-    [durable jobs](durable-jobs.md). Publishing then routes through the
-    transactional outbox and `jasil_processing_jobs`, which have the retry, backoff and
-    dead-letter path this bus deliberately does not.
+!!! warning "A failed handler is not retried"
+    Nothing redelivers an event a handler failed on, and the stream is capped at
+    roughly 10 000 entries, so a consumer that is down for long enough also
+    misses the oldest ones. This is why [`best_effort`](events-and-outbox.md)
+    swallows handler exceptions. If losing an event matters, enable
+    [durable jobs](durable-jobs.md): publishing then routes through the
+    transactional outbox and `jasil_processing_jobs`, which have the retry,
+    backoff and dead-letter path this bus deliberately does not.
 
 ## LockProvider
 
@@ -436,7 +419,10 @@ with platform.lock.try_acquire("nightly-backfill") as acquired:
 `try_acquire` is non-blocking — it yields `False` rather than waiting, so a
 replica that loses the race simply skips the work. The Postgres backend needs no
 infrastructure beyond the database you already have; the lock name is hashed to a
-signed 64-bit key because `pg_advisory_lock` keys are `bigint`.
+signed 64-bit key because `pg_advisory_lock` keys are `bigint`. The lock is held on
+a connection in autocommit mode, so no transaction sits open (and idle) while the
+guarded work runs, and `idle_in_transaction_session_timeout` cannot end the
+session and release the lock underneath it.
 
 ## ClockProvider
 

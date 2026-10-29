@@ -26,8 +26,13 @@ class FakeConnection:
         self._acquired = acquired
         self._unlock_error = unlock_error
         self.statements: list[tuple[str, dict]] = []
+        self.options: dict = {}
         self.closed = False
         self.invalidated = False
+
+    def execution_options(self, **options):
+        self.options.update(options)
+        return self
 
     def execute(self, statement, parameters=None):
         text = str(statement)
@@ -120,6 +125,13 @@ class TestAcquisition:
             pass
 
         assert engine.connect_calls == 1
+
+    def test_the_lock_is_held_outside_a_transaction(self):
+        """An open transaction would sit idle for the whole body, and a server may end the session for it."""
+        connection = FakeConnection()
+
+        with PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            assert connection.options == {"isolation_level": "AUTOCOMMIT"}
 
 
 class TestRelease:

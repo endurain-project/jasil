@@ -707,6 +707,18 @@ class TestOutboxRelay:
         assert db.query(EventOutbox).one().relayed_at is not None
         assert db.query(ProcessingJob).count() == 0
 
+    def test_an_event_with_no_subscribers_is_reported(self, db, session_factory, event, clock, registry, caplog):
+        """It was written to the outbox because the publisher saw a durable subscriber; the relaying process
+        knowing none is almost always a subscriber it never registered, and the event is now dropped."""
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.relay"):
+            jobs_relay.relay_outbox_once(
+                registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+            )
+
+        assert f"activity.created event {event.event_id} has no durable subscriber" in caplog.text
+
     def test_a_failure_mid_pass_relays_nothing(self, db, session_factory, event, clock, registry, monkeypatch):
         """The pass is one transaction, so a crash cannot leave a row stamped but
         un-fanned-out — which would drop the event permanently."""

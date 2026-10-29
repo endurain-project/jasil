@@ -33,7 +33,7 @@ is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from jasil._core.limits import MAX_PARTITION_DAYS_AHEAD
+from jasil._core.limits import MAX_AUDIT_RETENTION_DAYS, MAX_PARTITION_DAYS_AHEAD
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
 from jasil.profile import DeploymentProfile, JobWorkerMode
@@ -136,12 +136,12 @@ class AuditSettings:
             :func:`jasil.audit.record_detached` validate their arguments and then do nothing,
             and :func:`jasil.audit.run_audit_maintenance` is a no-op.
         retention_days: Age at which whole daily partitions are dropped. ``<= 0`` keeps every
-            row. Must be at least ``retention_floor_days`` when positive. The host maps its
+            row. Must be at least ``retention_floor_days`` when positive, and at most 36500. The host maps its
             deployment profile onto this value; JASIL only supplies the neutral default.
         retention_floor_days: The youngest age the database-side guard will let
             ``jasil_audit_drop_partitions`` drop, whatever the caller asks for. The value used is
             the one baked into the function when migration ``rev0006`` ran; see
-            :func:`jasil.audit.retention_floor_sql` to change it. Must be at least 1.
+            :func:`jasil.audit.retention_floor_sql` to change it. Must be between 1 and 36500.
         legal_hold: Suspend all pruning.
         partition_days_ahead: How many days of daily partitions the maintenance keeps created
             ahead of today (PostgreSQL). A row whose day has no partition is rejected, so this is
@@ -191,10 +191,14 @@ class AuditSettings:
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
                 raise ValueError(f"audit.{name} must be at least {minimum}, not {getattr(self, name)}")
-        if self.partition_days_ahead > MAX_PARTITION_DAYS_AHEAD:
-            raise ValueError(
-                f"audit.partition_days_ahead must be at most {MAX_PARTITION_DAYS_AHEAD}, not {self.partition_days_ahead}"
-            )
+        maximums = {
+            "retention_days": MAX_AUDIT_RETENTION_DAYS,
+            "retention_floor_days": MAX_AUDIT_RETENTION_DAYS,
+            "partition_days_ahead": MAX_PARTITION_DAYS_AHEAD,
+        }
+        for name, maximum in maximums.items():
+            if getattr(self, name) > maximum:
+                raise ValueError(f"audit.{name} must be at most {maximum}, not {getattr(self, name)}")
         if 1440 % self.checkpoint_window_minutes:
             raise ValueError(
                 f"audit.checkpoint_window_minutes ({self.checkpoint_window_minutes}) must divide a day (1440) evenly"

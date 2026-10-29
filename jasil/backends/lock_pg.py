@@ -58,7 +58,9 @@ class PgAdvisoryLock:
     def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Generator[bool]:
         del ttl_seconds  # session advisory locks are not TTL-based
         key = advisory_key(name)
-        connection = self._engine.connect()
+        # Autocommit: the lock belongs to the session, so no transaction needs to stay open (and sit idle,
+        # where ``idle_in_transaction_session_timeout`` would end the session and the lock) for the body.
+        connection = self._engine.connect().execution_options(isolation_level="AUTOCOMMIT")
         acquired = False
         try:
             result = connection.execute(text("SELECT pg_try_advisory_lock(CAST(:key AS bigint))"), {"key": key})

@@ -389,7 +389,10 @@ worker. Alternatively, let the `default` queue drain before rolling out.
 
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
-unnecessary. Durable jobs use the database only; Redis is not a job-queue
+unnecessary. The relay fans an event out to the durable subscribers registered
+**in its own process**, so register every durable subscriber in each process
+that runs it, the API processes included. An event it finds no subscriber for is
+marked relayed with no jobs and logged as a warning. Durable jobs use the database only; Redis is not a job-queue
 dependency.
 
 ## Dead letters
