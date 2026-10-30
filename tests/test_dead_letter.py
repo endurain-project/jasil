@@ -410,6 +410,22 @@ class TestReaperRecovery:
         assert received == ["boom"]
         assert stored_job(db).dead_letter_notified_at is not None
 
+    def test_a_callback_unregistered_after_the_claim_releases_it_at_once(
+        self, runner, registry, clock, db, calls, monkeypatch
+    ):
+        """Not a delivery: the claim must be given back, or the dead letter waits out the whole claim lease."""
+        self._crash_after_commit(db, clock, runner)
+        clock.advance(1)
+        original = registry.dead_letter_callback
+        monkeypatch.setattr(registry, "dead_letter_callback", lambda _subscriber_id: None)
+
+        delivered = deliver_dead_letters(registry=registry, session_factory=runner._session_factory, clock=clock)
+
+        assert (delivered, calls) == (0, [])
+        monkeypatch.setattr(registry, "dead_letter_callback", original)
+        delivered = deliver_dead_letters(registry=registry, session_factory=runner._session_factory, clock=clock)
+        assert delivered == 1  # no clock.advance(CLAIM_LEASE_SECONDS): the claim was released
+
 
 class TestCallbackRaising:
     @pytest.fixture

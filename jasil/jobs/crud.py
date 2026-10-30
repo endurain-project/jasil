@@ -67,6 +67,48 @@ STATUS_DEFERRALS_EXHAUSTED = "deferrals_exhausted"
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
 
+def insert_job(
+    event: Event,
+    subscriber_id: str,
+    *,
+    queue: str = DEFAULT_QUEUE,
+    max_attempts: int,
+    now: datetime,
+    db: Session,
+    available_at: datetime | None = None,
+    commit: bool = True,
+) -> str:
+    """Insert one job like :func:`enqueue_job`, returning the id it was given.
+
+    For a caller that does not need to know whether the row is new, such as the relay fanning a batch out:
+    unlike :func:`enqueue_job` it issues no ``SELECT`` per job. When a job for ``(event, subscriber_id)``
+    already existed nothing is inserted and the id names no row.
+    """
+    validate_queue_name(queue)
+    job_id = str(uuid.uuid4())
+    values = {
+        "id": job_id,
+        "queue": queue,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "subscriber_id": subscriber_id,
+        "source": event.source,
+        "event_timestamp": event.timestamp,
+        "payload": event.payload,
+        "schema_version": event.schema_version,
+        "job_metadata": event.metadata or None,
+        "status": STATUS_PENDING,
+        "attempts": 0,
+        "max_attempts": max_attempts,
+        "available_at": available_at or now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    db.execute(_insert_ignoring_duplicate(values, db))
+    commit_or_flush(db, commit)
+    return job_id
+
+
 def enqueue_job(
     event: Event,
     subscriber_id: str,
@@ -102,30 +144,18 @@ def enqueue_job(
         The inserted job, or ``None`` when a job for this ``(event, subscriber)``
         already existed.
     """
-    validate_queue_name(queue)
-    job_id = str(uuid.uuid4())
-    values = {
-        "id": job_id,
-        "queue": queue,
-        "event_id": event.event_id,
-        "event_type": event.event_type,
-        "subscriber_id": subscriber_id,
-        "source": event.source,
-        "event_timestamp": event.timestamp,
-        "payload": event.payload,
-        "schema_version": event.schema_version,
-        "job_metadata": event.metadata or None,
-        "status": STATUS_PENDING,
-        "attempts": 0,
-        "max_attempts": max_attempts,
-        "available_at": available_at or now,
-        "created_at": now,
-        "updated_at": now,
-    }
-    db.execute(_insert_ignoring_duplicate(values, db))
-    commit_or_flush(db, commit)
     # Returns the row only when this call inserted it: a skipped conflict leaves
     # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
+    job_id = insert_job(
+        event,
+        subscriber_id,
+        queue=queue,
+        max_attempts=max_attempts,
+        now=now,
+        db=db,
+        available_at=available_at,
+        commit=commit,
+    )
     return db.get(ProcessingJob, job_id)
 
 

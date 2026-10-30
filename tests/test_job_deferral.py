@@ -5,7 +5,7 @@ The same tests run on whichever database the suite is pointed at.
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select, update
@@ -102,6 +102,31 @@ class TestDeferral:
         # 300 s plus up to 10% jitter.
         wait = (job.available_at.replace(tzinfo=UTC) - T0).total_seconds()
         assert 300 <= wait <= 330
+
+    @pytest.mark.parametrize(
+        "retry_at",
+        [
+            pytest.param("tomorrow", id="not-a-datetime"),
+            pytest.param(None, id="none"),
+            pytest.param(datetime.max.replace(tzinfo=timezone(timedelta(hours=-5))), id="past-the-calendar"),
+        ],
+    )
+    def test_an_unusable_retry_instant_fails_the_attempt_instead_of_stranding_the_job(
+        self, runner, registry, db, retry_at
+    ):
+        def handler(_event):
+            raise DeferJob(retry_at, reason="later")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db)
+
+        runner.run_once()
+
+        job = _job(db)
+        assert job.status == "pending"  # an ordinary failure with retries left, not 'claimed' until the lease ends
+        assert job.attempts == 1
+        assert job.deferrals == 0
+        assert "retry_at" in job.last_error
 
     def test_a_job_deferred_more_often_than_max_attempts_still_runs(self, registry, clock, session_factory, db):
         seen = []

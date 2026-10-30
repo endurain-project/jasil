@@ -378,7 +378,13 @@ class JobRunner:
         Past ``max_deferrals`` the request becomes an ordinary failure.
         """
         now = self._clock.now()
-        requested = (as_utc(deferral.retry_at) - now).total_seconds()
+        try:
+            requested = (as_utc(deferral.retry_at) - now).total_seconds()
+        except (AttributeError, TypeError, ValueError, OverflowError) as error:
+            # The handler asked for something that is not an instant: a failure of this attempt like any other,
+            # recorded with its cause, not an exception that leaves the job claimed until its lease runs out.
+            problem = ValueError(f"DeferJob.retry_at is not a usable instant ({type(error).__name__})")
+            return self._fail(job, problem, duration_ms=duration_ms)
         delay = jobs_backoff.defer_seconds(requested, max_seconds=self._defer_max_seconds)
         retry_at = now + timedelta(seconds=delay)
         reason = deferral.reason or str(deferral)

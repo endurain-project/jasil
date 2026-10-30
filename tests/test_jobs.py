@@ -724,6 +724,30 @@ class TestOutboxRelay:
         assert relayed == 1
         assert {job.subscriber_id for job in db.query(ProcessingJob).all()} == {"a", "b"}
 
+    def test_fanning_out_issues_no_select_per_job(self, db, db_engine, session_factory, clock, registry):
+        """The relay never reads the jobs it inserts back, so a large batch is not three times the statements."""
+        from sqlalchemy import event as sa_event
+
+        for subscriber in ("a", "b", "c"):
+            registry.register("activity.created", subscriber, lambda _e: None)
+        for number in range(5):
+            jobs_outbox.add_to_outbox(new_event("activity.created", {"n": number}, source="test"), now=T0, db=db)
+        selects: list[str] = []
+        sa_event.listen(
+            db_engine,
+            "before_cursor_execute",
+            lambda _c, _cursor, statement, *_rest: (
+                selects.append(statement) if "FROM jasil_processing_jobs" in statement else None
+            ),
+        )
+
+        jobs_relay.relay_outbox_once(
+            registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+        )
+
+        assert [s for s in selects if s.lstrip().upper().startswith("SELECT")] == []
+        assert db.query(ProcessingJob).count() == 15
+
     def test_each_subscribers_queue_is_stamped_on_its_job(self, db, session_factory, event, clock, registry):
         registry.register("activity.created", "a", lambda _e: None, queue="campaign")
         registry.register("activity.created", "b", lambda _e: None, queue="maintenance")
@@ -819,7 +843,7 @@ class TestOutboxRelay:
         def explode(*args, **kwargs):
             raise RuntimeError("database went away")
 
-        monkeypatch.setattr(jobs_relay.jobs_crud, "enqueue_job", explode)
+        monkeypatch.setattr(jobs_relay.jobs_crud, "insert_job", explode)
 
         with pytest.raises(RuntimeError):
             jobs_relay.relay_outbox_once(

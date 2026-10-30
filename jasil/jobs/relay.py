@@ -81,7 +81,7 @@ def relay_outbox_once(
                     event.event_id,
                 )
             for subscriber_id in subscribers:
-                jobs_crud.enqueue_job(
+                jobs_crud.insert_job(
                     event,
                     subscriber_id,
                     queue=registry.queue_for(subscriber_id),
