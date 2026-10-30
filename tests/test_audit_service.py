@@ -10,7 +10,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError
 
@@ -29,6 +29,13 @@ class ProfileChange(VersionedPayload):
     SCHEMA_VERSION = 3
 
     fields: list[str]
+
+
+class Reading(VersionedPayload):
+    SCHEMA_VERSION = 1
+
+    value: float
+    note: dict[str, str] = Field(default_factory=dict)
 
 
 @pytest.fixture
@@ -214,6 +221,34 @@ class TestFailClosed:
     def test_an_over_long_target_id_raises_rather_than_being_clipped(self, db, change):
         with pytest.raises(ValueError, match="target_id"):
             jasil_audit.stage(db, change, target_id="x" * 65, details={"fields": []})
+
+    @pytest.mark.parametrize("field", ["target_type", "target_id", "target_owner_id"])
+    def test_a_target_with_a_nul_character_raises_before_the_database_can_refuse_it(self, db, change, field):
+        """PostgreSQL rejects NUL in text, SQLite stores it: the check has to be ours."""
+        with pytest.raises(ValueError, match=f"{field} must not contain a NUL"):
+            jasil_audit.stage(db, change, details={"fields": []}, **{field: "a\x00b"})
+
+        assert list(db.new) == []
+
+    def test_details_with_a_nul_character_raise(self, db, change):
+        with pytest.raises(jasil_audit.AuditDetailsError, match="NUL"):
+            jasil_audit.stage(db, change, details={"fields": ["a\x00b"]})
+
+    @pytest.fixture
+    def reading(self, audit_env):
+        return jasil_audit.get_catalog().register(
+            AuditAction("sensor.reading.record", Category.SYSTEM, Severity.INFO, "k", "d", details_model=Reading)
+        )
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_details_with_a_non_finite_number_raise(self, db, reading, value):
+        """JSON has no NaN or Infinity: PostgreSQL rejects the document."""
+        with pytest.raises(jasil_audit.AuditDetailsError, match="finite"):
+            jasil_audit.stage(db, reading, details={"value": value})
+
+    def test_a_nul_character_in_a_details_key_raises(self, db, reading):
+        with pytest.raises(jasil_audit.AuditDetailsError, match="NUL"):
+            jasil_audit.stage(db, reading, details={"value": 1.0, "note": {"k\x00": "v"}})
 
     def test_an_unknown_outcome_raises(self, db, change):
         with pytest.raises(ValueError, match="not a valid Outcome"):

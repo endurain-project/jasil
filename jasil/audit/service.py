@@ -19,6 +19,7 @@ Importing this module is safe before :func:`jasil.orm.map_models`; the model is 
 
 import json
 import logging
+import math
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -63,7 +64,7 @@ __all__ = [
 
 
 class AuditDetailsError(ValueError):
-    """The ``details`` of a row are over the size cap or do not serialize."""
+    """The ``details`` of a row are over the size cap, do not serialize, or hold a NUL or a non-finite number."""
 
 
 @dataclass(frozen=True)
@@ -132,8 +133,9 @@ def stage(
 
     Raises:
         UnknownAuditActionError: When the action is not registered.
-        AuditDetailsError: When ``details`` is over ``audit.max_details_bytes``.
-        ValueError: When an id is too long.
+        AuditDetailsError: When ``details`` is over ``audit.max_details_bytes``, or holds a NUL character or a
+            number that is not finite.
+        ValueError: When an id is too long or holds a NUL character.
         pydantic.ValidationError: When ``details`` does not match the action's model.
         sqlalchemy.exc.SQLAlchemyError: When the row cannot be stored. Not caught: the caller's
             transaction must roll back.
@@ -153,8 +155,9 @@ def stage_many(db: Session, records: Iterable[AuditRecord]) -> None:
 
     Raises:
         UnknownAuditActionError: When an action is not registered.
-        AuditDetailsError: When a ``details`` payload is over the cap.
-        ValueError: When an id is too long.
+        AuditDetailsError: When a ``details`` payload is over the cap, or holds a NUL character or a number
+            that is not finite.
+        ValueError: When an id is too long or holds a NUL character.
         pydantic.ValidationError: When a ``details`` payload does not match its model.
         sqlalchemy.exc.SQLAlchemyError: When a row cannot be stored.
     """
@@ -375,6 +378,24 @@ def now() -> datetime:
     return datetime.now(UTC)
 
 
+def _unstorable(value: Any) -> str | None:
+    """Say why ``value`` cannot be stored as JSON on every dialect, or return ``None``.
+
+    SQLite accepts a NUL character and a NaN or Infinity, but PostgreSQL rejects both in ``jsonb``, and a
+    rejected insert fails the request or silently drops a detached row. Refusing them here makes the
+    outcome the same wherever the host runs.
+    """
+    if isinstance(value, str):
+        return "contain a NUL character" if "\x00" in value else None
+    if isinstance(value, float):
+        return None if math.isfinite(value) else "contain a number that is not finite"
+    if isinstance(value, dict):
+        return next((reason for item in (*value.keys(), *value.values()) if (reason := _unstorable(item))), None)
+    if isinstance(value, list | tuple):
+        return next((reason for item in value if (reason := _unstorable(item))), None)
+    return None
+
+
 def _prepare(record: AuditRecord, settings: AuditSettings) -> AuditEntry:
     """Validate ``record`` and merge the ambient context."""
     action = get_catalog().resolve(record.action)
@@ -385,9 +406,14 @@ def _prepare(record: AuditRecord, settings: AuditSettings) -> AuditEntry:
     ):
         if value is not None:
             check_length(value, field=name, limit=limit)
+            if "\x00" in value:
+                raise ValueError(f"{name} must not contain a NUL character")
     payload = action.details_model.model_validate({} if record.details is None else record.details)
     details = payload.model_dump(mode="json") or None
     if details is not None:
+        unstorable = _unstorable(details)
+        if unstorable is not None:
+            raise AuditDetailsError(f"details of {action.id!r} {unstorable}")
         size = len(json.dumps(details, separators=(",", ":"), ensure_ascii=False).encode())
         if size > settings.max_details_bytes:
             raise AuditDetailsError(

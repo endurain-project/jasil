@@ -98,12 +98,14 @@ class AuditContext:
         """Coerce the enums and clip the client-controlled strings.
 
         Raises:
-            ValueError: When ``actor_type`` or ``source`` is not a known value, or an id exceeds its column.
+            ValueError: When ``actor_type`` or ``source`` is not a known value, or an id exceeds its column or contains a NUL character.
         """
         object.__setattr__(self, "actor_type", ActorType(self.actor_type))
         object.__setattr__(self, "source", Source(self.source))
-        object.__setattr__(self, "user_agent", fit_length(self.user_agent, MAX_USER_AGENT_LENGTH))
-        object.__setattr__(self, "ip_address", fit_length(self.ip_address, MAX_IP_ADDRESS_LENGTH))
+        # A NUL cannot be stored in PostgreSQL text; a client controls these two, so they are repaired, not refused.
+        for name, limit in (("user_agent", MAX_USER_AGENT_LENGTH), ("ip_address", MAX_IP_ADDRESS_LENGTH)):
+            value = getattr(self, name)
+            object.__setattr__(self, name, fit_length(value.replace("\x00", "\ufffd") if value else value, limit))
         for name, limit in (
             ("actor_id", MAX_AUDIT_ID_LENGTH),
             ("credential_type", MAX_AUDIT_NAME_LENGTH),
@@ -114,6 +116,8 @@ class AuditContext:
             value = getattr(self, name)
             if value is not None and len(value) > limit:
                 raise ValueError(f"audit context {name} is {len(value)} characters; the limit is {limit}")
+            if value is not None and "\x00" in value:
+                raise ValueError(f"audit context {name} must not contain a NUL character")
 
 
 _context: ContextVar[AuditContext | None] = ContextVar("jasil_audit_context", default=None)

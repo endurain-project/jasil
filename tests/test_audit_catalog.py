@@ -232,6 +232,16 @@ class TestContext:
         assert len(context.user_agent) == MAX_USER_AGENT_LENGTH
         assert context.user_agent.endswith("...")
 
+    def test_a_nul_character_in_a_client_supplied_string_is_replaced(self):
+        """Clipped like the rest of what a client controls: refusing it would lose the row being written."""
+        context = AuditContext(user_agent="curl\x00/8", ip_address="10.0.0.1\x00")
+
+        assert (context.user_agent, context.ip_address) == ("curl\ufffd/8", "10.0.0.1\ufffd")
+
+    def test_a_nul_character_in_an_id_is_rejected(self):
+        with pytest.raises(ValueError, match="actor_id must not contain a NUL"):
+            AuditContext(actor_id="4\x002")
+
     def test_a_short_user_agent_is_kept(self):
         assert AuditContext(user_agent="curl/8").user_agent == "curl/8"
 
