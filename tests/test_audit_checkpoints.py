@@ -460,12 +460,10 @@ class TestSignatures:
 
         assert trail.verify(None).signed is False
 
-    def test_a_malformed_signing_key_is_refused_when_sealing(self, trail, audit_env):
-        audit_env.configure(signing_key="not base64!")
-        trail.write(3)
-
+    def test_a_malformed_signing_key_is_refused_before_anything_is_written_to_seal(self, trail, audit_env):
+        """It used to be found at the first seal, which then stopped sealing and retention without a word."""
         with pytest.raises(ValueError, match="signing_key"):
-            trail.seal(60)
+            audit_env.configure(signing_key="not base64!")
         assert trail.all() == []
 
     def test_a_malformed_public_key_is_refused(self, sealed):

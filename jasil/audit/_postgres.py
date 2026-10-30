@@ -99,6 +99,7 @@ SET search_path = pg_catalog, pg_temp
 SET lock_timeout = '10s'
 SET TimeZone = 'UTC'
 SET DateStyle = 'ISO, YMD'
+SET standard_conforming_strings = on
 AS $body$
 DECLARE
     today date := (now() AT TIME ZONE 'UTC')::date;
@@ -146,6 +147,7 @@ SET search_path = pg_catalog, pg_temp
 SET lock_timeout = '10s'
 SET TimeZone = 'UTC'
 SET DateStyle = 'ISO, YMD'
+SET standard_conforming_strings = on
 AS $body$
 DECLARE
     floor_days constant integer := @FLOOR_DAYS@;

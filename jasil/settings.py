@@ -30,6 +30,7 @@ raise, because a Redis host or bucket name cannot be inferred. The one exception
 is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 """
 
+import base64
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -258,8 +259,9 @@ class AuditSettings:
 
         Raises:
             ValueError: When a numeric setting is out of range, ``retention_days`` is positive
-                but below ``retention_floor_days`` (every prune would be refused by the guard), or
-                ``app_name`` / ``app_version`` is longer than its column.
+                but below ``retention_floor_days`` (every prune would be refused by the guard),
+                ``app_name`` / ``app_version`` is longer than its column, or ``signing_key`` is not
+                the base64 of 32 bytes.
         """
         minimums = {
             "retention_floor_days": 1,
@@ -287,6 +289,15 @@ class AuditSettings:
             value = getattr(self, name)
             if value is not None and len(value) > limit:
                 raise ValueError(f"audit.{name} is {len(value)} characters; the limit is {limit}")
+        if self.signing_key is not None:
+            # Checked here, without importing ``cryptography``, so a typo fails where the host configures JASIL
+            # instead of silently stopping the sealing (and the retention behind it) at the first window.
+            try:
+                length = len(base64.b64decode(self.signing_key, validate=True))
+            except ValueError:  # binascii.Error is a ValueError
+                length = -1
+            if length != 32:
+                raise ValueError("audit.signing_key must be the base64 of a 32-byte Ed25519 private key")
         if 0 < self.retention_days < self.retention_floor_days:
             raise ValueError(
                 f"audit.retention_days ({self.retention_days}) must be at least audit.retention_floor_days "

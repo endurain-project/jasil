@@ -18,7 +18,12 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from enum import StrEnum
 
-from jasil._core.limits import MAX_AUDIT_ACTION_ID_LENGTH
+from jasil._core.limits import (
+    MAX_AUDIT_ACTION_ID_LENGTH,
+    MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH,
+    MAX_AUDIT_DESCRIPTION_KEY_LENGTH,
+    check_length,
+)
 from jasil._core.registry import ConfigSlot
 from jasil.event_versioning import VersionedPayload
 
@@ -120,7 +125,7 @@ class AuditAction:
 
         Raises:
             ValueError: When ``id`` does not match :data:`ACTION_ID_PATTERN` or is too long, a
-                description is empty, or ``details_model`` is not a ``VersionedPayload`` or allows extra keys.
+                description is empty or longer than its column, or ``details_model`` is not a ``VersionedPayload`` or allows extra keys.
         """
         if not ACTION_ID_PATTERN.fullmatch(self.id) or len(self.id) > MAX_AUDIT_ACTION_ID_LENGTH:
             raise ValueError(
@@ -129,6 +134,9 @@ class AuditAction:
             )
         if not self.description_key or not self.description_default:
             raise ValueError(f"audit action {self.id!r} needs a description_key and a description_default")
+        # The columns are narrower than the strings a host can pass; PostgreSQL would refuse the row at sync_catalog().
+        check_length(self.description_key, field="description_key", limit=MAX_AUDIT_DESCRIPTION_KEY_LENGTH)
+        check_length(self.description_default, field="description_default", limit=MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH)
         if not (isinstance(self.details_model, type) and issubclass(self.details_model, VersionedPayload)):
             raise ValueError(f"audit action {self.id!r}: details_model must subclass VersionedPayload")
         if self.details_model.model_config.get("extra") == "allow":

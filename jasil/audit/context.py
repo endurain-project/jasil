@@ -144,8 +144,11 @@ def set_context(context: AuditContext | None) -> None:
     """Set the audit context for the current execution context.
 
     Only consulted while no provider is installed via :func:`configure_provider` and no
-    :func:`audit_context` block is open. Each thread and each
-    asyncio task has its own value, so setting it in one request never leaks into another.
+    :func:`audit_context` block is open. Each thread and each asyncio task has its own
+    value, so concurrent requests do not see one another's. A value lives as long as its
+    thread or task, though: a worker thread reused across requests keeps the previous
+    request's actor until the next call, so set the context at the start of every request
+    (``set_context(None)`` for an anonymous one), or use :func:`audit_context` per request.
 
     Args:
         context: The context to read from now on, or ``None`` to clear it.

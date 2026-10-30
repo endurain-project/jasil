@@ -12,6 +12,8 @@ from jasil._core.limits import (
     MAX_AUDIT_ACTION_ID_LENGTH,
     MAX_AUDIT_APP_NAME_LENGTH,
     MAX_AUDIT_APP_VERSION_LENGTH,
+    MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH,
+    MAX_AUDIT_DESCRIPTION_KEY_LENGTH,
     MAX_AUDIT_ID_LENGTH,
     MAX_AUDIT_NAME_LENGTH,
     MAX_IP_ADDRESS_LENGTH,
@@ -166,8 +168,12 @@ class AuditActionRecord(Base):
     id: Mapped[str] = mapped_column(String(MAX_AUDIT_ACTION_ID_LENGTH), primary_key=True, comment="Action id")
     category: Mapped[str] = mapped_column(String(MAX_AUDIT_NAME_LENGTH), nullable=False, comment="Category")
     severity: Mapped[str] = mapped_column(String(MAX_AUDIT_NAME_LENGTH), nullable=False, comment="Severity")
-    description_key: Mapped[str] = mapped_column(String(200), nullable=False, comment="Translation key")
-    description_default: Mapped[str] = mapped_column(String(500), nullable=False, comment="Untranslated description")
+    description_key: Mapped[str] = mapped_column(
+        String(MAX_AUDIT_DESCRIPTION_KEY_LENGTH), nullable=False, comment="Translation key"
+    )
+    description_default: Mapped[str] = mapped_column(
+        String(MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH), nullable=False, comment="Untranslated description"
+    )
     deprecated: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=false(), comment="No longer emitted"
     )

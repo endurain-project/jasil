@@ -5,6 +5,7 @@ be undone later: a duplicate id, a malformed one, an unregistered one.
 """
 
 import asyncio
+import base64
 import threading
 from dataclasses import FrozenInstanceError, replace
 
@@ -45,6 +46,21 @@ class TestAction:
     def test_an_over_long_id_is_rejected(self):
         with pytest.raises(ValueError, match="at most 100"):
             _action("a." + "b" * 98 + ".c")
+
+    @pytest.mark.parametrize(
+        ("overrides", "message"),
+        [
+            ({"description_key": "k" * 201}, "description_key is 201 characters"),
+            ({"description_default": "d" * 501}, "description_default is 501 characters"),
+        ],
+    )
+    def test_a_description_longer_than_its_column_is_rejected(self, overrides, message):
+        """SQLite stores it; PostgreSQL would fail sync_catalog() at startup."""
+        with pytest.raises(ValueError, match=message):
+            _action(**overrides)
+
+    def test_a_description_at_its_limits_is_accepted(self):
+        assert _action(description_key="k" * 200, description_default="d" * 500)
 
     def test_a_description_is_required(self):
         with pytest.raises(ValueError, match="description"):
@@ -313,7 +329,25 @@ class TestSettings:
         assert jasil_settings.JasilSettings().audit == jasil_settings.AuditSettings()
 
     def test_the_signing_key_is_not_in_the_repr(self):
-        assert "secret" not in repr(jasil_settings.AuditSettings(signing_key="secret"))
+        key = base64.b64encode(b"s" * 32).decode()
+
+        assert key not in repr(jasil_settings.AuditSettings(signing_key=key))
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            pytest.param("not base64!", id="not-base64"),
+            pytest.param(base64.b64encode(b"s" * 31).decode(), id="too-short"),
+            pytest.param(base64.b64encode(b"s" * 33).decode(), id="too-long"),
+            pytest.param("", id="empty"),
+        ],
+    )
+    def test_a_malformed_signing_key_is_rejected_where_the_settings_are_built(self, key):
+        """Otherwise sealing, and the retention after it, stop at the first window and nobody is told."""
+        with pytest.raises(ValueError, match="signing_key must be the base64 of a 32-byte") as refused:
+            jasil_settings.AuditSettings(signing_key=key)
+
+        assert key not in str(refused.value) or key == ""
 
     @pytest.mark.parametrize(
         ("overrides", "message"),

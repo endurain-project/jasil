@@ -24,6 +24,8 @@ __all__ = [
     "MAX_AUDIT_ACTION_ID_LENGTH",
     "MAX_AUDIT_APP_NAME_LENGTH",
     "MAX_AUDIT_APP_VERSION_LENGTH",
+    "MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH",
+    "MAX_AUDIT_DESCRIPTION_KEY_LENGTH",
     "MAX_AUDIT_ID_LENGTH",
     "MAX_AUDIT_NAME_LENGTH",
     "MAX_AUDIT_RETENTION_DAYS",
@@ -128,6 +130,9 @@ def fit_length(value: str | None, limit: int) -> str | None:
 MAX_AUDIT_ACTION_ID_LENGTH = 100
 MAX_AUDIT_ID_LENGTH = 64
 MAX_AUDIT_NAME_LENGTH = 50
+#: Widths of ``jasil_audit_actions.description_key`` and ``description_default``, written by the host's catalog.
+MAX_AUDIT_DESCRIPTION_KEY_LENGTH = 200
+MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH = 500
 #: Widths of ``jasil_audit_log.app_name`` and ``app_version``, stamped from the audit settings.
 MAX_AUDIT_APP_NAME_LENGTH = 100
 MAX_AUDIT_APP_VERSION_LENGTH = 50

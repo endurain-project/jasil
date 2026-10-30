@@ -220,6 +220,13 @@ class TestMigration:
 
         assert "lock_timeout=10s" in settings
 
+    @pytest.mark.parametrize("function", ["jasil_audit_ensure_partitions", "jasil_audit_drop_partitions"])
+    def test_the_functions_read_string_literals_the_standard_way(self, migrated, function):
+        """The schema name is embedded as a literal, which a caller's own setting must not be able to reinterpret."""
+        settings = _scalar(migrated, "SELECT proconfig::text FROM pg_proc WHERE proname = :f", f=function)
+
+        assert "standard_conforming_strings=on" in settings
+
     def test_the_floor_is_baked_in_from_the_settings_at_migration_time(self, engine, mapped_base):
         jasil_settings.configure(
             jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(retention_floor_days=45))
