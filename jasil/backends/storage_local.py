@@ -195,7 +195,7 @@ class LocalStorage:
         except FileNotFoundError:
             temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                _make_directories(path.parent)
                 with temporary_path.open("x", encoding="utf-8") as handle:
                     handle.write(value)
                     _sync(handle)
@@ -267,7 +267,7 @@ class LocalStorage:
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            _make_directories(destination.parent)
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         return destination.with_name(f"{_PLAIN_TEMP_PREFIX}{uuid4().hex}.tmp")
@@ -284,12 +284,24 @@ class LocalStorage:
         except ValueError:
             return False
 
+    def _abandon_new_object(self, area: str, path: Path) -> None:
+        """After a failed write, remove what preparing it left of an object that was never committed.
+
+        The identity file of an opaque object is written before its payload, so a refused or failed write of a
+        new key would otherwise leave it, and the directories around it, for good. An existing object keeps its.
+        """
+        if area not in self._plain_areas:
+            with suppress(OSError):
+                if not path.exists():
+                    (path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
+        self._prune_empty_directories(path.parent)
+
     def _write_object_bytes(self, area: str, path: Path, data: bytes) -> None:
         """Write ``data`` to a temporary file and move it over ``path``, so a failed overwrite leaves the old bytes."""
         temporary_path = self._temporary_object_path(area, path)
         try:
             if temporary_path.parent == path.parent:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                _make_directories(path.parent)
             with temporary_path.open("xb") as destination:
                 destination.write(data)
                 _sync(destination)
@@ -297,7 +309,7 @@ class LocalStorage:
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            self._prune_empty_directories(path.parent)
+            self._abandon_new_object(area, path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     @staticmethod
@@ -307,7 +319,7 @@ class LocalStorage:
         Recreates a parent that a concurrent prune removed, once.
         """
         for attempt in range(2):
-            destination.parent.mkdir(parents=True, exist_ok=True)
+            _make_directories(destination.parent)
             try:
                 os.replace(temporary_path, destination)
                 break
@@ -559,11 +571,10 @@ class LocalStorage:
         temporary_path = self._temporary_object_path(area, path)
         try:
             if area not in self._plain_areas or temporary_path.parent == path.parent:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                _make_directories(path.parent)
             destination = temporary_path.open("xb")
         except OSError as error:
-            if area in self._plain_areas:
-                self._prune_empty_directories(path.parent)
+            self._abandon_new_object(area, path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
         total = 0
@@ -594,8 +605,7 @@ class LocalStorage:
                     destination.close()
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            if area in self._plain_areas:
-                self._prune_empty_directories(path.parent)
+            self._abandon_new_object(area, path)
             raise
         self._finish_commit(area, key)
         return total
@@ -727,7 +737,7 @@ class LocalStorage:
         temporary_path = self._temporary_object_path(session.area, destination_path)
         try:
             if session.area not in self._plain_areas or temporary_path.parent == destination_path.parent:
-                destination_path.parent.mkdir(parents=True, exist_ok=True)
+                _make_directories(destination_path.parent)
             with temporary_path.open("xb") as destination:
                 for part in ordered:
                     part_path = uploaded[part.part_number][0]
@@ -751,14 +761,12 @@ class LocalStorage:
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            if session.area in self._plain_areas:
-                self._prune_empty_directories(destination_path.parent)
+            self._abandon_new_object(session.area, destination_path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            if session.area in self._plain_areas:
-                self._prune_empty_directories(destination_path.parent)
+            self._abandon_new_object(session.area, destination_path)
             raise
         self._finish_commit(session.area, session.key)
         try:
@@ -997,6 +1005,8 @@ class LocalStorage:
             if area_identity != area:
                 raise StorageBackendUnavailableError("Local storage area identity does not match its address")
             for candidate in area_dir.rglob("*"):
+                if candidate.is_symlink():
+                    continue  # never followed, and a loop would fail the resolve below
                 resolved = candidate.resolve()
                 if (
                     resolved != candidate
@@ -1041,7 +1051,7 @@ class LocalStorage:
                 try:
                     if stat.S_ISDIR(plain_area.stat().st_mode):
                         for candidate in plain_area.rglob("*"):
-                            if self._is_plain_temporary_name(candidate.name):
+                            if self._is_plain_temporary_name(candidate.name) or candidate.is_symlink():
                                 continue
                             try:
                                 resolved = candidate.resolve()
@@ -1080,6 +1090,8 @@ class LocalStorage:
                 if not stat.S_ISDIR(legacy_area.stat().st_mode):
                     return
                 for candidate in legacy_area.rglob("*"):
+                    if candidate.is_symlink():
+                        continue
                     resolved = candidate.resolve()
                     if resolved != candidate or not resolved.is_relative_to(legacy_area):
                         continue
@@ -1178,6 +1190,22 @@ def _sync(handle: IO[Any]) -> None:
     """Flush ``handle`` to the disk, so the rename that publishes it cannot outlive its bytes in a crash."""
     handle.flush()
     os.fsync(handle.fileno())
+
+
+def _make_directories(directory: Path) -> None:
+    """Create ``directory`` and any missing parents, syncing the parent of each one made.
+
+    A directory's name lives in its parent, and syncing a file inside a new directory does not make that name
+    durable, so a first write to a new key would otherwise be able to lose the whole new branch in a crash.
+    """
+    missing: list[Path] = []
+    ancestor = directory
+    while not ancestor.exists():
+        missing.append(ancestor)
+        ancestor = ancestor.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    for parent in dict.fromkeys(created.parent for created in missing):
+        _sync_directory(parent)
 
 
 def _sync_directory(directory: Path) -> None:

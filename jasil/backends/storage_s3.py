@@ -18,7 +18,14 @@ from typing import Any, BinaryIO, Concatenate
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import UUID, uuid4
 
-import boto3
+from jasil._core import optional_deps
+
+try:
+    import boto3
+except ModuleNotFoundError as error:
+    if error.name != "boto3":
+        raise
+    raise optional_deps.not_installed("boto3", extra="s3", feature="S3 storage") from error
 from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
@@ -114,17 +121,22 @@ def _read_part(source: BinaryIO, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _has_control_character(value: str) -> bool:
+    """True for a C0 control (other than tab) or DEL: none may appear in a header value, and key validation refuses them too."""
+    return any((ord(char) < 0x20 and char != "\t") or ord(char) == 0x7F for char in value)
+
+
 def _content_disposition(filename: str) -> str:
-    if not filename or "\r" in filename or "\n" in filename:
-        raise ValueError("download_as must be a non-empty filename without line breaks")
+    if not filename or _has_control_character(filename):
+        raise ValueError("download_as must be a non-empty filename without control characters")
     fallback = filename.encode("ascii", "replace").decode("ascii").replace("\\", "\\\\").replace('"', '\\"')
     encoded = quote(filename, safe="")
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def _validate_response_content_type(content_type: str) -> None:
-    if not content_type or "\r" in content_type or "\n" in content_type:
-        raise ValueError("content_type must be non-empty and contain no line breaks")
+    if not content_type or _has_control_character(content_type):
+        raise ValueError("content_type must be non-empty and contain no control characters")
 
 
 def _check_endpoint(endpoint_url: str) -> None:

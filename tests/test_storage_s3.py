@@ -1705,8 +1705,13 @@ class TestUrl:
         [
             ({"download_as": "bad\r\nname.zip"}, "download_as"),
             ({"content_type": "text/plain\r\nX-Test: bad"}, "content_type"),
+            ({"download_as": "x\x00y"}, "download_as"),
+            ({"download_as": "x\x7fy"}, "download_as"),
+            ({"download_as": "x\x1b[31my"}, "download_as"),
+            ({"content_type": "text/html\x00"}, "content_type"),
+            ({"content_type": "text/\x0bhtml"}, "content_type"),
         ],
     )
-    def test_response_headers_refuse_line_breaks(self, storage, arguments, match):
+    def test_response_headers_refuse_control_characters(self, storage, arguments, match):
         with pytest.raises(ValueError, match=match):
             storage.url(AREA, KEY, **arguments)

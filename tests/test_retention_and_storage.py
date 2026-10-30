@@ -1637,7 +1637,6 @@ class TestRuntimeHandle:
         monkeypatch.setattr(runtime, "_active_platform", None)
 
 
-@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions enforced on the caller")
 @pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
 class TestLocalStorageDurability:
     """A rename is only as durable as the bytes behind it and the directory entry it writes.
@@ -1682,6 +1681,23 @@ class TestLocalStorageDurability:
 
         assert self._file_then_directory(synced), synced
 
+    def test_the_directories_a_first_write_created_are_made_durable_too(self, storage, monkeypatch, tmp_path):
+        """A new directory's name lives in its parent: syncing only the leaf can lose the whole new branch."""
+        synced_directories: list[int] = []
+        real = os.fsync
+
+        def recording(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                synced_directories.append(os.fstat(descriptor).st_ino)
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", recording)
+
+        storage.save("avatars", "nested/1.bin", b"data")
+
+        # The base directory already existed; it holds the name of the first directory the write created.
+        assert tmp_path.stat().st_ino in synced_directories
+
     def test_an_upload_part_is_synced_before_and_after_it_is_published(self, storage, monkeypatch):
         session = storage.begin_upload("avatars", "1.bin")
         parts = storage._load_upload_session(session) / storage_local._UPLOAD_PARTS_DIRECTORY
@@ -1697,6 +1713,52 @@ class TestLocalStorageDurability:
         storage.begin_upload("avatars", "1.bin")
 
         assert (False, True) in synced and (True, True) in synced
+
+
+class TestLocalStorageFailedWrites:
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+
+    @staticmethod
+    def _identity_files(root):
+        return [path for path in root.rglob("*") if path.name == storage_local._OBJECT_KEY_FILE]
+
+    def test_a_refused_new_object_leaves_no_identity_files_behind(self, storage, tmp_path):
+        """Each rejected upload of a fresh key used to leave a directory pair and a sidecar nothing removes."""
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("avatars", "fresh.bin", io.BytesIO(b"too long"), max_bytes=3)
+
+        assert self._identity_files(tmp_path) == []
+        assert storage.list_keys("avatars") == []
+
+    def test_a_refused_overwrite_keeps_the_object_and_its_identity(self, storage):
+        storage.save("avatars", "kept.bin", b"original")
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("avatars", "kept.bin", io.BytesIO(b"too long"), max_bytes=3)
+
+        assert storage.get("avatars", "kept.bin") == b"original"
+
+
+class TestLocalStorageListingGuards:
+    def test_a_symlink_loop_in_a_legacy_area_does_not_break_listing(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), legacy_layout=True)
+        area = tmp_path / "leg"
+        area.mkdir()
+        (area / "ok.txt").write_bytes(b"x")
+        (area / "loop").symlink_to("loop")
+
+        assert storage.list_keys("leg") == ["ok.txt"]
+
+    def test_a_symlink_loop_in_a_plain_area_does_not_break_listing(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        area = tmp_path / "plain"
+        area.mkdir()
+        (area / "ok.txt").write_bytes(b"x")
+        (area / "loop").symlink_to("loop")
+
+        assert storage.list_keys("plain") == ["ok.txt"]
 
 
 class TestLocalStorageConcurrentDelete:
