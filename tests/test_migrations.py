@@ -387,6 +387,21 @@ class TestRevisionTransactions:
 
         assert migrations.db_revision(engine) == "rev0003"
 
+    def test_a_fresh_install_that_failed_inside_its_second_revision_is_resumed(self, engine, failing_build):
+        """The first revision already created the prefixed tables, so the second must keep finding them."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL commits a revision's changes before building its index")
+        restore = failing_build({"idx_jasil_processing_jobs_worker_claim"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        assert migrations.db_revision(engine) == "rev0001"
+        restore()
+
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert "processing_jobs" not in inspect(engine).get_table_names()
+
     def test_an_upgrade_that_failed_in_an_index_build_is_resumed(self, engine, failing_build):
         if engine.dialect.name != "postgresql":
             pytest.skip("only PostgreSQL commits a revision's changes before building its index")

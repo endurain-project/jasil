@@ -173,7 +173,8 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     ``jasil_`` for a fresh database heading to :data:`_PREFIXED_FROM` or later, so
     JASIL never creates an unprefixed table that a host's own could already
     occupy; empty everywhere else (see :mod:`jasil.migrations._names`). Fresh means
-    no recorded revision and no prefixed table. A single unprefixed table of the
+    no recorded revision and no prefixed table; a run resumed after its first revision recorded keeps the prefix
+    its tables already carry. A single unprefixed table of the
     same name proves nothing, since it may be the host's; two of the baseline
     tables together are an unversioned old schema, which is refused.
     """
@@ -184,9 +185,11 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     from jasil.orm import jasil_table_names
 
     context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
-    if context.get_current_revision() is not None:
-        return ""
     present = set(inspect(connection).get_table_names())
+    if context.get_current_revision() is not None:
+        # An install interrupted after its first revision holds prefixed tables, which the rest of the run has to
+        # keep finding; a database from 0.8 or earlier holds unprefixed ones and renames them at ``rev0003``.
+        return _names.PREFIX if present & jasil_table_names() else ""
     if present & jasil_table_names():
         # Creating the unprefixed revisions beside prefixed tables would leave
         # duplicates, and rev0003 would then skip its renames.
