@@ -116,6 +116,8 @@ class TestLifecycleWrites:
         """The trail is best-effort; a missing row must not raise into the bus."""
         event_log_crud.mark_completed("never-published", "handler", 1, db, now=datetime.now(UTC))
 
+        assert db.query(EventLog).count() == 0
+
 
 class TestHandlerNameClamping:
     """The joined subscriber list grows with the number of subscribers.
@@ -422,6 +424,18 @@ class TestRecorder:
 
         assert "record_queued_in failed" in caplog.text
         assert db.get(EventLog, event.event_id).status == "queued"
+
+    def test_the_callers_own_failing_write_is_not_swallowed_as_an_event_log_failure(self, recorder, db):
+        """Only the event_log row is best-effort: a caller's constraint violation must surface as itself."""
+        from sqlalchemy.exc import IntegrityError
+
+        event = _event()
+        db.add(EventLog(id="duplicate", event_type="x.y", event_source="test", event_payload={}))
+        db.commit()
+        db.add(EventLog(id="duplicate", event_type="x.y", event_source="test", event_payload={}))
+
+        with pytest.raises(IntegrityError):
+            recorder.record_queued_in(event, db)
 
     def test_tracking_records_processing_then_completed(self, recorder, db):
         event = _event()

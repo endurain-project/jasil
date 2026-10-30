@@ -5,9 +5,10 @@ at import time, so it cannot be imported before ``jasil.orm.map_models`` has run
 Hosts wanting the dashboard aggregate should use :mod:`jasil.admin`, which is
 importable from anywhere and opens its own session.
 
-**Every write here commits the session it is given.** The recorder hands each one
-a short-lived session of its own; pass a session JASIL owns, not one carrying a
-caller's uncommitted work.
+**Every write here commits the session it is given, except** ``record_queued`` with
+``commit=False``, which only flushes so the row joins the caller's transaction. The
+recorder hands each other write a short-lived session of its own; pass a session
+JASIL owns, not one carrying a caller's uncommitted work.
 
 The recording helpers write the event lifecycle: ``record_published`` /
 ``mark_processing`` / ``mark_completed`` / ``mark_failed`` for bus-delivered

@@ -164,6 +164,26 @@ class TestRetention:
 
         assert "Retention prune: deleted" not in caplog.text
 
+    def test_a_failing_event_log_prune_does_not_stop_the_job_tables_being_pruned(
+        self, platform, session_factory, db, caplog, monkeypatch
+    ):
+        import jasil.event_log.crud as event_log_crud
+
+        _configure_retention(event_log_days=30, jobs_days=30)
+        outbox_id = jobs_outbox.add_to_outbox(new_event("a.b", {}, source="t"), now=OLD, db=db)
+        jobs_outbox.mark_relayed(outbox_id, now=OLD, db=db)
+
+        def failing(*_args, **_kwargs):
+            raise RuntimeError("statement timeout")
+
+        monkeypatch.setattr(event_log_crud, "delete_events_before", failing)
+
+        with caplog.at_level("INFO"), pytest.raises(RuntimeError, match="statement timeout"):
+            retention.prune_expired_records()
+
+        assert db.query(EventOutbox).count() == 0
+        assert "1 relayed outbox" in caplog.text  # what was deleted is reported before the failure is raised
+
     def test_a_pass_that_deletes_reports_what_it_removed(self, platform, session_factory, db, caplog):
         _configure_retention(event_log_days=30, jobs_days=0)
         _old_event_log_row(db)

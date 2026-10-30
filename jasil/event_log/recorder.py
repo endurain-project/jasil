@@ -4,7 +4,9 @@ Implements the :class:`~jasil.providers.EventRecorder` protocol. The
 composition root injects one instance into the event bus when
 ``event_log.enabled`` is set. Each write opens its own short-lived session and
 swallows/logs any storage error, so a database hiccup never breaks event
-processing — observability is best-effort by design.
+processing — observability is best-effort by design. The one exception is
+:meth:`record_queued_in`, which stages the ``queued`` row on the caller's session
+in a savepoint.
 """
 
 import logging
@@ -66,7 +68,15 @@ class EventLogRecorder:
 
         Returns:
             None.
+
+        Raises:
+            sqlalchemy.exc.SQLAlchemyError: When flushing the caller's own pending changes fails. That is the
+                caller's error, not an event_log one.
         """
+        # The caller's own pending rows are flushed first and outside the best-effort part: a constraint violation
+        # of theirs is theirs to see, not an event_log failure to log and swallow, and it must not be left to
+        # poison the savepoint below and the session behind it.
+        db.flush()
         try:
             with db.begin_nested():
                 event_log_crud.record_queued(event, db, now=self._clock.now(), commit=False)
