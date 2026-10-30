@@ -373,10 +373,12 @@ class TestConsumerLifecycleGuards:
     def test_two_starts_at_once_keep_one_consumer(self, bus, monkeypatch):
         """The second caller waits for the first instead of passing the same check and starting a second thread."""
         second_was_blocked = []
+        seconds: list[threading.Thread] = []
         original = bus._ensure_group
 
         def ensure_group_while_a_second_start_waits():
             second = threading.Thread(target=bus.start)
+            seconds.append(second)
             second.start()
             second.join(timeout=0.2)
             second_was_blocked.append(second.is_alive())
@@ -385,6 +387,10 @@ class TestConsumerLifecycleGuards:
         monkeypatch.setattr(bus, "_ensure_group", ensure_group_while_a_second_start_waits)
         try:
             bus.start()
+            # Let the waiting start finish first: stopping before it runs would let it start a consumer of its own,
+            # which would outlive the test.
+            for second in seconds:
+                second.join(timeout=5)
         finally:
             bus.stop()
 
