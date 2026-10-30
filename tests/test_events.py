@@ -93,6 +93,13 @@ class TestEnvelopeLengthLimits:
     would simply vanish with an opaque driver error in the log.
     """
 
+    def test_the_refused_value_is_not_echoed(self):
+        """Identifiers can be host-supplied and token-like; the message names the field and the lengths only."""
+        with pytest.raises(ValueError, match="event_type is 101 characters") as refused:
+            new_event("secret-token-" + "e" * 88, {}, source="test")
+
+        assert "secret-token" not in str(refused.value)
+
     def test_an_over_long_event_type_is_refused(self):
         with pytest.raises(ValueError, match="event_type is 101 characters"):
             new_event("e" * 101, {}, source="test")

@@ -347,6 +347,16 @@ class TestRealtimeResolution:
 
         assert stopped == [True]
 
+    def test_close_gives_the_clients_back_even_when_the_realtime_provider_raises(self, tmp_path, monkeypatch):
+        platform = container.build_platform(_settings(data_dir=str(tmp_path)))
+        released = []
+        monkeypatch.setattr(container.redis_clients, "release_shared_clients", lambda keys: released.append(keys))
+        monkeypatch.setattr(platform.realtime, "stop", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        platform.close()  # does not raise
+
+        assert len(released) == 1
+
     def test_close_joins_a_started_redis_subscriber(self, tmp_path, monkeypatch):
         import jasil.backends.realtime_redis as realtime_redis
 
@@ -419,6 +429,17 @@ class TestAUriIsNeverEchoed:
             _settings(
                 storage_uri="s3://bucket?endpoint_url=https://user:S3CRETPW@minio.internal",
                 audit=settings.AuditSettings(external_sink_uri="s3://sink?endpoint_url=https://u:S3CRETPW@minio"),
+            )
+        )
+
+        assert self.SECRET not in rendered
+
+    def test_the_settings_repr_hides_the_mail_and_geocoding_uris(self):
+        """A rejected URI carrying a mistyped credential is still a live settings object."""
+        rendered = repr(
+            _settings(
+                mail=settings.MailSettings(uri="smtps://user:S3CRETPW@relay.example.com"),
+                geocoding=settings.GeocodingSettings(uri="nominatim://user:S3CRETPW@geo.example.com"),
             )
         )
 

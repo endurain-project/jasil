@@ -10,6 +10,7 @@ Private to JASIL: hosts reach it only through
 ``build_platform(..., sources=RuntimeSources(...))``.
 """
 
+import itertools
 import logging
 import threading
 import time
@@ -82,6 +83,9 @@ class ReloadingBackend[S, B]:
         self._lock = threading.Lock()
         self._current: Outcome[S, B] | None = None
         self._source_failing = False
+        # Numbers each read in the order it began, so a slow older read cannot overwrite what a newer one built.
+        self._reads = itertools.count()
+        self._applied_read = -1
 
     def current_backend(self) -> B | None:
         """The backend built from the latest settings, without consulting the source."""
@@ -97,6 +101,7 @@ class ReloadingBackend[S, B]:
                 an older backend: its credentials may be the very thing the
                 operator just revoked.
         """
+        read = next(self._reads)
         try:
             fresh = self._source()
         except Exception as error:
@@ -111,6 +116,10 @@ class ReloadingBackend[S, B]:
         with self._lock:
             self._source_failing = False
             current = self._current
+            if current is not None and read < self._applied_read:
+                # A read that began after this one has already been applied: its settings are the newer ones.
+                return current
+            self._applied_read = read
             # One build per change, under the lock: every other caller needs that
             # same new backend, so none gains by running ahead of it.
             if current is None or current.settings != fresh or self._retry_due(current):

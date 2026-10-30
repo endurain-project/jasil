@@ -125,6 +125,15 @@ class TestAgainstARealPlatform:
 
         assert platform_runtime.is_platform_active() is False
 
+    def test_a_platform_whose_close_raises_is_still_unpublished(self, caplog):
+        platform_runtime.set_active_platform(RecordingPlatform(error=RuntimeError("boom")))
+
+        with caplog.at_level("WARNING"):
+            jasil_lifecycle.shutdown()
+
+        assert platform_runtime.is_platform_active() is False
+        assert "Failed to close the platform during shutdown" in caplog.text
+
 
 def _raise(error: Exception):
     def _fail() -> None:

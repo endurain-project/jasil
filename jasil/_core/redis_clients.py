@@ -29,6 +29,8 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
+from jasil._core import optional_deps
+
 if TYPE_CHECKING:
     from redis import Redis
 
@@ -138,7 +140,12 @@ def create_redis_client(
     # Imported lazily: ``redis`` is the optional ``distributed`` extra, so this
     # is the single point where the package is actually loaded and only on the
     # Redis code path.
-    from redis import Redis, RedisError
+    try:
+        from redis import Redis, RedisError
+    except ModuleNotFoundError as error:
+        if error.name != "redis":
+            raise
+        raise optional_deps.not_installed("redis", extra="redis", feature="A redis:// capability") from error
 
     try:
         redis_client = Redis.from_url(

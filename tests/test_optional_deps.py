@@ -22,7 +22,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Distributions behind an optional extra. None may be loaded as a side effect of
 # importing the package or any module on its pure surface.
-OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler", "cryptography")
+OPTIONAL_DISTRIBUTIONS = (
+    "redis",
+    "boto3",
+    "botocore",
+    "fastapi",
+    "requests",
+    "apscheduler",
+    "cryptography",
+    "psycopg",
+    "alembic",
+)
 
 # Modules a host may import without opting into any extra.
 PURE_MODULES = (
@@ -151,6 +161,32 @@ class TestRequire:
         assert "Redis state" in message
         assert "'redis' package" in message
         assert "pip install 'jasil[redis]'" in message
+
+
+class TestMissingExtrasAtBuildTime:
+    """A Redis or S3 URI without its extra says which extra to install, not just which module is missing."""
+
+    def test_a_redis_uri_without_redis_names_the_extra(self, monkeypatch):
+        import sys
+
+        from jasil._core import redis_clients
+
+        monkeypatch.setitem(sys.modules, "redis", None)
+
+        with pytest.raises(ImportError, match=r"pip install 'jasil\[redis\]'"):
+            redis_clients.create_redis_client("redis://cache:6379/0", purpose="state")
+
+    def test_an_s3_uri_without_boto3_names_the_extra(self, monkeypatch):
+        import sys
+
+        import jasil.container as container
+        import jasil.settings as settings
+
+        monkeypatch.delitem(sys.modules, "jasil.backends.storage_s3", raising=False)
+        monkeypatch.setitem(sys.modules, "boto3", None)
+
+        with pytest.raises(ImportError, match=r"pip install 'jasil\[s3\]'"):
+            container._build_storage(settings.JasilSettings(storage_uri="s3://bucket"))
 
 
 @pytest.mark.parametrize("module", ["jasil.jobs.service", "jasil.retention", "jasil.audit.maintenance"])

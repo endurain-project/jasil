@@ -121,7 +121,8 @@ def install_test_platform(
         clock: Time source to install. Defaults to a fresh :class:`FixedClock`.
         settings: Base configuration to build from. Defaults to an all-defaults
             :class:`~jasil.settings.JasilSettings`; ``data_dir`` is applied on top
-            either way. It is also installed via ``jasil.settings.configure`` so
+            either way, and a ``local://<path>`` storage URI becomes ``local://`` so
+            storage stays under ``data_dir``. It is also installed via ``jasil.settings.configure`` so
             code reading the settings directly agrees with the platform. When
             ``mail.uri`` is unset (or empty) it becomes ``memory://``, so sent
             messages land in the outbox :func:`memory_mail` returns — unless the
@@ -138,6 +139,9 @@ def install_test_platform(
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
     """
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
+    if configured.storage_uri and configured.storage_uri.startswith("local://"):
+        # An explicit ``local://<path>`` would root storage outside the test's directory.
+        configured = replace(configured, storage_uri="local://")
     if not configured.realtime_uri:
         # An unset realtime URI follows the event bus, which may be (fake)
         # Redis; a test wants hints delivered inline and capturable instead.
@@ -339,7 +343,9 @@ def reset_all() -> None:
     :func:`jasil.orm.configure_sessionmaker` itself.
 
     Does not close the platform: call :meth:`jasil.container.Platform.close`
-    first if this process opened real connections.
+    first if this process opened real connections. Does not stop a durable-job
+    worker a test started: call ``jasil.jobs.stop_job_worker`` (or
+    :func:`jasil.lifecycle.shutdown`) for that.
     """
     if platform_runtime.is_platform_active():
         realtime = platform_runtime.get_active_platform().realtime

@@ -101,9 +101,6 @@ class Platform:
             processes holding client connections need to); :meth:`close` stops it.
     """
 
-    # The shared Redis clients this platform's backends took, which :meth:`close` gives back. Set by
-    # ``build_platform``; a platform assembled by hand took none through it and releases none.
-
     profile: DeploymentProfile
     state: StateProvider
     storage: StorageProvider
@@ -115,6 +112,8 @@ class Platform:
     mail: MailProvider = field(default_factory=NullMail)
     realtime: RealtimeProvider = field(default_factory=InProcessRealtime)
     audit_sink: AuditSink | None = None
+    # The shared Redis clients this platform's backends took, which :meth:`close` gives back. Set by
+    # ``build_platform``; a platform assembled by hand took none through it and releases none.
     _shared_redis: list[redis_clients.ClientKey] = field(default_factory=list, repr=False, compare=False)
 
     def close(self) -> None:
@@ -137,7 +136,10 @@ class Platform:
             self.events.stop()
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
-        self.realtime.stop()  # the provider contract: never raises
+        try:
+            self.realtime.stop()
+        except Exception as error:
+            logger.warning("Failed to stop the realtime provider during shutdown: %r", error)
         # Taken out first, so a second close has nothing left to give back.
         shared, self._shared_redis[:] = list(self._shared_redis), []
         redis_clients.release_shared_clients(shared)

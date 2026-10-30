@@ -294,6 +294,19 @@ class TestCorrelationId:
 
         assert correlation.get_correlation_id() is None
 
+    def test_a_broken_provider_is_logged_once_by_type_only(self, caplog):
+        def _broken() -> str:
+            raise RuntimeError("token=s3cret")
+
+        correlation.configure_provider(_broken)
+
+        with caplog.at_level("WARNING"):
+            correlation.get_correlation_id()
+            correlation.get_correlation_id()
+
+        assert caplog.text.count("RuntimeError") == 1
+        assert "s3cret" not in caplog.text
+
     def test_clearing_the_provider_restores_the_context_var(self):
         correlation.set_correlation_id("req-1")
         correlation.configure_provider(lambda: "from-host")

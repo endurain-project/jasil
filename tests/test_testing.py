@@ -40,6 +40,17 @@ class TestFixedClock:
         assert jasil_testing.memory_mail(platform).built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
 
 
+class TestStorageRoot:
+    def test_an_explicit_local_path_in_the_settings_is_rooted_in_data_dir_instead(self, tmp_path):
+        """Otherwise a test writes outside its temporary directory and nothing is hermetic."""
+        elsewhere = tmp_path / "elsewhere"
+        configured = jasil_settings.JasilSettings(storage_uri=f"local://{elsewhere}")
+
+        platform = jasil_testing.install_test_platform(tmp_path / "data", settings=configured)
+
+        assert platform.storage._base.resolve() == (tmp_path / "data").resolve()
+
+
 class TestTestMail:
     def test_an_empty_mail_uri_is_recorded_too(self, tmp_path):
         """An empty value (an unset environment variable) means unset, as in the build."""

@@ -325,7 +325,7 @@ class GeocodingSettings:
             requires an identifying value, so hosts should set their own.
     """
 
-    uri: str | None = None
+    uri: str | None = field(default=None, repr=False)
     rate_limit: float = 1.0
     api_key: str | None = field(default=None, repr=False)
     user_agent: str = "jasil (ReverseGeocoding)"
@@ -361,7 +361,7 @@ class MailSettings:
             name.
     """
 
-    uri: str | None = None
+    uri: str | None = field(default=None, repr=False)
     from_address: str = ""
     secure: bool = True
     username: str | None = None

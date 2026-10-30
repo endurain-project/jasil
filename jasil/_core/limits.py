@@ -97,9 +97,10 @@ def check_length(value: str, *, field: str, limit: int) -> None:
             would route to the wrong subscribers, or to none at all.
     """
     if len(value) > limit:
+        # The value is not echoed: callers pass host-supplied identifiers, and a token-like one must not reach a log.
         raise ValueError(
             f"{field} is {len(value)} characters, which exceeds the {limit}-character limit "
-            f"and would be rejected or truncated on write: {value[:limit]!r}..."
+            "and would be rejected or truncated on write"
         )
 
 

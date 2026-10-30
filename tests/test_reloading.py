@@ -48,6 +48,44 @@ class Source:
         return self.value
 
 
+class TestAStaleRead:
+    def test_a_slow_older_read_never_replaces_a_newer_backend(self):
+        """The settings the operator replaced must not come back because their read finished last."""
+        from jasil._reloading import ReloadingBackend
+
+        first_read_started = threading.Event()
+        release_first_read = threading.Event()
+        reads = []
+        builds = []
+
+        def source():
+            reads.append(1)
+            if len(reads) == 1:
+                first_read_started.set()
+                release_first_read.wait(timeout=5)
+                return "A"
+            return "B"
+
+        def build(value):
+            builds.append(value)
+            return f"backend-{value}"
+
+        backend = ReloadingBackend("Test", source, build)
+        outcomes = []
+        slow = threading.Thread(target=lambda: outcomes.append(backend.resolve()))
+        slow.start()
+        assert first_read_started.wait(timeout=5)
+
+        newer = backend.resolve()
+        release_first_read.set()
+        slow.join(timeout=5)
+
+        assert builds == ["B"]
+        assert backend.current_backend() == "backend-B"
+        assert newer.backend == "backend-B"
+        assert outcomes[0].backend == "backend-B"
+
+
 def _mail(source, base: JasilSettings | None = None):
     return container._build_runtime_mail(base or JasilSettings(), container.SystemClock(), source)
 
