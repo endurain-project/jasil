@@ -56,6 +56,18 @@ def is_valid_hostname(value: str) -> bool:
     return len(value) <= 253 and _HOSTNAME_RE.fullmatch(value) is not None
 
 
+# ``is_private`` is True for these in Python before 3.12.4, but IANA marks them globally reachable: the PCP and TURN
+# anycast addresses, AMT, AS112, ORCHIDv2 and the drone remote ID prefix, all inside ``2001::/23``.
+_GLOBALLY_REACHABLE_NETWORKS = (
+    ipaddress.IPv6Network("2001:1::1/128"),
+    ipaddress.IPv6Network("2001:1::2/128"),
+    ipaddress.IPv6Network("2001:3::/32"),
+    ipaddress.IPv6Network("2001:4:112::/48"),
+    ipaddress.IPv6Network("2001:20::/28"),
+    ipaddress.IPv6Network("2001:30::/28"),
+)
+
+
 def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Return True if ``addr`` is anything but a public unicast address.
 
@@ -69,6 +81,9 @@ def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address)
     # Python 3.12.0-3.12.3 call ``::ffff:8.8.8.8`` private; judge the embedded IPv4.
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
+    # The same interpreters call 6to4 and Teredo addresses global, whatever IPv4 host they encode.
+    if isinstance(addr, ipaddress.IPv6Address) and any(addr in net for net in _TUNNELLED_NETWORKS):
+        return True
     return (
         addr.is_private
         or addr.is_loopback
@@ -200,6 +215,7 @@ def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
             not (addr.is_private or addr.is_loopback or addr.is_link_local)
             or addr.is_multicast
             or any(addr in net for net in _TUNNELLED_NETWORKS)
+            or any(addr in net for net in _GLOBALLY_REACHABLE_NETWORKS)
         ):
             return [], "resolves to a public address"
         if text not in addresses:

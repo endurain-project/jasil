@@ -229,6 +229,25 @@ class TestResponseParsing:
         )
 
     @responses.activate
+    def test_a_name_that_is_oversized_or_carries_control_characters_is_treated_as_absent(self, backend):
+        """The upstream is untrusted: its strings end up in a host's columns and logs."""
+        responses.add(
+            responses.GET,
+            "https://geo.test/reverse",
+            json={
+                "display_name": "x" * 5000,
+                "address": {
+                    "city": "L" * 5000,
+                    "town": "Lis\x1b[31mboa\n",
+                    "village": "Alvalade",
+                    "country": "Portugal\x00",
+                },
+            },
+        )
+
+        assert backend.reverse(38.7, -9.1) == GeocodedPlace(locality="Alvalade")
+
+    @responses.activate
     def test_a_photon_answer_is_mapped(self):
         """Photon names things differently, but lands on the same levels."""
         backend = HttpGeocoding("photon", "https://geo.test/reverse")

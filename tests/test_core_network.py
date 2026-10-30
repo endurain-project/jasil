@@ -99,6 +99,10 @@ class TestNonPublicAddresses:
             pytest.param("100.100.100.200", id="shared-address-space-cloud-metadata"),
             pytest.param("100.64.0.1", id="shared-address-space"),
             pytest.param("fec0::1", id="ipv6-site-local"),
+            pytest.param("2002:a00:1::", id="6to4-of-a-private-address"),
+            pytest.param("2002:a9fe:a9fe::", id="6to4-of-the-metadata-address"),
+            pytest.param("2002:808:808::", id="6to4-of-a-public-address"),
+            pytest.param("64:ff9b:1::a00:1", id="nat64-local-use"),
         ],
     )
     def test_a_non_public_address_is_refused(self, resolve, ip):
@@ -240,6 +244,18 @@ class TestAllowlist:
     ids=["nat64", "teredo", "6to4"],
 )
 def test_tunnelled_ipv6_ranges_are_not_private_for_cleartext(monkeypatch, address):
+    monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
+    addresses, reason = network.resolve_private_addresses("relay.internal")
+    assert addresses == [] and reason is not None
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["2001:1::1", "2001:1::2", "2001:3::1", "2001:4:112::1", "2001:20::1", "2001:30::1"],
+    ids=["pcp-anycast", "turn-anycast", "amt", "as112", "orchidv2", "drone-remote-id"],
+)
+def test_the_globally_reachable_corners_of_2001_are_not_private_for_cleartext(monkeypatch, address):
+    """Python before 3.12.4 calls these private; IANA marks them globally reachable."""
     monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
     addresses, reason = network.resolve_private_addresses("relay.internal")
     assert addresses == [] and reason is not None

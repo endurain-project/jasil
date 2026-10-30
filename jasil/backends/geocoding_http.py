@@ -167,11 +167,21 @@ def _failure_detail(error: Exception) -> str:
     return f"{type(error).__name__} (HTTP {status})" if status is not None else type(error).__name__
 
 
-def _first(data: dict, *names: str) -> str | None:
-    """Return the first non-empty string value among ``names`` in ``data``."""
+# Longest name taken from the upstream. A real place name is a few dozen characters, and the full line a service
+# composes ("display_name") a few hundred; anything longer is not a place.
+_MAX_NAME_CHARACTERS = 256
+_MAX_DISPLAY_NAME_CHARACTERS = 1024
+
+
+def _first(data: dict, *names: str, limit: int = _MAX_NAME_CHARACTERS) -> str | None:
+    """Return the first usable string value among ``names`` in ``data``.
+
+    The upstream is untrusted, so a value is usable only when it is non-empty, at most ``limit`` characters
+    and free of control characters; one that is not is treated as absent and the next name is tried.
+    """
     for name in names:
         value = data.get(name)
-        if isinstance(value, str) and value:
+        if isinstance(value, str) and value and len(value) <= limit and value.isprintable():
             return value
     return None
 
@@ -269,7 +279,7 @@ class HttpGeocoding:
                 region=_first(data, "state", "region", "province"),
                 country=_first(data, "country"),
                 country_code=_country_code(data.get("country_code")),
-                display_name=_first(payload, "display_name"),
+                display_name=_first(payload, "display_name", limit=_MAX_DISPLAY_NAME_CHARACTERS),
             )
         return place if any(vars(place).values()) else None
 
