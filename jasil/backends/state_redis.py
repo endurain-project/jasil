@@ -133,10 +133,14 @@ class RedisState:
         # INCRBY is atomic and leaves any existing TTL untouched; only (re)set
         # expiry when the caller asks for one, mirroring the memory backend.
         _check_ttl(ttl_seconds)
-        new_value = int(self._client.incrby(key, amount))
-        if ttl_seconds is not None:
-            self._client.expire(key, ttl_seconds)
-        return new_value
+        if ttl_seconds is None:
+            return int(self._client.incrby(key, amount))
+        # One MULTI/EXEC, so a failure between the two cannot leave a counter that never expires.
+        with self._client.pipeline(transaction=True) as pipeline:
+            pipeline.incrby(key, amount)
+            pipeline.expire(key, ttl_seconds)
+            new_value, _ = pipeline.execute()
+        return int(new_value)
 
     @_translate_state_errors
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
@@ -165,7 +169,12 @@ class RedisState:
         # Materialised eagerly so a mid-scan Redis failure is translated here
         # rather than leaking out of a half-consumed generator.
         pattern = f"{redis_clients.glob_escape(prefix)}*"
-        keys = [key.decode() if isinstance(key, bytes) else key for key in self._client.scan_iter(match=pattern)]
+        keys: dict[str, None] = {}  # SCAN may return a key more than once; order is kept
+        for key in self._client.scan_iter(match=pattern):
+            try:
+                keys[key.decode() if isinstance(key, bytes) else key] = None
+            except UnicodeDecodeError:
+                continue  # not a key this provider wrote: it only ever stores text names
         return iter(keys)
 
     @_translate_state_errors

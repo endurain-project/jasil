@@ -1,5 +1,6 @@
 """In-process ``StateProvider`` backend."""
 
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -9,6 +10,17 @@ from jasil.providers import TieredFailureOutcome
 #: How often a write also drops every expired key. Expiry is otherwise lazy, on read, and a key that is never
 #: read again (a rate-limit counter for a client that left) would stay in memory for the life of the process.
 SWEEP_INTERVAL_SECONDS = 60
+
+
+# What Redis accepts as an integer: an optional minus sign and no leading zeros, with nothing around it.
+_INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)")
+
+
+def _parse_integer(raw: bytes) -> int:
+    """Read a stored counter as Redis does, refusing what ``int()`` would let through (spaces, underscores)."""
+    if _INTEGER.fullmatch(raw) is None:
+        raise ValueError("value is not an integer or out of range")
+    return int(raw)
 
 
 class MemoryState:
@@ -76,7 +88,7 @@ class MemoryState:
         with self._lock:
             self._sweep_if_due()
             current_bytes = self._live_value(key)
-            current = int(current_bytes.decode()) if current_bytes is not None else 0
+            current = _parse_integer(current_bytes) if current_bytes is not None else 0
             new_value = current + amount
             if ttl_seconds is not None:
                 expiry: float | None = time.monotonic() + ttl_seconds
@@ -111,9 +123,11 @@ class MemoryState:
         _check_prefix(prefix)
         with self._lock:
             matching = [key for key in self._data if key.startswith(prefix)]
+            # An expired key the sweep has not dropped yet is not a key any more: Redis never counts it.
+            deleted = sum(1 for key in matching if self._live_value(key) is not None)
             for key in matching:
-                del self._data[key]
-            return len(matching)
+                self._data.pop(key, None)
+            return deleted
 
     def iter_keys(self, prefix: str) -> Iterator[str]:
         """Return an iterator over a snapshot of the unexpired keys starting with ``prefix``."""
@@ -140,15 +154,15 @@ class MemoryState:
             # locked-out caller cannot keep inflating the counter.
             gate_bytes = self._live_value(gate_key)
             if gate_bytes is not None:
-                gate_until = int(gate_bytes.decode())
+                gate_until = _parse_integer(gate_bytes)
                 if gate_until > now:
                     counter_bytes = self._live_value(counter_key)
-                    count = int(counter_bytes.decode()) if counter_bytes is not None else 0
+                    count = _parse_integer(counter_bytes) if counter_bytes is not None else 0
                     return TieredFailureOutcome(count, gate_until, False)
                 self._data.pop(gate_key, None)  # expired gate
 
             counter_bytes = self._live_value(counter_key)
-            count = (int(counter_bytes.decode()) if counter_bytes is not None else 0) + 1
+            count = (_parse_integer(counter_bytes) if counter_bytes is not None else 0) + 1
             self._data[counter_key] = (str(count).encode(), time.monotonic() + counter_ttl_seconds)
 
             lock_seconds = 0

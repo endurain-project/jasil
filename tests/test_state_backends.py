@@ -305,6 +305,31 @@ class TestMemoryBackendExpiry:
 
         assert state.set_if_absent("lock", b"second") is True
 
+    def test_delete_prefix_counts_only_the_keys_that_were_still_alive(self, clock):
+        """Redis never lists an expired key, so the count must not include one the sweep has not dropped yet."""
+        state = MemoryState()
+        state.set("p:gone", b"x", ttl_seconds=10)
+        state.set("p:kept", b"x")
+
+        clock["now"] += 11
+
+        assert state.delete_prefix("p:") == 1
+        assert state.get("p:kept") is None
+
+    @pytest.mark.parametrize("stored", [b" 5", b"1_0", b"5 ", b"+5", b"05", b"\xd9\xa5", b"1.5", b""])
+    def test_incr_refuses_what_redis_would_not_parse(self, stored):
+        state = MemoryState()
+        state.set("k", stored)
+
+        with pytest.raises(ValueError, match="not an integer"):
+            state.incr("k")
+
+    def test_incr_parses_negative_integers(self):
+        state = MemoryState()
+        state.set("k", b"-3")
+
+        assert state.incr("k", 5) == 2
+
     def test_incr_preserves_an_existing_expiry(self, clock):
         """Re-arming the TTL on every increment would let a steady stream of
         failures keep a rate-limit window alive forever."""
@@ -393,6 +418,36 @@ class TestRedisBackendErrorTranslation:
             failing_state.get("k")
 
         assert excinfo.value.__cause__ is not None
+
+    def test_incrementing_with_a_ttl_never_sends_a_separate_expire(self):
+        """INCRBY and EXPIRE travel together: a failure between two commands would leave a counter that never expires."""
+        sent: list[str] = []
+
+        class _Spy(fakeredis.FakeStrictRedis):
+            def expire(self, *args, **kwargs):
+                sent.append("expire")
+                return super().expire(*args, **kwargs)
+
+            def incrby(self, *args, **kwargs):
+                sent.append("incrby")
+                return super().incrby(*args, **kwargs)
+
+        client = _Spy(decode_responses=False)
+
+        assert RedisState(client).incr("k", ttl_seconds=30) == 1
+        assert sent == []
+        assert 0 < client.ttl("k") <= 30
+
+    def test_scanning_lists_a_key_once_and_skips_one_that_is_not_text(self):
+        class _Repeating(fakeredis.FakeStrictRedis):
+            def scan_iter(self, *args, **kwargs):
+                yield from list(super().scan_iter(*args, **kwargs)) * 2
+
+        client = _Repeating(decode_responses=False)
+        client.set("p:a", b"1")
+        client.set(b"p:\xff\xfe", b"1")
+
+        assert sorted(RedisState(client).iter_keys("p:")) == ["p:a"]
 
     def test_a_key_holding_another_type_is_a_value_error_not_an_outage(self):
         """Only a server that cannot serve is unavailable; a refused value is the caller's problem."""
