@@ -9,6 +9,7 @@ same invalid message production (``SmtpMail``) would.
 
 import contextlib
 import logging
+import os
 import smtplib
 import socket
 import ssl
@@ -25,6 +26,11 @@ from jasil._core.mail_message import build_mime
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.providers import MailError, MailMessage, MailNotConfiguredError, MailProvider
+
+# Windows: shutdown() does not wake a thread blocked in recv(), so the watchdog cannot interrupt a read there; only the per-read timeout bounds one.
+CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
+    os.name == "nt", reason="Windows: shutdown() does not wake a thread blocked in recv()"
+)
 
 REAL_SMTP, REAL_SMTP_SSL = smtplib.SMTP, smtplib.SMTP_SSL
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -805,6 +811,7 @@ class TestTheWatchdog:
         watchdog.start()
         return expired, finished, watchdog
 
+    @CANNOT_INTERRUPT_A_READ
     def test_it_releases_a_read_through_the_duplicate_it_watches(self, monkeypatch, blocked_read):
         """``watched`` is a duplicate of the raw socket; shutting it down reaches a TLS-wrapped read too."""
         sock, released = blocked_read
@@ -819,6 +826,7 @@ class TestTheWatchdog:
             watchdog.join(timeout=5)
             connection.watched.close()
 
+    @CANNOT_INTERRUPT_A_READ
     def test_a_socket_that_appears_after_the_deadline_is_shut_down_too(self, monkeypatch, blocked_read):
         """A slow connect hands the socket over only after the deadline; one shutdown attempt would miss it."""
         sock, released = blocked_read

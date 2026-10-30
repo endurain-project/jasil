@@ -17,6 +17,7 @@ intercepts the requests.
 
 import contextlib
 import itertools
+import os
 import socket
 import ssl
 import threading
@@ -34,6 +35,11 @@ from jasil.backends.geocoding_http import (
     resolve_reverse_endpoint,
 )
 from jasil.providers import GeocodedPlace, GeocodingProvider
+
+# Windows: shutdown() does not wake a thread blocked in recv(), so the watchdog cannot interrupt a read there; only the per-read timeout bounds one.
+CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
+    os.name == "nt", reason="Windows: shutdown() does not wake a thread blocked in recv()"
+)
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.5"
@@ -511,6 +517,7 @@ class TestTheWatchdog:
         theirs.close()
         reader.join(timeout=5)
 
+    @CANNOT_INTERRUPT_A_READ
     def test_expiring_releases_a_blocked_read(self, blocked_read):
         sock, released = blocked_read
         deadline = geocoding_http._Deadline()
@@ -520,6 +527,7 @@ class TestTheWatchdog:
 
         assert released.wait(5)
 
+    @CANNOT_INTERRUPT_A_READ
     def test_a_socket_opened_after_the_deadline_is_shut_down_at_once(self, blocked_read):
         """A slow connect hands its socket over only after the deadline has passed."""
         sock, released = blocked_read
@@ -530,6 +538,7 @@ class TestTheWatchdog:
 
         assert released.wait(5)
 
+    @CANNOT_INTERRUPT_A_READ
     def test_expiring_releases_a_tls_handshake_that_detached_the_watched_socket(self):
         """Wrapping a socket in TLS detaches the original, so the deadline must hold a duplicate of it."""
         ours, theirs = socket.socketpair()
@@ -566,6 +575,7 @@ class TestTheWatchdog:
         ours.close()
         theirs.close()
 
+    @CANNOT_INTERRUPT_A_READ
     def test_an_upstream_that_never_answers_is_cut_off_at_the_deadline(self, monkeypatch, caplog):
         """Headers come before the body loop, so a deadline checked between body reads never sees them."""
         ours, theirs = socket.socketpair()

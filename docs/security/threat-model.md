@@ -37,6 +37,10 @@ whenever configuration is.
   read, so an upstream dripping its reply a byte at a time cannot hold the caller
   past it. Name resolution and the connect are outside it: each connect attempt is
   bounded by the 10-second timeout, and resolution by the system resolver.
+- On Windows `shutdown` does not wake a thread blocked in `recv`, so the watchdog
+  cannot interrupt a read there: only the per-read timeout bounds a stalled
+  upstream, and one dripping a byte at a time is not cut off at the deadline. The
+  same holds for the SMTP deadline below.
 - Failures are logged by exception type and status code only. The `requests`
   error message embeds the request URL, and one supported service carries its
   API key in that URL's query string.
