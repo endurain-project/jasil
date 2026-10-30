@@ -15,6 +15,7 @@ Both paths are optional; with neither configured, events simply carry no
 correlation id.
 """
 
+import logging
 from collections.abc import Callable
 from contextvars import ContextVar
 
@@ -24,6 +25,10 @@ __all__ = [
     "reset",
     "set_correlation_id",
 ]
+
+logger = logging.getLogger(__name__)
+
+_provider_failing = False
 
 _correlation_id: ContextVar[str | None] = ContextVar("jasil_correlation_id", default=None)
 
@@ -58,18 +63,30 @@ def get_correlation_id() -> str | None:
     """Return the ambient correlation id, or ``None``.
 
     Never raises: a provider that fails is treated as "no id", because a
-    correlation id is diagnostic metadata and must not break publishing.
+    correlation id is diagnostic metadata and must not break publishing. The
+    failure is logged once, by exception type, until the provider works again, so a
+    permanently broken one does not strip the id from every event unseen.
     """
+    global _provider_failing
     if _provider is not None:
         try:
-            return _provider()
-        except Exception:
+            correlation_id = _provider()
+        except Exception as error:
+            if not _provider_failing:
+                _provider_failing = True
+                logger.warning(
+                    "The correlation id provider raised %s; events and audit rows carry no request id",
+                    type(error).__name__,
+                )
             return None
+        _provider_failing = False
+        return correlation_id
     return _correlation_id.get()
 
 
 def reset() -> None:
     """Clear the installed provider and the current context's id."""
-    global _provider
+    global _provider, _provider_failing
     _provider = None
+    _provider_failing = False
     _correlation_id.set(None)

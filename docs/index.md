@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.13.0"
+!!! warning "Status: 0.14.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -22,12 +22,14 @@ same code runs single-process on a laptop and multi-replica in production.
 | **Event pipeline** | One envelope, one publish seam, payload versioning that survives a rolling deploy. |
 | **Durable jobs** | A transactional outbox relayed into leased per-subscriber jobs, with backoff and a dead-letter queue. |
 | **Observability** | An event lifecycle log and bounded retention pruning. |
+| **Audit trail** | An append-only record written in the caller's transaction, with partitioned retention and signed checkpoints. |
 
 ## Install
 
 ```bash
 pip install jasil                    # core: memory / local disk / in-process
 pip install "jasil[redis,s3]"        # distributed state, events and storage
+pip install "jasil[audit]"           # Ed25519-signed audit checkpoints
 pip install "jasil[all]"             # every optional backend
 ```
 
@@ -63,7 +65,7 @@ files. You build a settings object from whatever source you like and install it.
     application is built on `AsyncSession` throughout, the event log and durable
     jobs will not fit without a second, synchronous engine.
 
-    Async support is a candidate for a later release; it is not in `0.1.0`.
+    Async support is a candidate for a later release; no release has it yet.
 
 ## Quick start
 
@@ -119,7 +121,8 @@ jasil_lifecycle.shutdown()
 ```
 
 It stops the durable-job worker, then releases the platform — the event-bus
-consumer thread and the shared Redis clients — and unpublishes it. That order
+consumer thread and the shared Redis clients it took, each closed once no other
+platform in the process still uses it — and unpublishes it. That order
 matters: the worker runs subscribers, and a subscriber that publishes needs the
 bus still up. It never raises, and it is safe to call when nothing was started.
 
@@ -185,6 +188,7 @@ time, so clearing it would strand every model already imported.
   payload versioning.
 - [Durable jobs](durable-jobs.md) — retries, leases, and dead-letters.
 - [Observability](observability.md) — the event log and retention.
+- [Audit trail](audit.md) — a complete, append-only record written in the caller's transaction.
 - [Threat model](security/threat-model.md) — what JASIL guards, and what it
   leaves to you.
 - [Integration checklist](security/integration-checklist.md) — the list to work

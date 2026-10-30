@@ -1,10 +1,11 @@
 """Test helpers for applications that embed JASIL.
 
-JASIL installs several things process-wide — settings, a correlation provider, a
-session factory, the active platform, memoized Redis clients, the durable
-subscriber registry — and a test suite has to put every one of them back between
-cases or state leaks from one test into the next. This module is the shared
-version of the fixture every host would otherwise write.
+JASIL installs several things process-wide — settings, a correlation provider, the
+active platform, memoized Redis clients, the durable subscriber registry, the
+audit state — and a test suite has to put every one of them back between cases or
+state leaks from one test into the next. This module is the shared version of the
+fixture every host would otherwise write. The ORM mapping and the session factory
+are configured once for the whole suite and left in place.
 
 Nothing here is imported by the library itself, and nothing here needs an
 optional extra::
@@ -18,11 +19,15 @@ optional extra::
         jasil_testing.reset_all()
 """
 
-from dataclasses import dataclass, replace
+from collections.abc import Generator
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import jasil._core.redis_clients as redis_clients
+import jasil.audit as jasil_audit
+import jasil.audit.service as audit_service
 import jasil.capabilities as capabilities
 import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
@@ -34,9 +39,11 @@ from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.container import Platform, build_platform
 
 __all__ = [
+    "AuditCapture",
     "FixedClock",
     "InProcessRealtime",
     "MemoryMail",
+    "capture_audit",
     "capture_hints",
     "install_test_platform",
     "memory_mail",
@@ -114,7 +121,8 @@ def install_test_platform(
         clock: Time source to install. Defaults to a fresh :class:`FixedClock`.
         settings: Base configuration to build from. Defaults to an all-defaults
             :class:`~jasil.settings.JasilSettings`; ``data_dir`` is applied on top
-            either way. It is also installed via ``jasil.settings.configure`` so
+            either way, and a ``local://<path>`` storage URI becomes ``local://`` so
+            storage stays under ``data_dir``. It is also installed via ``jasil.settings.configure`` so
             code reading the settings directly agrees with the platform. When
             ``mail.uri`` is unset (or empty) it becomes ``memory://``, so sent
             messages land in the outbox :func:`memory_mail` returns — unless the
@@ -131,6 +139,9 @@ def install_test_platform(
         The published :class:`~jasil.container.Platform`, carrying ``clock``.
     """
     configured = replace(settings or jasil_settings.JasilSettings(), data_dir=str(data_dir))
+    if configured.storage_uri and configured.storage_uri.startswith("local://"):
+        # An explicit ``local://<path>`` would root storage outside the test's directory.
+        configured = replace(configured, storage_uri="local://")
     if not configured.realtime_uri:
         # An unset realtime URI follows the event bus, which may be (fake)
         # Redis; a test wants hints delivered inline and capturable instead.
@@ -215,23 +226,126 @@ def capture_hints(platform: Platform) -> list[tuple[str, dict]]:
     return captured
 
 
+@dataclass
+class AuditCapture:
+    """The audit rows staged or recorded while a :func:`capture_audit` block was open.
+
+    Attributes:
+        entries: Every entry, in the order it was staged. An entry is captured when it is *staged*, so a
+            row whose transaction later rolled back is still listed; assert on the database to test
+            that.
+    """
+
+    entries: list[jasil_audit.AuditEntry] = field(default_factory=list)
+
+    def matching(
+        self,
+        action_id: str,
+        *,
+        outcome: jasil_audit.Outcome | str | None = None,
+        target_id: str | None = None,
+        **fields: object,
+    ) -> list[jasil_audit.AuditEntry]:
+        """Return the captured entries that match every given criterion.
+
+        Args:
+            action_id: The action id.
+            outcome: The outcome, when it matters.
+            target_id: The target id, when it matters.
+            **fields: Any other :class:`~jasil.audit.AuditEntry` field and the value it must have.
+
+        Returns:
+            The matching entries, in staging order.
+        """
+        wanted: dict[str, object] = {"action_id": action_id, **fields}
+        if outcome is not None:
+            wanted["outcome"] = str(jasil_audit.Outcome(outcome))
+        if target_id is not None:
+            wanted["target_id"] = target_id
+        return [entry for entry in self.entries if all(getattr(entry, name) == value for name, value in wanted.items())]
+
+    def assert_audited(
+        self,
+        action_id: str,
+        *,
+        outcome: jasil_audit.Outcome | str | None = None,
+        target_id: str | None = None,
+        **fields: object,
+    ) -> jasil_audit.AuditEntry:
+        """Assert that at least one captured entry matches, and return the first.
+
+        Args:
+            action_id: The action id.
+            outcome: The outcome, when it matters.
+            target_id: The target id, when it matters.
+            **fields: Any other :class:`~jasil.audit.AuditEntry` field and the value it must have.
+
+        Returns:
+            The first matching entry, for further assertions on its ``details``.
+
+        Raises:
+            AssertionError: When nothing matches; the message lists what was captured.
+        """
+        found = self.matching(action_id, outcome=outcome, target_id=target_id, **fields)
+        if not found:
+            captured = ", ".join(f"{entry.action_id}[{entry.outcome}]" for entry in self.entries) or "nothing"
+            raise AssertionError(
+                f"{action_id} was not audited (outcome={outcome}, target_id={target_id}); got {captured}"
+            )
+        return found[0]
+
+    def assert_not_audited(self, action_id: str) -> None:
+        """Assert that no captured entry has ``action_id``.
+
+        Args:
+            action_id: The action id.
+
+        Raises:
+            AssertionError: When one does.
+        """
+        if self.matching(action_id):
+            raise AssertionError(f"{action_id} was audited")
+
+
+@contextmanager
+def capture_audit() -> Generator[AuditCapture]:
+    """Collect every audit entry staged or recorded inside the block.
+
+    Entries are captured after validation and before persistence, so the capture works with
+    ``audit.enabled = False``, without a database, and the same whether durable jobs are enabled or not —
+    audit rows never go through the bus or the outbox.
+
+    Yields:
+        The capture, which fills as the block runs.
+    """
+    capture = AuditCapture()
+    remove = audit_service.add_observer(capture.entries.append)
+    try:
+        yield capture
+    finally:
+        remove()
+
+
 def reset_all() -> None:
     """Clear every process-wide slot JASIL installs, except the ORM mapping.
 
-    Covers the settings, the correlation provider, the published platform (and
+    Covers the settings, the correlation provider, the audit catalog and context, the published platform (and
     the realtime handlers registered on it), the durable subscriber registry, and
     the memoized Redis clients. Call it in
     fixture teardown; leaving any one of them set is how a passing test starts
     depending on the one before it.
 
-    **The declarative base is deliberately left alone.** JASIL's model modules
-    capture it at import time, so clearing it would strand every model already
-    imported — and a test module that imports one at module scope cannot re-import
-    it. Map once for the whole session and leave it mapped. Call
-    :func:`jasil.orm.reset` yourself only if you genuinely need to remap.
+    **The declarative base and the session factory are deliberately left alone.**
+    JASIL's model modules capture the base at import time, so they cannot be mapped
+    onto another one in the same process; map once for the whole session and leave
+    it mapped. The session factory usually belongs to a session-wide database
+    fixture, so a suite that swaps engines between tests calls
+    :func:`jasil.orm.configure_sessionmaker` itself.
 
     Does not close the platform: call :meth:`jasil.container.Platform.close`
-    first if this process opened real connections.
+    first if this process opened real connections. Does not stop a durable-job
+    worker a test started: call ``jasil.jobs.stop_job_worker`` (or
+    :func:`jasil.lifecycle.shutdown`) for that.
     """
     if platform_runtime.is_platform_active():
         realtime = platform_runtime.get_active_platform().realtime
@@ -241,6 +355,7 @@ def reset_all() -> None:
             realtime.clear()
     jasil_settings.reset()
     correlation.reset()
+    jasil_audit.reset()
     platform_runtime.reset()
     jobs_registry.registry.clear()
     redis_clients.reset_shared_clients()

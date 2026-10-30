@@ -81,7 +81,7 @@ def parse_profile(value: str | DeploymentProfile | None) -> DeploymentProfile:
     """Parse a raw profile value into a ``DeploymentProfile``.
 
     Args:
-        value: Raw environment value, an existing profile, or ``None``.
+        value: A profile name (case and surrounding space ignored), a profile, or ``None``.
 
     Returns:
         The parsed profile; ``DeploymentProfile.LOCAL`` when unset or empty.
@@ -103,14 +103,14 @@ def parse_profile(value: str | DeploymentProfile | None) -> DeploymentProfile:
         return DeploymentProfile(normalized)
     except ValueError as err:
         valid = ", ".join(profile.value for profile in DeploymentProfile)
-        raise ValueError(f"Invalid DEPLOYMENT_PROFILE '{value}'. Valid values: {valid}.") from err
+        raise ValueError(f"Invalid deployment profile '{value}'. Valid values: {valid}.") from err
 
 
 def parse_job_worker_mode(value: str | JobWorkerMode | None) -> JobWorkerMode:
     """Parse a raw job-worker-mode value into a ``JobWorkerMode``.
 
     Args:
-        value: Raw environment value, an existing mode, or ``None``.
+        value: A mode name (case and surrounding space ignored), a mode, or ``None``.
 
     Returns:
         The parsed mode; ``JobWorkerMode.IN_PROCESS`` when unset or empty.

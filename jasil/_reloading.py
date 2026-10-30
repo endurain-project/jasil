@@ -10,6 +10,7 @@ Private to JASIL: hosts reach it only through
 ``build_platform(..., sources=RuntimeSources(...))``.
 """
 
+import itertools
 import logging
 import threading
 import time
@@ -36,7 +37,7 @@ class SourceUnavailableError(Exception):
 class TransientBuildError(ValueError):
     """A build failed for a reason that may pass (a DNS lookup that did not answer).
 
-    Still a ``ValueError``, so a startup build fails with it as before; a
+    Still a ``ValueError``, so a startup build fails with it; a
     reloading provider caches it only for :data:`TRANSIENT_RETRY_SECONDS`.
     """
 
@@ -82,6 +83,9 @@ class ReloadingBackend[S, B]:
         self._lock = threading.Lock()
         self._current: Outcome[S, B] | None = None
         self._source_failing = False
+        # Numbers each read in the order it began, so a slow older read cannot overwrite what a newer one built.
+        self._reads = itertools.count()
+        self._applied_read = -1
 
     def current_backend(self) -> B | None:
         """The backend built from the latest settings, without consulting the source."""
@@ -97,6 +101,7 @@ class ReloadingBackend[S, B]:
                 an older backend: its credentials may be the very thing the
                 operator just revoked.
         """
+        read = next(self._reads)
         try:
             fresh = self._source()
         except Exception as error:
@@ -107,10 +112,14 @@ class ReloadingBackend[S, B]:
                 current = self._current
             if current is not None and current.backend is not None:
                 return current
-            raise SourceUnavailableError(f"{self._label} settings could not be loaded") from error
+            raise SourceUnavailableError(f"{self._label} settings could not be loaded") from None
         with self._lock:
             self._source_failing = False
             current = self._current
+            if current is not None and read < self._applied_read:
+                # A read that began after this one has already been applied: its settings are the newer ones.
+                return current
+            self._applied_read = read
             # One build per change, under the lock: every other caller needs that
             # same new backend, so none gains by running ahead of it.
             if current is None or current.settings != fresh or self._retry_due(current):
@@ -170,8 +179,9 @@ class ReloadingMail:
         """
         try:
             outcome = self._backend.resolve()
-        except SourceUnavailableError as error:
-            raise MailError("Mail settings could not be loaded") from error.__cause__
+        except SourceUnavailableError:
+            # Not chained: the source's exception is the host's, and its text may carry a secret.
+            raise MailError("Mail settings could not be loaded") from None
         if outcome.transient:
             raise MailError("Mail settings could not be verified; retry")
         if outcome.backend is None:

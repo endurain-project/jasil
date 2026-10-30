@@ -10,7 +10,9 @@ Three additions to the durable-job tables, shipped as one revision:
   that claims or finishes it. Previous-release workers neither read nor write it.
 
 The new release requires all of it, so run this migration before deploying the
-new code.
+new code. The two ``processing_jobs`` indexes are built last; on PostgreSQL
+concurrently, after the rest is committed, so a run that fails during a build is
+resumed by the next one.
 
 Revision ID: rev0002
 Revises: rev0001
@@ -23,6 +25,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
+from jasil.migrations import _online as online
 from jasil.migrations._names import index as ix
 from jasil.migrations._names import table as tb
 
@@ -35,6 +38,18 @@ _JSON = sa.JSON().with_variant(JSONB(), "postgresql")
 
 
 def upgrade() -> None:
+    if not online.resumed(tb("processing_jobs"), "queue"):
+        _add_queues_workers_and_attempts()
+    # Last: on PostgreSQL each build first commits the work above, so it can run without blocking the
+    # previous release's workers. ``status`` leads so a claim's range scan over queues never walks retained
+    # completed or dead-letter rows.
+    online.create_index(
+        ix("idx_processing_jobs_queue_claim"), tb("processing_jobs"), ["status", "queue", "available_at"]
+    )
+    online.create_index(ix("idx_processing_jobs_worker_claim"), tb("processing_jobs"), ["status", "locked_by"])
+
+
+def _add_queues_workers_and_attempts() -> None:
     op.add_column(
         tb("processing_jobs"),
         sa.Column(
@@ -44,13 +59,6 @@ def upgrade() -> None:
             server_default="default",
             comment="Named queue used to select which workers may claim the job",
         ),
-    )
-    # ``status`` leads so a claim's range scan over queues never walks retained
-    # completed or dead-letter rows.
-    op.create_index(
-        ix("idx_processing_jobs_queue_claim"),
-        tb("processing_jobs"),
-        ["status", "queue", "available_at"],
     )
     op.create_table(
         tb("job_workers"),
@@ -82,7 +90,6 @@ def upgrade() -> None:
     )
     op.create_index(ix("idx_job_workers_heartbeat"), tb("job_workers"), ["last_heartbeat_at"])
     op.create_index(ix("idx_job_workers_stopped"), tb("job_workers"), ["stopped_at"])
-    op.create_index(ix("idx_processing_jobs_worker_claim"), tb("processing_jobs"), ["status", "locked_by"])
     op.create_table(
         tb("job_attempts"),
         sa.Column("id", sa.String(36), primary_key=True, comment="Attempt identifier (UUIDv4)"),

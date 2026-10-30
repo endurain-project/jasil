@@ -5,6 +5,7 @@ must share a transaction with. Everything here reads, or prunes, and is surfaced
 to hosts through :mod:`jasil.admin`.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -13,6 +14,7 @@ from sqlalchemy import and_, case, delete, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from jasil._core.cursors import decode_cursor, encode_cursor
+from jasil._core.limits import check_limit
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil.jobs.models import JobAttempt, ProcessingJob
 from jasil.jobs.schema import DurationBuckets, EventJobs, JobAttemptInfo, JobDetail, WorkerAttempts
@@ -140,7 +142,7 @@ def last_worker_ids(db: Session, job_ids: list[str]) -> dict[str, str]:
 
 
 def _history(db: Session, job_id: str, limit: int) -> list[JobAttemptInfo]:
-    attempts = (
+    attempts: Sequence[JobAttempt] = (
         db.execute(
             select(JobAttempt)
             .where(JobAttempt.job_id == job_id)
@@ -151,11 +153,6 @@ def _history(db: Session, job_id: str, limit: int) -> list[JobAttemptInfo]:
         .all()
     )
     return [JobAttemptInfo.model_validate(attempt) for attempt in attempts]
-
-
-def check_limit(limit: int, *, maximum: int, name: str) -> None:
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= maximum:
-        raise ValueError(f"{name} must be an integer between 1 and {maximum}")
 
 
 def get_job_detail(
@@ -185,7 +182,7 @@ def get_event_jobs(
 ) -> EventJobs:
     """Return every subscriber's job for ``event_id``, each with its newest attempts."""
     check_limit(attempt_limit, maximum=MAX_ATTEMPT_LIMIT, name="attempt_limit")
-    jobs = (
+    jobs: Sequence[ProcessingJob] = (
         db.execute(
             select(ProcessingJob)
             .where(ProcessingJob.event_id == event_id)
@@ -223,7 +220,7 @@ def get_worker_attempts(
                 and_(JobAttempt.claimed_at == claimed_at, JobAttempt.id < attempt_id),
             )
         )
-    rows = list(
+    rows: list[JobAttempt] = list(
         db.execute(statement.order_by(JobAttempt.claimed_at.desc(), JobAttempt.id.desc()).limit(limit + 1))
         .scalars()
         .all()
@@ -261,7 +258,7 @@ def delete_attempts_before(cutoff: datetime, *, db: Session, batch_size: int = P
     kept = exists().where(ProcessingJob.id == JobAttempt.job_id)
     total = 0
     for _ in range(PRUNE_MAX_BATCHES):
-        ids = list(
+        ids: list[str] = list(
             db.execute(select(JobAttempt.id).where(JobAttempt.claimed_at < cutoff, ~kept).limit(batch_size))
             .scalars()
             .all()

@@ -5,9 +5,10 @@ at import time, so it cannot be imported before ``jasil.orm.map_models`` has run
 Hosts wanting the dashboard aggregate should use :mod:`jasil.admin`, which is
 importable from anywhere and opens its own session.
 
-**Every write here commits the session it is given.** The recorder hands each one
-a short-lived session of its own; pass a session JASIL owns, not one carrying a
-caller's uncommitted work.
+**Every write here commits the session it is given, except** ``record_queued`` with
+``commit=False``, which only flushes so the row joins the caller's transaction. The
+recorder hands each other write a short-lived session of its own; pass a session
+JASIL owns, not one carrying a caller's uncommitted work.
 
 The recording helpers write the event lifecycle: ``record_published`` /
 ``mark_processing`` / ``mark_completed`` / ``mark_failed`` for bus-delivered
@@ -18,7 +19,8 @@ portable SQL so the same code runs on PostgreSQL, MySQL and SQLite.
 """
 
 from collections import defaultdict
-from datetime import UTC, datetime, timedelta
+from collections.abc import Sequence
+from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
@@ -44,13 +46,14 @@ _STATUS_FAILED = "failed"
 _STATUS_DEAD_LETTER = "dead_letter"
 
 
-def record_published(event: Event, db: Session) -> None:
+def record_published(event: Event, db: Session, *, now: datetime) -> None:
     """
     Insert the initial ``published`` row for a freshly published event.
 
     Args:
         event: The event envelope being published.
         db: Active database session.
+        now: The platform clock's instant, stored as ``created_at``.
 
     Returns:
         None.
@@ -64,12 +67,13 @@ def record_published(event: Event, db: Session) -> None:
             event_metadata=event.metadata or None,
             status=_STATUS_PUBLISHED,
             retry_count=event.retry_count,
+            created_at=now,
         )
     )
     db.commit()
 
 
-def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
+def record_queued(event: Event, db: Session, *, now: datetime, commit: bool = True) -> None:
     """
     Insert a terminal ``queued`` row for an event handed to the durable job queue.
 
@@ -82,6 +86,7 @@ def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
     Args:
         event: The event envelope being staged for durable delivery.
         db: Active database session.
+        now: The platform clock's instant, stored as ``created_at``.
         commit: When True (default), commit immediately. When False, flush only
             so the row joins the caller's open transaction and commits or rolls
             back with it.
@@ -98,12 +103,13 @@ def record_queued(event: Event, db: Session, *, commit: bool = True) -> None:
             event_metadata=event.metadata or None,
             status=_STATUS_QUEUED,
             retry_count=event.retry_count,
+            created_at=now,
         )
     )
     commit_or_flush(db, commit)
 
 
-def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
+def mark_processing(event_id: str, worker_id: str, db: Session, *, now: datetime) -> None:
     """
     Transition an event to ``processing`` when a consumer picks it up.
 
@@ -111,6 +117,7 @@ def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
         event_id: The event_id (primary key).
         worker_id: The process/consumer handling the event.
         db: Active database session.
+        now: The platform clock's instant, stored as ``processed_at``.
 
     Returns:
         None.
@@ -121,13 +128,15 @@ def mark_processing(event_id: str, worker_id: str, db: Session) -> None:
         .values(
             status=_STATUS_PROCESSING,
             worker_id=fit_length(worker_id, MAX_WORKER_ID_LENGTH),
-            processed_at=func.now(),
+            processed_at=now,
         )
     )
     db.commit()
 
 
-def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: int, db: Session) -> None:
+def mark_completed(
+    event_id: str, handler_name: str | None, processing_time_ms: int, db: Session, *, now: datetime
+) -> None:
     """
     Transition an event to ``completed`` after its handlers succeed.
 
@@ -136,6 +145,7 @@ def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: 
         handler_name: The subscriber(s) that processed the event.
         processing_time_ms: Handler execution time in milliseconds.
         db: Active database session.
+        now: The platform clock's instant, stored as ``completed_at``.
 
     Returns:
         None.
@@ -147,7 +157,7 @@ def mark_completed(event_id: str, handler_name: str | None, processing_time_ms: 
             status=_STATUS_COMPLETED,
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
             processing_time_ms=processing_time_ms,
-            completed_at=func.now(),
+            completed_at=now,
         )
     )
     db.commit()
@@ -159,6 +169,8 @@ def mark_failed(
     error_message: str,
     processing_time_ms: int,
     db: Session,
+    *,
+    now: datetime,
 ) -> None:
     """
     Transition an event to ``failed`` when a handler raises.
@@ -169,6 +181,7 @@ def mark_failed(
         error_message: The failure reason (truncated for storage).
         processing_time_ms: Handler execution time in milliseconds.
         db: Active database session.
+        now: The platform clock's instant, stored as ``completed_at``.
 
     Returns:
         None.
@@ -181,7 +194,7 @@ def mark_failed(
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
             error_message=fit_length(error_message, MAX_STORED_ERROR_LENGTH),
             processing_time_ms=processing_time_ms,
-            completed_at=func.now(),
+            completed_at=now,
         )
     )
     db.commit()
@@ -190,6 +203,7 @@ def mark_failed(
 def get_event_log_summary(
     db: Session,
     *,
+    now: datetime,
     hours: int = 24,
     failure_limit: int = 20,
 ) -> event_log_schema.EventLogSummary:
@@ -198,13 +212,13 @@ def get_event_log_summary(
 
     Args:
         db: Active database session.
+        now: The instant the window ends at and pending ages are measured from.
         hours: Look-back window for throughput/outcome/latency stats.
         failure_limit: Maximum number of recent failures to return.
 
     Returns:
         The aggregated dashboard summary.
     """
-    now = datetime.now(UTC)
     window_start = now - timedelta(hours=hours)
     by_type = _summarize_by_type(db, window_start)
     return event_log_schema.EventLogSummary(
@@ -308,7 +322,7 @@ def _recent_failures(db: Session, limit: int) -> list[event_log_schema.EventLogF
     Returns:
         Recent failures, newest first.
     """
-    rows = (
+    rows: Sequence[EventLog] = (
         db.execute(
             select(EventLog)
             .where(EventLog.status.in_((_STATUS_FAILED, _STATUS_DEAD_LETTER)))

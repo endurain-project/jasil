@@ -1,14 +1,16 @@
 """The dead-letter hook: attempt counts on the event, and ``on_dead_letter`` delivery.
 
 The callback is delivered at least once. A job is owed one while it is
-``dead_letter`` with ``dead_letter_notified_at`` NULL; the process that
-dead-lettered it delivers at once, and a sweep delivers what a crash left behind.
+``dead_letter`` with ``dead_letter_notified_at`` NULL, and the scheduled sweep
+delivers it: never the worker, so a slow callback cannot hold a worker or the
+leases of the jobs waiting behind it.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import text, update
 
 import jasil.container as container
 import jasil.jobs.crud as jobs_crud
@@ -102,6 +104,19 @@ def fail_until_dead(runner, clock, db, attempts):
     return stored_job(db)
 
 
+def sweep(runner) -> int:
+    """Run the scheduled delivery once, as ``deliver_dead_letters_scheduled`` does."""
+    return deliver_dead_letters(registry=runner._registry, session_factory=runner._session_factory, clock=runner._clock)
+
+
+def reap_and_sweep(runner) -> int:
+    """Run the scheduled reaper, then the scheduled delivery, as production does; return the reaped count."""
+    with runner._session_factory() as db:
+        reclaimed = jobs_crud.reclaim_expired_leases(now=runner._clock.now(), db=db)
+    sweep(runner)
+    return reclaimed
+
+
 class TestAttemptCounts:
     def test_a_durable_handler_sees_a_one_based_attempt_and_the_ceiling(self, runner, registry, clock, db):
         seen = []
@@ -183,17 +198,42 @@ class TestRegistration:
         assert registry.dead_letter_subscriber_ids() == frozenset()
 
 
+class TestTheWorkerNeverRunsTheCallback:
+    def test_a_dead_letter_is_left_owed_for_the_sweep(self, runner, db, calls):
+        enqueue(db, max_attempts=1)
+
+        runner.run_once()
+
+        assert calls == []
+        assert stored_job(db).dead_letter_notified_at is None
+        assert sweep(runner) == 1
+        assert len(calls) == 1
+
+    def test_a_callback_that_never_returns_cannot_hold_the_rest_of_the_batch(self, runner, registry, db):
+        ran = []
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda _e, _r: pytest.fail("ran in the worker"))
+        registry.register("c.d", "t", lambda event: ran.append(event.event_type))
+        enqueue(db, max_attempts=1)
+        jobs_crud.enqueue_job(new_event("c.d", {}, source="test"), "t", max_attempts=1, now=T0, db=db)
+
+        assert runner.run_once() == 2
+
+        assert ran == ["c.d"]
+
+
 class TestHandlerException:
     def test_the_callback_runs_once_when_the_last_attempt_raises(self, runner, clock, db, calls):
         enqueue(db, max_attempts=2)
+        fail_until_dead(runner, clock, db, 2)
 
-        job = fail_until_dead(runner, clock, db, 2)
+        sweep(runner)
 
+        job = stored_job(db)
         assert len(calls) == 1
         event, error = calls[0]
         assert isinstance(event, Event)
         assert (event.event_type, event.payload, event.attempt, event.is_last_attempt) == ("a.b", {"id": 1}, 2, True)
-        assert error == "handler failed"
+        assert error == "RuntimeError: handler failed"
         assert job.dead_letter_notified_at is not None
 
     def test_it_does_not_run_while_attempts_remain(self, runner, db, calls):
@@ -209,7 +249,7 @@ class TestHandlerException:
         runner.run_once()
         clock.advance(CLAIM_LEASE_SECONDS * 2)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert len(calls) == 1
 
@@ -222,8 +262,9 @@ class TestHandlerException:
 
         registry.register("a.b", "s", _boom, on_dead_letter=callback)
         enqueue(db, max_attempts=1)
-
         runner.run_once()
+
+        sweep(runner)
 
         assert seen == [jobs_crud.STATUS_DEAD_LETTER]
 
@@ -234,7 +275,7 @@ class TestLeaseExpiry:
         jobs_crud.claim_jobs(worker_id="dead-worker", limit=10, lease_seconds=LEASE, now=T0, db=db)
         clock.advance(LEASE + 1)
 
-        assert runner.reap_once() == 1
+        assert reap_and_sweep(runner) == 1
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
@@ -248,7 +289,7 @@ class TestLeaseExpiry:
         jobs_crud.claim_jobs(worker_id="dead-worker", limit=10, lease_seconds=LEASE, now=T0, db=db)
         clock.advance(LEASE + 1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert calls == []
         assert stored_job(db).status == jobs_crud.STATUS_PENDING
@@ -305,7 +346,7 @@ class TestReaperRecovery:
         assert calls == []
         clock.advance(1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert [error for _e, error in calls] == ["boom"]
         assert stored_job(db).dead_letter_notified_at is not None
@@ -322,11 +363,11 @@ class TestReaperRecovery:
             )
         assert len(claimed) == 1
 
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert calls == []
 
         clock.advance(CLAIM_LEASE_SECONDS + 1)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(calls) == 1
 
     def test_only_one_of_two_claimers_wins(self, runner, registry, clock, db, calls):
@@ -359,7 +400,7 @@ class TestReaperRecovery:
         self._crash_after_commit(db, clock, runner)
         clock.advance(1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         assert stored_job(db).dead_letter_notified_at is None
         received = []
@@ -368,6 +409,22 @@ class TestReaperRecovery:
         deliver_dead_letters(registry=other, session_factory=runner._session_factory, clock=clock)
         assert received == ["boom"]
         assert stored_job(db).dead_letter_notified_at is not None
+
+    def test_a_callback_unregistered_after_the_claim_releases_it_at_once(
+        self, runner, registry, clock, db, calls, monkeypatch
+    ):
+        """Not a delivery: the claim must be given back, or the dead letter waits out the whole claim lease."""
+        self._crash_after_commit(db, clock, runner)
+        clock.advance(1)
+        original = registry.dead_letter_callback
+        monkeypatch.setattr(registry, "dead_letter_callback", lambda _subscriber_id: None)
+
+        delivered = deliver_dead_letters(registry=registry, session_factory=runner._session_factory, clock=clock)
+
+        assert (delivered, calls) == (0, [])
+        monkeypatch.setattr(registry, "dead_letter_callback", original)
+        delivered = deliver_dead_letters(registry=registry, session_factory=runner._session_factory, clock=clock)
+        assert delivered == 1  # no clock.advance(CLAIM_LEASE_SECONDS): the claim was released
 
 
 class TestCallbackRaising:
@@ -387,6 +444,7 @@ class TestCallbackRaising:
 
         with caplog.at_level("ERROR"):
             assert runner.run_once() == 1
+            sweep(runner)
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
@@ -396,31 +454,33 @@ class TestCallbackRaising:
     def test_it_is_retried_after_a_growing_backoff_not_on_every_pass(self, runner, clock, db, failing):
         enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         assert len(failing) == 1
 
         clock.advance(RETRY_BASE_SECONDS - 1)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 1
 
         clock.advance(2)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 2
 
         clock.advance(RETRY_BASE_SECONDS + 1)  # the second wait is twice as long
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 2
 
         clock.advance(RETRY_BASE_SECONDS)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(failing) == 3
 
     def test_the_failure_is_stored_and_the_dead_letter_time_is_kept(self, runner, clock, db, failing):
         enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         dead_at = stored_job(db).updated_at
         clock.advance(RETRY_BASE_SECONDS + 1)
 
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         job = stored_job(db)
         assert job.updated_at == dead_at
@@ -440,6 +500,7 @@ class TestCallbackRaising:
         __import__("logging").getLogger("jasil.jobs.runner").addHandler(spy)
         try:
             runner.run_once()
+            sweep(runner)
         finally:
             __import__("logging").getLogger("jasil.jobs.runner").removeHandler(spy)
 
@@ -452,8 +513,9 @@ class TestCallbackRaising:
         event = new_event("a.b", {}, source="t")
         jobs_crud.enqueue_job(event, "bad", max_attempts=1, now=T0, db=db)
         jobs_crud.enqueue_job(event, "good", max_attempts=1, now=T0, db=db)
-
         runner.run_once()
+
+        sweep(runner)
 
         assert done == [event.event_id]
 
@@ -487,6 +549,7 @@ class TestReplay:
     ):
         job = enqueue(db, max_attempts=1)
         runner.run_once()
+        sweep(runner)
         assert len(calls) == 1
 
         assert jobs_crud.replay_dead_letter_job(job.id, now=clock.now(), db=db)
@@ -494,10 +557,11 @@ class TestReplay:
         assert replayed.dead_letter_notified_at is None
         assert replayed.status == jobs_crud.STATUS_PENDING
         clock.advance(CLAIM_LEASE_SECONDS * 2)
-        runner.reap_once()
+        reap_and_sweep(runner)
         assert len(calls) == 1  # replaying does not call it
 
         runner.run_once()
+        sweep(runner)
         assert len(calls) == 2
         assert stored_job(db).dead_letter_notified_at is not None
 
@@ -509,11 +573,11 @@ class TestNoCallback:
 
         assert runner.run_once() == 1
         clock.advance(CLAIM_LEASE_SECONDS * 2)
-        runner.reap_once()
+        reap_and_sweep(runner)
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
-        assert job.last_error == "handler failed"
+        assert job.last_error == "RuntimeError: handler failed"
         assert job.dead_letter_notified_at is None
 
     def test_no_work_is_done_when_no_subscriber_has_a_callback(self, registry, clock, session_factory):
@@ -524,13 +588,26 @@ class TestNoCallback:
         assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock, job_ids=[]) == 0
 
 
+class TestTheCallbackEnvelope:
+    def test_it_carries_the_publish_timestamp(self, db):
+        event = replace(new_event("a.b", {}, source="t"), timestamp="2025-12-31T23:59:00+00:00")
+        job = jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=1, now=T0, db=db)
+
+        assert jobs_crud.event_from_row(job).timestamp == "2025-12-31T23:59:00+00:00"
+
+    def test_a_job_enqueued_before_the_column_existed_falls_back_to_its_enqueue_time(self, db):
+        job = jobs_crud.enqueue_job(
+            new_event("a.b", {}, source="t"), "s", queue="default", max_attempts=1, now=T0, db=db
+        )
+        job.event_timestamp = None
+
+        assert jobs_crud.event_from_row(job).timestamp == T0.isoformat()
+
+
 class TestDeliveryGuards:
     def _dead(self, db):
         enqueue(db, max_attempts=1)
-        db.execute(
-            text("UPDATE jasil_processing_jobs SET status = 'dead_letter', last_error = 'x', updated_at = :t"),
-            {"t": T0},
-        )
+        db.execute(update(ProcessingJob).values(status="dead_letter", last_error="x", updated_at=T0))
         db.commit()
 
     def test_a_stale_claim_cannot_overwrite_a_newer_delivery(self, registry, clock, db, session_factory):
@@ -541,9 +618,36 @@ class TestDeliveryGuards:
             0
         ]
 
-        assert not jobs_crud.mark_dead_letter_notified(first.id, delivery_attempt=first.delivery_attempt, now=T0, db=db)
+        assert not jobs_crud.mark_dead_letter_notified(first, now=T0, db=db)
         assert stored_job(db).dead_letter_notified_at is None
-        assert jobs_crud.mark_dead_letter_notified(second.id, delivery_attempt=second.delivery_attempt, now=T0, db=db)
+        assert jobs_crud.mark_dead_letter_notified(second, now=T0, db=db)
+
+    def test_a_claim_from_before_a_replay_cannot_settle_the_next_dead_letter(
+        self, registry, clock, db, session_factory
+    ):
+        """A replay restarts the delivery count, so the count alone cannot tell the two dead letters apart."""
+        self._dead(db)
+        registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: None)
+        stale = jobs_crud.claim_dead_letter_callbacks(["s"], now=T0, lease_seconds=300, db=db)[0]
+        assert jobs_crud.replay_dead_letter_job(stale.id, now=T0, db=db)
+        later = T0 + timedelta(minutes=1)
+        claimed = jobs_crud.claim_jobs(worker_id="w", limit=1, lease_seconds=60, now=later, db=db)[0]
+        jobs_crud.mark_job_failed(
+            claimed.id,
+            "again",
+            worker_id="w",
+            attempt=claimed.attempts,
+            base_seconds=1,
+            max_seconds=1,
+            now=later,
+            db=db,
+        )
+        fresh = jobs_crud.claim_dead_letter_callbacks(["s"], now=later, lease_seconds=300, db=db)[0]
+        assert fresh.delivery_attempt == stale.delivery_attempt
+
+        assert not jobs_crud.mark_dead_letter_notified(stale, now=later, db=db)
+        assert stored_job(db).dead_letter_notified_at is None
+        assert jobs_crud.mark_dead_letter_notified(fresh, now=later, db=db)
 
     def test_a_callback_that_always_fails_is_given_up_on(self, registry, clock, db, session_factory):
         self._dead(db)
@@ -575,7 +679,7 @@ class TestDeliveryGuards:
     def test_a_job_is_not_leased_until_its_own_callback_starts(self, registry, clock, db, session_factory):
         for _ in range(2):
             enqueue(db, max_attempts=1)
-        db.execute(text("UPDATE jasil_processing_jobs SET status = 'dead_letter', updated_at = :t"), {"t": T0})
+        db.execute(update(ProcessingJob).values(status="dead_letter", updated_at=T0))
         db.commit()
         leased_during_callback = []
 

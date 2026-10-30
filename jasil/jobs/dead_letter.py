@@ -1,10 +1,10 @@
 """Delivery of the ``on_dead_letter`` callbacks of durable subscribers.
 
 A callback is owed for every job that is ``dead_letter`` while
-``processing_jobs.dead_letter_notified_at`` is NULL. It is delivered twice over: at
-once by the process that dead-lettered the job (the worker after a failed last
-attempt, the reaper after a lease expiry), and by a sweep that picks up whatever a
-crash left behind. A delivery first claims the job with a compare-and-set lease, one job at a time
+``processing_jobs.dead_letter_notified_at`` is NULL. The scheduled sweep
+(``jasil.jobs.service.deliver_dead_letters_scheduled``) delivers it, never the worker that dead-lettered the
+job: a callback that ran there would hold the worker, and the leases of the jobs waiting behind it in its
+batch, for as long as the callback took. A delivery first claims the job with a compare-and-set lease, one job at a time
 so that each lease starts when its own callback does, and the marker is written
 only after the callback returns, so delivery is at least once and a callback has
 to be idempotent. The outcome is written only while that claim is still the live
@@ -27,8 +27,8 @@ from jasil.providers import ClockProvider
 
 logger = logging.getLogger(__name__)
 
-#: How long a claimed delivery holds off every other process. The callback runs
-#: inline, so this is the longest one is expected to take: past it a second process
+#: How long a claimed delivery holds off every other process. The sweep waits for the callback, so this is
+#: the longest one is expected to take: past it a second process
 #: may start the callback again while the first is still running.
 CLAIM_LEASE_SECONDS = 300
 
@@ -105,7 +105,7 @@ def deliver_dead_letters(
             subscribers.discard(job.subscriber_id)
             logger.warning("Dead-letter callback was unregistered before it ran; leaving it owed", extra=context)
             _record(
-                partial(jobs_crud.release_dead_letter_claim, job.id, delivery_attempt=job.delivery_attempt),
+                partial(jobs_crud.release_dead_letter_claim, job),
                 session_factory,
                 context,
             )
@@ -121,8 +121,7 @@ def deliver_dead_letters(
             _record(
                 partial(
                     jobs_crud.defer_dead_letter_callback,
-                    job.id,
-                    delivery_attempt=job.delivery_attempt,
+                    job,
                     retry_at=retry_at,
                     error=f"{type(error).__name__}: {error}",
                 ),
@@ -134,40 +133,13 @@ def deliver_dead_letters(
         _record(
             partial(
                 jobs_crud.mark_dead_letter_notified,
-                job.id,
-                delivery_attempt=job.delivery_attempt,
+                job,
                 now=clock.now(),
             ),
             session_factory,
             context,
         )
     return delivered
-
-
-def deliver_after_reap(
-    *,
-    registry: JobHandlerRegistry,
-    session_factory: Callable[[], Session],
-    clock: ClockProvider,
-    dead_lettered: list[str],
-) -> None:
-    """
-    Deliver the callbacks a lease reap owes: the jobs it just killed, then the sweep.
-
-    Never raises: the reap is already committed, and a failure here is retried by
-    the next one.
-
-    Args:
-        registry: Where the callbacks are registered.
-        session_factory: Opens short-lived sessions.
-        clock: Source of the current instant.
-        dead_lettered: Ids the reap dead-lettered.
-    """
-    for job_ids in (dead_lettered, None):
-        try:
-            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=job_ids)
-        except Exception as error:
-            logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
 
 
 def _backoff(delivery_attempt: int) -> int:

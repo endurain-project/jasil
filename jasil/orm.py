@@ -2,7 +2,8 @@
 
 **Option B (the host owns the ``Base``).** JASIL's companion tables —
 ``jasil_event_log``, ``jasil_processing_jobs``, ``jasil_event_outbox``,
-``jasil_job_workers``, and ``jasil_job_attempts`` — must
+``jasil_job_workers``, ``jasil_job_attempts``, ``jasil_audit_log``,
+``jasil_audit_actions``, ``jasil_audit_checkpoints`` and ``jasil_instance`` — must
 live in the same declarative registry as the host's own models so that one
 ``create_all`` / migration run and one metadata object cover the whole schema.
 The host owns that registry; JASIL maps its models **into** it.
@@ -27,8 +28,9 @@ Host applications:
    base may call ``map_models()`` with no argument and use JASIL's convenience
    :data:`Base`.
 
-   Two modules reach a model directly and therefore inherit that ordering
-   constraint: :mod:`jasil.jobs.crud` and :mod:`jasil.event_log.crud`. Import
+   Three modules reach a model directly and therefore inherit that ordering
+   constraint: :mod:`jasil.jobs.crud`, :mod:`jasil.event_log.crud` and
+   :mod:`jasil.audit.models`. Import
    them inside a function, or only after ``map_models`` has run. Every other
    public entry point — :mod:`jasil.publisher`, :mod:`jasil.retention`,
    :mod:`jasil.jobs.service`, :mod:`jasil.container`, :mod:`jasil.deps`,
@@ -86,10 +88,14 @@ mapper_registry = Base.registry
 # The active declarative base JASIL's models are mapped onto; ``None`` until
 # ``map_models`` runs.
 _active_base: type[DeclarativeBase] | None = None
+# The base the model modules were imported against. They keep it for the life of the process, so it
+# survives :func:`reset`: a module that is already imported is not imported again for another base.
+_bound_base: type[DeclarativeBase] | None = None
 
 # Every module defining a JASIL companion model. ``map_models`` imports each, and
 # each binds its classes to the active base via ``get_active_base()``.
 _MODEL_MODULES: tuple[str, ...] = (
+    "jasil.audit.models",
     "jasil.event_log.models",
     "jasil.jobs.models",
 )
@@ -104,6 +110,10 @@ _TABLE_NAMES: frozenset[str] = frozenset(
         "jasil_event_outbox",
         "jasil_job_workers",
         "jasil_job_attempts",
+        "jasil_audit_log",
+        "jasil_audit_actions",
+        "jasil_audit_checkpoints",
+        "jasil_instance",
     }
 )
 
@@ -167,23 +177,35 @@ def map_models(base: type[DeclarativeBase] | None = None) -> None:
             it to use JASIL's own :data:`Base`.
 
     Raises:
-        RuntimeError: If called again with a different base.
+        RuntimeError: If called again with a different base, also after :func:`reset`: the model modules
+            stay bound to the base they were first imported against.
+
+    A call that fails part-way (a table name the host's metadata already defines, say) leaves the models that
+    were already imported mapped into ``base``; fix the cause and restart the process rather than calling it again.
     """
-    global _active_base
+    global _active_base, _bound_base
     target = base if base is not None else Base
     if _active_base is not None:
         if _active_base is not target:
             raise RuntimeError("jasil.orm.map_models() was already called with a different base; call it once.")
         return
+    if _bound_base is not None and _bound_base is not target:
+        raise RuntimeError(
+            f"JASIL's models are already bound to {_bound_base.__qualname__} in this process and cannot be "
+            "mapped onto another base; map the same base again, or remap in a fresh process."
+        )
     _active_base = target
     try:
         for module_name in _MODEL_MODULES:
             importlib.import_module(module_name)
+            _bound_base = target
         # Resolve every mapper now so a misconfiguration fails fast at startup
         # rather than on the first query.
         target.registry.configure()
     except Exception:
-        _active_base = None  # let the host fix the problem and retry
+        # Not a state to retry from: the modules that already imported keep their tables in the host's metadata
+        # and a retry would redefine them. The host fixes the problem and restarts the process.
+        _active_base = None
         raise
 
 
@@ -245,7 +267,9 @@ def reset() -> None:
     """Clear the mapped base and the session factory.
 
     For tests that need a clean process-wide state between cases; production code
-    configures once at startup and never resets.
+    configures once at startup and never resets. The model modules stay bound to the
+    base they were imported against, so :func:`map_models` afterwards accepts that
+    base only.
     """
     global _active_base
     _active_base = None

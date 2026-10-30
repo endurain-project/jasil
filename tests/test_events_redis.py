@@ -13,6 +13,7 @@ the bottom, where it is the subject.
 """
 
 import json
+import logging
 import threading
 
 import fakeredis
@@ -138,9 +139,11 @@ class TestConsumerGroup:
 
         assert [group["name"] for group in client.xinfo_groups(STREAM)] == [GROUP]
 
-    def test_creating_it_twice_is_a_no_op(self, bus):
+    def test_creating_it_twice_is_a_no_op(self, bus, client):
         """Every replica calls this at startup; only one of them can win."""
         bus._ensure_group()
+
+        assert [group["name"] for group in client.xinfo_groups(STREAM)] == [GROUP]
 
     def test_a_real_redis_error_is_not_swallowed(self, bus, monkeypatch):
         """Only BUSYGROUP means 'someone beat me to it'; anything else is a fault."""
@@ -200,8 +203,11 @@ class TestDispatch:
 
         assert _pending_count(client) == 0
 
-    def test_polling_an_empty_stream_does_nothing(self, bus):
+    def test_polling_an_empty_stream_does_nothing(self, bus, client):
         bus._poll_once()
+
+        assert client.xlen(STREAM) == 0
+        assert _pending_count(client) == 0
 
     def test_a_batch_is_dispatched_in_order(self, bus):
         seen = []
@@ -214,32 +220,70 @@ class TestDispatch:
         assert seen == [0, 1, 2]
 
 
+class TestAckFailure:
+    def test_a_failed_ack_does_not_strand_the_rest_of_the_batch(self, bus, client, monkeypatch, caplog):
+        """The batch is read with ``>``, so an entry skipped here is never read again."""
+        seen = []
+        bus.subscribe("order.created", lambda event: seen.append(event.payload["id"]))
+        for index in range(3):
+            bus.publish(new_event("order.created", {"id": index}, source="api"))
+        acks = []
+        real_xack = client.xack
+
+        def flaky_xack(stream, group, entry_id):
+            acks.append(entry_id)
+            if len(acks) == 1:
+                raise redis.exceptions.ConnectionError("blip")
+            return real_xack(stream, group, entry_id)
+
+        monkeypatch.setattr(client, "xack", flaky_xack)
+
+        with caplog.at_level(logging.ERROR):
+            bus._poll_once()
+
+        assert seen == [0, 1, 2]
+        assert len(acks) == 3
+        assert "ack" in caplog.text
+
+
 class TestFailureIsolation:
     def test_a_raising_handler_does_not_kill_the_consumer(self, bus):
         """One poisoned entry must not take the whole replica's bus down."""
+        seen = []
+        bus.subscribe("order.created", lambda event: seen.append(event.payload["n"]) or 1 / event.payload["n"])
+        bus.publish(new_event("order.created", {"n": 0}, source="api"))
+        bus._poll_once()
+
+        bus.publish(new_event("order.created", {"n": 1}, source="api"))
+        bus._poll_once()
+
+        assert seen == [0, 1]
+
+    def test_every_handler_runs_when_one_raises(self, bus):
+        calls = []
+        bus.subscribe("order.created", lambda _event: calls.append("first"))
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.subscribe("order.created", lambda _event: calls.append("third"))
         bus.publish(new_event("order.created", {}, source="api"))
 
         bus._poll_once()
 
-    def test_a_failed_entry_is_left_pending(self, bus, client, caplog):
-        """At-least-once: an unacked entry is recoverable with XAUTOCLAIM.
+        assert calls == ["first", "third"]
 
-        It is *not* redelivered on its own — the consumer reads with ``>``, which
-        only returns unclaimed entries. The operator recovery path is documented
-        in providers-and-backends.md.
-        """
+    def test_a_failed_entry_is_logged_and_acked(self, bus, client, caplog):
+        """Best-effort: nothing reads a claimed entry again, so leaving it pending would only grow the PEL."""
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
         bus.publish(new_event("order.created", {}, source="api"))
 
         with caplog.at_level("ERROR"):
             bus._poll_once()
 
-        assert _pending_count(client) == 1
-        assert "leaving it pending" in caplog.text
+        assert _pending_count(client) == 0
+        assert "Event handling failed" in caplog.text
+        assert "boom" in caplog.text
 
     def test_a_second_poll_does_not_redeliver_it(self, bus):
-        """Pins the limitation the documentation warns about, so it cannot change silently."""
+        """Pins the best-effort contract: retrying is what durable jobs are for."""
         attempts = []
 
         def _always_fails(_event):
@@ -261,8 +305,26 @@ class TestFailureIsolation:
         with caplog.at_level("ERROR"):
             bus._poll_once()
 
-        assert _pending_count(client) == 1
-        assert "Event handler failed" in caplog.text
+        assert _pending_count(client) == 0
+        assert "Event handling failed" in caplog.text
+
+    def test_a_lost_consumer_group_is_recreated(self, bus, client, monkeypatch):
+        """A Redis restarted without persistence, or flushed, keeps the stream (XADD recreates it) but not the group."""
+        client.delete(STREAM)
+        bus.subscribe("order.created", lambda _event: bus._stop.set())
+        bus.publish(new_event("order.created", {}, source="api"))
+        waits = []
+
+        def _wait(timeout=None):
+            waits.append(timeout)
+            if len(waits) > 3:  # stop a consumer that never recovers, rather than hang the suite
+                bus._stop.set()
+
+        monkeypatch.setattr(bus._stop, "wait", _wait)
+
+        bus._run(bus._stop)
+
+        assert len(waits) == 1  # one failed poll, then the group is back and the event delivered
 
     def test_a_redis_outage_is_logged_and_retried(self, bus, monkeypatch, caplog):
         """The consumer loop must survive Redis going away and come back on its own."""
@@ -278,10 +340,81 @@ class TestFailureIsolation:
         monkeypatch.setattr(bus._stop, "wait", lambda timeout=None: None)
 
         with caplog.at_level("ERROR"):
-            bus._run()
+            bus._run(bus._stop)
 
         assert len(polls) == 2
         assert "consumer poll failed" in caplog.text
+
+    def test_repeated_failures_back_off_and_log_a_traceback_once(self, bus, monkeypatch, caplog):
+        waits: list[float] = []
+        polls = []
+
+        def _failing():
+            polls.append(1)
+            if len(polls) <= 4:
+                raise redis.RedisError("connection lost")
+            bus._stop.set()
+
+        monkeypatch.setattr(bus, "_poll_once", _failing)
+        monkeypatch.setattr(bus._stop, "wait", lambda timeout=None: waits.append(timeout))
+
+        with caplog.at_level("DEBUG"):
+            bus._run(bus._stop)
+
+        assert len(waits) == 4
+        for wait, (low, high) in zip(waits, [(0.5, 1), (1, 2), (2, 4), (4, 8)], strict=True):
+            assert low <= wait <= high
+        errors = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(errors) == 1 and errors[0].exc_info is not None
+        assert "recovered after 4 failed poll(s)" in caplog.text
+
+
+class TestConsumerLifecycleGuards:
+    def test_two_starts_at_once_keep_one_consumer(self, bus, monkeypatch):
+        """The second caller waits for the first instead of passing the same check and starting a second thread."""
+        second_was_blocked = []
+        seconds: list[threading.Thread] = []
+        original = bus._ensure_group
+
+        def ensure_group_while_a_second_start_waits():
+            second = threading.Thread(target=bus.start)
+            seconds.append(second)
+            second.start()
+            second.join(timeout=0.2)
+            second_was_blocked.append(second.is_alive())
+            original()
+
+        monkeypatch.setattr(bus, "_ensure_group", ensure_group_while_a_second_start_waits)
+        try:
+            bus.start()
+            # Let the waiting start finish first: stopping before it runs would let it start a consumer of its own,
+            # which would outlive the test.
+            for second in seconds:
+                second.join(timeout=5)
+        finally:
+            bus.stop()
+
+        assert second_was_blocked == [True]
+
+    def test_a_handler_may_stop_the_bus_it_runs_on(self, bus):
+        outcome: list[object] = []
+        done = threading.Event()
+
+        def stopping_handler(event):
+            try:
+                bus.stop()
+                outcome.append("stopped")
+            except Exception as error:
+                outcome.append(error)
+            finally:
+                done.set()
+
+        bus.subscribe("activity.created", stopping_handler)
+        bus.start()
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert done.wait(timeout=5)
+        assert outcome == ["stopped"]
 
 
 class TestRecorderIntegration:
@@ -326,6 +459,13 @@ class TestRecorderIntegration:
 
         assert recorder.tracked[0][2] is None
 
+    def test_an_envelope_that_cannot_be_serialized_is_not_recorded_as_published(self, bus, recorder):
+        """The row would stay ``published`` with nothing on the stream to move it on."""
+        with pytest.raises(TypeError):
+            bus.publish(new_event("order.created", {"when": object()}, source="api"))
+
+        assert recorder.published == []
+
     def test_a_failure_reaches_the_recorder(self, bus, recorder):
         event = new_event("order.created", {}, source="api")
         bus.subscribe("order.created", lambda _event: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -367,6 +507,23 @@ class TestConsumerLifecycle:
 
         assert not thread.is_alive()
         assert bus._thread is None
+
+    def test_a_restart_after_a_stop_that_timed_out_leaves_the_old_thread_stopped(self, bus):
+        """A handler outlasting the stop timeout keeps its thread alive; restarting must not revive that loop."""
+        bus.start()
+        old_thread, old_stop = bus._thread, bus._stop
+        # What a timed-out stop leaves: the thread forgotten, its stop event set, the thread perhaps still running.
+        bus._thread = None
+        old_stop.set()
+
+        bus.start()
+        try:
+            assert old_stop.is_set()
+            old_thread.join(timeout=5)
+            assert not old_thread.is_alive()
+            assert bus._thread is not old_thread and bus._thread.is_alive()
+        finally:
+            bus.stop()
 
     def test_stopping_a_bus_that_never_started_is_a_no_op(self, bus):
         """``Platform.close`` calls this unconditionally."""

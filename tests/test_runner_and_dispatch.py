@@ -8,6 +8,7 @@ different contract:
 * the **subscriber wrapper** swallows, so one bad subscriber cannot fail a request.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -81,6 +82,44 @@ class TestJobRunner:
     def test_an_empty_queue_processes_nothing(self, runner):
         assert runner.run_once() == 0
 
+    @pytest.mark.parametrize("exit_signal", [SystemExit(3), KeyboardInterrupt()])
+    def test_a_handler_that_exits_is_recorded_failed_and_the_exit_goes_on(self, runner, registry, db, exit_signal):
+        """The process is going down, but the job must not sit claimed and unexplained until its lease expires."""
+
+        def leave(_event):
+            raise exit_signal
+
+        registry.register("activity.created", "s", leave)
+        self._enqueue(db)
+
+        with pytest.raises(type(exit_signal)):
+            runner.run_once()
+
+        job = stored_job(db)
+        assert job.status == jobs_crud.STATUS_PENDING
+        assert job.last_error.startswith(type(exit_signal).__name__)
+        assert job.locked_by is None
+
+    def test_the_jobs_waiting_behind_an_exiting_handler_go_back_to_the_queue(self, runner, registry, db):
+        ran = []
+
+        def leave(event):
+            ran.append(event.event_id)
+            raise SystemExit(3)
+
+        registry.register("activity.created", "s", leave)
+        self._enqueue(db)
+        self._enqueue(db)
+
+        with pytest.raises(SystemExit):
+            runner.run_once()
+
+        db.rollback()
+        jobs = db.query(ProcessingJob).all()
+        assert len(ran) == 1
+        waiting = [job for job in jobs if job.event_id != ran[0]]
+        assert [(job.status, job.locked_by, job.attempts) for job in waiting] == [(jobs_crud.STATUS_PENDING, None, 0)]
+
     def test_a_due_job_runs_its_handler(self, runner, registry, db):
         seen = []
         registry.register("activity.created", "s", seen.append)
@@ -100,6 +139,17 @@ class TestJobRunner:
 
         assert seen[0].event_type == "activity.created"
         assert seen[0].payload == {"id": 1}
+
+    def test_the_handler_sees_the_publish_timestamp_not_the_enqueue_time(self, runner, registry, db):
+        """The envelope's ``timestamp`` is when the event was first published, whenever its job was enqueued."""
+        seen = []
+        registry.register("activity.created", "s", seen.append)
+        event = replace(new_event("activity.created", {"id": 1}, source="test"), timestamp="2025-12-31T23:59:00+00:00")
+        jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        assert seen[0].timestamp == "2025-12-31T23:59:00+00:00"
 
     def test_a_successful_run_completes_the_job(self, runner, registry, db):
         registry.register("activity.created", "s", lambda _e: None)
@@ -130,6 +180,27 @@ class TestJobRunner:
         runner.run_once()
 
         assert stored_job(db).status == jobs_crud.STATUS_DEAD_LETTER
+
+    @pytest.mark.parametrize(
+        ("error", "recorded"),
+        [
+            (AssertionError(), "AssertionError: "),
+            (KeyError("x"), "KeyError: 'x'"),
+            (RuntimeError("down"), "RuntimeError: down"),
+        ],
+    )
+    def test_the_recorded_error_names_its_type(self, runner, registry, db, error, recorded):
+        """``str(AssertionError())`` is empty: a dead letter would carry no reason at all."""
+
+        def _raise(_event):
+            raise error
+
+        registry.register("activity.created", "s", _raise)
+        self._enqueue(db, max_attempts=1)
+
+        runner.run_once()
+
+        assert stored_job(db).last_error == recorded
 
     def test_a_job_with_no_registered_handler_fails_rather_than_vanishing(self, runner, db):
         """A subscriber removed from the code while jobs are still queued must
@@ -407,7 +478,7 @@ class TestJobRunner:
         jobs_crud.claim_jobs(worker_id="other", limit=10, lease_seconds=60, now=T0, db=db)
         clock.advance(61)
 
-        assert runner.reap_once() == 1
+        assert jobs_crud.reclaim_expired_leases(now=clock.now(), db=db) == 1
 
     def test_later_jobs_of_a_batch_get_a_fresh_lease_when_their_turn_comes(self, runner, registry, clock, db):
         leases = []
@@ -565,6 +636,28 @@ class TestInProcessBus:
 
         with pytest.raises(RuntimeError, match="boom"):
             bus.publish(new_event("activity.created", {}, source="test"))
+
+    def test_every_handler_runs_before_the_failure_propagates(self):
+        bus = InProcessEventBus()
+        calls = []
+        bus.subscribe("activity.created", lambda _e: calls.append("first"))
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.subscribe("activity.created", lambda _e: calls.append("third"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert calls == ["first", "third"]
+
+    def test_several_failures_propagate_together(self):
+        bus = InProcessEventBus()
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("one")))
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(ValueError("two")))
+
+        with pytest.raises(ExceptionGroup) as excinfo:
+            bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert [type(error) for error in excinfo.value.exceptions] == [RuntimeError, ValueError]
 
     def test_start_and_stop_are_no_ops(self):
         bus = InProcessEventBus()

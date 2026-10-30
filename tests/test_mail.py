@@ -1,17 +1,21 @@
 """Outbound mail: the MIME builder, the backends, and what never leaks.
 
-``smtplib`` is replaced by a fake, so no socket ever opens. The conformance suite
+``smtplib`` is replaced by a fake. The few tests of the genuine ``smtplib`` talk to an
+in-process peer over ``socket.socketpair()``, and the watchdog is exercised on socket
+pairs too, so no port is opened and nothing waits on a wall clock. The conformance suite
 runs against both real backends: a host's tests (``MemoryMail``) must fail on the
 same invalid message production (``SmtpMail``) would.
 """
 
+import contextlib
 import logging
+import os
 import smtplib
 import socket
 import ssl
 import threading
-import time
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -22,6 +26,11 @@ from jasil._core.mail_message import build_mime
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.providers import MailError, MailMessage, MailNotConfiguredError, MailProvider
+
+# Windows: shutdown() does not wake a thread blocked in recv(), so the watchdog cannot interrupt a read there; only the per-read timeout bounds one.
+CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
+    os.name == "nt", reason="Windows: shutdown() does not wake a thread blocked in recv()"
+)
 
 REAL_SMTP, REAL_SMTP_SSL = smtplib.SMTP, smtplib.SMTP_SSL
 NOW = datetime(2026, 10, 13, 12, 0, tzinfo=UTC)
@@ -519,12 +528,13 @@ class TestSmtpTransport:
 
     def test_cleartext_does_not_dial_another_address_after_the_deadline(self, monkeypatch):
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["::1", "127.0.0.1"], None))
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.05)
+        clock = [0.0]
+        monkeypatch.setattr(mail_smtp.time, "monotonic", lambda: clock[0])
         tried: list[str] = []
 
         def connect(self, host, port):
             tried.append(host)
-            time.sleep(0.15)
+            clock[0] += mail_smtp.SEND_DEADLINE_SECONDS + 1  # a failure that took longer than the whole send may
             raise OSError("slow failure")
 
         monkeypatch.setattr(FakeSMTP, "connect", connect)
@@ -534,44 +544,77 @@ class TestSmtpTransport:
 
         assert tried == ["::1"]
 
-    @pytest.mark.parametrize("implicit_tls", [True, False])
-    def test_a_stalled_tls_handshake_cannot_outlive_the_deadline(self, monkeypatch, implicit_tls):
-        """The handshake reads from a socket ``connection.sock`` no longer names."""
+    def test_the_watched_socket_is_taken_before_the_tls_wrap(self, monkeypatch):
+        """A handshake reads from a socket ``connection.sock`` does not name yet; the watchdog needs ``watched``."""
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
-        monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 10)
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.5)
-        monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
+        ours, theirs = socket.socketpair()
+        seen = []
 
-        def serve():
-            conn, _ = server.accept()
-            try:
-                with conn, conn.makefile("rb") as f:
-                    if not implicit_tls:
-                        conn.sendall(b"220 hi\r\n")
-                        f.readline()  # EHLO
-                        conn.sendall(b"250-hi\r\n250 STARTTLS\r\n")
-                        f.readline()  # STARTTLS
-                        conn.sendall(b"220 go\r\n")
-                    time.sleep(5)  # never speak TLS
-            except OSError:
-                pass
+        class Context:
+            def wrap_socket(self, raw, server_hostname):
+                seen.append(connection.watched is not None and connection.watched.fileno() != raw.fileno())
+                return raw
 
-        threading.Thread(target=serve, daemon=True).start()
-        mail = SmtpMail(
-            "127.0.0.1", server.getsockname()[1], implicit_tls=implicit_tls, from_address=SENDER, clock=_Clock()
-        )
-
+        connection = mail_smtp._tracked(REAL_SMTP_SSL)(local_hostname="localhost", context=Context())
+        monkeypatch.setattr(type(connection), "_dial", lambda self, host, port, timeout: ours)
+        connection._host = "relay.test"
         try:
-            started = time.monotonic()
-            with pytest.raises(MailError, match="deadline"):
-                mail.send(_message())
-            assert time.monotonic() - started < 3
+            connection._get_socket("relay.test", 465, 30)
+
+            assert seen == [True]
         finally:
-            server.close()
+            connection.watched.close()
+            ours.close()
+            theirs.close()
+
+    def test_a_failed_tls_wrap_closes_the_raw_socket(self, monkeypatch):
+        """The wrap detaches nothing on failure, so the descriptor would otherwise leak until garbage collection."""
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
+        ours, theirs = socket.socketpair()
+
+        class Context:
+            def wrap_socket(self, raw, server_hostname):
+                raise ssl.SSLError("handshake failed")
+
+        connection = mail_smtp._tracked(REAL_SMTP_SSL)(local_hostname="localhost", context=Context())
+        monkeypatch.setattr(type(connection), "_dial", lambda self, host, port, timeout: ours)
+        connection._host = "relay.test"
+        try:
+            with pytest.raises(ssl.SSLError):
+                connection._get_socket("relay.test", 465, 30)
+
+            assert ours.fileno() == -1
+        finally:
+            connection.watched.close()
+            theirs.close()
+
+    def test_dialling_without_a_deadline_is_a_plain_create_connection(self, monkeypatch):
+        dialled = []
+        monkeypatch.setattr(socket, "create_connection", lambda *args: dialled.append(args) or "connected")
+        connection = mail_smtp._tracked(REAL_SMTP)(local_hostname="localhost", timeout=30)
+
+        assert connection._dial("relay.test", 587, 12) == "connected"
+        assert dialled == [(("relay.test", 587), 12, None)]
+
+    def test_dialling_under_a_deadline_binds_the_source_address_and_returns_the_first_connection(self, monkeypatch):
+        entries = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{n}", 587)) for n in (1, 2)]
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: entries)
+        bound, connected = [], []
+        monkeypatch.setattr(socket.socket, "bind", lambda self, address: bound.append(address))
+        monkeypatch.setattr(socket.socket, "connect", lambda self, address: connected.append(address[0]))
+        connection = mail_smtp._tracked(REAL_SMTP)(
+            local_hostname="localhost", timeout=30, source_address=("192.0.2.9", 0)
+        )
+        connection.deadline = mail_smtp.time.monotonic() + 60
+
+        candidate = connection._dial("relay.test", 587, 30)
+        try:
+            assert connected == ["192.0.2.1"]  # the first address answered, so the second is never tried
+            assert bound == [("192.0.2.9", 0)]
+        finally:
+            candidate.close()
 
     @pytest.mark.parametrize("value", ["a@-bad-.com", "a@bad-.com", "a@a..com"])
     def test_a_malformed_domain_is_refused(self, value):
@@ -642,117 +685,34 @@ class TestSmtpRobustness:
 
         assert FakeSMTP.instances[0].local_hostname == "localhost"
 
-    def test_a_slow_connect_cannot_outlive_the_deadline_either(self, monkeypatch):
-        """The watchdog fires before any socket exists; it must keep trying."""
-        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.3)
-        monkeypatch.setattr(mail_smtp, "_WATCH_INTERVAL_SECONDS", 0.02)
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
+    def test_an_error_after_the_watchdog_fired_is_reported_as_the_deadline(self, monkeypatch):
+        """The watchdog's shutdown surfaces as whatever the blocked step raises, here a refused DATA."""
+        monkeypatch.setattr(SmtpMail, "_watch", staticmethod(lambda connection, expired, finished: expired.set()))
+        FakeSMTP.fail_on = "data"
 
-        def serve():
-            conn, _ = server.accept()
-            try:
-                with conn:
-                    for _ in range(40):  # a multi-line greeting dripped over 4s
-                        conn.sendall(b"220-x\r\n")
-                        time.sleep(0.1)
-            except OSError:
-                pass
-
-        real_tracked = mail_smtp._tracked
-
-        def slow_tracked(base):
-            tracked = real_tracked(base)
-            real_dial = tracked._dial
-
-            def slow_dial(self, *args):
-                sock = real_dial(self, *args)
-                time.sleep(0.6)  # the socket is handed over only after the deadline
-                return sock
-
-            tracked._dial = slow_dial
-            return tracked
-
-        monkeypatch.setattr(mail_smtp, "_tracked", slow_tracked)
-        threading.Thread(target=serve, daemon=True).start()
-        monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["127.0.0.1"], None))
-        mail = SmtpMail(
-            "127.0.0.1", server.getsockname()[1], implicit_tls=False, tls=False, from_address=SENDER, clock=_Clock()
-        )
-
-        started = time.monotonic()
         with pytest.raises(MailError, match="deadline"):
-            mail.send(_message())
-
-        assert time.monotonic() - started < 2.5
-        server.close()
-
-    @pytest.mark.parametrize("slow", ["greeting", "MAIL"])
-    def test_a_server_dripping_its_reply_cannot_outlive_the_deadline(self, monkeypatch, slow):
-        """Each byte arrives well inside the per-read timeout, so only the
-        watchdog can stop the send. Real ``smtplib``, loopback server."""
-        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
-        monkeypatch.setattr(mail_smtp, "_TIMEOUT_SECONDS", 1)
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0.5)
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
-
-        def reply(conn, line, drip):
-            if not drip:
-                conn.sendall(line)
-                return
-            # Long enough that, dripped, it would outlast the deadline twice over.
-            for byte in line[:4] + b"x" * 10 + line[4:]:
-                conn.sendall(bytes([byte]))
-                time.sleep(0.1)
-
-        def serve():
-            conn, _ = server.accept()
-            try:
-                with conn, conn.makefile("rb") as f:
-                    reply(conn, b"220 hi\r\n", drip=slow == "greeting")
-                    while line := f.readline():
-                        verb = line.split()[0].upper()
-                        reply(conn, b"250 ok\r\n", drip=verb.decode() == slow)
-            except OSError:
-                pass  # the client's watchdog hung up mid-reply
-
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-        mail = SmtpMail(
-            "127.0.0.1", server.getsockname()[1], implicit_tls=False, tls=False, from_address=SENDER, clock=_Clock()
-        )
-
-        try:
-            started = time.monotonic()
-            with pytest.raises(MailError, match="deadline"):
-                mail.send(_message())
-            assert time.monotonic() - started < 1.0
-            thread.join(5)
-        finally:
-            server.close()
+            _smtp().send(_message())
 
     def test_a_name_with_many_dead_addresses_cannot_connect_past_the_deadline(self, monkeypatch):
         entries = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{n}", 587)) for n in range(1, 6)]
         monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: entries)
+        clock = [0.0]
+        monkeypatch.setattr(mail_smtp.time, "monotonic", lambda: clock[0])
         dialed: list[str] = []
 
         def connect(self, address):
             dialed.append(address[0])
-            time.sleep(0.1)
+            clock[0] += 0.1  # each dead address takes a tenth of a second to fail
             raise OSError("unreachable")
 
         monkeypatch.setattr(socket.socket, "connect", connect)
         connection = mail_smtp._tracked(smtplib.SMTP)(local_hostname="localhost", timeout=30)
-        connection.deadline = time.monotonic() + 0.25
+        connection.deadline = 0.25
 
         with pytest.raises(OSError):
             connection._get_socket("relay.test", 587, 30)
 
-        assert 1 < len(dialed) < 5
+        assert dialed == ["192.0.2.1", "192.0.2.2", "192.0.2.3"]  # the fourth would start past the deadline
 
     def test_a_malformed_sender_is_refused_at_construction(self):
         with pytest.raises(ValueError, match="sender address"):
@@ -770,42 +730,129 @@ class TestSmtpRobustness:
             _smtp(**credentials)
 
     def test_real_smtplib_never_looks_up_the_fqdn_and_refuses_a_cleartext_server(self, monkeypatch):
-        """No fake: the genuine ``smtplib`` against a loopback server that does
-        not offer STARTTLS."""
+        """No fake ``smtplib``: the genuine one against an in-process peer that does not offer STARTTLS."""
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
         monkeypatch.setattr(socket, "getfqdn", lambda *_a: pytest.fail("getfqdn was called"))
-        server = socket.socket()
-        server.bind(("127.0.0.1", 0))
-        server.listen(1)
 
-        def serve():
-            conn, _ = server.accept()
-            with conn, conn.makefile("rwb") as f:
-                f.write(b"220 hi\r\n")
-                f.flush()
-                while line := f.readline():
-                    verb = line.split()[0].upper()
-                    if verb == b"EHLO":
-                        f.write(b"250 localhost\r\n")
-                    elif verb == b"QUIT":
-                        f.write(b"221 bye\r\n")
-                        f.flush()
-                        return
-                    else:
-                        f.write(b"250 ok\r\n")
+        def serve(f):
+            f.write(b"220 hi\r\n")
+            f.flush()
+            while line := f.readline():
+                verb = line.split()[0].upper()
+                if verb == b"EHLO":
+                    f.write(b"250 localhost\r\n")
+                elif verb == b"QUIT":
+                    f.write(b"221 bye\r\n")
                     f.flush()
+                    return
+                else:
+                    f.write(b"250 ok\r\n")
+                f.flush()
 
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-        mail = SmtpMail("127.0.0.1", server.getsockname()[1], implicit_tls=False, from_address=SENDER, clock=_Clock())
+        peer = _Peer(monkeypatch, serve)
+        mail = SmtpMail("relay.test", 587, implicit_tls=False, from_address=SENDER, clock=_Clock())
 
+        with pytest.raises(MailError, match="STARTTLS"):
+            mail.send(_message())
+        peer.join()
+
+
+class _Peer:
+    """An in-process SMTP server on a ``socket.socketpair()``: ``SmtpMail`` dials it, and no port is opened."""
+
+    def __init__(self, monkeypatch, serve) -> None:
+        client, self._server = socket.socketpair()
+
+        def dial(_connection, _host, _port, timeout):
+            client.settimeout(timeout)
+            return client
+
+        for base in (REAL_SMTP, REAL_SMTP_SSL):
+            monkeypatch.setattr(mail_smtp._tracked(base), "_dial", dial)
+        self._thread = threading.Thread(target=self._serve, args=(serve,), daemon=True)
+        self._thread.start()
+
+    def _serve(self, serve) -> None:
+        with self._server, self._server.makefile("rwb") as f:
+            serve(f)
+
+    def join(self) -> None:
+        self._thread.join(timeout=5)
+        assert not self._thread.is_alive()
+
+
+class TestTheWatchdog:
+    """A socket timeout restarts on every read, so a server dripping its reply never trips one: once the deadline
+    passes, the watchdog shuts the connection's socket down, and keeps doing so until the send ends."""
+
+    @pytest.fixture
+    def blocked_read(self):
+        """A socket with a thread blocked reading it, and the event set when that read returns."""
+        ours, theirs = socket.socketpair()
+        released = threading.Event()
+
+        def read():
+            with contextlib.suppress(OSError):
+                ours.recv(1)
+            released.set()
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        yield ours, released
+        ours.close()
+        theirs.close()
+        reader.join(timeout=5)
+
+    @staticmethod
+    def _start(connection):
+        expired, finished = threading.Event(), threading.Event()
+        watchdog = threading.Thread(target=SmtpMail._watch, args=(connection, expired, finished), daemon=True)
+        watchdog.start()
+        return expired, finished, watchdog
+
+    @CANNOT_INTERRUPT_A_READ
+    def test_it_releases_a_read_through_the_duplicate_it_watches(self, monkeypatch, blocked_read):
+        """``watched`` is a duplicate of the raw socket; shutting it down reaches a TLS-wrapped read too."""
+        sock, released = blocked_read
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0)
+        connection = SimpleNamespace(watched=sock.dup(), sock=None)
+        expired, finished, watchdog = self._start(connection)
         try:
-            with pytest.raises(MailError, match="STARTTLS"):
-                mail.send(_message())
-            thread.join(5)
+            assert released.wait(5)
+            assert expired.is_set()
         finally:
-            server.close()
+            finished.set()
+            watchdog.join(timeout=5)
+            connection.watched.close()
+
+    @CANNOT_INTERRUPT_A_READ
+    def test_a_socket_that_appears_after_the_deadline_is_shut_down_too(self, monkeypatch, blocked_read):
+        """A slow connect hands the socket over only after the deadline; one shutdown attempt would miss it."""
+        sock, released = blocked_read
+        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0)
+        connection = SimpleNamespace(watched=None, sock=None)
+        expired, finished, watchdog = self._start(connection)
+        try:
+            assert expired.wait(5)
+            assert not released.is_set()
+
+            connection.sock = sock
+
+            assert released.wait(5)
+        finally:
+            finished.set()
+            watchdog.join(timeout=5)
+
+    def test_it_stops_once_the_send_ends(self):
+        connection = SimpleNamespace(watched=None, sock=None)
+        expired, finished, watchdog = self._start(connection)
+
+        finished.set()
+        watchdog.join(timeout=5)
+
+        assert not watchdog.is_alive()
+        assert not expired.is_set()
 
 
 class TestFailuresAreRedacted:

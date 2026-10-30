@@ -6,7 +6,9 @@ real (SQLite) database rather than mocking it. Time is injected everywhere, so
 nothing sleeps and lease expiry is exercised deterministically.
 """
 
+import threading
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -157,6 +159,62 @@ class TestSubscriberRegistration:
 
         assert registry.subscribers_for("a.b") == (subscriber_id,)
 
+    def test_re_registering_under_another_event_type_moves_the_subscriber(self):
+        """Left listed under the old type, the relay would fan its events out to the new handler."""
+        registry = JobHandlerRegistry()
+        registry.register("a.created", "sub", lambda _e: None)
+
+        registry.register("b.created", "sub", lambda _e: None)
+
+        assert (registry.subscribers_for("a.created"), registry.subscribers_for("b.created")) == ((), ("sub",))
+
+    def test_registering_while_another_thread_reads_is_safe(self):
+        """The runner reads the registry on every claim, and a subscriber may register after it started."""
+        registry = JobHandlerRegistry()
+        errors: list[Exception] = []
+        done = threading.Event()
+
+        def read() -> None:
+            while not done.is_set():
+                try:
+                    registry.subscriber_ids_for_queues(["default"])
+                except Exception as error:
+                    errors.append(error)
+                    return
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            for index in range(20_000):
+                registry.register("a.b", f"sub-{index}", lambda _e: None)
+                if errors:
+                    break
+        finally:
+            done.set()
+            reader.join(timeout=10)
+
+        assert errors == []
+
+
+class TestInsertIgnoringDuplicate:
+    """The enqueue's conflict clause, per dialect name (MySQL and MariaDB report different ones)."""
+
+    @staticmethod
+    def _session(dialect: str):
+        return SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_and_mariadb_ignore_a_duplicate_with_a_no_op_update(self, dialect):
+        from sqlalchemy.dialects import mysql
+
+        statement = jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session(dialect))
+
+        assert "ON DUPLICATE KEY UPDATE" in str(statement.compile(dialect=mysql.dialect()))
+
+    def test_an_unsupported_dialect_is_refused(self):
+        with pytest.raises(RuntimeError, match="insert-or-ignore"):
+            jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session("oracle"))
+
 
 class TestClaim:
     def test_claiming_takes_a_lease_and_counts_the_attempt(self, db, event):
@@ -288,6 +346,36 @@ class TestClaim:
         assert intake.id in {job.id for job in second}
 
 
+class TestALostClaimRace:
+    """Without SKIP LOCKED two workers can select the same pending rows; the compare-and-set picks one."""
+
+    def test_the_loser_takes_nothing_and_records_no_attempt(self, db, event, monkeypatch):
+        from sqlalchemy import update
+
+        from jasil.jobs.models import JobAttempt
+
+        job = _enqueue(event, db)
+        select_due = jobs_crud._select_due_ids
+
+        def won_by_another_worker_after_the_select(*args, **kwargs):
+            ids = select_due(*args, **kwargs)
+            db.execute(
+                update(ProcessingJob)
+                .where(ProcessingJob.id.in_(ids))
+                .values(status=jobs_crud.STATUS_CLAIMED, locked_by="winner", attempts=1)
+            )
+            return ids
+
+        monkeypatch.setattr(jobs_crud, "_select_due_ids", won_by_another_worker_after_the_select)
+
+        claimed = jobs_crud.claim_jobs(worker_id="loser", limit=10, lease_seconds=60, now=T0, db=db)
+
+        assert claimed == []
+        stored = db.get(ProcessingJob, job.id)
+        assert (stored.locked_by, stored.attempts) == ("winner", 1)
+        assert db.query(JobAttempt).filter_by(worker_id="loser").count() == 0
+
+
 class TestCompletion:
     def test_completing_marks_the_job_terminal(self, db, event):
         job = _enqueue(event, db)
@@ -295,7 +383,7 @@ class TestCompletion:
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_COMPLETED
         assert stored.completed_at is not None
 
@@ -322,13 +410,13 @@ class TestFinishingGuardedByTheLeaseHolder:
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db)
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is True
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_COMPLETED
 
     def test_a_late_worker_cannot_complete(self, db, event):
         job = self._claim_then_lose(db, event)
 
         assert jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=1, now=T0, db=db) is False
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "w2"
 
@@ -340,7 +428,7 @@ class TestFinishingGuardedByTheLeaseHolder:
         )
 
         assert status == ""
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "w2"
         assert stored.last_error != "boom"
@@ -356,7 +444,7 @@ class TestFinishingGuardedByTheLeaseHolder:
             )
             == ""
         )
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_COMPLETED
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_COMPLETED
 
 
 class TestFailureAndBackoff:
@@ -379,7 +467,7 @@ class TestFailureAndBackoff:
         )
 
         assert status == jobs_crud.STATUS_PENDING
-        assert as_utc(jobs_crud.get_job(job.id, db).available_at) > T0
+        assert as_utc(db.get(ProcessingJob, job.id).available_at) > T0
 
     def test_the_failure_reason_is_recorded(self, db, event):
         _enqueue(event, db)
@@ -396,7 +484,7 @@ class TestFailureAndBackoff:
             db=db,
         )
 
-        assert "downstream exploded" in jobs_crud.get_job(job.id, db).last_error
+        assert "downstream exploded" in db.get(ProcessingJob, job.id).last_error
 
     def test_the_lease_is_released_on_failure(self, db, event):
         _enqueue(event, db)
@@ -413,7 +501,7 @@ class TestFailureAndBackoff:
             db=db,
         )
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.locked_by is None
         assert stored.lease_expires_at is None
 
@@ -433,7 +521,7 @@ class TestFailureAndBackoff:
         )
 
         assert status == jobs_crud.STATUS_DEAD_LETTER
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_DEAD_LETTER
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_DEAD_LETTER
 
     def test_a_dead_lettered_job_is_never_claimed_again(self, db, event):
         _enqueue(event, db, max_attempts=1)
@@ -523,7 +611,10 @@ class TestLeaseReclamation:
 
         jobs_crud.reclaim_expired_leases(now=T0 + timedelta(seconds=61), db=db)
 
-        assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_DEAD_LETTER
+        job = db.query(ProcessingJob).one()
+        assert job.status == jobs_crud.STATUS_DEAD_LETTER
+        # Every lease column is cleared, as on the other terminal paths.
+        assert (job.locked_by, job.locked_at, job.lease_expires_at) == (None, None, None)
 
     def test_a_second_pass_reclaims_nothing(self, db, event):
         """The count is rows this call changed, so a losing reaper reports zero."""
@@ -581,7 +672,7 @@ class TestLeaseReclamation:
             )
             assert finalized == ""
 
-        stored = jobs_crud.get_job(job.id, db)
+        stored = db.get(ProcessingJob, job.id)
         assert stored.status == jobs_crud.STATUS_CLAIMED
         assert stored.locked_by == "worker-b"
         assert stored.attempts == replacement.attempts
@@ -605,7 +696,7 @@ class TestDeadLetterReplay:
         replayed = jobs_crud.replay_dead_letter_job(job.id, now=T0, db=db)
 
         assert replayed is True
-        assert jobs_crud.get_job(job.id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job.id).status == jobs_crud.STATUS_PENDING
 
     def test_replaying_a_job_that_is_not_dead_lettered_is_refused(self, db, event):
         job = _enqueue(event, db)
@@ -632,6 +723,30 @@ class TestOutboxRelay:
 
         assert relayed == 1
         assert {job.subscriber_id for job in db.query(ProcessingJob).all()} == {"a", "b"}
+
+    def test_fanning_out_issues_no_select_per_job(self, db, db_engine, session_factory, clock, registry):
+        """The relay never reads the jobs it inserts back, so a large batch is not three times the statements."""
+        from sqlalchemy import event as sa_event
+
+        for subscriber in ("a", "b", "c"):
+            registry.register("activity.created", subscriber, lambda _e: None)
+        for number in range(5):
+            jobs_outbox.add_to_outbox(new_event("activity.created", {"n": number}, source="test"), now=T0, db=db)
+        selects: list[str] = []
+        sa_event.listen(
+            db_engine,
+            "before_cursor_execute",
+            lambda _c, _cursor, statement, *_rest: (
+                selects.append(statement) if "FROM jasil_processing_jobs" in statement else None
+            ),
+        )
+
+        jobs_relay.relay_outbox_once(
+            registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+        )
+
+        assert [s for s in selects if s.lstrip().upper().startswith("SELECT")] == []
+        assert db.query(ProcessingJob).count() == 15
 
     def test_each_subscribers_queue_is_stamped_on_its_job(self, db, session_factory, event, clock, registry):
         registry.register("activity.created", "a", lambda _e: None, queue="campaign")
@@ -707,6 +822,18 @@ class TestOutboxRelay:
         assert db.query(EventOutbox).one().relayed_at is not None
         assert db.query(ProcessingJob).count() == 0
 
+    def test_an_event_with_no_subscribers_is_reported(self, db, session_factory, event, clock, registry, caplog):
+        """It was written to the outbox because the publisher saw a durable subscriber; the relaying process
+        knowing none is almost always a subscriber it never registered, and the event is now dropped."""
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        with caplog.at_level("WARNING", logger="jasil.jobs.relay"):
+            jobs_relay.relay_outbox_once(
+                registry=registry, clock=clock, session_factory=session_factory, max_attempts=3, batch_size=10
+            )
+
+        assert f"activity.created event {event.event_id} has no durable subscriber" in caplog.text
+
     def test_a_failure_mid_pass_relays_nothing(self, db, session_factory, event, clock, registry, monkeypatch):
         """The pass is one transaction, so a crash cannot leave a row stamped but
         un-fanned-out — which would drop the event permanently."""
@@ -716,7 +843,7 @@ class TestOutboxRelay:
         def explode(*args, **kwargs):
             raise RuntimeError("database went away")
 
-        monkeypatch.setattr(jobs_relay.jobs_crud, "enqueue_job", explode)
+        monkeypatch.setattr(jobs_relay.jobs_crud, "insert_job", explode)
 
         with pytest.raises(RuntimeError):
             jobs_relay.relay_outbox_once(
@@ -766,7 +893,7 @@ class TestJobsSummary:
         return datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=1)
 
     def test_an_empty_queue_summarises_to_nothing(self, db):
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.total_jobs == 0
         assert summary.by_subscriber == []
@@ -774,14 +901,14 @@ class TestJobsSummary:
         assert summary.oldest_pending_seconds is None
 
     def test_the_window_is_reported_back(self, db):
-        assert jobs_crud.get_jobs_summary(db, hours=6).window_hours == 6
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), hours=6).window_hours == 6
 
     def test_jobs_are_counted_by_status(self, db, event, now):
         _enqueue(event, db, subscriber="a", now=now)
         _enqueue(event, db, subscriber="b", now=now)
         jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.total_jobs == 2
         assert summary.claimed == 1
@@ -792,7 +919,7 @@ class TestJobsSummary:
         _enqueue(event, db, subscriber="thumbnails.generate", now=now)
         _enqueue(event, db, subscriber="invoice.render", now=now)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert [row.subscriber_id for row in summary.by_subscriber] == ["invoice.render", "thumbnails.generate"]
         assert all(row.event_type == "activity.created" for row in summary.by_subscriber)
@@ -802,7 +929,7 @@ class TestJobsSummary:
         claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
         jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.completed == 1
         assert summary.by_subscriber[0].completed == 1
@@ -810,20 +937,20 @@ class TestJobsSummary:
     def test_jobs_outside_the_window_are_excluded(self, db, event, now):
         _enqueue(event, db, now=now - timedelta(days=2))
 
-        assert jobs_crud.get_jobs_summary(db, hours=1).total_jobs == 0
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), hours=1).total_jobs == 0
 
     def test_the_oldest_pending_age_is_reported(self, db, event, now):
         """The number that says whether the queue is keeping up."""
         _enqueue(event, db, now=now - timedelta(minutes=10))
 
-        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds > 500
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC)).oldest_pending_seconds > 500
 
     def test_a_finished_queue_has_no_pending_age(self, db, event, now):
         job = _enqueue(event, db, now=now)
         claimed = jobs_crud.claim_jobs(worker_id="w1", limit=1, lease_seconds=60, now=now, db=db)[0]
         jobs_crud.mark_job_completed(job.id, worker_id="w1", attempt=claimed.attempts, now=now, db=db)
 
-        assert jobs_crud.get_jobs_summary(db).oldest_pending_seconds is None
+        assert jobs_crud.get_jobs_summary(db, now=datetime.now(UTC)).oldest_pending_seconds is None
 
     def test_dead_letters_are_listed_for_inspection(self, db, event, now):
         job = _enqueue(event, db, max_attempts=1, now=now)
@@ -839,7 +966,7 @@ class TestJobsSummary:
             db=db,
         )
 
-        summary = jobs_crud.get_jobs_summary(db)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC))
 
         assert summary.dead_letter == 1
         assert [entry.id for entry in summary.recent_dead_letter] == [job.id]
@@ -860,6 +987,6 @@ class TestJobsSummary:
                 db=db,
             )
 
-        summary = jobs_crud.get_jobs_summary(db, dead_letter_limit=2)
+        summary = jobs_crud.get_jobs_summary(db, now=datetime.now(UTC), dead_letter_limit=2)
 
         assert len(summary.recent_dead_letter) == 2

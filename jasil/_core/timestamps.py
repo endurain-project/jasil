@@ -20,13 +20,17 @@ __all__ = ["age_seconds", "as_utc"]
 def as_utc(moment: datetime) -> datetime:
     """Return ``moment`` as an aware UTC datetime, assuming UTC when it is naive.
 
+    An aware value is converted, not just passed through: PostgreSQL hands a
+    ``timestamptz`` back in the session's ``TimeZone``, and anything rendered from
+    it (a hashed or signed string, a file name) must not depend on that setting.
+
     Args:
         moment: A timestamp, possibly naive after a SQLite round-trip.
 
     Returns:
-        The same instant, guaranteed timezone-aware.
+        The same instant, timezone-aware with a UTC offset.
     """
-    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC) if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
 def age_seconds(moment: datetime | None, now: datetime) -> float | None:

@@ -1,7 +1,8 @@
 """The event envelope and the payload-versioning skew rules."""
 
+import dataclasses
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta, timezone
 from typing import ClassVar
 
 import pytest
@@ -50,6 +51,18 @@ class TestNewEvent:
         assert parsed.tzinfo is not None
         assert parsed.utcoffset().total_seconds() == 0
 
+    def test_a_given_instant_is_the_timestamp_in_utc(self):
+        moment = datetime(2026, 1, 1, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+
+        event = new_event("activity.created", {}, source="test", now=moment)
+
+        assert event.timestamp == "2026-01-01T12:00:00+00:00"
+
+    def test_a_naive_instant_is_taken_as_utc(self):
+        event = new_event("activity.created", {}, source="test", now=datetime(2026, 1, 1, 12, 0))
+
+        assert event.timestamp == datetime(2026, 1, 1, 12, 0, tzinfo=UTC).isoformat()
+
     def test_metadata_defaults_to_an_empty_dict(self):
         event = new_event("activity.created", {}, source="test")
 
@@ -68,7 +81,7 @@ class TestNewEvent:
         """Handlers share one envelope; a mutation would be visible to the others."""
         event = new_event("a.b", {}, source="test")
 
-        with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             event.event_type = "other"  # type: ignore[misc]
 
 
@@ -79,6 +92,13 @@ class TestEnvelopeLengthLimits:
     all on SQLite — and the publish seam swallows delivery failures, so the event
     would simply vanish with an opaque driver error in the log.
     """
+
+    def test_the_refused_value_is_not_echoed(self):
+        """Identifiers can be host-supplied and token-like; the message names the field and the lengths only."""
+        with pytest.raises(ValueError, match="event_type is 101 characters") as refused:
+            new_event("secret-token-" + "e" * 88, {}, source="test")
+
+        assert "secret-token" not in str(refused.value)
 
     def test_an_over_long_event_type_is_refused(self):
         with pytest.raises(ValueError, match="event_type is 101 characters"):
@@ -125,6 +145,23 @@ class PayloadWithMissingUpgrader(VersionedPayload):
 
 def _event_at(version: int, payload: dict) -> Event:
     return new_event("thing.happened", payload, source="test", schema_version=version)
+
+
+class TestEnvelopeContentTypes:
+    """A payload that is not a dict would be stored, then fail every time the outbox relay reads it."""
+
+    @pytest.mark.parametrize("payload", [["not", "a", "dict"], "text", None, 7])
+    def test_a_payload_that_is_not_a_dict_is_refused(self, payload):
+        with pytest.raises(TypeError, match="payload must be a dict"):
+            new_event("activity.created", payload, source="test")
+
+    def test_metadata_that_is_not_a_dict_is_refused(self):
+        with pytest.raises(TypeError, match="metadata must be a dict"):
+            new_event("activity.created", {}, source="test", metadata=["x"])  # type: ignore[arg-type]
+
+    def test_an_envelope_built_by_hand_is_checked_too(self):
+        with pytest.raises(TypeError, match="payload must be a dict"):
+            Event(event_id="e", event_type="t", source="s", timestamp="2026-01-01T00:00:00+00:00", payload=[])
 
 
 class TestParsePayload:

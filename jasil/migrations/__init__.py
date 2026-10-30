@@ -26,6 +26,7 @@ directly; from a host's own history ``rev0001`` first creates the unprefixed nam
 and ``rev0003`` renames them.
 """
 
+import logging
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -42,6 +43,8 @@ except ImportError:  # pragma: no cover - exercised via the missing-dep guard
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "VERSION_TABLE",
@@ -114,17 +117,66 @@ def _config(connection: Any = None) -> Any:
     return config
 
 
-def _run_on_connection(connection: Any, command_name: str, *args: Any) -> None:
-    _require_alembic()
-    from alembic import command
+#: Name of the database lock a migration run holds; see :func:`_one_run_at_a_time`.
+_RUN_LOCK = "jasil_migrations"
 
-    config = _config(connection)
-    getattr(command, command_name)(config, *args)
+#: How long a MySQL or MariaDB run waits for the lock another run holds. Finite because MariaDB does not take a
+#: negative timeout as "forever" (``GET_LOCK`` then returns NULL), and so that a hung migration cannot block the
+#: others for good.
+_MYSQL_LOCK_WAIT_SECONDS = 3600
+
+#: MySQL lock names are server-wide, so the database's name is part of the lock's: two databases on one server
+#: do not queue behind each other. Hashed to stay inside the 64-character limit.
+_MYSQL_LOCK_NAME = "CONCAT(:name, ':', MD5(COALESCE(DATABASE(), '')))"
+
+
+@contextmanager
+def _one_run_at_a_time(connection: Any) -> Generator[None]:
+    """Hold a database lock for one migration run, so processes upgrading at once queue instead of colliding.
+
+    The run that waited then reads the version table after the first one committed and finds nothing left
+    to do. Each revision commits on its own, so PostgreSQL and MySQL hold a session lock for the whole run
+    and give it back afterwards, a failed run included. SQLite is not locked: it serves a single process,
+    and JASIL refuses a multi-process SQLite deployment.
+
+    Raises:
+        RuntimeError: When MySQL or MariaDB does not grant the lock within the wait.
+    """
+    from sqlalchemy import text
+
+    dialect = connection.dialect.name
+    if dialect == "postgresql":
+        connection.execute(text("SELECT pg_advisory_lock(hashtext(:name))"), {"name": _RUN_LOCK})
+        try:
+            yield
+        except BaseException:
+            # A failure can leave the connection in an aborted transaction, where the unlock would fail too. On
+            # success a transaction still open is the caller's (adoption stamps inside one) and is left to it.
+            if connection.in_transaction():
+                connection.rollback()
+            raise
+        finally:
+            connection.execute(text("SELECT pg_advisory_unlock(hashtext(:name))"), {"name": _RUN_LOCK})
+    elif dialect in ("mysql", "mariadb"):
+        acquired = connection.execute(
+            text(f"SELECT GET_LOCK({_MYSQL_LOCK_NAME}, :wait)"), {"name": _RUN_LOCK, "wait": _MYSQL_LOCK_WAIT_SECONDS}
+        ).scalar()
+        if acquired != 1:
+            raise RuntimeError("MySQL did not grant the JASIL migration lock")
+        try:
+            yield
+        finally:
+            connection.execute(text(f"SELECT RELEASE_LOCK({_MYSQL_LOCK_NAME})"), {"name": _RUN_LOCK})
+    else:
+        yield
 
 
 def _run(engine: "Engine", command_name: str, *args: Any) -> None:
+    _require_alembic()
+    from alembic import command
+
     with engine.connect() as connection:
-        _run_on_connection(connection, command_name, *args)
+        getattr(command, command_name)(_config(connection), *args)
 
 
 def _fresh_install_prefix(connection: Any, revision: str) -> str:
@@ -133,7 +185,8 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     ``jasil_`` for a fresh database heading to :data:`_PREFIXED_FROM` or later, so
     JASIL never creates an unprefixed table that a host's own could already
     occupy; empty everywhere else (see :mod:`jasil.migrations._names`). Fresh means
-    no recorded revision and no prefixed table. A single unprefixed table of the
+    no recorded revision and no prefixed table; a run resumed after its first revision recorded keeps the prefix
+    its tables already carry. A single unprefixed table of the
     same name proves nothing, since it may be the host's; two of the baseline
     tables together are an unversioned old schema, which is refused.
     """
@@ -144,9 +197,11 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     from jasil.orm import jasil_table_names
 
     context = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE})
-    if context.get_current_revision() is not None:
-        return ""
     present = set(inspect(connection).get_table_names())
+    if context.get_current_revision() is not None:
+        # An install interrupted after its first revision holds prefixed tables, which the rest of the run has to
+        # keep finding; a database from 0.8 or earlier holds unprefixed ones and renames them at ``rev0003``.
+        return _names.PREFIX if present & jasil_table_names() else ""
     if present & jasil_table_names():
         # Creating the unprefixed revisions beside prefixed tables would leave
         # duplicates, and rev0003 would then skip its renames.
@@ -171,8 +226,12 @@ def upgrade(engine: "Engine", revision: str = "head") -> None:
     On a fresh database the tables are created with their final ``jasil_`` names
     directly. A 0.8 database (unprefixed names) is renamed in place by ``rev0003``,
     so **stop every process running 0.8 or earlier before running this**.
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
     """
     _require_alembic()
+    _refuse_schema_qualified_base()
     # On its own connection: inspecting begins a transaction, and Alembic only
     # commits one it began itself.
     with engine.connect() as connection:
@@ -182,8 +241,33 @@ def upgrade(engine: "Engine", revision: str = "head") -> None:
 
 
 def downgrade(engine: "Engine", revision: str) -> None:
-    """Downgrade JASIL's tables to ``revision`` (``"base"`` drops them all)."""
+    """Downgrade JASIL's tables to ``revision`` (``"base"`` drops them all).
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
+    """
+    _refuse_schema_qualified_base()
     _run(engine, "downgrade", revision)
+
+
+def _refuse_schema_qualified_base() -> None:
+    """Refuse a base whose ``MetaData`` names a schema.
+
+    The migrations create JASIL's tables, and the audit trail's PostgreSQL functions, in the connection's
+    default schema; models mapped into another one would query tables that are not there.
+
+    Raises:
+        SchemaCompatibilityError: When the mapped base's ``MetaData`` names a schema.
+    """
+    from jasil.orm import get_active_base
+
+    schema = get_active_base().metadata.schema
+    if schema is not None:
+        raise SchemaCompatibilityError(
+            f"JASIL's migrations create its tables in the connection's default schema, but the mapped base's "
+            f"MetaData names schema {schema!r}; map JASIL onto a base without one, and point the connection's "
+            "search_path (or default database) at the schema instead"
+        )
 
 
 def head_revision() -> str | None:
@@ -241,8 +325,9 @@ def _adoption_include_object(tables: frozenset[str]) -> Any:
             if name in _POSTGRES_GIN_INDEXES.values():
                 return False
             if reflected and compare_to is None:
-                # Additional non-unique indexes do not change JASIL's write contract.
-                return False
+                # An additional non-unique index does not change JASIL's write contract; a unique one refuses
+                # writes JASIL makes, so it is reported.
+                return bool(getattr(obj, "unique", False))
         return True
 
     return include_object
@@ -255,6 +340,77 @@ def _primary_key_differences(inspector: Any, metadata: Any, table_names: frozens
         actual = inspector.get_pk_constraint(table_name).get("constrained_columns") or []
         if actual != expected:
             differences.append(f"{table_name}: expected primary key {expected!r}, found {actual!r}")
+    return differences
+
+
+def _server_default_differences(inspector: Any, metadata: Any, table_names: frozenset[str]) -> list[str]:
+    """Name each NOT NULL column whose database default is missing.
+
+    A writer of the previous release omits the columns a newer revision added and relies on that default, so
+    its absence breaks the rolling deploy. Only presence is compared: how a database spells a default (quoting,
+    casts, ``now()`` or ``CURRENT_TIMESTAMP``) differs by dialect and driver.
+    """
+    differences = []
+    for table_name in sorted(table_names):
+        reflected = {column["name"]: column for column in inspector.get_columns(table_name)}
+        for column in metadata.tables[table_name].columns:
+            if column.server_default is None or column.nullable:
+                continue
+            found = reflected.get(column.name)
+            if found is not None and found.get("default") is None:
+                differences.append(f"{table_name}.{column.name}: missing server default")
+    return differences
+
+
+def _check_constraint_differences(inspector: Any, metadata: Any, table_names: frozenset[str]) -> list[str]:
+    """Name each CHECK constraint the schema lacks, by name; their expressions differ by dialect too."""
+    from sqlalchemy import CheckConstraint
+
+    differences: list[str] = []
+    for table_name in sorted(table_names):
+        expected = {
+            constraint.name
+            for constraint in metadata.tables[table_name].constraints
+            if isinstance(constraint, CheckConstraint) and isinstance(constraint.name, str)
+        }
+        if not expected:
+            continue
+        present = {constraint["name"] for constraint in inspector.get_check_constraints(table_name)}
+        differences.extend(f"{table_name}: missing check constraint {name!r}" for name in sorted(expected - present))
+    return differences
+
+
+def _postgres_audit_differences(connection: Any) -> list[str]:
+    """Name what a PostgreSQL audit log built by ``rev0006`` has and this one lacks.
+
+    ``create_all`` builds a plain table, and ``upgrade`` after adoption would never add the partitions, the
+    append-only triggers or the retention functions.
+    """
+    if connection.dialect.name != "postgresql":
+        return []
+    from sqlalchemy import text
+
+    from jasil.audit import _postgres as audit_pg
+
+    table = audit_pg.LOG
+    differences = []
+    kind = connection.execute(text("SELECT relkind FROM pg_class WHERE oid = to_regclass(:name)"), {"name": table})
+    if kind.scalar() != "p":
+        differences.append(f"{table}: not partitioned")
+    triggers = set(
+        connection.execute(
+            text("SELECT tgname FROM pg_trigger WHERE tgrelid = to_regclass(:name) AND NOT tgisinternal"),
+            {"name": table},
+        ).scalars()
+    )
+    differences.extend(
+        f"{table}: missing trigger {name!r}"
+        for name in (f"{table}_no_update_delete", f"{table}_no_truncate")
+        if name not in triggers
+    )
+    for signature in (f"{audit_pg.ENSURE_FUNCTION}(integer)", f"{audit_pg.DROP_FUNCTION}({audit_pg.DROP_ARGUMENTS})"):
+        if connection.execute(text("SELECT to_regprocedure(:signature)"), {"signature": signature}).scalar() is None:
+            differences.append(f"{table}: missing function {signature!r}")
     return differences
 
 
@@ -444,8 +600,12 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
         if difference[0] != "remove_table"
     ]
     detailed.extend(_primary_key_differences(inspector, restricted, common))
+    detailed.extend(_server_default_differences(inspector, restricted, common))
+    detailed.extend(_check_constraint_differences(inspector, restricted, common))
     for table_name in common & _POSTGRES_GIN_INDEXES.keys():
         detailed.extend(_postgres_gin_differences(connection, inspector, table_name))
+    if "jasil_audit_log" in common:
+        detailed.extend(_postgres_audit_differences(connection))
     return differences + detailed, count + len(detailed)
 
 
@@ -465,9 +625,11 @@ def adopt_existing_schema(engine: "Engine") -> bool:
 
     Raises:
         SchemaCompatibilityError: If no revision matches exactly; the message
-            names the closest revision and lists its differences.
+            names the closest revision and lists its differences. Also when the
+            mapped base's ``MetaData`` names a schema.
     """
     _require_alembic()
+    _refuse_schema_qualified_base()
     from alembic import command
     from alembic.runtime.migration import MigrationContext
     from sqlalchemy import inspect
@@ -490,7 +652,9 @@ def adopt_existing_schema(engine: "Engine") -> bool:
         else:
             return False
 
-        closest: tuple[str, list[str], int] | None = None
+        # (weight, revision, differences) per candidate revision, newest first. One always qualifies: the head
+        # for prefixed tables, the revisions before the prefix rename for unprefixed ones.
+        mismatches: list[tuple[int, str, list[str]]] = []
         for revision, metadata in _revision_schemas():
             if not set(metadata.tables) <= candidate_names:
                 continue
@@ -499,27 +663,41 @@ def adopt_existing_schema(engine: "Engine") -> bool:
                 command.stamp(_config(connection), revision)
                 connection.commit()
                 return True
-            if closest is None or weight < closest[2]:
-                closest = (revision, differences, weight)
+            mismatches.append((weight, revision, differences))
 
-        if closest is None:
-            raise RuntimeError("JASIL has no packaged migration head")
+        # ``min`` keeps the first of equal weights: the newest revision.
+        _, closest, differences = min(mismatches, key=lambda mismatch: mismatch[0])
         raise SchemaCompatibilityError(
-            f"Cannot adopt an incompatible JASIL schema (closest revision {closest[0]}): " + "; ".join(closest[1])
+            f"Cannot adopt an incompatible JASIL schema (closest revision {closest}): " + "; ".join(differences)
         )
 
 
 def verify_schema_current(engine: "Engine") -> None:
-    """Raise if the database is not migrated to the packaged head revision.
+    """Raise if the database is not migrated at least to the packaged head revision.
 
     A fail-fast startup check: call it after configuring the engine to catch a
-    forgotten upgrade before the first query does.
+    forgotten upgrade before the first query does. A revision this package does not
+    ship can only have been recorded by a newer JASIL, whose revisions stay
+    compatible with the previous release during a rolling deploy, so it passes with
+    a warning rather than stopping the previous release from starting.
 
     Raises:
-        RuntimeError: If the recorded revision differs from the packaged head.
+        RuntimeError: If no revision is recorded, or the recorded one precedes the packaged head.
     """
-    head = head_revision()
+    _require_alembic()
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(_config())
+    head = script.get_current_head()
     current = db_revision(engine)
+    if current is not None and current != head and current not in {s.revision for s in script.walk_revisions()}:
+        logger.warning(
+            "JASIL database revision %r is newer than this release's head %r; running against it as a rolling "
+            "deploy does",
+            current,
+            head,
+        )
+        return
     if current != head:
         raise RuntimeError(
             "JASIL database schema is out of date "

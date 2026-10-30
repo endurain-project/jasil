@@ -1,6 +1,5 @@
 """The system clock is the one capability with no alternative backend."""
 
-import time
 from datetime import UTC, datetime, timedelta
 
 from jasil.backends.clock_system import SystemClock
@@ -21,10 +20,7 @@ class TestSystemClock:
 
     def test_monotonic_never_goes_backwards(self):
         clock = SystemClock()
-        first = clock.monotonic()
+        readings = [clock.monotonic() for _ in range(100)]
 
-        time.sleep(0.001)
-
-        # ``>=``: Windows' monotonic clock ticks every ~15 ms, so a short sleep
-        # can read the same value.
-        assert clock.monotonic() >= first
+        # ``>=``: Windows' monotonic clock ticks every ~15 ms, so consecutive reads can be equal.
+        assert readings == sorted(readings)

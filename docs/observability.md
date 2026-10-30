@@ -1,6 +1,6 @@
 # Observability
 
-JASIL owns five operational tables, every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
+JASIL owns five operational tables — and four more for the [audit trail](audit.md) — every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
 the worker registry updates one row per restart-unique instance. This page covers
 what goes in them, how to create them, and how to bound their growth.
 
@@ -11,6 +11,8 @@ what goes in them, how to create them, and how to bound their growth.
 | `jasil_processing_jobs` | The relay and the worker | One row per `(event, subscriber)`. |
 | `jasil_job_workers` | Durable workers | Identity, queue selection, heartbeat, stop time, and metadata. |
 | `jasil_job_attempts` | Durable workers | One row per attempt to run a job. See [Job attempts](#job-attempts). |
+
+The audit trail's `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance` are covered in [Audit trail](audit.md); they share the migrations below and are *not* pruned by `jasil.retention`.
 
 ## The event log
 
@@ -29,17 +31,19 @@ how long it took, and why it failed:
 
 | Status | Meaning |
 |---|---|
-| `published` | Written, dispatch not finished. |
+| `published` | Written, dispatch not finished. On the Redis bus a row that stays `published` can also be an `XADD` that failed after the row was written; the publisher logs that failure. |
 | `queued` | Handed to the durable job queue (terminal here; execution is tracked in `jasil_processing_jobs` and `jasil_job_attempts`). |
 | `processing` | A consumer picked it up. |
 | `completed` | Handlers succeeded. |
 | `failed` | A handler raised. |
-| `dead_letter` | Abandoned after retries. |
+| `dead_letter` | Reserved: JASIL never writes it. A durable job that is dead-lettered is tracked in `jasil_processing_jobs` and `jasil_job_attempts`, and the Redis bus acks a failed entry after one attempt. |
 
 !!! note "Best-effort by design"
-    Every write opens its own short-lived session and swallows any storage error.
-    A database hiccup degrades observability rather than breaking event
-    processing — the trail is never the source of truth.
+    Every write opens its own short-lived session and swallows any storage error,
+    except the `queued` row staged beside the outbox row, which joins the
+    producer's transaction in a savepoint. A database hiccup degrades
+    observability rather than breaking event processing — the trail is never the
+    source of truth.
 
 Because the durable route bypasses the bus, an event handed to the outbox is
 recorded `queued` explicitly. Otherwise the dashboard would go dark exactly when
@@ -155,9 +159,9 @@ The summaries carry it too. `get_jobs_summary()` adds, per subscriber and queue,
 `avg_duration_ms`, `max_duration_ms`, `duration_buckets` and `superseded` (over
 the window), and each dead letter's `last_worker_id`. `get_workers_summary()`
 adds each worker's `completed`, `failed`, `dead_lettered`, `lease_expired`, `superseded`,
-`released` and `abandoned` counts, `last_finished_at`, and `claimed_by_stale_workers`: jobs
-waiting out a lease behind a worker that stopped beating, which is the number to
-watch during a crash.
+`released` and `abandoned` counts and `last_finished_at`, and, for the whole fleet,
+`claimed_by_stale_workers`: jobs waiting out a lease behind a worker that stopped
+beating, which is the number to watch during a crash.
 
 **Duration buckets.** An average hides a slow tail and a maximum shows only that
 it exists, so completed attempts are also counted in six fixed ranges:
@@ -204,20 +208,42 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 
 | Function | Use |
 |---|---|
-| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. |
+| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. Each revision commits on its own, and on PostgreSQL the indexes on `jasil_processing_jobs` are built `CONCURRENTLY`, so the previous release's workers keep claiming jobs while it runs. The `ALTER TABLE ... ADD COLUMN` statements still take a brief exclusive lock on that table, and if a long transaction holds it every claim queues behind them, so run the upgrade when none is open. If a run fails, run it again: it resumes from the last revision that committed, and finishes or rebuilds an interrupted index build. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
 | `adopt_existing_schema(engine)` | Validate and adopt unversioned JASIL tables at head or an earlier revision. |
 | `head_revision()` | The newest revision shipped in this package. |
 | `db_revision(engine)` | What the database currently records. |
-| `verify_schema_current(engine)` | Raise unless the database is at head. |
+| `verify_schema_current(engine)` | Raise unless the database is at head or at a revision a newer release recorded. |
 
 `verify_schema_current` is a useful fail-fast at startup — it turns "forgot to
 migrate" into a clear message at boot rather than a confusing query error later.
+A revision this release does not ship was recorded by a newer JASIL, so during a
+rolling deploy a restarting replica of the previous release logs a warning and
+starts instead of refusing.
+
+!!! note "Revision `rev0006` (0.14): the audit trail, and two changes to jobs"
+    - Adds `jasil_audit_log`, `jasil_audit_actions`, `jasil_audit_checkpoints` and `jasil_instance`. On
+      PostgreSQL (13 or newer) it also partitions the log by day, installs the append-only triggers and creates
+      the two `SECURITY DEFINER` functions, so run it as the role that should own them. Details in
+      [Audit trail → Upgrading](audit.md#upgrading).
+    - Adds the nullable `jasil_processing_jobs.event_timestamp`, so a durable subscriber's envelope carries the
+      event's publish `timestamp` rather than the time its job was enqueued. Jobs written before it, or by a
+      previous-release process during a rollout, have none and keep the enqueue time.
+    - Indexes `jasil_processing_jobs.created_at`, which `get_jobs_summary` filters its window on. On
+      PostgreSQL the index is built `CONCURRENTLY`, after the rest of the revision has committed.
+
+    Processes of the previous release are unaffected and keep running while it applies.
+
+!!! note "One schema: the connection's default"
+    The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
+    `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`, because the models would then look
+    for the tables somewhere else; point the connection's `search_path` (or default database) at the schema
+    you want instead.
 
 !!! note "It will not touch your tables"
     JASIL's migrations use their own version table, `jasil_alembic_version`, so
     they never collide with your Alembic history. Every operation is scoped to
-    JASIL's five tables, so autogenerate cannot propose dropping yours — even
+    JASIL's own tables, so autogenerate cannot propose dropping yours — even
     though both live in the same registry.
 
 ### Upgrading from 0.8 or earlier: the `jasil_` prefix
@@ -249,12 +275,17 @@ row changes.
 
 `adopt_existing_schema()` is only for a database where JASIL's tables already
 exist but `jasil_alembic_version` does not record a revision. It compares their
-columns, types, nullability, primary keys, unique constraints, and required
-indexes with the schema of the installed migration head. If that does not match
+columns, types, nullability, primary keys, unique constraints, required indexes,
+named `CHECK` constraints, and the presence of a database default on every
+`NOT NULL` column that has one (a previous release's writers rely on it), with the
+schema of the installed migration head. If that does not match
 exactly, it tries each earlier revision's schema, newest first, and records the
 first exact match (the newest, if two describe the same schema). It returns
 `True` only when this call recorded a revision. PostgreSQL adoption also
-requires the metadata GIN index and its PostgreSQL-specific definition.
+requires the metadata GIN index and its PostgreSQL-specific definition, and an
+audit log partitioned with its append-only triggers and both `jasil_audit_*`
+functions, as `rev0006` builds it: one made by `create_all` is refused, because
+`upgrade()` would never add them afterwards.
 
 Adopting an older revision leaves the database behind head, so always call
 `upgrade()` next: it applies the revisions after the recorded one. That is how a
@@ -265,13 +296,14 @@ shape) catches up without copying JASIL's DDL into its own history.
 An empty database is left unversioned for `upgrade()` to create. A schema that
 matches no revision raises `SchemaCompatibilityError` without changing it or
 recording a revision; the message names the closest revision and lists its
-differences. Unexpected tables and columns are incompatible; additional ordinary
-non-unique indexes are allowed because they do not change JASIL's write
-contract. JASIL never repairs an incompatible schema automatically.
+differences. Unexpected tables, columns and unique indexes are incompatible;
+additional ordinary non-unique indexes are allowed because they do not change
+JASIL's write contract. JASIL never repairs an incompatible schema automatically.
 
 !!! note "Tables your host created itself"
     Create them in exactly the shape of a revision JASIL ships (same columns,
-    types, nullability, primary keys, unique constraints and index names), at
+    types, nullability, database defaults, primary keys, unique constraints,
+    `CHECK` constraint and index names), at
     that revision or at head. If your host evolved them differently, migrate
     them to a shipped revision's shape in your own history first; adoption never
     guesses and there is no public way to stamp an arbitrary revision. A host
@@ -293,6 +325,31 @@ fresh database with the `jasil_` names directly. Run from your own history,
 `rev0001` creates the unprefixed tables and `rev0003` renames them, so a table of
 yours called `event_log` (or another old name) still collides on a fresh
 install. Create JASIL's tables with `upgrade()` first if that applies to you.
+
+Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev0002`,
+`rev0004` and `rev0006` commit their other changes before building their
+`jasil_processing_jobs` indexes `CONCURRENTLY`; inside one transaction for the whole
+run, that commit would also commit every revision before them.
+
+To render the SQL instead of running it (`alembic upgrade --sql`), pass
+`-x schema=<name>`: on PostgreSQL `rev0006` creates its audit functions in the
+schema its tables go into, and offline there is no database to ask. Name the
+schema the connection that runs the script creates tables in.
+
+### When a migration fails
+
+On PostgreSQL a failed revision rolls back and `upgrade()` resumes from it. A
+revision that fails while building its indexes `CONCURRENTLY` keeps the changes it
+committed before the build, and `upgrade()` carries on from there. SQLite and MySQL
+commit each `CREATE`, `ALTER` and `DROP` on its own, so a revision that fails
+part-way leaves the statements before the failure applied and the revision
+unrecorded, and running it again fails on what already exists. Restore the
+database from the backup taken before the upgrade, or undo the failed revision's
+applied statements by hand, then run `upgrade()` again. A SQLite development
+database is simply recreated.
+
+Downgrades drop columns with `ALTER TABLE ... DROP COLUMN`, which SQLite supports
+from 3.35. Check `sqlite3.sqlite_version` before downgrading a SQLite database.
 
 ## Retention
 

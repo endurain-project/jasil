@@ -46,6 +46,7 @@ from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
 from jasil.profile import DeploymentProfile
 from jasil.providers import (
+    AuditSink,
     ClockProvider,
     EventBusProvider,
     EventRecorder,
@@ -91,6 +92,8 @@ class Platform:
             this is a backend whose ``send`` raises
             :class:`~jasil.providers.MailNotConfiguredError`, so a message is
             never dropped silently.
+        audit_sink: Write-once external copy of the audit checkpoints, or ``None`` when
+            ``audit.external_sink_uri`` is unset (or auditing is disabled).
         realtime: Cross-process keyed hint channel. Defaults to an
             :class:`~jasil.backends.realtime_inprocess.InProcessRealtime`, so a
             hand-built ``Platform`` need not supply it. The host registers its
@@ -108,9 +111,13 @@ class Platform:
     recorder: EventRecorder | None = None
     mail: MailProvider = field(default_factory=NullMail)
     realtime: RealtimeProvider = field(default_factory=InProcessRealtime)
+    audit_sink: AuditSink | None = None
+    # The shared Redis clients this platform's backends took, which :meth:`close` gives back. Set by
+    # ``build_platform``; a platform assembled by hand took none through it and releases none.
+    _shared_redis: list[redis_clients.ClientKey] = field(default_factory=list, repr=False, compare=False)
 
     def close(self) -> None:
-        """Release what the platform owns: the bus consumer, the realtime subscriber and the Redis clients.
+        """Release what the platform owns: the bus consumer, the realtime subscriber and its Redis clients.
 
         Call once on shutdown, after the host has stopped producing events. Only
         the capabilities that hold something beyond the process are affected —
@@ -118,7 +125,9 @@ class Platform:
 
         Two things it deliberately does *not* stop, because the platform does not
         own them: the durable-job worker and its scheduled maintenance (see
-        ``jasil.jobs.service.stop_job_worker``), and the database engine.
+        ``jasil.jobs.service.stop_job_worker``), and the database engine. A Redis
+        client another platform in the process still uses stays open until that
+        one closes too.
 
         Safe to call more than once, and never raises: a failure to shut a
         connection down must not mask whatever prompted the shutdown.
@@ -127,8 +136,13 @@ class Platform:
             self.events.stop()
         except Exception as error:
             logger.warning("Failed to stop the event bus during shutdown: %r", error)
-        self.realtime.stop()  # the provider contract: never raises
-        redis_clients.close_shared_clients()
+        try:
+            self.realtime.stop()
+        except Exception as error:
+            logger.warning("Failed to stop the realtime provider during shutdown: %r", error)
+        # Taken out first, so a second close has nothing left to give back.
+        shared, self._shared_redis[:] = list(self._shared_redis), []
+        redis_clients.release_shared_clients(shared)
 
 
 def build_platform(
@@ -157,8 +171,10 @@ def build_platform(
     Raises:
         ValueError: When a capability URI uses an unsupported scheme, is unset
             under a profile that has no default for it, when the resolved
-            wiring contradicts the deployment topology, or when ``mail`` is
-            configured incorrectly.
+            wiring contradicts the deployment topology, when ``mail`` is
+            configured incorrectly, or when a host that must be private (cleartext
+            mail) does not resolve yet. That last one is transient: a later build
+            may succeed, so retry it rather than treating it as a settings error.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
@@ -170,32 +186,41 @@ def build_platform(
     # of best-effort (bus-delivered) events, while the publish facade uses the
     # same recorder to record 'published' for durable (outbox-delivered) events
     # so the event_log dashboard never goes dark when durable jobs are enabled.
-    recorder = _build_event_recorder(settings)
     clock = clock if clock is not None else SystemClock()
+    recorder = _build_event_recorder(settings, clock)
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
     geocoding = (
         _build_runtime_geocoding(settings, sources.geocoding) if sources.geocoding else _build_geocoding(settings)
     )
-    try:
-        return Platform(
-            profile=profile,
-            state=_build_state(settings),
-            storage=_build_storage(settings),
-            events=_build_events(settings, recorder),
-            lock=_build_lock(settings),
-            clock=clock,
-            geocoding=geocoding,
-            mail=mail,
-            recorder=recorder,
-            realtime=_build_realtime(settings),
-        )
-    except Exception:
-        # No Platform exists to close, so release the Redis clients a backend
-        # that did build has already opened.
-        redis_clients.close_shared_clients()
-        raise
+    with redis_clients.track_acquisitions() as shared_redis:
+        try:
+            state = _build_state(settings)
+            storage = _build_storage(settings)
+            events = _build_events(settings, recorder)
+            lock = _build_lock(settings)
+            realtime = _build_realtime(settings)
+            audit_sink = _build_audit_sink(settings)
+        except Exception:
+            # No Platform exists to close, so give back the Redis clients the backends that did build took,
+            # and only those: another platform in the process may be using the same clients.
+            redis_clients.release_shared_clients(shared_redis)
+            raise
+    return Platform(
+        profile=profile,
+        state=state,
+        storage=storage,
+        events=events,
+        lock=lock,
+        clock=clock,
+        geocoding=geocoding,
+        mail=mail,
+        recorder=recorder,
+        realtime=realtime,
+        audit_sink=audit_sink,
+        _shared_redis=shared_redis,
+    )
 
 
 def _check_deployment_consistency(settings: JasilSettings, sources: RuntimeSources | None = None) -> None:
@@ -221,6 +246,14 @@ def _check_deployment_consistency(settings: JasilSettings, sources: RuntimeSourc
     )
 
 
+def _unsupported_scheme(setting: str, uri: str) -> ValueError:
+    """Return the error for a URI no backend serves, naming its scheme only: the rest may hold a password."""
+    scheme, separator, _ = uri.partition("://")
+    if separator:
+        return ValueError(f"Unsupported {setting} scheme: {scheme!r}")
+    return ValueError(f"{setting} is not a scheme://... URI")
+
+
 def _build_state(settings: JasilSettings) -> StateProvider:
     state_uri = settings.resolved_state_uri
     scheme, _, _ = state_uri.partition("://")
@@ -228,7 +261,7 @@ def _build_state(settings: JasilSettings) -> StateProvider:
         return MemoryState()
     if scheme in ("redis", "rediss", "unix"):
         return RedisState.from_uri(state_uri)
-    raise ValueError(f"Unsupported state_uri scheme: {scheme or state_uri!r}")
+    raise _unsupported_scheme("state_uri", state_uri)
 
 
 def _build_storage(settings: JasilSettings) -> StorageProvider:
@@ -249,7 +282,7 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
         from jasil.backends.storage_s3 import S3Storage
 
         return S3Storage.from_uri(storage_uri)
-    raise ValueError(f"Unsupported storage_uri scheme: {scheme or storage_uri!r}")
+    raise _unsupported_scheme("storage_uri", storage_uri)
 
 
 def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> EventBusProvider:
@@ -263,7 +296,7 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
         return RedisStreamEventBus.from_uri(
             events_uri, stream=settings.events_stream, group=settings.events_group, recorder=recorder
         )
-    raise ValueError(f"Unsupported events_uri scheme: {scheme or events_uri!r}")
+    raise _unsupported_scheme("events_uri", events_uri)
 
 
 def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
@@ -277,17 +310,34 @@ def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
         from jasil.backends.realtime_redis import RedisRealtime
 
         return RedisRealtime.from_uri(realtime_uri, channel=settings.realtime_channel)
-    raise ValueError(f"Unsupported realtime_uri scheme: {scheme or realtime_uri!r}")
+    raise _unsupported_scheme("realtime_uri", realtime_uri)
 
 
-def _build_event_recorder(settings: JasilSettings) -> EventRecorder | None:
+def _build_audit_sink(settings: JasilSettings) -> AuditSink | None:
+    uri = settings.audit.external_sink_uri
+    if not uri or not settings.audit.enabled:
+        return None
+    scheme, _, _ = uri.partition("://")
+    if scheme == "file":
+        from jasil.backends.audit_sink_file import FileAuditSink
+
+        return FileAuditSink.from_uri(uri)
+    if scheme == "s3":
+        from jasil.backends.audit_sink_storage import StorageAuditSink
+        from jasil.backends.storage_s3 import S3Storage
+
+        return StorageAuditSink(S3Storage.from_uri(uri))
+    raise _unsupported_scheme("audit.external_sink_uri", uri)
+
+
+def _build_event_recorder(settings: JasilSettings, clock: ClockProvider) -> EventRecorder | None:
     if not settings.event_log.enabled:
         return None
     # Imported lazily: the recorder pulls in the ORM/session layer, which the
     # pure providers/events modules deliberately do not depend on.
     from jasil.event_log.recorder import EventLogRecorder
 
-    return EventLogRecorder()
+    return EventLogRecorder(clock)
 
 
 def _build_lock(settings: JasilSettings) -> LockProvider:
@@ -297,7 +347,7 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
         return NoopLock()
     if scheme == "postgres-advisory":
         return PgAdvisoryLock.from_main_database()
-    raise ValueError(f"Unsupported lock_uri scheme: {scheme or lock_uri!r}")
+    raise _unsupported_scheme("lock_uri", lock_uri)
 
 
 def _build_runtime_geocoding(settings: JasilSettings, source: Callable[[], GeocodingSettings]) -> ReloadingGeocoding:

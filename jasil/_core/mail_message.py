@@ -34,15 +34,24 @@ class MailMessageLike(Protocol):
     """
 
     @property
-    def to(self) -> Sequence[str]: ...
+    def to(self) -> Sequence[str]:
+        """Recipient addresses."""
+
     @property
-    def subject(self) -> str: ...
+    def subject(self) -> str:
+        """Subject line."""
+
     @property
-    def text(self) -> str | None: ...
+    def text(self) -> str | None:
+        """Plain-text body, if any."""
+
     @property
-    def html(self) -> str | None: ...
+    def html(self) -> str | None:
+        """HTML body, if any."""
+
     @property
-    def reply_to(self) -> str | None: ...
+    def reply_to(self) -> str | None:
+        """Single ``Reply-To`` address, if any."""
 
 
 def _has_control_character(value: str) -> bool:

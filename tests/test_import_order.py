@@ -28,6 +28,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ALWAYS_IMPORTABLE = (
     "jasil",
     "jasil.admin",
+    "jasil.audit",
     "jasil.container",
     "jasil.deps",
     "jasil.jobs.registry",
@@ -43,6 +44,7 @@ ALWAYS_IMPORTABLE = (
 # The database layer proper. A host importing one of these is already in ORM
 # territory, so the ordering constraint stands — it just has to be legible.
 NEEDS_MAPPING_FIRST = (
+    "jasil.audit.models",
     "jasil.event_log.crud",
     "jasil.event_log.models",
     "jasil.jobs.crud",

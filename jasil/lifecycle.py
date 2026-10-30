@@ -7,10 +7,10 @@ runs subscribers, and a subscriber that publishes needs the bus still up, so the
 worker stops first.
 
 They are two calls underneath because :mod:`jasil.container` must not import
-:mod:`jasil.jobs`: the jobs layer imports APScheduler at module scope, and a
-deployment that never enables durable jobs has to be able to build a platform
-without the ``jobs`` extra installed at all. This module is the seam that
-composes them, so the ordering lives in one place instead of in every host::
+:mod:`jasil.jobs`: the jobs layer binds the ORM models, which a deployment that
+never enables durable jobs has not mapped, and the platform has to build
+without them. This module is the seam that composes them, so the ordering
+lives in one place instead of in every host::
 
     import jasil.lifecycle as jasil_lifecycle
 
@@ -57,7 +57,7 @@ def _stop_job_worker() -> None:
     try:
         import jasil.jobs.service as jobs_service
     except ImportError:
-        # The ``jobs`` extra is not installed, so no worker can be running.
+        # The jobs layer cannot be imported at all (a partial install), so no worker can be running.
         return
     try:
         jobs_service.stop_job_worker()
@@ -69,4 +69,7 @@ def _close_platform() -> None:
     """Release the platform's own resources, if one was ever published."""
     if not platform_runtime.is_platform_active():
         return
-    platform_runtime.get_active_platform().close()
+    try:
+        platform_runtime.get_active_platform().close()
+    except Exception as error:
+        logger.warning("Failed to close the platform during shutdown: %r", error)

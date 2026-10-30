@@ -46,6 +46,12 @@ Includes `RuntimeSources` (callables returning mail / geocoding settings, passed
 
 ::: jasil.correlation
 
+## Audit trail
+
+The public surface is what `jasil.audit` exports. See [Audit trail](audit.md).
+
+::: jasil.audit
+
 ## ORM integration
 
 ::: jasil.orm
@@ -68,11 +74,11 @@ Includes `RuntimeSources` (callables returning mail / geocoding settings, passed
 
 ## Durable jobs
 
+::: jasil.jobs
+
 ::: jasil.jobs.registry
 
 ::: jasil.jobs.reconciliation
-
-::: jasil.jobs.runner
 
 ::: jasil.jobs.service
 

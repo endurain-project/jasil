@@ -19,11 +19,12 @@ from collections.abc import Sequence
 logger = logging.getLogger(__name__)
 
 # RFC 1123 hostname syntax: labels of 1-63 alphanumeric/hyphen characters,
-# separated by dots. Hyphens may not start or end a label.
+# separated by dots. Hyphens may not start or end a label. ASCII-only, so case folding cannot admit letters
+# such as the Kelvin sign, and matched with ``fullmatch`` because ``$`` also accepts a trailing newline.
 _HOSTNAME_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)"  # first label
-    r"(?:\.(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?))*$",  # more
-    re.IGNORECASE,
+    r"(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)"  # first label
+    r"(?:\.(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?))*",  # more
+    re.IGNORECASE | re.ASCII,
 )
 
 # Reasons a destination is refused. Phrased to read correctly after a host value.
@@ -52,20 +53,37 @@ def is_valid_hostname(value: str) -> bool:
     Returns:
         True when ``value`` conforms to RFC 1123 hostname syntax.
     """
-    return len(value) <= 253 and _HOSTNAME_RE.match(value) is not None
+    return len(value) <= 253 and _HOSTNAME_RE.fullmatch(value) is not None
+
+
+# ``is_private`` is True for these in Python before 3.12.4, but IANA marks them globally reachable: the PCP and TURN
+# anycast addresses, AMT, AS112, ORCHIDv2 and the drone remote ID prefix, all inside ``2001::/23``.
+_GLOBALLY_REACHABLE_NETWORKS = (
+    ipaddress.IPv6Network("2001:1::1/128"),
+    ipaddress.IPv6Network("2001:1::2/128"),
+    ipaddress.IPv6Network("2001:3::/32"),
+    ipaddress.IPv6Network("2001:4:112::/48"),
+    ipaddress.IPv6Network("2001:20::/28"),
+    ipaddress.IPv6Network("2001:30::/28"),
+)
 
 
 def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Return True if ``addr`` belongs to any non-routable range.
+    """Return True if ``addr`` is anything but a public unicast address.
 
     Combines every "do not dial" predicate ``ipaddress`` exposes: private
-    (RFC1918, fc00::/7), loopback, link-local, multicast, unspecified, and
-    reserved. Any of these would let an attacker pivot to internal
-    infrastructure or a cloud metadata service.
+    (RFC1918, fc00::/7), loopback, link-local, multicast, unspecified, reserved,
+    and not globally reachable. The last catches what the others leave out, such
+    as the shared address space ``100.64.0.0/10``, where one cloud serves its
+    instance metadata. Any of these would let an attacker pivot to internal
+    infrastructure or a metadata service.
     """
     # Python 3.12.0-3.12.3 call ``::ffff:8.8.8.8`` private; judge the embedded IPv4.
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
+    # The same interpreters call 6to4 and Teredo addresses global, whatever IPv4 host they encode.
+    if isinstance(addr, ipaddress.IPv6Address) and any(addr in net for net in _TUNNELLED_NETWORKS):
+        return True
     return (
         addr.is_private
         or addr.is_loopback
@@ -73,6 +91,9 @@ def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address)
         or addr.is_multicast
         or addr.is_unspecified
         or addr.is_reserved
+        or not addr.is_global
+        # Deprecated IPv6 site-local (fec0::/10) still routes inside a network but counts as global.
+        or (isinstance(addr, ipaddress.IPv6Address) and addr.is_site_local)
     )
 
 
@@ -152,10 +173,11 @@ def _address_rejection_reason(
 
 
 # ``is_private`` is True for these, but a gateway carries them to a public IPv4
-# host (NAT64 local-use prefix, Teredo), so they do not "stay inside the network".
+# host (NAT64 local-use prefix, Teredo, 6to4), so they do not "stay inside the network".
 _TUNNELLED_NETWORKS = (
     ipaddress.IPv6Network("64:ff9b:1::/48"),
     ipaddress.IPv6Network("2001::/32"),
+    ipaddress.IPv6Network("2002::/16"),
 )
 
 
@@ -193,6 +215,7 @@ def resolve_private_addresses(hostname: str) -> tuple[list[str], str | None]:
             not (addr.is_private or addr.is_loopback or addr.is_link_local)
             or addr.is_multicast
             or any(addr in net for net in _TUNNELLED_NETWORKS)
+            or any(addr in net for net in _GLOBALLY_REACHABLE_NETWORKS)
         ):
             return [], "resolves to a public address"
         if text not in addresses:

@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 #: The envelope version this build writes.
 ENVELOPE_VERSION = 2
 
-#: The previous envelope version, still read so a rolling upgrade from 0.7 loses
-#: no hints. Drop it once no supported release writes it.
+#: The previous envelope version, written by 0.7. Still read, so the hints a 0.7
+#: process publishes during a rolling upgrade are not lost.
 LEGACY_ENVELOPE_VERSION = 1
 
 #: Cap on the length of a hint key, in characters (code points, not bytes).
@@ -94,26 +94,31 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
     envelope = {"v": ENVELOPE_VERSION, "key": key, "hint": hint}
     try:
         encoded = json.dumps(envelope, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode()
-    except (TypeError, ValueError) as error:
+    except (TypeError, ValueError, RecursionError) as error:
         raise ValueError(f"hint is not JSON-serialisable: {error}") from None
     if len(encoded) > max_bytes:
         raise ValueError(f"realtime hint envelope is {len(encoded)} bytes, over the {max_bytes}-byte cap")
     return encoded
 
 
-def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
+def decode(raw: str | bytes, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES) -> tuple[str, dict[str, Any]] | None:
     """Parse one envelope, or log and return ``None`` when it is unusable.
 
     Args:
         raw: The payload as received.
+        max_bytes: The cap on the payload. Anything over it is ignored without being parsed: other publishers
+            share the channel, so the receiver cannot rely on the sender having held to the cap.
 
     Returns:
-        ``(key, hint)``, or ``None`` for a malformed payload or an unknown
+        ``(key, hint)``, or ``None`` for an oversized or malformed payload or an unknown
         envelope version.
     """
+    if isinstance(raw, str | bytes) and len(raw) > max_bytes:
+        logger.warning("Ignoring an oversized realtime hint of %d bytes (the cap is %d)", len(raw), max_bytes)
+        return None
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):  # nesting past the parser's depth is not a JSON error
         logger.warning("Ignoring a realtime hint that is not valid JSON")
         return None
     if not isinstance(envelope, dict):
@@ -145,7 +150,7 @@ def _encodes(hint: dict) -> bool:
     # drop both here so no handler sees a hint no backend could send.
     try:
         json.dumps(hint, ensure_ascii=False, allow_nan=False).encode()
-    except (UnicodeEncodeError, ValueError):
+    except (UnicodeEncodeError, ValueError, RecursionError):
         return False
     return True
 

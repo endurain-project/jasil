@@ -219,6 +219,18 @@ class _ReadOnceSource(io.BytesIO):
         return False
 
 
+class _EndlessSource:
+    """Never runs out, and counts what was taken from it."""
+
+    def __init__(self) -> None:
+        self.taken = 0
+
+    def read(self, size=-1):
+        assert size >= 0, "an unbounded read of an endless source never returns"
+        self.taken += size
+        return b"x" * size
+
+
 class _OverReadingSource:
     def read(self, size=-1):
         return b"x" * (size + 1)
@@ -404,6 +416,16 @@ class TestStreamingConformance:
         with pytest.raises(StorageSizeLimitError):
             storage.save_stream(AREA, KEY, source, max_bytes=S3_PART_BYTES)
 
+        assert storage.exists(AREA, KEY) is False
+
+    def test_the_limit_stops_reading_one_byte_past_it(self, storage):
+        """A client streaming without end costs the host ``max_bytes`` plus one byte, not memory or disk."""
+        source = _EndlessSource()
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream(AREA, KEY, source, max_bytes=1000)
+
+        assert source.taken == 1001
         assert storage.exists(AREA, KEY) is False
 
     def test_a_negative_size_limit_is_refused_before_writing(self, storage):
@@ -820,7 +842,11 @@ class TestWritableConformance:
 
 
 class TestSegmentValidationConformance:
-    @pytest.mark.parametrize("area", [".jasil-objects", ".jasil-upload-sessions"])
+    @pytest.mark.parametrize(
+        "area",
+        # Case variants too: on a case-insensitive filesystem they name the same directory.
+        [".jasil-objects", ".jasil-upload-sessions", ".JASIL-OBJECTS", ".Jasil-Upload-Sessions", ".jasil-anything"],
+    )
     def test_the_private_upload_staging_area_is_reserved(self, storage, area):
         with pytest.raises(ValueError, match="reserved"):
             storage.begin_upload(area, KEY)
@@ -892,6 +918,30 @@ class TestSegmentValidationConformance:
 
         with pytest.raises(ValueError, match="escapes base directory"):
             call(arguments["area"], arguments["key"], *extra)
+
+    @pytest.mark.parametrize("bad", ["a\x00b", "line\nbreak", "tab\there", "del\x7f"])
+    @pytest.mark.parametrize("field", ["area", "key"])
+    @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "exists", "delete", "url"])
+    def test_a_control_character_is_refused_by_every_backend(self, storage, bad, field, operation):
+        """S3 cannot list or batch-delete such a key, and a local path cannot hold a NUL."""
+        arguments = {"area": "avatars", "key": "42.webp", field: bad}
+        call = getattr(storage, operation)
+        extra = (b"x",) if operation == "save" else (_ReadOnceSource(b"x"),) if operation == "save_stream" else ()
+
+        with pytest.raises(ValueError, match="control character"):
+            call(arguments["area"], arguments["key"], *extra)
+
+    def test_a_key_longer_than_object_storage_allows_is_refused_by_every_backend(self, storage):
+        """S3 refuses a key over 1024 bytes; local disk must refuse it too, or the two contracts differ."""
+        too_long = "é" * 513  # 1026 bytes in UTF-8
+
+        with pytest.raises(ValueError, match="1024 bytes"):
+            storage.save(AREA, too_long, b"x")
+
+    def test_a_key_at_the_limit_is_accepted(self, storage):
+        at_limit = "/".join(["k" * 200] * 5)[:1000]
+
+        assert storage.save(AREA, at_limit, b"x") == at_limit
 
     @pytest.mark.parametrize("field", ["area", "key"])
     @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "open_stream", "exists", "delete", "url"])

@@ -5,9 +5,10 @@ is mocked here.
 """
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 from jasil import migrations
+from jasil.audit import _postgres as audit_pg
 from jasil.orm import legacy_table_names
 
 pytest.importorskip("alembic", reason="migrations require the 'migrations' extra")
@@ -26,6 +27,10 @@ def engine(mapped_base, database_url):
             connection.exec_driver_sql(f"DROP TABLE IF EXISTS {migrations.VERSION_TABLE}")
             for name in sorted(legacy_table_names()):
                 connection.exec_driver_sql(f"DROP TABLE IF EXISTS {name}")
+            # rev0006's functions outlive the tables; see ``test_migrations._drop_everything``.
+            schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+            for statement in audit_pg.uninstall_statements(schema):
+                connection.exec_driver_sql(statement)
 
     clean()
     yield engine

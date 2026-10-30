@@ -61,7 +61,10 @@ jobs_registry.registry.register(
 Queue ownership belongs to the subscriber rather than the event. One event can
 fan out to several subscribers on different queues, and the relay stamps each
 subscriber's queue on its own job. Names are 1–100 lowercase ASCII characters:
-letters, digits, `.`, `_`, and `-`; an invalid name raises before persistence.
+letters, digits, `.`, `_`, and `-`, starting with a letter or a digit; an invalid
+name raises before persistence. Registering a `subscriber_id` again replaces its
+handler, queue and callback, and moves it to the new event type if it was
+registered under another one.
 
 ### Attempt counts
 
@@ -159,30 +162,39 @@ jobs_registry.registry.register(
 whichever way it got there: the handler raised on its last attempt, the lease
 expired on the last attempt, or the reaper recovered a worker that died.
 `event` is the job's envelope with its final `retry_count` and `max_attempts`;
-`error` is the stored last failure reason (`str | None`).
+`error` is the stored last failure reason (`str | None`); for an exception it is
+`"<ExceptionType>: <message>"`, so it names the failure even when the message is empty.
 
-* **At least once.** Delivery is recorded in `dead_letter_notified_at` only after the
-  callback returns. A crash, or a callback that raises, leaves the callback owed and a
-  later reaper pass calls it again, after a backoff that starts at 60 seconds and
-  doubles per failure up to an hour. Each delivery first claims the job with a
-  5-minute lease, so a worker and a reaper (or two reapers) do not run it together.
-  The count and the last failure are kept in `dead_letter_attempts` and
-  `dead_letter_callback_error`. **Make the callback idempotent.**
-* **After the transition, outside the handler.** It runs in the worker or reaper
-  process, after the dead-letter is committed and in no session of the failed handler.
-  An exception from it is logged and swallowed; the job stays `dead_letter`.
-* **It runs inline.** The worker (or reaper) waits for it, after the failure has been
-  logged, so keep it short and give any network call its own timeout. A callback that
-  outlasts its 5-minute lease may be started a second time by another process.
+* **At least once, within bounds.** Delivery is recorded in `dead_letter_notified_at`
+  only after the callback returns. A crash, or a callback that raises, leaves the
+  callback owed and a later sweep calls it again, after a backoff that starts at 60
+  seconds and doubles per failure up to an hour. Each delivery first claims the job
+  with a 5-minute lease, so two sweeps do not run it together. The count and the last
+  failure are kept in `dead_letter_attempts` and `dead_letter_callback_error`. Two
+  limits bound the retries: after 10 deliveries that raised, the callback is given up
+  on, and the sweep only picks up jobs dead-lettered in the last 7 days, so a callback
+  added to a subscriber later does not fire for its old history and one owed while no
+  process registered it for a week is not called. Either way the job keeps
+  `dead_letter_notified_at` NULL, so a query for owed notifications still finds it.
+  **Make the callback idempotent.**
+* **In the scheduled sweep, never in the worker.** The sweep that
+  `schedule_job_maintenance` runs every 60 seconds delivers it, so it arrives within
+  about a minute of the dead letter, after the dead-letter is committed and in no
+  session of the failed handler. The worker never waits for a callback, so a slow or
+  hung one cannot hold a worker or the leases of the jobs behind it. An exception from
+  it is logged and swallowed; the job stays `dead_letter`.
+* **Keep it short.** The sweep runs callbacks one at a time and waits for each, so
+  give any network call its own timeout. A callback that outlasts its 5-minute lease
+  may be started a second time by another process.
 * **Check your own state.** A handler that finishes after its lease was taken still
   writes its result, but the job stays `dead_letter`. The callback may then run for
   work that succeeded, so read the app's record before overwriting it.
 * **Replay.** `replay_dead_letter_job` clears the record, and the callback runs
   again only if the job dead-letters again.
-* **Register it where the reaper runs.** The callback lives in the process-local
+* **Register it where the maintenance runs.** The callback lives in the process-local
   registry. A process that did not register it never delivers or consumes the
   notification, so register subscribers, callbacks included, in every process that
-  runs a worker or the reaper. A job whose subscriber has no callback in the process
+  runs `schedule_job_maintenance`. A job whose subscriber has no callback in the process
   doing the sweep is skipped without a log line.
 * **Dead letters before this feature** are not called back; the migration marks them
   as delivered.
@@ -192,14 +204,20 @@ A subscriber registered without `on_dead_letter` behaves exactly as before.
 ## The job state machine
 
 ```
-                 ┌──────────────── backoff ◀────────────┐
-                 ▼                                      │
-enqueue ──▶ pending ──claim──▶ claimed ──success──▶ completed
-                                  │
-                                  ├──failure, attempts left──▶ pending
-                                  ├──failure, ceiling hit───▶ dead_letter
-                                  └──lease expired──────────▶ pending | dead_letter
+enqueue ──▶ pending ──claim──▶ claimed ──success──────────────▶ completed
+              ▲                   │
+              │                   ├──failure, attempts left──▶ pending, after a backoff
+              │                   ├──deferred (DeferJob)─────▶ pending, at retry_at; not an attempt
+              │                   ├──released, never started─▶ pending at once; attempt refunded
+              │                   ├──failure, ceiling hit────▶ dead_letter
+              │                   └──lease expired───────────▶ pending | dead_letter
+              │
+              └──────── replay ◀──────── dead_letter
 ```
+
+A claim is **released** when the worker will not run it: a batch is claimed up
+front, and a worker that stops early (shutdown, a lost lease, or a run past
+`max_runtime_seconds`) returns the jobs it has not started.
 
 | Status | Meaning |
 |---|---|
@@ -247,6 +265,12 @@ dependency.
 
 Once `attempts` reaches `max_attempts`, the job becomes `dead_letter`.
 
+A handler that raises `SystemExit`, `KeyboardInterrupt` or a cancellation is a
+failure too, recorded like any other, but the exception is then re-raised: the
+jobs still waiting in that batch go back to `pending` and the worker stops, with an
+`ERROR` log line. Nothing restarts an in-process worker, so do not use these to end
+a job.
+
 Only real attempts count. A run the handler [deferred](#deferring-a-job) with
 `DeferJob` is neither a failure nor an attempt: `jasil_processing_jobs.attempts`
 still counts every claim (it identifies the claim), `deferrals` counts the
@@ -263,6 +287,16 @@ A *running* worker does not lose its leases. Its heartbeat renews every lease it
 holds, the running job's and the waiting jobs' of its batch, on each beat, so
 `lease_seconds` is how long a worker may go **silent**, not how long a handler may
 run. See [Long-running handlers](#long-running-handlers).
+
+One reaper run reclaims up to 10 000 expired leases, in transactions of 100, so a
+crash that expires a whole batch is recovered within a minute.
+
+**Keep the hosts' clocks synchronised.** A lease's expiry is written with the
+claiming worker's clock and compared with the reaper's, which may run on another
+host. A reaper whose clock runs ahead by more than `lease_seconds` minus
+`heartbeat_interval_seconds` reclaims leases that are still being renewed, and
+the job runs twice. Run NTP, or your platform's time sync, everywhere a worker or
+the scheduler runs.
 
 ## Idempotency
 
@@ -389,7 +423,10 @@ worker. Alternatively, let the `default` queue drain before rolling out.
 
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
-unnecessary. Durable jobs use the database only; Redis is not a job-queue
+unnecessary. The relay fans an event out to the durable subscribers registered
+**in its own process**, so register every durable subscriber in each process
+that runs it, the API processes included. An event it finds no subscriber for is
+marked relayed with no jobs and logged as a warning. Durable jobs use the database only; Redis is not a job-queue
 dependency.
 
 ## Dead letters
@@ -477,8 +514,8 @@ failure.
 `lease_seconds` is how long a worker may go silent. One heartbeat renews leases
 and proves the worker alive, so it must be at least **three**
 `heartbeat_interval_seconds` (two missed beats must not expire a lease), and
-`max_runtime_seconds` must not be below it; `build_runner` refuses anything else
-at startup. A worker is therefore reported stale no later than its leases start
+`max_runtime_seconds` must not be below it; `JobSettings` refuses anything else
+when it is built. A worker is therefore reported stale no later than its leases start
 expiring.
 
 A late worker finalizes with its worker id and attempt generation, so even a
@@ -499,7 +536,12 @@ twice. Three things bound that:
   operator's signal.
 - **Self-fencing.** If renewals fail for almost a whole lease (the database is
   unreachable), the handler is signalled *before* another worker can have
-  reclaimed the job.
+  reclaimed the job. Only a renewal that *fails* counts: one that hangs holds the
+  worker, which waits for it before starting each job. Give the engine a connect
+  timeout and a statement timeout (PostgreSQL `statement_timeout`; on MySQL, whose
+  `max_execution_time` covers only `SELECT`, a driver read timeout such as
+  PyMySQL's `read_timeout`) well below
+  `heartbeat_interval_seconds`, so a stalled database fails a renewal instead.
 - **A stolen lease.** If the job is found to belong to another worker, the handler
   is signalled and its result is discarded.
 

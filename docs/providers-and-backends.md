@@ -55,6 +55,12 @@ A Redis outage surfaces as `StateBackendUnavailableError`, never as a redis-py
 exception, so domain code catching it needs no knowledge of the backend. The
 memory backend never raises it.
 
+Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
+zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
+Redis it would match every key in the database), and an operation the stored
+value does not support, such as `incr` of a non-integer or, on Redis, a key that
+holds another type.
+
 ## StorageProvider
 
 Object storage addressed by a key within a named *area*. The whole-object API is
@@ -77,6 +83,12 @@ small test doubles can depend on only the slice they use:
 |---|---|---|
 | `LocalStorage` | `local://`, `local://<path>` | Logical objects in a private versioned filesystem layout. |
 | `S3Storage` | `s3://<bucket>` | Key prefix per area. Requires the `s3` extra. |
+
+`s3://<bucket>[/prefix]` takes two optional query parameters: `region`, and
+`endpoint_url` for an S3-compatible store (MinIO, R2, Ceph). `endpoint_url` must be
+`https://`, or `http://` to a host that resolves only to private addresses:
+request signatures, objects and presigned URLs cross that connection. The client
+waits at most 10 seconds to connect and 60 seconds for each read.
 
 ```python
 platform.storage.save("avatars", "42.webp", data)
@@ -174,6 +186,11 @@ operations.
     `max_bytes` while reading. On a breach they raise `StorageSizeLimitError`, and
     no partial new object is visible: local disk removes its temporary file and S3
     calls `AbortMultipartUpload`. The previous object, if any, stays in place.
+- Every local write (`save`, `save_stream`, an upload part, `complete_upload`)
+    goes to a temporary file that is flushed to disk before an atomic rename
+    publishes it, and the directory holding the new name is synced after, so a
+    write that returned survives a crash. A crash mid-write can leave a hidden
+    temporary file beside the object; it is never listed or served.
 - `open_stream` returns a read-once, non-seekable binary stream on **both**
     backends. Always close it, normally with `with`. A missing object raises
     `FileNotFoundError`; it never becomes an empty stream.
@@ -207,11 +224,15 @@ code never branches by backend:
 - A part is at most 5 GiB. At completion, every part except the final one must
     be at least 5 MiB. The final part may be smaller or empty.
 - `upload_part(session, part_number, source, size=...)` reads a non-seekable
-    binary source once without materializing the part. `size` is required and
-    must exactly match the source: a short or longer source raises `ValueError`
-    and leaves the session available for a replacement upload. The caller owns
-    and closes the source. A failed attempt may have consumed it, so retry with
-    a newly opened source and the same session and part number.
+    binary source once. `size` is required and must exactly match the source: a
+    short or longer source raises `ValueError` and leaves the session available
+    for a replacement upload. The caller owns and closes the source. A failed
+    attempt may have consumed it, so retry with a newly opened source and the
+    same session and part number. Local storage writes the part straight to its
+    staging file. S3 stages it first, in memory up to 8 MiB and in a temporary
+    file (under `TMPDIR`) beyond that, so the client can checksum it and resend
+    it after a transient failure: allow temporary disk for the largest part in
+    flight.
 - `PartRef` records the part number, actual byte size, and an opaque
     `validator`. The validator may internally be a digest, an S3 ETag, or
     another backend token; callers compare or persist it but never interpret
@@ -233,7 +254,9 @@ storage uses durable manifests and atomic part files under the reserved
 the same reserved namespace and maps their opaque IDs to native multipart upload
 IDs. Both backends reserve that area name so switching backends cannot expose
 session state as ordinary objects. `.jasil-objects` is also reserved for the
-local physical layout.
+local physical layout, and so is every other area whose name starts with
+`.jasil-`, in any letter case (a case-insensitive filesystem would otherwise
+reach the reserved directories under another spelling).
 
 `upload_part` and `complete_upload` raise `StorageUploadSessionError` for an
 unknown, cleaned, completed, mismatched, or foreign session and for a stale part
@@ -339,7 +362,9 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
     Area, key, source, destination, and deletion-prefix values are validated
     before backend I/O. Addresses must be canonical slash-delimited paths: an
     absolute path, a `.` or `..` component, a repeated or trailing separator,
-    or any backslash raises `ValueError`. Dots inside a component, such as
+    or any backslash raises `ValueError`, and so does a control character or a
+    value over 1024 bytes in UTF-8, S3's key limit (on S3 the bucket prefix and
+    area count toward it too). Dots inside a component, such as
     `.metadata.json`, remain valid. Keys are expected to be server-generated,
     but a stray value must never escape or alias another address. Local storage
     also rejects object addresses that traverse symbolic links and omits symlink
@@ -349,7 +374,9 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 !!! danger "URL controls are honoured by S3 only"
     In addition to the plain-area key/descendant limitation above, this is a
     delivery-contract difference between the backends. `s3://` returns a
-    presigned URL that honours `expires_in`, `download_as`, and `content_type`.
+    presigned URL (Signature Version 4) that honours `expires_in`, `download_as`,
+    and `content_type`; `expires_in` must be between 1 second and 7 days, the
+    longest a Signature Version 4 URL can live, or `url` raises `ValueError`.
     `download_as` pins an `attachment` content disposition, so an untrusted
     object is downloaded rather than rendered inline. `local://` returns a plain
     path for **your** web server to serve and cannot enforce any of those controls
@@ -368,53 +395,30 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 | `InProcessEventBus` | `memory://` | Synchronous. `publish` runs subscribers inline. |
 | `RedisStreamEventBus` | `redis://`, `rediss://`, `unix://` | Redis Streams with a consumer group. |
 
-In-process dispatch is a direct function call, so a handler exception propagates
-to the publisher. Under Redis Streams, replicas form one consumer group, giving
-competing-consumer semantics: each derived computation runs once per event across
-the cluster, while in-process fan-out to every handler of an event type happens
-on whichever replica claims the entry.
+In-process dispatch is a direct function call. Every handler of the event runs
+even when one raises; the failure then propagates to the publisher (several
+together as an `ExceptionGroup`), which logs it. Under Redis Streams, replicas
+form one consumer group, giving competing-consumer semantics: each derived
+computation runs once per event across the cluster, while in-process fan-out to
+every handler of an event type happens on whichever replica claims the entry.
 
-Redis delivery is at-least-once — an entry is acked only after its handlers
-succeed. There is no in-bus retry or reclaim: an entry orphaned by a crashed
-consumer stays pending. For retry, backoff, dead-lettering and replay, enable
-[durable jobs](durable-jobs.md).
+Redis delivery is best-effort, at most once per event. Every handler runs even
+when one raises, the failure is logged and recorded in the event log, and the
+entry is acked either way: the consumer reads with `XREADGROUP ... >`, which
+only returns entries no one has claimed, so an entry left pending would never be
+processed and would only grow the pending-entries list. An entry claimed by a
+consumer that then crashed stays pending. If Redis loses the consumer group (a
+restart without persistence, or a flush), the consumer creates it again and
+reads the stream from its start.
 
-!!! danger "An entry the bus cannot process is stuck, not retried"
-    A handler that raises, or an entry the consumer cannot deserialize, is logged
-    and left **pending** — unacked, and never redelivered. The consumer reads
-    with `XREADGROUP ... >`, which only ever returns entries no one has claimed
-    yet, so nothing brings a claimed-but-unacked entry back. Two consequences to
-    plan for:
-
-    - the event is **not** processed, and nothing retries it; and
-    - the pending-entries list (PEL) grows without bound, while the stream itself
-      is capped at roughly 10 000 entries — so a long-pending entry is eventually
-      trimmed away underneath its own PEL record.
-
-    This is why [`best_effort`](events-and-outbox.md) swallows handler
-    exceptions: on this bus, letting one escape loses the event rather than
-    retrying it.
-
-    **Check for it.** The count is the second field of `XPENDING`:
-
-    ```console
-    $ redis-cli XPENDING jasil:events jasil
-    ```
-
-    A number that only grows is the symptom.
-
-    **Recover from it.** Claim the stuck entries onto a consumer of your own and
-    decide per entry — reprocess it, or ack it to drop it:
-
-    ```console
-    $ redis-cli XAUTOCLAIM jasil:events jasil recovery 0 0 COUNT 100
-    $ redis-cli XACK jasil:events jasil <entry-id>
-    ```
-
-    **Avoid it.** If losing an event matters, enable
-    [durable jobs](durable-jobs.md). Publishing then routes through the
-    transactional outbox and `jasil_processing_jobs`, which have the retry, backoff and
-    dead-letter path this bus deliberately does not.
+!!! warning "A failed handler is not retried"
+    Nothing redelivers an event a handler failed on, and the stream is capped at
+    roughly 10 000 entries, so a consumer that is down for long enough also
+    misses the oldest ones. This is why [`best_effort`](events-and-outbox.md)
+    swallows handler exceptions. If losing an event matters, enable
+    [durable jobs](durable-jobs.md): publishing then routes through the
+    transactional outbox and `jasil_processing_jobs`, which have the retry,
+    backoff and dead-letter path this bus deliberately does not.
 
 ## LockProvider
 
@@ -432,20 +436,36 @@ with platform.lock.try_acquire("nightly-backfill") as acquired:
 `try_acquire` is non-blocking — it yields `False` rather than waiting, so a
 replica that loses the race simply skips the work. The Postgres backend needs no
 infrastructure beyond the database you already have; the lock name is hashed to a
-signed 64-bit key because `pg_advisory_lock` keys are `bigint`.
+signed 64-bit key because `pg_advisory_lock` keys are `bigint`. The lock is held on
+a connection in autocommit mode, so no transaction sits open (and idle) while the
+guarded work runs, and `idle_in_transaction_session_timeout` cannot end the
+session and release the lock underneath it. That connection comes from your
+engine's pool and stays checked out for the whole body, so a pool that is
+exhausted makes `try_acquire` wait for `pool_timeout` and then raise instead of
+yielding `False`, and a body that opens sessions from the same engine competes
+with the lock for a slot. Size the pool for one extra connection per lock held.
+
+The lock lasts as long as that connection. If the connection drops while the
+guarded work runs (a database restart, a failover, a network cut), PostgreSQL
+releases the lock and another replica may start the same work. The body is not
+interrupted: JASIL sees the loss only when it releases the lock, and logs it at
+`ERROR`. Make the guarded work idempotent, as you would for any scheduled job.
 
 ## ClockProvider
 
 `SystemClock` returns timezone-aware UTC. It exists so time can be injected in
-tests without patching `datetime` globally — every module that needs "now" takes
-it from the platform.
+tests without patching `datetime` globally — the modules that stamp or compare
+rows take "now" from the platform. The two state backends are the exception:
+`MemoryState` and `RedisState` read the process clock for expiry and for the
+lockout gate in `record_tiered_failure`, so a test of their expiry patches the
+clock the backend module reads.
 
 ## GeocodingProvider
 
 | Backend | Notes |
 |---|---|
 | `NullGeocoding` | Resolves nothing. Selected when geocoding is unconfigured or misconfigured. |
-| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co, chosen by the `geocoding.uri` scheme. Requires the `geocoding` extra. |
+| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co, chosen by the `geocoding.uri` scheme: `nominatim://`, `photon://` or `geocode://`, and `nominatim+http://` or `photon+http://` for a cleartext instance on a private network. Requires the `geocoding` extra. |
 
 `reverse(latitude, longitude)` returns a `GeocodedPlace` or `None`. Its fields are
 administrative levels, filled the same way whichever service answered:
@@ -710,3 +730,16 @@ platform = Platform(
     recorder=None,
 )
 ```
+
+## AuditSink
+
+A write-once copy of the [audit checkpoints](audit.md#the-external-sink), kept outside the audited database.
+`Platform.audit_sink` is `None` unless `audit.external_sink_uri` is set.
+
+| Backend | URI | Notes |
+|---|---|---|
+| `FileAuditSink` | `file:///absolute/directory` | Exclusive-create, read-only files. |
+| `StorageAuditSink` | `s3://bucket/prefix` | Over the S3 storage backend; use a separate bucket with Object Lock and a default retention period. |
+
+`write_once(name, content)` never replaces an object: the same bytes again are a no-op, different bytes raise
+`AuditSinkConflictError`.

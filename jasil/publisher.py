@@ -30,6 +30,7 @@ lost*. Channel names and payload shape stay owned by the publishing domain; this
 layer only knows the generic envelope.
 """
 
+import copy
 import logging
 from collections.abc import Callable, Sequence
 from datetime import datetime
@@ -42,7 +43,15 @@ import jasil.correlation as correlation
 import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil._core.after_commit import run_after_commit
-from jasil.events import INITIAL_SCHEMA_VERSION, META_REQUEST_ID, Event, new_event
+from jasil._core.limits import check_length
+from jasil.events import (
+    INITIAL_SCHEMA_VERSION,
+    MAX_EVENT_TYPE_LENGTH,
+    MAX_SOURCE_LENGTH,
+    META_REQUEST_ID,
+    Event,
+    new_event,
+)
 from jasil.providers import EventRecorder
 from jasil.settings import get_settings
 
@@ -56,14 +65,21 @@ def _mint(
     metadata: dict | None,
     schema_version: int = INITIAL_SCHEMA_VERSION,
 ) -> Event:
-    """Build the event envelope, stamping the ambient request id for correlation."""
+    """Build the event envelope on the platform clock, stamping the ambient request id for correlation."""
     merged: dict = {}
     request_id = correlation.get_correlation_id()
     if request_id:
         merged[META_REQUEST_ID] = request_id
     if metadata:
         merged.update(metadata)
-    return new_event(event_type, payload, source=source, metadata=merged, schema_version=schema_version)
+    return new_event(
+        event_type,
+        payload,
+        source=source,
+        metadata=merged,
+        schema_version=schema_version,
+        now=platform_runtime.get_active_platform().clock.now(),
+    )
 
 
 def _stage_in_outbox(
@@ -103,20 +119,43 @@ def _publish_on_bus(
     event_type: str,
     payload: dict,
     source: str,
-    metadata: dict | None,
+    metadata_of: Callable[[dict], dict | None],
     schema_version: int,
 ) -> None:
-    """Mint and dispatch one event on the bus, logging and swallowing any failure."""
+    """Build, mint and dispatch one event on the bus, logging and swallowing any failure."""
     try:
-        event = _mint(event_type, payload, source, metadata, schema_version)
+        event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, _describe(err))
         return
     _dispatch_event(event)
 
 
+def _describe(error: Exception) -> str:
+    """Name ``error``, and the driver error it wraps, by type only.
+
+    Never the text or the traceback: a SQLAlchemy error carries the statement's parameters, which are the
+    event's payload and metadata, and the engine's ``hide_parameters`` is the host's choice.
+    """
+    cause = getattr(error, "orig", None)
+    return type(error).__name__ + (f" ({type(cause).__name__})" if cause is not None else "")
+
+
 def _no_metadata(_payload: dict) -> dict | None:
     return None
+
+
+def _check_identifiers(event_type: str, source: str) -> None:
+    """Refuse an ``event_type`` or ``source`` too long for its column, before any route is taken.
+
+    The durable route stages before committing and so raises; checked here, the best-effort route raises the
+    same way instead of logging the failure after the commit.
+
+    Raises:
+        ValueError: When either is longer than its column.
+    """
+    check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
+    check_length(source, field="source", limit=MAX_SOURCE_LENGTH)
 
 
 def _dispatch_event(event: Event) -> None:
@@ -125,7 +164,7 @@ def _dispatch_event(event: Event) -> None:
         platform_runtime.get_active_platform().events.publish(event)
         logger.debug("Dispatched %s (%s) on the event bus", event.event_type, event.event_id)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event.event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event.event_type, _describe(err))
 
 
 def _stage_batch(
@@ -152,8 +191,7 @@ def _stage_batch(
             "Failed to stage %d %s event(s) in the domain transaction: %s",
             len(payloads),
             event_type,
-            err,
-            exc_info=err,
+            _describe(err),
         )
         raise
 
@@ -195,7 +233,7 @@ def publish(
         else:
             _dispatch_event(event)
     except Exception as err:
-        logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+        logger.error("Failed to publish event %s: %s", event_type, _describe(err))
 
 
 def publish_committing(
@@ -235,6 +273,10 @@ def publish_committing(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
     publish_many_committing(
         event_type,
@@ -286,7 +328,12 @@ def publish_many_committing(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
+    _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if db is not None and _durable_delivery_enabled(event_type):
         # Atomic path: stage every outbox row inside the caller's transaction.
@@ -298,7 +345,7 @@ def publish_many_committing(
         # subscriber's reconciliation net recovers anything dropped).
         commit()
         for payload in payloads:
-            _publish_on_bus(event_type, payload, source, metadata_of(payload), schema_version)
+            _publish_on_bus(event_type, payload, source, metadata_of, schema_version)
 
 
 def publish_on_commit(
@@ -328,9 +375,10 @@ def publish_on_commit(
       dispatched. Dispatch failures are logged and swallowed.
 
     "Outermost" is the session's outermost transaction. If the session joined an
-    external transaction (``join_transaction_mode="create_savepoint"``), its
-    ``commit()`` is that session's outermost commit even though the enclosing
-    transaction may still roll back.
+    external transaction (bound to a connection that already has one open, in any
+    ``join_transaction_mode``), its ``commit()`` is that session's outermost commit
+    and the events are dispatched then, even though the enclosing transaction may
+    still roll back.
 
     Publishing starts the session's transaction if none is active. Sessions are
     synchronous ``sqlalchemy.orm.Session`` instances; each carries its own pending
@@ -346,6 +394,10 @@ def publish_on_commit(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
+            anything is committed or staged.
     """
     publish_many_on_commit(
         event_type,
@@ -383,6 +435,11 @@ def publish_many_on_commit(
 
     Returns:
         None.
+
+    Raises:
+        ValueError: When ``db`` is ``None``, or ``event_type`` or ``source`` is longer than its column, on
+            either route and before anything is staged.
+        TypeError: When ``db`` is not a synchronous ``Session``.
     """
     if db is None:
         raise ValueError("publish_on_commit/publish_many_on_commit require the producer's session as `db`")
@@ -392,13 +449,15 @@ def publish_many_on_commit(
         )
     if not payloads:
         return
+    _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
     if _durable_delivery_enabled(event_type):
         _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
         return
     for payload in payloads:
         try:
-            event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+            # A copy: the event is the one published now, whatever the caller does to the dict before committing.
+            event = _mint(event_type, copy.deepcopy(payload), source, metadata_of(payload), schema_version)
             run_after_commit(db, partial(_dispatch_event, event))
         except Exception as err:
-            logger.error("Failed to publish event %s: %s", event_type, err, exc_info=err)
+            logger.error("Failed to publish event %s: %s", event_type, _describe(err))

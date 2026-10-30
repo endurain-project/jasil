@@ -8,9 +8,9 @@ from sqlalchemy import CursorResult, and_, case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from jasil._core.cursors import decode_cursor, encode_cursor
+from jasil._core.limits import MAX_JOB_SECONDS, check_limit
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil._core.timestamps import age_seconds
-from jasil.jobs._attempts import check_limit
 from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.crud import STATUS_CLAIMED
 from jasil.jobs.models import JobAttempt, JobWorker, ProcessingJob
@@ -103,8 +103,9 @@ def get_workers_summary(
     ``hours`` windows the per-worker attempt counts (attempts that *ended* in it).
     With ``record_attempts`` false those counts are ``None``, not ``0``.
     """
-    if stale_after_seconds <= 0:
-        raise ValueError("stale_after_seconds must be greater than zero")
+    # Written so that NaN, for which every comparison is false, is refused too.
+    if not 0 < stale_after_seconds <= MAX_JOB_SECONDS:
+        raise ValueError(f"stale_after_seconds must be greater than zero and at most {MAX_JOB_SECONDS}")
     check_limit(limit, maximum=MAX_WORKER_PAGE_SIZE, name="limit")
     stale_before = now - timedelta(seconds=stale_after_seconds)
     total_workers, stopped, stale, running = db.execute(
@@ -155,7 +156,7 @@ def get_workers_summary(
                 and_(JobWorker.started_at == cursor_started_at, JobWorker.instance_id < cursor_instance_id),
             )
         )
-    rows = list(
+    rows: list[JobWorker] = list(
         db.execute(statement.order_by(JobWorker.started_at.desc(), JobWorker.instance_id.desc()).limit(limit + 1))
         .scalars()
         .all()
@@ -184,7 +185,8 @@ def get_workers_summary(
             .where(JobAttempt.worker_id.in_(instance_ids), JobAttempt.finished_at >= window_start)
             .group_by(JobAttempt.worker_id, JobAttempt.outcome)
         ).all():
-            outcomes.setdefault(worker_id, {})[outcome] = int(count)
+            if outcome is not None:  # the column is nullable only while an attempt is open, and these are finished
+                outcomes.setdefault(worker_id, {})[outcome] = int(count)
             if finished is not None and (worker_id not in last_finished or finished > last_finished[worker_id]):
                 last_finished[worker_id] = finished
     workers: list[WorkerInfo] = []
@@ -262,7 +264,7 @@ def prune_worker_records_before(cutoff: datetime, *, db: Session, batch_size: in
         and_(JobWorker.stopped_at.is_(None), JobWorker.last_heartbeat_at < cutoff),
     )
     for _ in range(PRUNE_MAX_BATCHES):
-        instance_ids = list(
+        instance_ids: list[str] = list(
             db.execute(select(JobWorker.instance_id).where(old_record).limit(batch_size)).scalars().all()
         )
         if not instance_ids:

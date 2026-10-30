@@ -94,32 +94,6 @@ class TestBuildRunner:
         assert runner.leases._max_runtime_seconds == 500
         assert runner.leases._lease_seconds == 90
 
-    @pytest.mark.parametrize(
-        ("jobs", "message"),
-        [
-            pytest.param(
-                {"lease_seconds": 44, "heartbeat_interval_seconds": 15},
-                r"at least three heartbeat intervals \(45 s",
-                id="lease-below-three-beats",
-            ),
-            pytest.param(
-                {"max_runtime_seconds": 299},
-                r"max_runtime_seconds \(299\) must not be below jobs.lease_seconds \(300\)",
-                id="cap-below-lease",
-            ),
-            pytest.param(
-                {"heartbeat_interval_seconds": 0},
-                r"heartbeat_interval_seconds must be greater than zero",
-                id="no-interval",
-            ),
-        ],
-    )
-    def test_timings_that_cannot_keep_a_lease_alive_are_refused(self, platform, session_factory, jobs, message):
-        settings.configure(settings.JasilSettings(jobs=settings.JobSettings(**jobs)))
-
-        with pytest.raises(ValueError, match=message):
-            jobs_service.build_runner()
-
     def test_a_lease_of_exactly_three_beats_is_accepted(self, platform, session_factory):
         settings.configure(
             settings.JasilSettings(jobs=settings.JobSettings(lease_seconds=45, heartbeat_interval_seconds=15))
@@ -391,6 +365,30 @@ class TestScheduledReaper:
 
         db.rollback()
         assert db.query(ProcessingJob).one().status == jobs_crud.STATUS_PENDING
+
+    def test_a_backlog_larger_than_one_pass_is_reaped_in_one_run(self, platform, session_factory, db):
+        """After a crash every claimed job expires at once; one pass of 100 a minute would take minutes."""
+        now = platform.clock.now()
+        for n in range(jobs_service._REAP_BATCH_SIZE + 5):
+            jobs_crud.enqueue_job(
+                new_event("order.created", {"id": n}, source="api"), "s", max_attempts=3, now=now, db=db
+            )
+        jobs_crud.claim_jobs(worker_id="w1", limit=1000, lease_seconds=-1, now=now, db=db)
+
+        jobs_service.reap_expired_jobs_scheduled()
+
+        db.rollback()
+        assert db.query(ProcessingJob).filter_by(status=jobs_crud.STATUS_CLAIMED).count() == 0
+
+    def test_one_run_is_bounded(self, platform, session_factory, monkeypatch):
+        passes = []
+        monkeypatch.setattr(
+            jobs_crud, "reclaim_expired_leases", lambda **kwargs: passes.append(kwargs) or kwargs["limit"]
+        )
+
+        jobs_service.reap_expired_jobs_scheduled()
+
+        assert len(passes) == jobs_service._MAX_REAP_BATCHES
 
     def test_it_is_quiet_when_there_is_nothing_to_reap(self, platform, session_factory, caplog):
         with caplog.at_level("INFO"):

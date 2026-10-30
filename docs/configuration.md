@@ -5,6 +5,7 @@ JASIL never reads environment variables or secret files. The host builds a
 secrets manager — and installs it once at startup:
 
 ```python
+import jasil
 import jasil.settings as jasil_settings
 
 jasil_settings.configure(
@@ -46,10 +47,11 @@ fields.
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
 | `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
-| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Ignored for `memory://`. |
+| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Must not be empty for Redis, checked when the platform is built; ignored for `memory://`. |
 | `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
+| `audit` | `AuditSettings()` | [Audit trail](audit.md). |
 | `geocoding` | `GeocodingSettings()` | Reverse-geocoding backend. |
 | `storage` | `StorageSettings()` | Options of the `local://` storage backend. |
 | `mail` | `MailSettings()` | Outbound mail backend. |
@@ -62,34 +64,57 @@ fields.
 | `enabled` | `False` | Route events through the outbox instead of the bus. |
 | `lease_seconds` | `300` | How long a worker may go **silent** before the reaper may reclaim the jobs it holds. A running worker renews its leases on every heartbeat, so this is not a cap on handler runtime. At least three `heartbeat_interval_seconds`. |
 | `max_runtime_seconds` | `1800` | The longest a single handler is kept leased. Past it the job is abandoned to the reaper, the handler is signalled (`jasil.jobs.lease_lost`), and the rest of the batch is released. Not below `lease_seconds`. |
-| `batch_size` | `20` | Maximum rows claimed or relayed per pass. |
-| `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. |
-| `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. |
+| `batch_size` | `20` | Maximum rows claimed or relayed per pass, 1 to 1000. |
+| `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. At least 0. |
+| `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. Not below `backoff_base_seconds`. |
 | `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`; a later `retry_at` is clamped to it (jitter included). |
-| `max_deferrals` | `100` | Deferrals a job may take. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
-| `poll_interval_seconds` | `5.0` | Idle wait between empty polls. |
+| `max_deferrals` | `100` | Deferrals a job may take, at least 0. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
+| `poll_interval_seconds` | `5.0` | Idle wait between empty polls; greater than zero. |
 | `record_attempts` | `True` | Write one `jasil_job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
-| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. |
-| `max_attempts` | `5` | Attempts before a job is dead-lettered. |
+| `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. Greater than zero. |
+| `max_attempts` | `5` | Attempts before a job is dead-lettered; at least 1. |
 | `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. A job's history goes after the job row itself is pruned; pending, claimed and dead-lettered jobs keep theirs. `<= 0` disables. |
+
+Every range above is checked when the object is built, so a value the pipeline cannot honour raises `ValueError` where you configure JASIL, not when a worker starts. Durations (`lease_seconds`, `max_runtime_seconds`, `backoff_*_seconds`, `defer_max_seconds` and the two intervals) are at most one year (`31536000` seconds), and `retention_days` at most `36500`.
 
 ### `EventLogSettings`
 
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `False` | Record every event's lifecycle to `jasil_event_log`. |
-| `retention_days` | `30` | Age at which trail rows are pruned. `<= 0` disables. |
+| `retention_days` | `30` | Age at which trail rows are pruned. `<= 0` disables; at most `36500`. |
 
 Both `jobs.enabled` and `event_log.enabled` default to **off**, because both
 write to the database. A library should not start writing to your database
 because you installed it.
 
+### `AuditSettings`
+
+The [audit trail](audit.md). Unlike the two above it defaults to **on**, because it writes nothing until the host
+calls `stage` or `record_detached`. Numeric values are checked when the object is built (a bad one raises
+`ValueError`); `external_sink_uri` is checked when `build_platform` constructs the audit sink, and `signing_key` when
+checkpoint maintenance seals a window, so an invalid key makes that maintenance step fail and be logged.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `True` | Write audit rows. `False` still validates every call, then writes nothing; maintenance does nothing. |
+| `retention_days` | `90` | Age at which whole daily partitions are dropped. `<= 0` keeps every row. When positive it must be at least `retention_floor_days`; at most `36500`. Your deployment profiles map onto this value; JASIL supplies only the neutral default. |
+| `retention_floor_days` | `30` | The youngest cutoff the database-side guard `jasil_audit_drop_partitions` accepts. **Baked into the function when migration `rev0006` runs**; changing the setting later does not change the guard (see [the retention floor](audit.md#the-retention-floor)). Between `1` and `36500`. |
+| `legal_hold` | `False` | Suspend all pruning. |
+| `partition_days_ahead` | `7` | Days of daily partitions maintenance keeps created ahead of today (PostgreSQL). A row whose day has none is rejected, so this is the margin by which maintenance may stop. Between `1` and `366`. |
+| `checkpoint_window_minutes` | `15` | Length of a tamper-evidence window. At least `1`, and it must divide a day (1440). |
+| `checkpoint_grace_minutes` | `5` | How long past its end a window waits before it is sealed. Longer than your longest audited transaction plus replica clock skew. |
+| `signing_key` | `None` | Ed25519 private key, base64 of the 32 raw bytes. `None` writes unsigned, hash-chained checkpoints. A value that is not base64 of 32 bytes raises `ValueError` when the settings are built. Needs `jasil[audit]`. Not shown in `repr`. |
+| `external_sink_uri` | `None` | `file:///directory` or `s3://bucket/prefix`: a write-once copy of every checkpoint kept outside the database. |
+| `max_details_bytes` | `4096` | Largest serialized `details` payload a row may carry. At least `1`. |
+| `app_name`, `app_version` | `None` | Stamped on every row. At most `100` and `50` characters; a longer value raises `ValueError` when the settings are built. |
+
 ### `GeocodingSettings`
 
 | Field | Default | Meaning |
 |---|---|---|
-| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
-| `rate_limit` | `1.0` | Maximum requests per second; `<= 0` disables throttling. |
+| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network: refused for a host that resolves to any public address), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
+| `rate_limit` | `1.0` | Maximum requests per second **per process**; `<= 0` disables throttling. Each process throttles on its own, so a deployment of N processes sends up to N times this rate: divide a provider's limit (Nominatim's public instance allows one request a second) by the number of processes that geocode. |
 | `api_key` | `None` | Required by `geocode://`. |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
 
@@ -136,7 +161,7 @@ Each capability resolves its backend by URI scheme, independently of the profile
 | Capability | Schemes |
 |---|---|
 | `state_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
-| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>` |
+| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>[/<prefix>][?region=...&endpoint_url=...]` |
 | `events_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
 | `lock_uri` | `noop://`, `postgres-advisory://` |
 
@@ -268,12 +293,13 @@ correlation.configure_provider(my_middleware.get_request_id)
 `map_models` must run **before any JASIL model module is imported** — importing
 one beforehand raises a `RuntimeError` telling you so.
 
-In practice that constrains two modules only:
+In practice that constrains the model modules and the internals that use them:
 
 | Module | Safe to import at module scope? |
 |---|---|
-| `jasil.jobs.crud`, `jasil.event_log.crud` | **No** — import them inside a function, or after `map_models` has run. |
-| everything else, including `jasil.publisher`, `jasil.retention`, `jasil.jobs.service`, `jasil.container`, `jasil.deps`, `jasil.testing` | Yes, from anywhere. |
+| `jasil.jobs.models`, `jasil.event_log.models`, `jasil.audit.models`, `jasil.jobs.crud`, `jasil.event_log.crud` | **No** — import them inside a function, or after `map_models` has run. |
+| The durable-job and event-log internals: `jasil.jobs.runner`, `worker`, `heartbeat`, `relay`, `outbox`, `dead_letter`, and `jasil.event_log.recorder` | **No**, for the same reason. |
+| everything else, including `jasil.audit`, `jasil.publisher`, `jasil.retention`, `jasil.jobs.service`, `jasil.jobs.registry`, `jasil.admin`, `jasil.migrations`, `jasil.container`, `jasil.deps`, `jasil.testing` | Yes, from anywhere. |
 
 That split matters because `jasil.publisher` is imported by every module that
 publishes an event, deep in your import graph and long before any startup hook

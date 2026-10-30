@@ -24,13 +24,23 @@ whenever configuration is.
   into a URL — `evil.example.com/x` becomes `https://evil.example.com/x/reverse`,
   whose hostname check passes.
 - Every A/AAAA record the name resolves to must be public unicast. A single
-  private, loopback, link-local, multicast, unspecified, or reserved answer
-  rejects the host. Requiring *all* answers is what defeats a name that returns
-  a public address on the first lookup and a private one on the next.
+  private, loopback, link-local, multicast, unspecified, reserved, or otherwise
+  not globally reachable answer (such as the shared address space
+  `100.64.0.0/10`) rejects the host. Requiring *all* answers defeats a name that
+  mixes public and private addresses in one lookup; it does not defeat one that
+  changes its answer after the check (see the limits below).
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
-  cannot exhaust memory.
+  cannot exhaust memory. The request, headers and body, runs under a 30-second
+  deadline: a watchdog shuts its sockets down when it passes, which ends a blocked
+  read, so an upstream dripping its reply a byte at a time cannot hold the caller
+  past it. Name resolution and the connect are outside it: each connect attempt is
+  bounded by the 10-second timeout, and resolution by the system resolver.
+- On Windows `shutdown` does not wake a thread blocked in `recv`, so the watchdog
+  cannot interrupt a read there: only the per-read timeout bounds a stalled
+  upstream, and one dripping a byte at a time is not cut off at the deadline. The
+  same holds for the SMTP deadline below.
 - Failures are logged by exception type and status code only. The `requests`
   error message embeds the request URL, and one supported service carries its
   API key in that URL's query string.
@@ -47,9 +57,21 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
   assembled. A name that resolves publicly at startup and privately afterwards
   is not caught. What *is* caught is the case that matters for an
   operator-supplied setting: a host that was already internal when configured.
+- The reverse direction matters more for the cleartext `+http` forms: a host that
+  was private when configured is checked once, and every later request re-resolves
+  the name. If its record later points at a public address, the coordinates travel
+  unencrypted to it. Mail re-resolves and dials the address it validated on every
+  send; geocoding does not, so keep `+http` for an address you control.
 - `socket.getaddrinfo` takes no timeout, so resolution is bounded by your
   resolver configuration rather than by JASIL. At startup this shows up as a
   slow boot rather than a hung request.
+- `urllib3` logs each request line at `DEBUG`, query string included, and
+  geocode.maps.co takes its `api_key` and the coordinates there. JASIL keeps them out
+  of its own log lines, but a host that turns the root logger to `DEBUG` writes them. Keep
+  `urllib3` at `INFO` or above in production.
+- The text an upstream returns is untrusted: a place name longer than 256
+  characters (1024 for `display_name`) or containing a control character is
+  dropped, not passed on.
 
 ## Outbound mail
 
@@ -61,7 +83,8 @@ field through which a caller could set an arbitrary header.
 not offer STARTTLS rather than downgrading, and AUTH is sent only after TLS is
 up. The one opt-out, `mail.secure = False`, is cleartext and is accepted only for
 `smtp://`, only when the host resolves exclusively to private, loopback or
-link-local addresses, and never with credentials. The check runs at startup and
+link-local addresses (IPv6 ranges a gateway carries to a public IPv4 host, NAT64,
+Teredo and 6to4, do not count), and never with credentials. The check runs at startup and
 again on every send, and the connection goes to the address that was checked
 rather than to the name, so a DNS change cannot redirect cleartext mail to a
 public host. Every
@@ -94,7 +117,8 @@ pair.
 
 - Both segments are validated before any filesystem or client access: empty,
   absolute, dot-component, parent-traversing, repeated-separator,
-  trailing-separator, and backslash-bearing values raise `ValueError`. The check
+  trailing-separator, backslash-bearing, control-character-bearing and over-1024-byte
+  values raise `ValueError`. The check
   is pure and shared, so **both** backends enforce one canonical slash-delimited
   grammar. Without it, local paths normalize aliases such as `.` and `a//b`
   while S3 preserves them as distinct literal keys. An area is exactly one
@@ -113,6 +137,13 @@ pair.
 
 A conformance suite runs the same rules against both backends, so they cannot
 drift apart.
+
+**Limit.** The symlink and base-directory checks run on the path before the
+operation, and the operation then walks the path again. They hold against a storage
+tree that is static or changed in advance, not against a process with write access
+to the tree that swaps a path component for a symlink in between. Write access to
+the data directory is already the operator's trust boundary, so keep it to JASIL's
+own process.
 
 ## Pattern injection into the state store (CWE-77)
 
@@ -153,8 +184,11 @@ authorization.
 ## SQL injection (CWE-89)
 
 **Not a surface.** Every query is SQLAlchemy Core or ORM with bound parameters.
-The only raw SQL in the package is the two PostgreSQL advisory-lock statements,
-which pass their key as a bound `:key` parameter. Table and column names are
+The raw SQL in the package (the advisory-lock and migration-lock statements, the
+audit maintenance calls) passes every value as a bound parameter. The audit DDL
+and `grants_sql` / `retention_floor_sql` render role and schema names into SQL,
+always as quoted identifiers or literals; a schema name holding `$` is refused,
+since it could end a dollar-quoted function body. Table and column names are
 never interpolated from input.
 
 ## Resource exhaustion (CWE-400)
@@ -166,8 +200,9 @@ never interpolated from input.
   column width.
 - The geocoding response body is capped (above).
 - Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
-  Resumable parts stream under an exact declared size rather than being buffered
-  in memory. JASIL's built-in portability limits cap parts at 5 GiB and part
+  Resumable parts are read under an exact declared size and never buffered whole
+  in memory: S3 stages a part in memory up to 8 MiB and in a temporary file
+  beyond that, so allow temporary disk for the largest part in flight. JASIL's built-in portability limits cap parts at 5 GiB and part
   numbers at 10,000. Active parts remain backend resources until completion,
   abort, or explicit `cleanup_uploads` maintenance. Parallel part calls may
   temporarily stage more than the session limit because completion is the
@@ -201,6 +236,42 @@ that ignores the signal mid-side-effect, and a handler abandoned past
 **Yours.** Subscriber handlers must be idempotent. If running one twice would
 double-charge, double-send, or double-count, that is a correctness bug in the
 handler, not in the queue.
+
+## Tampering with the audit trail
+
+**Guarded.** `jasil_audit_log` is append-only for every role but its owner: `UPDATE`, `DELETE` and `TRUNCATE` are
+rejected by triggers, retention drops whole partitions through a `SECURITY DEFINER` function that refuses a cutoff
+inside a floor fixed in the database, and the recommended grants give the application `INSERT` only. Signed,
+hash-chained checkpoints over fixed windows, copied to a write-once sink, make a change by anyone else detectable
+(`verify_checkpoints`). An audited change and its row share a transaction, so a change cannot happen unrecorded.
+
+`audit.legal_hold` is enforced by JASIL's maintenance, not by the database: a role with `EXECUTE` on
+`jasil_audit_drop_partitions` can drop partitions older than the floor during a hold. Revoke that right for the hold
+when it must bind every role ([Retention](../audit.md#retention)). The S3 sink writes each checkpoint with a
+conditional `PutObject`; only a bucket policy requiring that condition stops another holder of its credentials from
+replacing one.
+
+**Yours: default privileges.** `grants_sql` revokes on the four tables, not on the daily partitions, which are
+separate tables created by `jasil_audit_ensure_partitions`. A role that inherits `ALTER DEFAULT PRIVILEGES ... GRANT
+SELECT ON TABLES` for the audit schema can read a partition directly although it is refused the parent. Do not let
+default privileges cover the audit schema, or revoke on the partitions after they are created.
+
+**Yours.** Nothing stops the table owner or a database superuser: they can disable the triggers and rewrite rows,
+checkpoints and chain together, and if they delete a period's checkpoints the application re-seals and signs the
+rewritten rows with its own key. Against them only the external sink holds the original checkpoints. Keep the sink
+and the signing key outside the database operators' reach, and reconcile the sink with the database, and verify,
+somewhere they do not control. See
+[Audit trail → What this does not do](../audit.md#what-this-does-not-do).
+
+**Yours, too: stalling maintenance.** PostgreSQL advisory locks are open to every role that can connect,
+the observability product's reader role included. Holding the key of JASIL's maintenance lock makes every
+replica skip audit maintenance; holding the partition functions' lock makes them fail after their 10-second
+`lock_timeout`. On PostgreSQL 13 and 14, where `PUBLIC` may still create tables in the `public` schema,
+anyone can also create a table under a future partition's name, which `jasil_audit_ensure_partitions` then
+refuses. Either way no new partitions are made, and once `partition_days_ahead` days pass, audited writes
+fail. Revoke `CREATE` on the audit schema from `PUBLIC` (the default from PostgreSQL 15), keep database
+logins to the roles that need them, and alert on `get_audit_health()`: a `furthest_partition_date` closer
+than `partition_days_ahead`, or a `last_checkpoint_at` falling behind, is the symptom.
 
 ## Out of scope
 

@@ -20,6 +20,13 @@ through.
 - [ ] Leave `enforce_deployment_consistency` on. It refuses to build a platform
       whose wiring contradicts its topology. Turning it off downgrades those to
       warnings — reasonable on a development machine, not in production.
+- [ ] Under the `custom` profile, check the wiring yourself. `custom` is exempt
+      from the state, event bus, realtime, lock and mail rules, so
+      `enforce_deployment_consistency` does not refuse process-local memory, a
+      `noop` lock or `memory://` mail there, however many processes run.
+- [ ] Under the `distributed` profile, point `audit.external_sink_uri` at `s3://`.
+      A `file://` sink is refused there, because each node would keep its own
+      share of the checkpoint copies.
 - [ ] Read the capability report JASIL logs at `INFO` on startup and confirm each
       capability resolved to what you expected.
 
@@ -133,12 +140,33 @@ through.
       container-health policy in the host rather than mapping status to health
       automatically.
 
+## The audit trail
+
+- [ ] Run migration `rev0006` as the role that should own the audit table and functions, and
+      [grant](../audit.md#roles-and-grants) the application `INSERT` on `jasil_audit_log` and nothing else on it.
+- [ ] Give the observability product a separate, `SELECT`-only role, and run `run_audit_maintenance` as a role
+      that can read the log, ideally not the application's.
+- [ ] Set the context (`set_context`/`audit_context`) in every entry point: with none, rows say `anonymous`/`api`.
+- [ ] Keep `details` to ids and changed field names. Never a secret, a token or a password.
+- [ ] Schedule `schedule_audit_maintenance` on every replica, each using a role with the
+      [maintenance grants](../audit.md#roles-and-grants) (or run it from a separate maintenance process), and alert
+      on `get_audit_health()` (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing
+      partition fails audited writes, and the runtime grants cannot seal checkpoints or apply retention.
+- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock and a default compliance-mode retention period),
+      give the bucket a default compliance-mode retention period and a policy denying any `PutObject` without
+      `If-None-Match: *`, and verify on a schedule with `verify_checkpoints`, passing every key the trail was signed with.
+      Reconcile the sink with `jasil_audit_checkpoints` from outside the database operators' reach: against the table
+      owner the signing key alone detects nothing, because the application re-signs whatever it re-seals.
+- [ ] Do not expose a read route for the trail from the host application.
+
 ## Logging
 
 - [ ] JASIL logs through `logging.getLogger(__name__)` and configures nothing.
       Route the `jasil.*` loggers wherever your application logs go.
 - [ ] Do not run production at `DEBUG`. The debug lines name every event
-      published and every job batch claimed.
+      published and every job batch claimed, and at `DEBUG` the `urllib3` logger
+      writes each geocoding request line, with the coordinates and, for
+      `geocode://`, the API key in its query string.
 - [ ] Do not parse or alert on log *wording* — only levels and structured fields
       are stable. See [API stability](../api-stability.md).
 - [ ] Wire `jasil.correlation.configure_provider` to your request-id middleware so

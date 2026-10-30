@@ -9,7 +9,7 @@ commits a session the caller handed it — because it is handed none.
 import base64
 import inspect
 import json
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -19,8 +19,9 @@ import jasil.event_log.crud as event_log_crud
 import jasil.jobs.crud as jobs_crud
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
+import jasil.testing as jasil_testing
 from jasil.events import new_event
-from jasil.jobs.models import JobWorker
+from jasil.jobs.models import JobWorker, ProcessingJob
 
 SUBSCRIBER = "invoice.render"
 
@@ -154,6 +155,11 @@ class TestWorkersSummary:
         assert stopped.queues == ["maintenance"]
         assert stopped.metadata == {"zone": "a"}
 
+    @pytest.mark.parametrize("stale_after", [0, -1, float("nan"), float("inf"), 1e30])
+    def test_an_unusable_stale_threshold_is_refused(self, platform, db, stale_after):
+        with pytest.raises(ValueError, match="stale_after_seconds must be greater than zero and at most"):
+            jasil_admin.get_workers_summary(stale_after_seconds=stale_after)
+
     def test_an_empty_registry_summarizes_to_zero(self, platform, db):
         assert jasil_admin.get_workers_summary().total_workers == 0
 
@@ -229,9 +235,59 @@ class TestWorkersSummary:
             jasil_admin.get_workers_summary(cursor=cursor)
 
 
+class TestTheWindowEndsAtThePlatformClock:
+    """A platform clock two days ahead puts what was written just now outside a one-day window."""
+
+    @pytest.fixture
+    def ahead(self, tmp_path, session_factory):
+        return jasil_testing.install_test_platform(
+            tmp_path, clock=jasil_testing.FixedClock(moment=datetime.now(UTC) + timedelta(days=2))
+        )
+
+    def test_for_jobs(self, ahead, db):
+        event = new_event("order.created", {}, source="api:create_order")
+        jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=datetime.now(UTC), db=db)
+
+        assert jasil_admin.get_jobs_summary(hours=24).total_jobs == 0
+
+    def test_for_the_event_log(self, ahead, db):
+        event_log_crud.record_published(
+            new_event("order.created", {}, source="api:create_order"), db, now=datetime.now(UTC)
+        )
+
+        assert jasil_admin.get_event_log_summary(hours=24).total_events == 0
+
+
+class TestTheSummariesRefuseUnboundedArguments:
+    """An unbounded window or limit reads every retained row, or overflows ``timedelta``."""
+
+    @pytest.mark.parametrize("hours", [0, -1, 24 * 366 + 1, 10**12, True, 1.5])
+    @pytest.mark.parametrize(
+        "summary", [jasil_admin.get_jobs_summary, jasil_admin.get_event_log_summary, jasil_admin.get_workers_summary]
+    )
+    def test_the_window(self, platform, summary, hours):
+        with pytest.raises(ValueError, match="hours"):
+            summary(hours=hours)
+
+    @pytest.mark.parametrize("limit", [-1, 501, True])
+    @pytest.mark.parametrize(
+        ("summary", "name"),
+        [(jasil_admin.get_jobs_summary, "dead_letter_limit"), (jasil_admin.get_event_log_summary, "failure_limit")],
+    )
+    def test_the_list_limits(self, platform, summary, name, limit):
+        with pytest.raises(ValueError, match=name):
+            summary(**{name: limit})
+
+    def test_the_bounds_themselves_are_accepted(self, platform, db):
+        assert jasil_admin.get_jobs_summary(hours=24 * 366, dead_letter_limit=500).window_hours == 24 * 366
+        assert jasil_admin.get_event_log_summary(hours=1, failure_limit=0).recent_failures == []
+
+
 class TestEventLogSummary:
     def test_it_reports_a_recorded_event(self, platform, db):
-        event_log_crud.record_published(new_event("order.created", {}, source="api:create_order"), db)
+        event_log_crud.record_published(
+            new_event("order.created", {}, source="api:create_order"), db, now=datetime.now(UTC)
+        )
 
         summary = jasil_admin.get_event_log_summary()
 
@@ -243,8 +299,8 @@ class TestEventLogSummary:
 
     def test_the_failure_limit_is_configurable(self, platform, db):
         event = new_event("order.created", {}, source="api:create_order")
-        event_log_crud.record_published(event, db)
-        event_log_crud.mark_failed(event.event_id, "h", "boom", 5, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event.event_id, "h", "boom", 5, db, now=datetime.now(UTC))
 
         assert jasil_admin.get_event_log_summary(failure_limit=0).recent_failures == []
 
@@ -256,7 +312,7 @@ class TestReplay:
         assert jasil_admin.replay_dead_letter_job(job_id).replayed is True
 
         db.rollback()  # the facade committed on its own session, not this one
-        assert jobs_crud.get_job(job_id, db).status == jobs_crud.STATUS_PENDING
+        assert db.get(ProcessingJob, job_id).status == jobs_crud.STATUS_PENDING
 
     def test_replaying_a_job_that_is_not_dead_lettered_reports_false(self, platform, db, now):
         job_id = _dead_letter_job(db, now)

@@ -5,7 +5,7 @@ The same tests run on whichever database the suite is pointed at.
 """
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select, update
@@ -15,6 +15,7 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
 from jasil.events import new_event
 from jasil.jobs import DeferJob
+from jasil.jobs.dead_letter import deliver_dead_letters
 from jasil.jobs.models import JobAttempt, ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -101,6 +102,31 @@ class TestDeferral:
         # 300 s plus up to 10% jitter.
         wait = (job.available_at.replace(tzinfo=UTC) - T0).total_seconds()
         assert 300 <= wait <= 330
+
+    @pytest.mark.parametrize(
+        "retry_at",
+        [
+            pytest.param("tomorrow", id="not-a-datetime"),
+            pytest.param(None, id="none"),
+            pytest.param(datetime.max.replace(tzinfo=timezone(timedelta(hours=-5))), id="past-the-calendar"),
+        ],
+    )
+    def test_an_unusable_retry_instant_fails_the_attempt_instead_of_stranding_the_job(
+        self, runner, registry, db, retry_at
+    ):
+        def handler(_event):
+            raise DeferJob(retry_at, reason="later")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db)
+
+        runner.run_once()
+
+        job = _job(db)
+        assert job.status == "pending"  # an ordinary failure with retries left, not 'claimed' until the lease ends
+        assert job.attempts == 1
+        assert job.deferrals == 0
+        assert "retry_at" in job.last_error
 
     def test_a_job_deferred_more_often_than_max_attempts_still_runs(self, registry, clock, session_factory, db):
         seen = []
@@ -229,6 +255,7 @@ class TestDeferralBound:
         assert callbacks == []
         clock.advance(1)
         runner.run_once()
+        deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock)
 
         assert _job(db).status == "dead_letter"
         assert len(callbacks) == 1
@@ -377,7 +404,7 @@ class TestDeferralAccounting:
             clock.advance(1000)
 
         db.rollback()
-        (dead,) = jobs_crud.get_jobs_summary(db).recent_dead_letter
+        (dead,) = jobs_crud.get_jobs_summary(db, now=T0 + timedelta(days=1)).recent_dead_letter
         assert (dead.attempts, dead.deferrals, dead.max_attempts) == (2, 1, 1)
 
     def test_a_dead_letter_callback_event_carries_the_budget_counts(self, registry, clock, session_factory, db):
@@ -394,6 +421,7 @@ class TestDeferralAccounting:
         for _ in range(3):
             runner.run_once()
             clock.advance(1000)
+        deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock)
 
         assert [(e.retry_count, e.max_attempts, e.deferral_count) for e in events] == [(1, 1, 2)]
 

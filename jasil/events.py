@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from jasil._core.limits import check_length
+from jasil._core.timestamps import as_utc
 
 # --- Standard metadata key (correlation context, not domain data) ---
 #
@@ -115,6 +116,19 @@ class Event:
     max_attempts: int | None = None
     deferral_count: int = 0
 
+    def __post_init__(self) -> None:
+        """Refuse a payload or metadata that is not a dict.
+
+        Both are written to JSON columns that accept any JSON value, and read back with ``dict(...)``, so a
+        list stored today would fail the outbox relay's read on every pass and stall everything queued behind it.
+
+        Raises:
+            TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
+        """
+        for name in ("payload", "metadata"):
+            if not isinstance(getattr(self, name), dict):
+                raise TypeError(f"{name} must be a dict, not {type(getattr(self, name)).__name__}")
+
     @property
     def attempt(self) -> int | None:
         """The 1-based attempt a durable handler is running; ``None`` when ``max_attempts`` is unset (not a durable delivery)."""
@@ -135,6 +149,7 @@ def new_event(
     event_id: str | None = None,
     retry_count: int = 0,
     schema_version: int = INITIAL_SCHEMA_VERSION,
+    now: datetime | None = None,
 ) -> Event:
     """Mint an :class:`Event`, generating ``event_id`` and ``timestamp``.
 
@@ -147,6 +162,8 @@ def new_event(
             original id when re-publishing a retry so tracing stays stable.
         retry_count: Attempt counter (incremented on re-publish).
         schema_version: The payload-shape version this producer writes.
+        now: The instant to stamp, normally the platform clock's; a naive value is
+            taken as UTC. Defaults to the system clock.
 
     Returns:
         A frozen :class:`Event` with a fresh id and UTC timestamp.
@@ -154,6 +171,7 @@ def new_event(
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
             than the column it is persisted in.
+        TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
     """
     resolved_event_id = event_id or str(uuid.uuid4())
     check_length(resolved_event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)
@@ -163,7 +181,7 @@ def new_event(
         event_id=resolved_event_id,
         event_type=event_type,
         source=source,
-        timestamp=datetime.now(UTC).isoformat(),
+        timestamp=as_utc(now if now is not None else datetime.now(UTC)).isoformat(),
         payload=payload,
         metadata=metadata if metadata is not None else {},
         retry_count=retry_count,

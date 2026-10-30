@@ -6,7 +6,12 @@ and worker all run on every process and coordinate through ``SELECT ... FOR
 UPDATE SKIP LOCKED`` plus compare-and-set claims and the idempotent job fan-out
 (dedup on ``event_id + subscriber_id``), so replicas scale horizontally without a
 single-runner lock — duplicate work is skipped or deduplicated rather than
-serialized. All of this is inert unless durable jobs are enabled.
+serialized.
+
+``jobs.enabled`` gates only what the publisher writes: with it false no durable
+job or outbox row is produced. None of the functions here reads it, so a host starts the
+worker and registers the maintenance only in the deployments that enable durable
+jobs (and have migrated the tables); otherwise they poll for work that never comes.
 """
 
 import logging
@@ -14,8 +19,6 @@ import threading
 import uuid
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
@@ -29,9 +32,10 @@ from jasil.settings import get_settings
 # ``import jasil.jobs.service`` fail until ``jasil.orm.map_models`` had run. Each
 # function imports what it needs instead.
 if TYPE_CHECKING:
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
     from jasil.jobs.runner import JobRunner
     from jasil.jobs.worker import BackgroundWorker, WorkerHeartbeat
-    from jasil.settings import JobSettings
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,10 @@ _RELAY_INTERVAL_SECONDS = 5
 _REAP_INTERVAL_SECONDS = 60
 # Bound how many outbox batches one relay pass drains before yielding.
 _MAX_RELAY_BATCHES = 100
+# Expired leases reclaimed per transaction, and how many of those one reaper run takes before yielding: a
+# crash expires every job its worker held at once.
+_REAP_BATCH_SIZE = 100
+_MAX_REAP_BATCHES = 100
 
 _RELAY_JOB_ID = "jasil_outbox_relay"
 _REAP_JOB_ID = "jasil_job_reaper"
@@ -63,16 +71,10 @@ def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
 
     Args:
         queues: Optional non-empty queue allowlist. Omit it to consume all queues.
-
-    Raises:
-        ValueError: When ``jobs.heartbeat_interval_seconds``,
-            ``jobs.lease_seconds`` and ``jobs.max_runtime_seconds`` cannot keep a
-            lease alive (see :func:`_validate_job_timing`).
     """
     from jasil.jobs.runner import JobRunner
 
     jobs = get_settings().jobs
-    _validate_job_timing(jobs)
     platform = platform_runtime.get_active_platform()
     return JobRunner(
         registry=jobs_registry.registry,
@@ -201,31 +203,6 @@ def _build_heartbeat(
     )
 
 
-def _validate_job_timing(jobs: "JobSettings") -> None:
-    """Refuse timings under which a lease cannot be kept alive.
-
-    One heartbeat renews leases and proves the worker alive, so the lease has to
-    outlast several missed beats, and a handler has to be allowed at least one
-    lease. ``lease_seconds >= 3 * heartbeat_interval_seconds`` is also the
-    threshold ``jasil.admin.get_workers_summary`` uses to call a worker stale, so
-    a worker is flagged stale no later than its leases start expiring.
-    """
-    if jobs.heartbeat_interval_seconds <= 0:
-        raise ValueError("jobs.heartbeat_interval_seconds must be greater than zero")
-    floor = 3 * jobs.heartbeat_interval_seconds
-    if jobs.lease_seconds < floor:
-        raise ValueError(
-            f"jobs.lease_seconds ({jobs.lease_seconds}) must be at least three heartbeat intervals "
-            f"({floor:g} s, from jobs.heartbeat_interval_seconds={jobs.heartbeat_interval_seconds:g}): "
-            "a worker is renewed on its heartbeat, and two missed beats must not expire a lease"
-        )
-    if jobs.max_runtime_seconds < jobs.lease_seconds:
-        raise ValueError(
-            f"jobs.max_runtime_seconds ({jobs.max_runtime_seconds}) must not be below "
-            f"jobs.lease_seconds ({jobs.lease_seconds})"
-        )
-
-
 def stop_job_worker() -> None:
     """Stop the in-process worker from synchronous shutdown code."""
     global _worker
@@ -297,7 +274,7 @@ def relay_outbox_scheduled() -> None:
 
 
 def reap_expired_jobs_scheduled() -> None:
-    """Requeue or dead-letter jobs with expired leases, then run owed dead-letter callbacks.
+    """Requeue or dead-letter jobs with expired leases; the dead-letter sweep runs their callbacks.
 
     Runs on every replica; ``reclaim_expired_leases`` combines ``FOR UPDATE SKIP
     LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
@@ -308,11 +285,16 @@ def reap_expired_jobs_scheduled() -> None:
     platform = platform_runtime.get_active_platform()
     now = platform.clock.now()
     session_factory = jasil_orm.get_sessionmaker()
+    reclaimed = 0
     with session_factory() as db:
         # Read before reclaiming, which clears the holder: a crash should name the
         # worker, not just say that one happened.
         holders = jobs_crud.expired_lease_holders(now=now, db=db)
-        reclaimed, _ = jobs_crud.reclaim_expired_leases_detailed(now=now, db=db)
+        for _ in range(_MAX_REAP_BATCHES):
+            batch = jobs_crud.reclaim_expired_leases(now=now, db=db, limit=_REAP_BATCH_SIZE)
+            reclaimed += batch
+            if batch < _REAP_BATCH_SIZE:
+                break
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.
@@ -344,7 +326,7 @@ def deliver_dead_letters_scheduled() -> None:
         logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
 
 
-def schedule_job_maintenance(scheduler: AsyncIOScheduler) -> None:
+def schedule_job_maintenance(scheduler: "AsyncIOScheduler") -> None:
     """
     Register the recurring relay and reaper jobs on the scheduler.
 

@@ -21,9 +21,9 @@ single worker is still correct. Callers pass an explicit ``now`` (from the
 
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, and_, func, insert, or_, select, update
@@ -67,6 +67,48 @@ STATUS_DEFERRALS_EXHAUSTED = "deferrals_exhausted"
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
 
+def insert_job(
+    event: Event,
+    subscriber_id: str,
+    *,
+    queue: str = DEFAULT_QUEUE,
+    max_attempts: int,
+    now: datetime,
+    db: Session,
+    available_at: datetime | None = None,
+    commit: bool = True,
+) -> str:
+    """Insert one job like :func:`enqueue_job`, returning the id it was given.
+
+    For a caller that does not need to know whether the row is new, such as the relay fanning a batch out:
+    unlike :func:`enqueue_job` it issues no ``SELECT`` per job. When a job for ``(event, subscriber_id)``
+    already existed nothing is inserted and the id names no row.
+    """
+    validate_queue_name(queue)
+    job_id = str(uuid.uuid4())
+    values = {
+        "id": job_id,
+        "queue": queue,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "subscriber_id": subscriber_id,
+        "source": event.source,
+        "event_timestamp": event.timestamp,
+        "payload": event.payload,
+        "schema_version": event.schema_version,
+        "job_metadata": event.metadata or None,
+        "status": STATUS_PENDING,
+        "attempts": 0,
+        "max_attempts": max_attempts,
+        "available_at": available_at or now,
+        "created_at": now,
+        "updated_at": now,
+    }
+    db.execute(_insert_ignoring_duplicate(values, db))
+    commit_or_flush(db, commit)
+    return job_id
+
+
 def enqueue_job(
     event: Event,
     subscriber_id: str,
@@ -102,29 +144,18 @@ def enqueue_job(
         The inserted job, or ``None`` when a job for this ``(event, subscriber)``
         already existed.
     """
-    validate_queue_name(queue)
-    job_id = str(uuid.uuid4())
-    values = {
-        "id": job_id,
-        "queue": queue,
-        "event_id": event.event_id,
-        "event_type": event.event_type,
-        "subscriber_id": subscriber_id,
-        "source": event.source,
-        "payload": event.payload,
-        "schema_version": event.schema_version,
-        "job_metadata": event.metadata or None,
-        "status": STATUS_PENDING,
-        "attempts": 0,
-        "max_attempts": max_attempts,
-        "available_at": available_at or now,
-        "created_at": now,
-        "updated_at": now,
-    }
-    db.execute(_insert_ignoring_duplicate(values, db))
-    commit_or_flush(db, commit)
     # Returns the row only when this call inserted it: a skipped conflict leaves
     # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
+    job_id = insert_job(
+        event,
+        subscriber_id,
+        queue=queue,
+        max_attempts=max_attempts,
+        now=now,
+        db=db,
+        available_at=available_at,
+        commit=commit,
+    )
     return db.get(ProcessingJob, job_id)
 
 
@@ -226,7 +257,7 @@ def claim_jobs(
     if record_attempts:
         _open_attempts(job_ids, worker_id=worker_id, now=now, db=db)
     db.commit()
-    claimed = (
+    claimed: Sequence[ProcessingJob] = (
         db.execute(
             select(ProcessingJob).where(
                 ProcessingJob.id.in_(job_ids),
@@ -436,12 +467,7 @@ def _close_open(job_attempts: dict[str, int], *, worker_id: str, outcome: str, n
         db.execute(
             update(JobAttempt)
             .where(
-                or_(
-                    *(
-                        and_(JobAttempt.job_id == job_id, JobAttempt.attempt == attempt)
-                        for job_id, attempt in job_attempts.items()
-                    )
-                ),
+                _claims_match(JobAttempt.job_id, JobAttempt.attempt, job_attempts),
                 JobAttempt.worker_id == worker_id,
                 JobAttempt.finished_at.is_(None),
             )
@@ -552,7 +578,7 @@ def renew_leases(
     )
     # No ``UPDATE ... RETURNING``: MySQL and MariaDB do not support it. Same
     # transaction, so the rows read back are the ones just renewed.
-    ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
+    ids: set[str] = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
     db.commit()
     return ids
 
@@ -614,15 +640,22 @@ def release_leases(
     return released.rowcount
 
 
+def _claims_match(job_id_column: Any, attempt_column: Any, job_attempts: dict[str, int]) -> Any:
+    """Match each ``{job_id: attempt}`` pair, with one term per distinct attempt rather than per job.
+
+    A term per job makes the condition as deep as the batch, which SQLite's expression-depth limit refuses at
+    about a thousand jobs. Attempt numbers are few (at most ``max_attempts``), so this stays small.
+    """
+    by_attempt: dict[int, list[str]] = {}
+    for job_id, attempt in job_attempts.items():
+        by_attempt.setdefault(attempt, []).append(job_id)
+    return or_(*(and_(attempt_column == attempt, job_id_column.in_(ids)) for attempt, ids in by_attempt.items()))
+
+
 def _held_claims(job_attempts: dict[str, int], *, worker_id: str) -> list[Any]:
     """Match the claims ``worker_id`` still holds, each at the attempt it took."""
     return [
-        or_(
-            *(
-                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
-                for job_id, attempts in job_attempts.items()
-            )
-        ),
+        _claims_match(ProcessingJob.id, ProcessingJob.attempts, job_attempts),
         ProcessingJob.status == STATUS_CLAIMED,
         ProcessingJob.locked_by == worker_id,
     ]
@@ -883,7 +916,8 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     Return jobs whose lease expired (a crashed worker) to a runnable state.
 
     Exhausted rows (``attempts - deferrals >= max_attempts``) are dead-lettered; the rest are
-    made ``pending`` and immediately available again.
+    made ``pending`` and immediately available again. Their ``on_dead_letter`` callbacks are owed
+    to the scheduled sweep.
 
     Args:
         now: Current instant.
@@ -893,24 +927,6 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     Returns:
         The number of jobs this call reclaimed (requeued plus dead-lettered).
     """
-    return reclaim_expired_leases_detailed(now=now, db=db, limit=limit)[0]
-
-
-def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 100) -> tuple[int, list[str]]:
-    """
-    Reclaim expired leases like :func:`reclaim_expired_leases`, and say which died.
-
-    Args:
-        now: Current instant.
-        db: Active database session.
-        limit: Maximum number of expired leases to reclaim in one pass.
-
-    Returns:
-        ``(reclaimed, dead_lettered_ids)``: the number of jobs reclaimed, and the
-        ids among the selected ones that are ``dead_letter`` after the pass (a
-        concurrent reaper's may be included; delivery claims each job with a
-        compare-and-set, so only one process runs its callback).
-    """
     id_stmt = (
         select(ProcessingJob.id)
         .where(ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.lease_expires_at < now)
@@ -918,10 +934,10 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
     )
     if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
         id_stmt = id_stmt.with_for_update(skip_locked=True)
-    job_ids = list(db.execute(id_stmt).scalars().all())
+    job_ids: list[str] = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()
-        return 0, []
+        return 0
     # Both updates re-assert ``status = 'claimed'`` *and* the expiry. Without SKIP
     # LOCKED two reapers can select the same rows, and the loser must not
     # overwrite the requeue the winner already performed; and a worker's heartbeat
@@ -943,6 +959,7 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
                 completed_at=now,
                 updated_at=now,
                 locked_by=None,
+                locked_at=None,
                 lease_expires_at=None,
             )
             # ``fetch`` rather than the default in-Python evaluation: the criteria now
@@ -989,21 +1006,8 @@ def reclaim_expired_leases_detailed(*, now: datetime, db: Session, limit: int = 
         .values(outcome=OUTCOME_LEASE_EXPIRED, finished_at=now)
         .execution_options(synchronize_session=False)
     )
-    dead_ids = (
-        list(
-            db.execute(
-                select(ProcessingJob.id).where(
-                    ProcessingJob.id.in_(job_ids), ProcessingJob.status == STATUS_DEAD_LETTER
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if dead_lettered.rowcount
-        else []
-    )
     db.commit()
-    return dead_lettered.rowcount + requeued.rowcount, dead_ids
+    return dead_lettered.rowcount + requeued.rowcount
 
 
 def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
@@ -1033,23 +1037,10 @@ def expired_lease_holders(*, now: datetime, db: Session) -> dict[str, int]:
     return {str(worker): int(count) for worker, count in rows}
 
 
-def get_job(job_id: str, db: Session) -> ProcessingJob | None:
-    """
-    Fetch a job by id.
-
-    Args:
-        job_id: The job identifier.
-        db: Active database session.
-
-    Returns:
-        The job, or ``None`` when it does not exist.
-    """
-    return db.get(ProcessingJob, job_id)
-
-
 def get_jobs_summary(
     db: Session,
     *,
+    now: datetime,
     hours: int = 24,
     dead_letter_limit: int = 50,
     record_attempts: bool = True,
@@ -1059,6 +1050,7 @@ def get_jobs_summary(
 
     Args:
         db: Active database session.
+        now: The instant the window ends at and ages are measured from.
         hours: Look-back window for the status/subscriber counts.
         dead_letter_limit: Maximum dead-letter jobs to return for inspection.
         record_attempts: Whether attempts are being recorded. When ``False`` the
@@ -1070,7 +1062,6 @@ def get_jobs_summary(
         The durable-jobs summary — window counts, per-subscriber breakdown,
         oldest pending age, and the current dead-letter queue.
     """
-    now = datetime.now(UTC)
     window_start = now - timedelta(hours=hours)
     rows = db.execute(
         select(ProcessingJob.subscriber_id, ProcessingJob.event_type, ProcessingJob.status, func.count())
@@ -1133,7 +1124,7 @@ def get_jobs_summary(
         for status_counts in (queue_counts[queue],)
     ]
     oldest_pending = min(queue_oldest.values(), default=None)
-    dead_letter_jobs = (
+    dead_letter_jobs: Sequence[ProcessingJob] = (
         db.execute(
             select(ProcessingJob)
             .where(ProcessingJob.status == STATUS_DEAD_LETTER)
@@ -1235,10 +1226,18 @@ class DeadLetterJob:
     event: Event
     last_error: str | None
     delivery_attempt: int
+    #: When the job became ``dead_letter`` (its ``completed_at``). A replay clears it, so it tells this dead
+    #: letter apart from a later one of the same job, whose delivery count starts again.
+    dead_at: datetime | None
 
     def to_event(self) -> Event:
         """The envelope handed to the callback."""
         return self.event
+
+
+def envelope_timestamp(row: ProcessingJob) -> str:
+    """Return the publish timestamp a job's envelope carries; a job from before ``rev0006`` has its enqueue time."""
+    return row.event_timestamp or as_utc(row.created_at).isoformat()
 
 
 def event_from_row(row: ProcessingJob) -> Event:
@@ -1247,7 +1246,7 @@ def event_from_row(row: ProcessingJob) -> Event:
         event_id=row.event_id,
         event_type=row.event_type,
         source=row.source,
-        timestamp=as_utc(row.created_at).isoformat(),
+        timestamp=envelope_timestamp(row),
         payload=dict(row.payload),
         metadata=dict(row.job_metadata) if row.job_metadata else {},
         retry_count=row.attempts - row.deferrals,
@@ -1308,7 +1307,9 @@ def claim_dead_letter_callbacks(
         statement = statement.where(ProcessingJob.updated_at >= dead_after)
     if job_ids is not None:
         statement = statement.where(ProcessingJob.id.in_(list(job_ids)))
-    rows = db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
+    rows: Sequence[ProcessingJob] = (
+        db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
+    )
     lease_until = now + timedelta(seconds=lease_seconds)
     jobs: list[DeadLetterJob] = []
     for row in rows:
@@ -1334,30 +1335,29 @@ def claim_dead_letter_callbacks(
                 event=event_from_row(row),
                 last_error=row.last_error,
                 delivery_attempt=row.dead_letter_attempts + 1,
+                dead_at=row.completed_at,
             )
         )
     db.commit()
     return jobs
 
 
-def mark_dead_letter_notified(job_id: str, *, delivery_attempt: int, now: datetime, db: Session) -> bool:
+def mark_dead_letter_notified(claim: DeadLetterJob, *, now: datetime, db: Session) -> bool:
     """
-    Record that the dead-letter callback succeeded for ``job_id``.
+    Record that the dead-letter callback succeeded for the job ``claim`` delivered.
 
     Args:
-        job_id: The dead-lettered job.
-        delivery_attempt: The claim being settled (``DeadLetterJob.delivery_attempt``).
+        claim: The delivery being settled, as :func:`claim_dead_letter_callbacks` returned it.
         now: Current instant.
         db: Active database session.
 
     Returns:
         True when this call set the marker; False when the claim was no longer
-        this one's (already recorded, re-claimed after its lease ran out, or
-        replayed meanwhile).
+        the live one (already recorded, re-claimed after its lease ran out, or
+        replayed meanwhile, also when the job has dead-lettered again since).
     """
     return _update_dead_letter(
-        job_id,
-        delivery_attempt,
+        claim,
         db=db,
         dead_letter_notified_at=now,
         dead_letter_notify_after=None,
@@ -1365,48 +1365,60 @@ def mark_dead_letter_notified(job_id: str, *, delivery_attempt: int, now: dateti
     )
 
 
-def defer_dead_letter_callback(
-    job_id: str, *, delivery_attempt: int, retry_at: datetime, error: str, db: Session
-) -> bool:
+def defer_dead_letter_callback(claim: DeadLetterJob, *, retry_at: datetime, error: str, db: Session) -> bool:
     """
     Schedule a failed callback's next delivery and keep the failure for diagnosis.
 
     Leaves ``updated_at`` alone, which is the instant the job was dead-lettered.
 
     Args:
-        job_id: The dead-lettered job.
-        delivery_attempt: The claim being settled (``DeadLetterJob.delivery_attempt``).
+        claim: The delivery being settled, as :func:`claim_dead_letter_callbacks` returned it.
         retry_at: Earliest instant the callback may be delivered again.
         error: What the callback raised.
         db: Active database session.
+
+    Returns:
+        True when the claim was still the live one and the retry was recorded.
     """
     return _update_dead_letter(
-        job_id,
-        delivery_attempt,
+        claim,
         db=db,
         dead_letter_notify_after=retry_at,
         dead_letter_callback_error=fit_length(error, MAX_STORED_ERROR_LENGTH),
     )
 
 
-def release_dead_letter_claim(job_id: str, *, delivery_attempt: int, db: Session) -> bool:
-    """Undo a claim whose callback was never run, so the delivery is not counted."""
+def release_dead_letter_claim(claim: DeadLetterJob, *, db: Session) -> bool:
+    """
+    Undo a claim whose callback was never run, so the delivery is not counted.
+
+    Args:
+        claim: The delivery being released, as :func:`claim_dead_letter_callbacks` returned it.
+        db: Active database session.
+
+    Returns:
+        True when the claim was still the live one and was released.
+    """
     return _update_dead_letter(
-        job_id, delivery_attempt, db=db, dead_letter_notify_after=None, dead_letter_attempts=delivery_attempt - 1
+        claim, db=db, dead_letter_notify_after=None, dead_letter_attempts=claim.delivery_attempt - 1
     )
 
 
-def _update_dead_letter(job_id: str, delivery_attempt: int, *, db: Session, **values: Any) -> bool:
-    """Write to a dead letter only while ``delivery_attempt`` is still the live claim."""
+def _update_dead_letter(claim: DeadLetterJob, *, db: Session, **values: Any) -> bool:
+    """Write to a dead letter only while ``claim`` is still the live claim of the same dead letter."""
+    same_dead_letter = (
+        ProcessingJob.completed_at.is_(None) if claim.dead_at is None else ProcessingJob.completed_at == claim.dead_at
+    )
     updated = cast(
         CursorResult[Any],
         db.execute(
             update(ProcessingJob)
             .where(
-                ProcessingJob.id == job_id,
+                ProcessingJob.id == claim.id,
                 ProcessingJob.status == STATUS_DEAD_LETTER,
                 ProcessingJob.dead_letter_notified_at.is_(None),
-                ProcessingJob.dead_letter_attempts == delivery_attempt,
+                ProcessingJob.dead_letter_attempts == claim.delivery_attempt,
+                same_dead_letter,
             )
             .values(**values)
         ),
@@ -1468,7 +1480,7 @@ def _insert_ignoring_duplicate(values: dict, db: Session):
         return pg_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
     if dialect == "sqlite":
         return sqlite_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect == "mysql":  # pragma: no cover - exercised on MySQL, not in SQLite tests
+    if dialect in ("mysql", "mariadb"):  # pragma: no cover - exercised on MySQL, not in SQLite tests
         # MySQL has no ON CONFLICT DO NOTHING. Assigning a column to *itself*
         # is the standard no-op form; ``INSERT IGNORE`` would also swallow
         # unrelated errors such as truncation.
@@ -1476,5 +1488,5 @@ def _insert_ignoring_duplicate(values: dict, db: Session):
         return statement.on_duplicate_key_update(event_id=ProcessingJob.event_id)
     raise RuntimeError(
         f"JASIL's durable jobs need an insert-or-ignore clause, which dialect {dialect!r} does not provide. "
-        "Supported: postgresql, mysql, sqlite."
+        "Supported: postgresql, mysql, mariadb, sqlite."
     )

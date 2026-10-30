@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -163,6 +164,26 @@ class TestRetention:
 
         assert "Retention prune: deleted" not in caplog.text
 
+    def test_a_failing_event_log_prune_does_not_stop_the_job_tables_being_pruned(
+        self, platform, session_factory, db, caplog, monkeypatch
+    ):
+        import jasil.event_log.crud as event_log_crud
+
+        _configure_retention(event_log_days=30, jobs_days=30)
+        outbox_id = jobs_outbox.add_to_outbox(new_event("a.b", {}, source="t"), now=OLD, db=db)
+        jobs_outbox.mark_relayed(outbox_id, now=OLD, db=db)
+
+        def failing(*_args, **_kwargs):
+            raise RuntimeError("statement timeout")
+
+        monkeypatch.setattr(event_log_crud, "delete_events_before", failing)
+
+        with caplog.at_level("INFO"), pytest.raises(RuntimeError, match="statement timeout"):
+            retention.prune_expired_records()
+
+        assert db.query(EventOutbox).count() == 0
+        assert "1 relayed outbox" in caplog.text  # what was deleted is reported before the failure is raised
+
     def test_a_pass_that_deletes_reports_what_it_removed(self, platform, session_factory, db, caplog):
         _configure_retention(event_log_days=30, jobs_days=0)
         _old_event_log_row(db)
@@ -229,6 +250,24 @@ class TestLocalStorage:
     @pytest.fixture
     def legacy_storage(self, tmp_path):
         return LocalStorage(str(tmp_path), url_prefix="/media", legacy_layout=True)
+
+    def test_a_key_component_too_long_for_the_filesystem_is_simply_absent_from_the_legacy_layout(
+        self, legacy_storage, tmp_path, caplog
+    ):
+        """No file can have that name, so probing for a legacy copy is not an outage."""
+        (tmp_path / "thumbnails").mkdir()  # the filesystem only reports a long name inside an existing directory
+        key = "x" * 300
+
+        assert legacy_storage.get("thumbnails", key) is None
+        assert legacy_storage.exists("thumbnails", key) is False
+        assert legacy_storage.stat("thumbnails", key) is None
+        legacy_storage.delete("thumbnails", key)
+
+        legacy_storage.save("thumbnails", key, b"bytes")
+        assert legacy_storage.get("thumbnails", key) == b"bytes"
+        legacy_storage.delete("thumbnails", key)
+        assert legacy_storage.get("thumbnails", key) is None
+        assert "Failed to remove" not in caplog.text
 
     def test_a_blob_round_trips(self, storage):
         storage.save("thumbnails", "1.webp", b"bytes")
@@ -517,6 +556,26 @@ class TestLocalStorage:
         assert list((tmp_path / "activity_files").glob(temporary_pattern)) == []
         assert list(storage._upload_root().glob(temporary_pattern)) == []
 
+    def test_opaque_save_is_atomic_when_replacement_fails(self, tmp_path, monkeypatch):
+        """An overwrite that fails part-way must leave the previous object, never a torn new one."""
+        storage = LocalStorage(str(tmp_path))
+        storage.save("avatars", "42.webp", b"old")
+        payload = storage._resolve("avatars", "42.webp")
+        original_replace = os.replace
+
+        def fail_replace(source, destination):
+            if Path(destination) == payload:
+                raise OSError("storage unavailable")
+            original_replace(source, destination)
+
+        monkeypatch.setattr(os, "replace", fail_replace)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("avatars", "42.webp", b"new")
+
+        assert storage.get("avatars", "42.webp") == b"old"
+        assert sorted(path.name for path in payload.parent.iterdir()) == sorted(["key", payload.name])
+
     def test_plain_area_delete_removes_plain_and_opaque_copies(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "processed/42.fit", b"plain")
@@ -647,6 +706,38 @@ class TestLocalStorage:
         with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
             storage.get("thumbnails", "original.webp")
         assert storage.list_keys("thumbnails") == []
+
+    def test_listing_refuses_a_symlinked_area_identity(self, storage, tmp_path):
+        storage.save("thumbnails", "original.webp", b"original")
+        area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
+        area_file.unlink()
+        outside = tmp_path / "outside-area"
+        outside.write_text("thumbnails")
+        area_file.symlink_to(outside)
+
+        with pytest.raises(StorageBackendUnavailableError, match="area identity path is unsafe"):
+            storage.list_keys("thumbnails")
+
+    def test_listing_refuses_an_area_identity_naming_another_area(self, storage):
+        storage.save("thumbnails", "original.webp", b"original")
+        area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
+        area_file.write_text("avatars")
+
+        with pytest.raises(StorageBackendUnavailableError, match="area identity does not match"):
+            storage.list_keys("thumbnails")
+
+    def test_a_plain_area_never_follows_a_symlink_out_of_the_base_directory(self, tmp_path):
+        base = tmp_path / "data"
+        outside = tmp_path / "outside"
+        base.mkdir()
+        outside.mkdir()
+        (base / "activity_files").symlink_to(outside, target_is_directory=True)
+        storage = LocalStorage(str(base), plain_areas=frozenset({"activity_files"}))
+
+        with pytest.raises(ValueError, match="escapes base directory"):
+            storage.save("activity_files", "a.fit", b"x")
+
+        assert list(outside.iterdir()) == []
 
     def test_a_symlinked_area_identity_blocks_new_writes(self, storage, tmp_path):
         storage.save("thumbnails", "original.webp", b"original")
@@ -1546,7 +1637,170 @@ class TestRuntimeHandle:
         monkeypatch.setattr(runtime, "_active_platform", None)
 
 
-@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX permissions enforced on the caller")
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot open a directory for fsync")
+class TestLocalStorageDurability:
+    """A rename is only as durable as the bytes behind it and the directory entry it writes.
+
+    Without a sync, a crash after a write returned can leave an empty or missing object on ext4 or XFS.
+    """
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+
+    @staticmethod
+    def _record(monkeypatch, published):
+        synced = []
+        real = os.fsync
+
+        def recording(descriptor):
+            synced.append((stat.S_ISDIR(os.fstat(descriptor).st_mode), published()))
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", recording)
+        return synced
+
+    @staticmethod
+    def _file_then_directory(synced) -> bool:
+        """A file synced before the name existed, then a directory synced once it did."""
+        return (False, False) in synced and (True, True) in synced[synced.index((False, False)) :]
+
+    @pytest.mark.parametrize("area", ["avatars", "plain"])
+    @pytest.mark.parametrize("write", ["save", "save_stream", "complete_upload"])
+    def test_an_object_is_synced_before_and_after_it_is_published(self, storage, monkeypatch, area, write):
+        session = storage.begin_upload(area, "1.bin") if write == "complete_upload" else None
+        part = _upload_part(storage, session, 1, b"data") if session is not None else None
+        synced = self._record(monkeypatch, lambda: storage.get(area, "1.bin") is not None)
+
+        if write == "save":
+            storage.save(area, "1.bin", b"data")
+        elif write == "save_stream":
+            storage.save_stream(area, "1.bin", io.BytesIO(b"data"))
+        else:
+            storage.complete_upload(session, [part])
+
+        assert self._file_then_directory(synced), synced
+
+    def test_the_directories_a_first_write_created_are_made_durable_too(self, storage, monkeypatch, tmp_path):
+        """A new directory's name lives in its parent: syncing only the leaf can lose the whole new branch."""
+        synced_directories: list[int] = []
+        real = os.fsync
+
+        def recording(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                synced_directories.append(os.fstat(descriptor).st_ino)
+            real(descriptor)
+
+        monkeypatch.setattr(os, "fsync", recording)
+
+        storage.save("avatars", "nested/1.bin", b"data")
+
+        # The base directory already existed; it holds the name of the first directory the write created.
+        assert tmp_path.stat().st_ino in synced_directories
+
+    def test_an_upload_part_is_synced_before_and_after_it_is_published(self, storage, monkeypatch):
+        session = storage.begin_upload("avatars", "1.bin")
+        parts = storage._load_upload_session(session) / storage_local._UPLOAD_PARTS_DIRECTORY
+        synced = self._record(monkeypatch, lambda: (parts / "00001.part").exists())
+
+        _upload_part(storage, session, 1, b"data")
+
+        assert self._file_then_directory(synced), synced
+
+    def test_an_upload_session_is_synced_when_it_begins(self, storage, monkeypatch, tmp_path):
+        synced = self._record(monkeypatch, lambda: True)
+
+        storage.begin_upload("avatars", "1.bin")
+
+        assert (False, True) in synced and (True, True) in synced
+
+
+class TestLocalStorageFailedWrites:
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+
+    @staticmethod
+    def _identity_files(root):
+        return [path for path in root.rglob("*") if path.name == storage_local._OBJECT_KEY_FILE]
+
+    def test_a_refused_new_object_leaves_no_identity_files_behind(self, storage, tmp_path):
+        """Each rejected upload of a fresh key used to leave a directory pair and a sidecar nothing removes."""
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("avatars", "fresh.bin", io.BytesIO(b"too long"), max_bytes=3)
+
+        assert self._identity_files(tmp_path) == []
+        assert storage.list_keys("avatars") == []
+
+    def test_a_refused_overwrite_keeps_the_object_and_its_identity(self, storage):
+        storage.save("avatars", "kept.bin", b"original")
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("avatars", "kept.bin", io.BytesIO(b"too long"), max_bytes=3)
+
+        assert storage.get("avatars", "kept.bin") == b"original"
+
+
+class TestLocalStorageListingGuards:
+    def test_a_symlink_loop_in_a_legacy_area_does_not_break_listing(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), legacy_layout=True)
+        area = tmp_path / "leg"
+        area.mkdir()
+        (area / "ok.txt").write_bytes(b"x")
+        (area / "loop").symlink_to("loop")
+
+        assert storage.list_keys("leg") == ["ok.txt"]
+
+    def test_a_symlink_loop_in_a_plain_area_does_not_break_listing(self, tmp_path):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        area = tmp_path / "plain"
+        area.mkdir()
+        (area / "ok.txt").write_bytes(b"x")
+        (area / "loop").symlink_to("loop")
+
+        assert storage.list_keys("plain") == ["ok.txt"]
+
+
+class TestLocalStorageConcurrentDelete:
+    """A delete that runs between a writer's preparation and its install must not leave an unreadable payload."""
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), url_prefix="/media")
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            pytest.param(lambda storage: storage.save("thumbnails", "1.webp", b"new"), id="save"),
+            pytest.param(
+                lambda storage: storage.save_stream("thumbnails", "1.webp", io.BytesIO(b"new")), id="save_stream"
+            ),
+        ],
+    )
+    def test_the_object_a_writer_published_stays_readable(self, storage, monkeypatch, write):
+        storage.save("thumbnails", "1.webp", b"old")
+        install = LocalStorage._install
+
+        payload = storage._resolve("thumbnails", "1.webp")
+
+        def delete_then_install(temporary_path, destination):
+            if destination == payload and not deleted:
+                deleted.append(True)
+                storage.delete("thumbnails", "1.webp")
+            install(temporary_path, destination)
+
+        deleted: list[bool] = []
+
+        monkeypatch.setattr(LocalStorage, "_install", staticmethod(delete_then_install))
+
+        write(storage)
+
+        monkeypatch.undo()
+        assert storage.get("thumbnails", "1.webp") == b"new"
+        assert storage.exists("thumbnails", "1.webp")
+        assert storage.list_keys("thumbnails") == ["1.webp"]
+
+
 class TestLocalStorageFilesystemFailures:
     """Real filesystem faults, not stubs: a backend that cannot write must say so
     in provider-neutral terms and leave no half-written object behind."""
@@ -1558,6 +1812,8 @@ class TestLocalStorageFilesystemFailures:
     @pytest.fixture
     def read_only(self):
         """Make directories unwritable for the test, restoring them afterwards."""
+        if os.name == "nt" or os.geteuid() == 0:
+            pytest.skip("needs POSIX permissions enforced on the caller")
         changed: list[tuple[Path, int]] = []
 
         def lock(path: Path, mode: int = 0o500) -> None:
@@ -1594,14 +1850,16 @@ class TestLocalStorageFilesystemFailures:
 
         assert isinstance(excinfo.value.__cause__, OSError)
 
-    def test_overwriting_a_read_only_payload_is_unavailable(self, storage, read_only):
+    def test_overwriting_in_an_unwritable_object_directory_is_unavailable(self, storage, read_only):
         storage.save("thumbnails", "1.webp", b"original")
-        read_only(storage._resolve("thumbnails", "1.webp"), 0o400)
+        object_directory = storage._resolve("thumbnails", "1.webp").parent
+        read_only(object_directory)
 
         with pytest.raises(StorageBackendUnavailableError):
             storage.save("thumbnails", "1.webp", b"replacement")
 
         assert storage.get("thumbnails", "1.webp") == b"original"
+        assert self._leftovers(object_directory) == []
 
     def test_a_stream_into_an_unwritable_object_directory_is_unavailable(self, storage, read_only):
         storage.save("thumbnails", "1.webp", b"original")

@@ -5,6 +5,7 @@ import pytest
 from jasil.capabilities import (
     StateSource,
     build_capability_report,
+    check_audit_sink_consistency,
     check_deployment_consistency,
     check_job_worker_consistency,
     check_lock_consistency,
@@ -22,7 +23,7 @@ from jasil.profile import (
     parse_profile,
     resolve_topology,
 )
-from jasil.settings import GeocodingSettings, JasilSettings, JobSettings, MailSettings, RuntimeSources
+from jasil.settings import AuditSettings, GeocodingSettings, JasilSettings, JobSettings, MailSettings, RuntimeSources
 
 LOCAL = DeploymentProfile.LOCAL
 DISTRIBUTED = DeploymentProfile.DISTRIBUTED
@@ -58,7 +59,7 @@ class TestParseProfile:
     def test_a_typo_raises_rather_than_defaulting(self):
         """Defaulting a typo to ``local`` would silently disable the shared-state
         fail-fast on a distributed deployment."""
-        with pytest.raises(ValueError, match="Invalid DEPLOYMENT_PROFILE 'distributd'"):
+        with pytest.raises(ValueError, match="Invalid deployment profile 'distributd'"):
             parse_profile("distributd")
 
     def test_the_error_lists_the_valid_values(self):
@@ -394,7 +395,8 @@ class TestDeploymentConsistency:
         ("profile", "web_workers", "uri"),
         [
             pytest.param(LOCAL, 1, "memory://", id="single-process"),
-            pytest.param(CUSTOM, 4, "memory://", id="custom"),
+            pytest.param(CUSTOM, 1, "memory://", id="custom-single-process"),
+            pytest.param(CUSTOM, 4, "smtp://relay.test", id="custom-relay"),
             pytest.param(LOCAL, 4, "smtp://relay.test", id="relay"),
             pytest.param(LOCAL, 4, None, id="unset"),
             pytest.param(LOCAL, 4, "", id="empty"),
@@ -443,8 +445,8 @@ class TestDeploymentConsistency:
 
         assert issues == []
 
-    def test_the_custom_profile_opts_out(self):
-        """``custom`` promises no defaults, so nothing here can contradict one."""
+    def test_the_custom_profile_is_held_to_the_same_rules(self):
+        """``custom`` promises no defaults, but eight workers on process-local backends still contradict."""
         issues = check_deployment_consistency(
             JasilSettings(
                 profile=DeploymentProfile.CUSTOM,
@@ -456,7 +458,11 @@ class TestDeploymentConsistency:
             )
         )
 
-        assert issues == []
+        assert {label for label in ("state_uri", "events_uri", "lock_uri") if any(label in i for i in issues)} == {
+            "state_uri",
+            "events_uri",
+            "lock_uri",
+        }
 
 
 class TestStandaloneJobWorkers:
@@ -540,14 +546,23 @@ class TestStandaloneJobWorkers:
 
         assert len(issues) == 1 and "jobs.enabled is false" in issues[0]
 
-    def test_the_custom_profile_opts_out_of_wiring_rules_but_not_the_contradiction(self):
+    def test_the_custom_profile_gets_no_exemption_from_the_multi_process_rules(self):
+        """It promises no defaults, but a declared multi-process topology contradicts a process-local backend."""
         custom = _topology(CUSTOM, job_worker_mode=STANDALONE)
+        sources = (StateSource(label="state_uri", uri="memory://"),)
+
+        assert len(check_state_consistency(topology=custom, state_sources=sources)) == 1
+        assert len(check_lock_consistency(topology=custom, lock_uri="noop://", lock_label="l")) == 1
+        assert len(check_mail_consistency(topology=custom, mail_uri="memory://", mail_label="m")) == 1
+        assert len(check_job_worker_consistency(topology=custom, jobs_enabled=False)) == 1
+
+    def test_a_custom_single_process_deployment_may_use_process_local_backends(self):
+        custom = _topology(CUSTOM)
         sources = (StateSource(label="state_uri", uri="memory://"),)
 
         assert check_state_consistency(topology=custom, state_sources=sources) == []
         assert check_lock_consistency(topology=custom, lock_uri="noop://", lock_label="l") == []
         assert check_mail_consistency(topology=custom, mail_uri="memory://", mail_label="m") == []
-        assert len(check_job_worker_consistency(topology=custom, jobs_enabled=False)) == 1
 
 
 class TestRulesTakeATopology:
@@ -589,9 +604,44 @@ class TestRulesTakeATopology:
         ("topology", "refused"),
         [
             pytest.param(_topology(), False, id="single-process"),
+            pytest.param(_topology(web_workers=4), False, id="several-processes-share-a-disk"),
+            pytest.param(_topology(DISTRIBUTED), True, id="separate-nodes"),
+        ],
+    )
+    def test_a_file_audit_sink_follows_multi_node(self, topology, refused):
+        issues = check_audit_sink_consistency(
+            topology=topology, sink_uri="FILE:///var/audit", sink_label="audit.external_sink_uri"
+        )
+
+        assert bool(issues) is refused
+        assert all("audit.external_sink_uri" in issue for issue in issues)
+
+    @pytest.mark.parametrize("uri", [None, "s3://audit-bucket/prefix"])
+    def test_no_sink_or_an_object_store_sink_is_valid_on_separate_nodes(self, uri):
+        assert check_audit_sink_consistency(topology=_topology(DISTRIBUTED), sink_uri=uri, sink_label="s") == []
+
+    def test_the_deployment_check_judges_the_sink_only_while_auditing_is_on(self):
+        def distributed(enabled):
+            return JasilSettings(
+                profile=DISTRIBUTED,
+                state_uri="redis://cache/0",
+                events_uri="redis://cache/1",
+                storage_uri="s3://bucket",
+                lock_uri="postgres-advisory://",
+                audit=AuditSettings(enabled=enabled, external_sink_uri="file:///var/audit"),
+            )
+
+        assert any("audit.external_sink_uri" in issue for issue in check_deployment_consistency(distributed(True)))
+        assert check_deployment_consistency(distributed(False)) == []
+
+    @pytest.mark.parametrize(
+        ("topology", "refused"),
+        [
+            pytest.param(_topology(), False, id="single-process"),
             pytest.param(_topology(web_workers=2), True, id="web-workers"),
             pytest.param(_topology(job_worker_mode=STANDALONE), True, id="standalone-workers"),
-            pytest.param(_topology(CUSTOM, 4), False, id="custom"),
+            pytest.param(_topology(CUSTOM, 4), True, id="custom-multi-process"),
+            pytest.param(_topology(CUSTOM), False, id="custom-single-process"),
         ],
     )
     def test_lock_follows_multi_process(self, topology, refused):

@@ -17,18 +17,34 @@ and MySQL, silent acceptance on SQLite, and — because the publish seam swallow
 delivery failures — a lost event on all three.
 
 **Every constant here is imported by the model declaring the column it bounds**,
-so a width and the code protecting it cannot drift apart. The one pair that was
-allowed to drift is what produced the bug recorded on
-:data:`MAX_HANDLER_NAME_LENGTH`.
+so a width and the code protecting it cannot drift apart.
 """
 
 __all__ = [
+    "MAX_AUDIT_ACTION_ID_LENGTH",
+    "MAX_AUDIT_APP_NAME_LENGTH",
+    "MAX_AUDIT_APP_VERSION_LENGTH",
+    "MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH",
+    "MAX_AUDIT_DESCRIPTION_KEY_LENGTH",
+    "MAX_AUDIT_ID_LENGTH",
+    "MAX_AUDIT_NAME_LENGTH",
+    "MAX_AUDIT_RETENTION_DAYS",
+    "MAX_DASHBOARD_LIST_LIMIT",
+    "MAX_DASHBOARD_WINDOW_HOURS",
     "MAX_HANDLER_NAME_LENGTH",
+    "MAX_IP_ADDRESS_LENGTH",
+    "MAX_JOB_BATCH_SIZE",
+    "MAX_JOB_SECONDS",
+    "MAX_PARTITION_DAYS_AHEAD",
+    "MAX_REQUEST_ID_LENGTH",
+    "MAX_RETENTION_DAYS",
     "MAX_STORED_ERROR_LENGTH",
+    "MAX_USER_AGENT_LENGTH",
     "MAX_WORKER_ID_LENGTH",
     "MAX_WORKER_LABEL_LENGTH",
     "MAX_WORKER_ROLE_LENGTH",
     "check_length",
+    "check_limit",
     "fit_length",
 ]
 
@@ -40,11 +56,11 @@ MAX_STORED_ERROR_LENGTH = 4000
 
 #: Width of ``event_log.handler_name``, which holds the comma-joined list of every
 #: subscriber that ran for one event — so its length grows with the subscriber
-#: count and is unbounded from the writing layer's point of view. Overflowing it
-#: made PostgreSQL reject the whole UPDATE, and because event-log writes are
-#: deliberately best-effort (swallowed by the recorder so observability never
-#: breaks processing) the failure was silent: the handlers had already run, so
-#: the work completed while the row stayed ``published`` forever.
+#: count and is unbounded from the writing layer's point of view. The list is
+#: clipped to it: an overflow would make PostgreSQL reject the whole UPDATE, and
+#: because event-log writes are best-effort (swallowed by the recorder so
+#: observability never breaks processing) the row would silently stay
+#: ``published`` after its handlers had run.
 MAX_HANDLER_NAME_LENGTH = 500
 
 #: Width of ``event_log.worker_id`` and ``processing_jobs.locked_by``. The event
@@ -57,6 +73,11 @@ MAX_WORKER_ID_LENGTH = 100
 #: these values are supplied directly by the host and are rejected if overlong.
 MAX_WORKER_ROLE_LENGTH = 100
 MAX_WORKER_LABEL_LENGTH = 200
+
+#: Bounds on the admin dashboards' arguments: the look-back window, and the length of the lists they return.
+#: An unbounded window reads every retained row (and overflows ``timedelta`` past about 2.7 million years).
+MAX_DASHBOARD_WINDOW_HOURS = 24 * 366
+MAX_DASHBOARD_LIST_LIMIT = 500
 
 _TRUNCATION_MARKER = "..."
 
@@ -76,9 +97,10 @@ def check_length(value: str, *, field: str, limit: int) -> None:
             would route to the wrong subscribers, or to none at all.
     """
     if len(value) > limit:
+        # The value is not echoed: callers pass host-supplied identifiers, and a token-like one must not reach a log.
         raise ValueError(
             f"{field} is {len(value)} characters, which exceeds the {limit}-character limit "
-            f"and would be rejected or truncated on write: {value[:limit]!r}..."
+            "and would be rejected or truncated on write"
         )
 
 
@@ -100,3 +122,62 @@ def fit_length(value: str | None, limit: int) -> str | None:
     if value is None or len(value) <= limit:
         return value
     return value[: limit - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+
+
+#: Widths of the ``jasil_audit_log`` columns holding host-supplied identifiers. The
+#: host writes the action id, the actor, credential and target ids, so an over-long
+#: one is rejected (:func:`check_length`) rather than clipped: a truncated target id
+#: would point an investigator at the wrong record.
+MAX_AUDIT_ACTION_ID_LENGTH = 100
+MAX_AUDIT_ID_LENGTH = 64
+MAX_AUDIT_NAME_LENGTH = 50
+#: Widths of ``jasil_audit_actions.description_key`` and ``description_default``, written by the host's catalog.
+MAX_AUDIT_DESCRIPTION_KEY_LENGTH = 200
+MAX_AUDIT_DESCRIPTION_DEFAULT_LENGTH = 500
+#: Widths of ``jasil_audit_log.app_name`` and ``app_version``, stamped from the audit settings.
+MAX_AUDIT_APP_NAME_LENGTH = 100
+MAX_AUDIT_APP_VERSION_LENGTH = 50
+
+#: Widths of the audit columns copied from the request. The client controls a
+#: ``User-Agent`` and may influence a request id, so these are clipped
+#: (:func:`fit_length`): refusing the request would lose the very row that records it.
+MAX_REQUEST_ID_LENGTH = 100
+MAX_USER_AGENT_LENGTH = 512
+#: Longest textual IPv6 address, including an IPv4-mapped suffix.
+MAX_IP_ADDRESS_LENGTH = 45
+
+#: Most jobs a worker claims, or outbox rows the relay takes, in one pass: ``jobs.batch_size`` is validated
+#: against it. A claim binds every id it selected in one ``IN (...)``, and pruning deletes in batches this size.
+MAX_JOB_BATCH_SIZE = 1000
+
+#: Longest duration, in seconds, that a job-pipeline setting may hold (a year): leases, runtimes, backoff, deferral
+#: and the worker intervals. Anything longer is no real schedule and overflows ``timedelta`` arithmetic.
+MAX_JOB_SECONDS = 31_536_000
+
+#: Longest retention, in days (a century), for the job tables and the event log, so every cutoff stays a
+#: representable date. Audit retention has its own ceiling below.
+MAX_RETENTION_DAYS = 36_500
+
+#: How many days of audit partitions may be created ahead: ``audit.partition_days_ahead`` is validated
+#: against it, and ``jasil_audit_ensure_partitions`` refuses more.
+MAX_PARTITION_DAYS_AHEAD = 366
+
+#: Longest audit retention, and retention floor, in days (a century). ``audit.retention_days`` and
+#: ``audit.retention_floor_days`` are validated against it, so every cutoff stays a representable date.
+MAX_AUDIT_RETENTION_DAYS = 36_500
+
+
+def check_limit(limit: int, *, maximum: int, name: str, minimum: int = 1) -> None:
+    """Require ``limit`` to be an integer from ``minimum`` to ``maximum``.
+
+    Args:
+        limit: The value to check; a ``bool`` is rejected.
+        maximum: The largest accepted value.
+        name: The parameter name used in the error message.
+        minimum: The smallest accepted value.
+
+    Raises:
+        ValueError: When ``limit`` is not an integer in range.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or not minimum <= limit <= maximum:
+        raise ValueError(f"{name} must be an integer between {minimum} and {maximum}")

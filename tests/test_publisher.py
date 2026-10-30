@@ -12,6 +12,7 @@ Two behaviours matter most and are easy to regress:
 from datetime import UTC, datetime
 
 import pytest
+from sqlalchemy.exc import StatementError
 from sqlalchemy.orm import Session
 
 import jasil.correlation as correlation
@@ -157,6 +158,21 @@ class TestDurableRouting:
         assert db.query(EventOutbox).count() == 0
 
 
+class TestTheEventIsStampedByThePlatformClock:
+    def test_on_the_bus(self, platform):
+        publisher.publish("activity.created", {}, source="test")
+
+        assert [event.timestamp for event in platform.events.published] == [T0.isoformat()]
+
+    def test_in_the_outbox(self, platform, db):
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        assert db.query(EventOutbox).one().timestamp == T0.isoformat()
+
+
 class TestCorrelation:
     def test_the_ambient_correlation_id_is_stamped(self, platform):
         import jasil.correlation as correlation
@@ -198,6 +214,41 @@ class TestFailuresAreSwallowed:
         monkeypatch.setattr(runtime, "_active_platform", None)
 
         publisher.publish("activity.created", {}, source="test")
+
+
+SECRET_PARAMETER = "s3cret-payload-value"
+
+
+def _statement_error(*_args, **_kwargs):
+    raise StatementError("insert failed", "INSERT INTO t VALUES (?)", {"payload": SECRET_PARAMETER}, ValueError())
+
+
+class TestFailureLogsCarryNoStatementParameters:
+    """A SQLAlchemy error's text carries the statement's parameters: the event's payload and metadata."""
+
+    def test_a_bus_failure_is_logged_by_type(self, monkeypatch, caplog):
+        bus = RecordingBus()
+        bus.publish = _statement_error
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=bus))
+
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {}, source="test")
+
+        assert "StatementError (ValueError)" in caplog.text
+        assert SECRET_PARAMETER not in caplog.text
+
+    def test_a_durable_staging_failure_is_logged_by_type(self, platform, db, monkeypatch, caplog):
+        _enable_durable_jobs()
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+        monkeypatch.setattr(jobs_outbox, "add_to_outbox", _statement_error)
+
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {}, source="test", db=db)
+            with pytest.raises(StatementError):
+                publisher.publish_on_commit("activity.created", {}, source="test", db=db)
+
+        assert caplog.text.count("StatementError (ValueError)") == 2
+        assert SECRET_PARAMETER not in caplog.text
 
 
 class TestPublishCommitting:
@@ -279,6 +330,27 @@ class TestPublishManyCommitting:
         )
 
         assert committed == [True]
+
+    def test_a_metadata_builder_failure_after_the_commit_skips_only_that_event(self, platform, db, caplog):
+        """The domain change is committed by then, so raising would tell the caller its unit of work failed."""
+
+        def _metadata(payload):
+            if payload["id"] == 1:
+                raise RuntimeError("bad metadata")
+            return None
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_committing(
+                "activity.deleted",
+                [{"id": 1}, {"id": 2}],
+                source="test",
+                metadata_for=_metadata,
+                db=db,
+                commit=db.commit,
+            )
+
+        assert [event.payload["id"] for event in platform.events.published] == [2]
+        assert "Failed to publish event activity.deleted" in caplog.text
 
     def test_the_durable_path_stages_one_outbox_row_per_payload(self, platform, db):
         _enable_durable_jobs()
@@ -398,7 +470,7 @@ def _outbox_kwargs(event_id: str) -> dict:
         "event_id": event_id,
         "event_type": "domain.row",
         "source": "test",
-        "timestamp": T0,
+        "timestamp": T0.isoformat(),  # the envelope's ISO-8601 string, as the column stores it
         "payload": {},
         "schema_version": 1,
         "created_at": T0,
@@ -579,7 +651,7 @@ class TestPublishOnCommitIsolation:
         def _work(n: int) -> None:
             with session_factory() as session:
                 publisher.publish_on_commit("a.one", {"n": n}, source="test", db=session)
-                barrier.wait()
+                barrier.wait(timeout=5)
                 if n % 2:
                     session.rollback()
                 else:
@@ -592,6 +664,54 @@ class TestPublishOnCommitIsolation:
             thread.join()
 
         assert sorted(e.payload["n"] for e in platform.events.published) == [0, 2]
+
+
+class TestIdentifiersAreValidatedOnEveryRoute:
+    """An identifier too long for its column raises before the commit, whether or not durable jobs are on."""
+
+    # The registry refuses an oversize event type, so only the source can be oversize on the durable route.
+    @pytest.mark.parametrize(("field", "durable"), [("event_type", False), ("source", False), ("source", True)])
+    def test_publish_many_committing_raises_before_committing(self, platform, db, durable, field):
+        if durable:
+            _enable_durable_jobs()
+            jobs_registry.registry.register("activity.deleted", "s", lambda _e: None)
+        arguments = {"event_type": "activity.deleted", "source": "test", field: "a" * 300}
+        committed = []
+
+        with pytest.raises(ValueError, match=field):
+            publisher.publish_many_committing(
+                arguments["event_type"],
+                [{"id": 1}],
+                source=arguments["source"],
+                db=db,
+                commit=lambda: committed.append(True),
+            )
+
+        assert committed == []
+        assert platform.events.published == []
+
+    @pytest.mark.parametrize("field", ["event_type", "source"])
+    def test_publish_on_commit_raises_on_the_bus_route_too(self, platform, db, field):
+        arguments = {"event_type": "activity.created", "source": "test", field: "a" * 300}
+
+        with pytest.raises(ValueError, match=field):
+            publisher.publish_on_commit(arguments["event_type"], {}, source=arguments["source"], db=db)
+        db.commit()
+
+        assert platform.events.published == []
+
+
+class TestPublishOnCommitCapturesThePayload:
+    def test_a_payload_changed_after_publishing_is_dispatched_as_it_was(self, platform, db):
+        """The event is minted when it is published; the commit may come much later."""
+        payload = {"id": 1, "tags": ["a"]}
+        publisher.publish_on_commit("activity.created", payload, source="test", db=db)
+        payload["id"] = 2
+        payload["tags"].append("b")
+
+        db.commit()
+
+        assert [event.payload for event in platform.events.published] == [{"id": 1, "tags": ["a"]}]
 
 
 class TestPublishCommittingStillOwnsItsCommit:

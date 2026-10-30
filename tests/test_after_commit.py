@@ -33,7 +33,7 @@ def test_a_failed_flush_discards_the_callbacks(db):
         "event_id": "x",
         "event_type": "t",
         "source": "s",
-        "timestamp": now,
+        "timestamp": now.isoformat(),
         "payload": {},
         "schema_version": 1,
         "created_at": now,

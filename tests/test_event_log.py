@@ -23,9 +23,11 @@ import pytest
 import jasil.event_log.crud as event_log_crud
 import jasil.orm as jasil_orm
 from jasil._core.limits import MAX_HANDLER_NAME_LENGTH, MAX_STORED_ERROR_LENGTH, MAX_WORKER_ID_LENGTH, fit_length
+from jasil._core.timestamps import as_utc
 from jasil.event_log.models import EventLog
 from jasil.event_log.recorder import EventLogRecorder
 from jasil.events import new_event
+from jasil.testing import FixedClock
 
 
 def _event(event_type: str = "order.created", **kwargs):
@@ -41,7 +43,7 @@ class TestLifecycleWrites:
     def test_publishing_records_the_envelope(self, db):
         event = _event(metadata={"request_id": "r-1"})
 
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "published"
@@ -54,7 +56,7 @@ class TestLifecycleWrites:
         """Nothing to correlate reads better as NULL than as an empty object."""
         event = _event()
 
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
         assert _row(db, event.event_id).event_metadata is None
 
@@ -62,15 +64,15 @@ class TestLifecycleWrites:
         """Terminal from event_log's view: execution lives in processing_jobs."""
         event = _event()
 
-        event_log_crud.record_queued(event, db)
+        event_log_crud.record_queued(event, db, now=datetime.now(UTC))
 
         assert _row(db, event.event_id).status == "queued"
 
     def test_processing_stamps_the_worker(self, db):
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_processing(event.event_id, "worker-7", db)
+        event_log_crud.mark_processing(event.event_id, "worker-7", db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "processing"
@@ -79,9 +81,9 @@ class TestLifecycleWrites:
 
     def test_completion_stamps_the_handler_and_duration(self, db):
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_completed(event.event_id, "render_invoice", 42, db)
+        event_log_crud.mark_completed(event.event_id, "render_invoice", 42, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "completed"
@@ -91,9 +93,9 @@ class TestLifecycleWrites:
 
     def test_failure_stores_the_reason(self, db):
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_failed(event.event_id, "render_invoice", "upstream refused", 7, db)
+        event_log_crud.mark_failed(event.event_id, "render_invoice", "upstream refused", 7, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "failed"
@@ -102,15 +104,19 @@ class TestLifecycleWrites:
     def test_a_long_error_is_clamped_to_the_column(self, db):
         """Clipped, not refused: losing the diagnostic beats losing the failure record."""
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_failed(event.event_id, None, "x" * (MAX_STORED_ERROR_LENGTH * 2), 1, db)
+        event_log_crud.mark_failed(
+            event.event_id, None, "x" * (MAX_STORED_ERROR_LENGTH * 2), 1, db, now=datetime.now(UTC)
+        )
 
         assert len(_row(db, event.event_id).error_message) == MAX_STORED_ERROR_LENGTH
 
     def test_a_transition_for_an_unknown_event_is_a_no_op(self, db):
         """The trail is best-effort; a missing row must not raise into the bus."""
-        event_log_crud.mark_completed("never-published", "handler", 1, db)
+        event_log_crud.mark_completed("never-published", "handler", 1, db, now=datetime.now(UTC))
+
+        assert db.query(EventLog).count() == 0
 
 
 class TestHandlerNameClamping:
@@ -141,9 +147,9 @@ class TestHandlerNameClamping:
     def test_a_clamped_name_round_trips_to_the_database(self, db):
         """The point of the clamp: the write must actually land."""
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_completed(event.event_id, "subscriber," * 200, 1, db)
+        event_log_crud.mark_completed(event.event_id, "subscriber," * 200, 1, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "completed"
@@ -155,9 +161,9 @@ class TestWorkerIdClamping:
 
     def test_a_long_worker_id_is_clamped_rather_than_lost(self, db):
         event = _event()
-        event_log_crud.record_published(event, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_processing(event.event_id, "w" * (MAX_WORKER_ID_LENGTH * 2), db)
+        event_log_crud.mark_processing(event.event_id, "w" * (MAX_WORKER_ID_LENGTH * 2), db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "processing"
@@ -169,7 +175,7 @@ class TestWorkerIdClamping:
 
 class TestSummary:
     def test_an_empty_log_summarises_to_nothing(self, db):
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         assert summary.total_events == 0
         assert summary.by_type == []
@@ -177,17 +183,17 @@ class TestSummary:
         assert summary.recent_failures == []
 
     def test_the_window_is_reported_back(self, db):
-        assert event_log_crud.get_event_log_summary(db, hours=6).window_hours == 6
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), hours=6).window_hours == 6
 
     def test_events_are_counted_per_type_and_status(self, db):
         for _ in range(2):
-            event_log_crud.record_published(_event("order.created"), db)
+            event_log_crud.record_published(_event("order.created"), db, now=datetime.now(UTC))
         completed = _event("order.created")
-        event_log_crud.record_published(completed, db)
-        event_log_crud.mark_completed(completed.event_id, "h", 10, db)
-        event_log_crud.record_published(_event("invoice.rendered"), db)
+        event_log_crud.record_published(completed, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(completed.event_id, "h", 10, db, now=datetime.now(UTC))
+        event_log_crud.record_published(_event("invoice.rendered"), db, now=datetime.now(UTC))
 
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         by_type = {stats.event_type: stats for stats in summary.by_type}
         assert summary.total_events == 4
@@ -199,28 +205,28 @@ class TestSummary:
     def test_types_are_ordered_by_name(self, db):
         """A dashboard that reorders itself between refreshes is unreadable."""
         for event_type in ("zeta.happened", "alpha.happened"):
-            event_log_crud.record_published(_event(event_type), db)
+            event_log_crud.record_published(_event(event_type), db, now=datetime.now(UTC))
 
-        summary = event_log_crud.get_event_log_summary(db)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
 
         assert [stats.event_type for stats in summary.by_type] == ["alpha.happened", "zeta.happened"]
 
     def test_latency_is_averaged_and_peaked(self, db):
         for duration in (10, 30):
             event = _event()
-            event_log_crud.record_published(event, db)
-            event_log_crud.mark_completed(event.event_id, "h", duration, db)
+            event_log_crud.record_published(event, db, now=datetime.now(UTC))
+            event_log_crud.mark_completed(event.event_id, "h", duration, db, now=datetime.now(UTC))
 
-        stats = event_log_crud.get_event_log_summary(db).by_type[0]
+        stats = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0]
 
         assert stats.avg_processing_time_ms == 20.0
         assert stats.max_processing_time_ms == 30
 
     def test_unmeasured_types_report_no_latency(self, db):
         """Zero would read as 'instant' rather than 'never finished'."""
-        event_log_crud.record_published(_event(), db)
+        event_log_crud.record_published(_event(), db, now=datetime.now(UTC))
 
-        stats = event_log_crud.get_event_log_summary(db).by_type[0]
+        stats = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0]
 
         assert stats.avg_processing_time_ms is None
         assert stats.max_processing_time_ms is None
@@ -238,20 +244,20 @@ class TestSummary:
         )
         db.commit()
 
-        assert event_log_crud.get_event_log_summary(db, hours=1).total_events == 0
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), hours=1).total_events == 0
 
     def test_queued_events_are_counted_separately(self, db):
-        event_log_crud.record_queued(_event(), db)
+        event_log_crud.record_queued(_event(), db, now=datetime.now(UTC))
 
-        assert event_log_crud.get_event_log_summary(db).by_type[0].queued == 1
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0].queued == 1
 
 
 class TestPendingGroups:
     def test_unfinished_events_are_grouped(self, db):
-        event_log_crud.record_published(_event(), db)
-        event_log_crud.record_published(_event(), db)
+        event_log_crud.record_published(_event(), db, now=datetime.now(UTC))
+        event_log_crud.record_published(_event(), db, now=datetime.now(UTC))
 
-        pending = event_log_crud.get_event_log_summary(db).pending
+        pending = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending
 
         assert len(pending) == 1
         assert pending[0].status == "published"
@@ -259,16 +265,16 @@ class TestPendingGroups:
 
     def test_finished_events_are_not_pending(self, db):
         event = _event()
-        event_log_crud.record_published(event, db)
-        event_log_crud.mark_completed(event.event_id, "h", 1, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(event.event_id, "h", 1, db, now=datetime.now(UTC))
 
-        assert event_log_crud.get_event_log_summary(db).pending == []
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending == []
 
     def test_a_queued_event_is_not_pending(self, db):
         """Durable events are terminal here; the Jobs dashboard tracks them."""
-        event_log_crud.record_queued(_event(), db)
+        event_log_crud.record_queued(_event(), db, now=datetime.now(UTC))
 
-        assert event_log_crud.get_event_log_summary(db).pending == []
+        assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending == []
 
     def test_the_oldest_group_comes_first(self, db):
         """The backlog a human should look at first is the one that has waited longest."""
@@ -294,7 +300,7 @@ class TestPendingGroups:
         )
         db.commit()
 
-        pending = event_log_crud.get_event_log_summary(db).pending
+        pending = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending
 
         assert [group.event_type for group in pending] == ["old.thing", "recent.thing"]
         assert pending[0].oldest_seconds > pending[1].oldest_seconds
@@ -303,22 +309,22 @@ class TestPendingGroups:
 class TestRecentFailures:
     def test_only_failures_are_returned(self, db):
         completed = _event()
-        event_log_crud.record_published(completed, db)
-        event_log_crud.mark_completed(completed.event_id, "h", 1, db)
+        event_log_crud.record_published(completed, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(completed.event_id, "h", 1, db, now=datetime.now(UTC))
         failed = _event()
-        event_log_crud.record_published(failed, db)
-        event_log_crud.mark_failed(failed.event_id, "h", "boom", 1, db)
+        event_log_crud.record_published(failed, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(failed.event_id, "h", "boom", 1, db, now=datetime.now(UTC))
 
-        failures = event_log_crud.get_event_log_summary(db).recent_failures
+        failures = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures
 
         assert [failure.id for failure in failures] == [failed.event_id]
 
     def test_the_failure_carries_enough_to_investigate(self, db):
         event = _event(metadata={"request_id": "r-9"})
-        event_log_crud.record_published(event, db)
-        event_log_crud.mark_failed(event.event_id, "render_invoice", "boom", 5, db)
+        event_log_crud.record_published(event, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event.event_id, "render_invoice", "boom", 5, db, now=datetime.now(UTC))
 
-        failure = event_log_crud.get_event_log_summary(db).recent_failures[0]
+        failure = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures[0]
 
         assert failure.error_message == "boom"
         assert failure.handler_name == "render_invoice"
@@ -327,10 +333,10 @@ class TestRecentFailures:
     def test_the_list_is_capped(self, db):
         for _ in range(5):
             event = _event()
-            event_log_crud.record_published(event, db)
-            event_log_crud.mark_failed(event.event_id, "h", "boom", 1, db)
+            event_log_crud.record_published(event, db, now=datetime.now(UTC))
+            event_log_crud.mark_failed(event.event_id, "h", "boom", 1, db, now=datetime.now(UTC))
 
-        summary = event_log_crud.get_event_log_summary(db, failure_limit=2)
+        summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), failure_limit=2)
 
         assert len(summary.recent_failures) == 2
 
@@ -346,7 +352,9 @@ class TestRecentFailures:
         )
         db.commit()
 
-        assert [f.id for f in event_log_crud.get_event_log_summary(db).recent_failures] == ["dead"]
+        assert [f.id for f in event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures] == [
+            "dead"
+        ]
 
 
 class TestRecorder:
@@ -354,7 +362,24 @@ class TestRecorder:
 
     @pytest.fixture
     def recorder(self, session_factory):
-        return EventLogRecorder()
+        return EventLogRecorder(FixedClock())
+
+    def test_every_timestamp_comes_from_its_clock(self, session_factory, db):
+        """Never the database's ``now()``: on MySQL that is the session time zone's local time."""
+        clock = FixedClock(moment=datetime(2026, 1, 1, 12, 0, tzinfo=UTC))
+        recorder = EventLogRecorder(clock)
+        event = _event()
+
+        recorder.record_published(event)
+        clock.advance(5)
+        with recorder.track(event, worker_id="w", handler_name="h"):
+            clock.advance(2)
+
+        row = _row(db, event.event_id)
+        assert as_utc(row.created_at) == datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+        assert as_utc(row.processed_at) == datetime(2026, 1, 1, 12, 0, 5, tzinfo=UTC)
+        assert as_utc(row.completed_at) == datetime(2026, 1, 1, 12, 0, 7, tzinfo=UTC)
+        assert row.processing_time_ms == 2000
 
     def test_it_records_a_publication(self, recorder, db):
         event = _event()
@@ -374,7 +399,7 @@ class TestRecorder:
         event = _event()
         # A caller always has a domain write in flight; on SQLite the savepoint
         # only joins the transaction once one has begun.
-        event_log_crud.record_queued(_event(), db, commit=False)
+        event_log_crud.record_queued(_event(), db, commit=False, now=datetime.now(UTC))
 
         recorder.record_queued_in(event, db)
         db.rollback()
@@ -399,6 +424,18 @@ class TestRecorder:
 
         assert "record_queued_in failed" in caplog.text
         assert db.get(EventLog, event.event_id).status == "queued"
+
+    def test_the_callers_own_failing_write_is_not_swallowed_as_an_event_log_failure(self, recorder, db):
+        """Only the event_log row is best-effort: a caller's constraint violation must surface as itself."""
+        from sqlalchemy.exc import IntegrityError
+
+        event = _event()
+        db.add(EventLog(id="duplicate", event_type="x.y", event_source="test", event_payload={}))
+        db.commit()
+        db.add(EventLog(id="duplicate", event_type="x.y", event_source="test", event_payload={}))
+
+        with pytest.raises(IntegrityError):
+            recorder.record_queued_in(event, db)
 
     def test_tracking_records_processing_then_completed(self, recorder, db):
         event = _event()
@@ -455,7 +492,7 @@ class TestRecorderNeverBreaksProcessing:
             raise RuntimeError("database is gone")
 
         monkeypatch.setattr(jasil_orm, "get_sessionmaker", _explode)
-        return EventLogRecorder()
+        return EventLogRecorder(FixedClock())
 
     def test_a_failed_publication_write_is_swallowed(self, broken, caplog):
         with caplog.at_level("WARNING"):
@@ -506,7 +543,7 @@ class TestPruning:
         assert db.query(EventLog).count() == 0
 
     def test_rows_after_the_cutoff_are_kept(self, db):
-        event_log_crud.record_published(_event(), db)
+        event_log_crud.record_published(_event(), db, now=datetime.now(UTC))
 
         event_log_crud.delete_events_before(datetime.now(UTC) - timedelta(days=30), db=db)
 

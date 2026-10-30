@@ -34,7 +34,7 @@ from jasil.container import build_platform
 
 # Distributions behind an optional extra. A core install must load none of them,
 # even after the composition root has assembled a full platform.
-OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler")
+OPTIONAL_DISTRIBUTIONS = ("redis", "boto3", "botocore", "fastapi", "requests", "apscheduler", "cryptography")
 
 # The tables JASIL maps into the host's registry.
 EXPECTED_TABLES = {
@@ -43,6 +43,10 @@ EXPECTED_TABLES = {
     "jasil_event_outbox",
     "jasil_job_workers",
     "jasil_job_attempts",
+    "jasil_audit_log",
+    "jasil_audit_actions",
+    "jasil_audit_checkpoints",
+    "jasil_instance",
 }
 EXPECTED_REVISIONS = {
     "rev0001_initial.py",
@@ -50,6 +54,7 @@ EXPECTED_REVISIONS = {
     "rev0003_prefix_table_names.py",
     "rev0004_dead_letter_notified.py",
     "rev0005_job_deferrals.py",
+    "rev0006_audit_trail_and_job_columns.py",
 }
 
 

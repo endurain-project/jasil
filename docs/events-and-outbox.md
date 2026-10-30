@@ -21,10 +21,13 @@ event = new_event(
 | `event_id` | UUIDv4, stable across retries — also the deduplication key. |
 | `event_type` | Dot-notation channel, owned by the publishing domain. |
 | `source` | Where it originated. |
-| `timestamp` | ISO-8601 UTC, of the first publish. |
+| `timestamp` | ISO-8601 UTC, of the first publish. The publish functions stamp the platform clock's instant; `new_event` takes it as `now` and uses the system clock without one. |
 | `payload` | Domain data, homogeneous per `event_type`. |
 | `metadata` | Correlation context. |
 | `schema_version` | Which version of the payload's shape this carries. |
+| `retry_count` | Processing attempts so far: 0 on first publish; in a durable handler, the attempt being run, from 1. Read `attempt` and `is_last_attempt` rather than comparing it. |
+| `max_attempts` | The durable job's attempt ceiling; `None` outside a durable delivery. |
+| `deferral_count` | How many earlier runs of this durable job deferred with `DeferJob`; not counted in `retry_count`. |
 
 The envelope is frozen. Handlers share one instance, so a mutation would be
 visible to every other handler.
@@ -62,7 +65,10 @@ inlining it.
 
 Identifiers *are* bounded, because they are indexed columns: `event_type` is
 capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
-Going over raises at `new_event` rather than failing at the write.
+Going over raises at `new_event` rather than failing at the write. The functions
+tied to your commit (`publish_committing`, `publish_on_commit` and their batch
+forms) raise it before committing or staging anything, on the durable and the
+best-effort route alike; `publish` logs and swallows it with every other failure.
 
 ## Publishing
 
@@ -138,17 +144,21 @@ db.commit()  # whoever owns the transaction
   wait for the outermost commit. Dispatch failures are logged and swallowed.
 
 Details worth knowing: the envelope (and ambient request id) is captured when you
-publish, not when you commit; publishing starts the session's transaction if none
+publish, not when you commit, including a copy of the payload, so changing the dict
+afterwards does not change the event; publishing starts the session's transaction if none
 is active; "outermost" means the session's outermost transaction, so a session
-joined to an external transaction (`join_transaction_mode="create_savepoint"`)
-dispatches on its own commit; an event published from a subscriber during
+joined to an external transaction (`Session(bind=connection)` over a connection
+that already has one open, in any `join_transaction_mode`) dispatches when the
+session commits, before the external transaction does: if that one then rolls
+back, the event has already gone out. Publish on a session that owns its
+transaction when that matters; an event published from a subscriber during
 dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op.
 Only synchronous `Session` objects are supported; anything else (an `AsyncSession`,
 a `scoped_session` proxy) raises `TypeError`.
 
 ## Delivery routing
 
-An event takes the durable route only when **both** are true:
+An event takes the durable route only when **all three** are true:
 
 1. `jobs.enabled` is set, and
 2. at least one durable subscriber is registered for its `event_type`, and

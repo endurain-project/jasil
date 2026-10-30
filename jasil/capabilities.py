@@ -28,6 +28,10 @@ Five consistency rules are enforced:
   separate nodes with no shared disk. Several processes of a *local* deployment
   share one host disk, so local storage stays valid there. Validated by
   :func:`check_storage_consistency`.
+- **The audit sink** must not resolve to a local directory (``file://``) when the
+  topology is multi-node: whichever node runs maintenance would write that day's
+  checkpoint copies to its own disk, scattering them. Validated by
+  :func:`check_audit_sink_consistency`.
 - **The coordination lock** must not resolve to the in-process ``noop`` lock
   when the topology is multi-process, or every process would run every scheduled
   job. Validated by :func:`check_lock_consistency`.
@@ -41,7 +45,7 @@ Five consistency rules are enforced:
 The *clock* is always the system clock, so its default is never a fatal choice
 here.
 
-:func:`check_deployment_consistency` applies all five to a
+:func:`check_deployment_consistency` applies all six to a
 :class:`~jasil.settings.JasilSettings`, and ``jasil.container.build_platform``
 calls it at startup: an inconsistency raises unless the host sets
 ``enforce_deployment_consistency=False``, which downgrades it to a warning.
@@ -54,7 +58,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from jasil.profile import (
-    DeploymentProfile,
     DeploymentTopology,
     JobWorkerMode,
     StateBackendKind,
@@ -125,9 +128,9 @@ class CapabilityReport:
 
 
 def _scheme_of(uri: str) -> str:
-    """Return a URI's scheme, or the whole value when it carries none."""
+    """Return a URI's scheme, or ``invalid`` when it carries none: the value may hold a password."""
     scheme, separator, _ = uri.partition("://")
-    return scheme if separator else uri
+    return scheme if separator else "invalid"
 
 
 def _mail_backend_of(uri: str | None, *, secure: bool) -> str:
@@ -242,7 +245,7 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
     """Return every fatal wiring inconsistency in ``settings`` (empty when sound).
 
     The entry point ``build_platform`` uses: it resolves the capability URIs the
-    profile would actually build from, then applies all five rules to them.
+    profile would actually build from, then applies all six rules to them.
 
     Args:
         settings: The configuration the platform is being built from.
@@ -272,6 +275,12 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
             topology=topology,
             storage_uri=settings.resolved_storage_uri,
             storage_label="storage_uri",
+        ),
+        *check_audit_sink_consistency(
+            topology=topology,
+            # Disabled, auditing builds no sink, so there is nothing to judge.
+            sink_uri=settings.audit.external_sink_uri if settings.audit.enabled else None,
+            sink_label="audit.external_sink_uri",
         ),
         *check_lock_consistency(
             topology=topology,
@@ -312,9 +321,10 @@ def check_state_consistency(
 
     Returns:
         Human-readable issue messages; empty when consistent. The ``custom``
-        profile is exempt — it promises no defaults, so nothing can contradict one.
+        profile gets no exemption: it promises no defaults, but a declared multi-process
+        topology still contradicts a process-local backend.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not topology.multi_process:
+    if not topology.multi_process:
         return []
     issues: list[str] = []
     for source in state_sources:
@@ -363,6 +373,38 @@ def check_storage_consistency(
     ]
 
 
+def check_audit_sink_consistency(
+    *,
+    topology: DeploymentTopology,
+    sink_uri: str | None,
+    sink_label: str,
+) -> list[str]:
+    """Return a fatal issue when a multi-node deployment copies audit checkpoints to local disk.
+
+    Under the ``distributed`` profile replicas run on separate nodes that do not
+    share a filesystem, and audit maintenance runs on whichever node takes the
+    lock, so a ``file://`` sink would leave each checkpoint copy on a different
+    node's disk. No sink, or an object-store sink, is not flagged.
+
+    Args:
+        topology: The deployment topology.
+        sink_uri: The audit external sink URI, or ``None`` when no sink is built.
+        sink_label: The setting backing the sink (for the message).
+
+    Returns:
+        A single-item issue list when misconfigured; empty otherwise.
+    """
+    if not topology.multi_node or not sink_uri:
+        return []
+    if sink_uri.partition("://")[0].strip().lower() != "file":
+        return []
+    return [
+        f"{sink_label} resolves to a local directory, but profile={topology.profile.value} runs replicas on "
+        f"separate nodes that do not share a disk, so checkpoint copies would scatter across them. Point it at "
+        f"object storage (s3://bucket/prefix)."
+    ]
+
+
 def check_lock_consistency(
     *,
     topology: DeploymentTopology,
@@ -374,10 +416,10 @@ def check_lock_consistency(
     The coordination lock makes scheduled and backfill work single-runner across
     processes. Whenever the topology is multi-process, an in-process ``noop://``
     lock coordinates nothing, so every process would run every interval job (the
-    retention prune, a backfill, an upstream sync). The profile-aware default
-    already resolves to ``postgres-advisory://`` under ``distributed``, so this
-    trips on an explicit ``lock_uri="noop://"`` override, or on a ``local``
-    default paired with several processes. A single-process deployment has
+    retention prune, a backfill, an upstream sync). Only the ``local`` profile has
+    a default lock (``noop://``); ``distributed`` and ``custom`` must set one. So
+    this trips on an explicit ``lock_uri="noop://"``, or on the ``local`` default
+    paired with several processes. A single-process deployment has
     nothing to coordinate, so ``noop`` stays valid there.
 
     Args:
@@ -386,10 +428,9 @@ def check_lock_consistency(
         lock_label: The setting backing the lock (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The
-        ``custom`` profile is exempt — it promises no defaults.
+        A single-item issue list when misconfigured; empty otherwise.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not topology.multi_process:
+    if not topology.multi_process:
         return []
     if not lock_uri.strip().lower().startswith("noop://"):
         return []
@@ -420,10 +461,9 @@ def check_mail_consistency(
         mail_label: The setting backing mail (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The
-        ``custom`` profile is exempt — it promises no defaults.
+        A single-item issue list when misconfigured; empty otherwise.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not mail_uri or not topology.multi_process:
+    if not mail_uri or not topology.multi_process:
         return []
     # ``build_platform`` accepts only the literal ``scheme://`` form, so this is
     # the same test the builder applies.
@@ -445,8 +485,9 @@ def check_job_worker_consistency(
 
     ``job_worker_mode=standalone`` tells every process that other processes
     consume durable jobs, which makes the other rules stricter. With
-    ``jobs.enabled`` false the jobs layer is dormant, so no such consumer can
-    exist and the declaration would only impose constraints nothing justifies.
+    ``jobs.enabled`` false the publisher writes no durable jobs, so there is
+    nothing for such a consumer to run and the declaration would only impose
+    constraints nothing justifies.
 
     Args:
         topology: The deployment topology.

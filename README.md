@@ -12,7 +12,7 @@
 framework-agnostic infrastructure substrate for Python services: swappable
 capability backends, an event pipeline, durable jobs, and observability.
 
-> **Status:** `0.13.0` - the API is still settling. Expect breaking changes on
+> **Status:** `0.14.0` - the API is still settling. Expect breaking changes on
 > minor versions until `1.0.0`.
 
 ---
@@ -27,6 +27,7 @@ capability backends, an event pipeline, durable jobs, and observability.
 | **Event pipeline** | One envelope, one publish seam, payload schema versioning that survives a rolling deploy. |
 | **Durable jobs** | A transactional outbox relayed into named, leased per-subscriber queues, with fair/selective workers, exponential backoff, and a dead-letter queue. |
 | **Observability** | An event lifecycle log and bounded retention pruning for every table it owns. |
+| **Audit trail** | An append-only record of who did what, written in the caller's transaction, with signed, hash-chained checkpoints and an optional write-once copy. |
 
 A core install depends on **`sqlalchemy` and `pydantic` only**. Every backend
 client lives behind an extra and is imported lazily, so a single-process
@@ -55,6 +56,8 @@ pip install "jasil[all]"             # every optional backend
 | `fastapi` | `Depends` helpers exposing the providers to routes |
 | `geocoding` | HTTP reverse geocoding |
 | `migrations` | Packaged Alembic revisions |
+| `audit` | Ed25519 signing of audit checkpoints |
+| `all` | Every optional backend above |
 
 ### Verifying a release
 
@@ -129,6 +132,9 @@ publish("order.created", {"order_id": 42}, source="api:create_order", db=db)
 Change the profile and point the capability URIs at real infrastructure:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         profile=jasil.DeploymentProfile.DISTRIBUTED,

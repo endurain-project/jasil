@@ -1,14 +1,33 @@
 """In-process ``StateProvider`` backend."""
 
+import re
 import threading
 import time
 from collections.abc import Iterator
 
 from jasil.providers import TieredFailureOutcome
 
+#: How often a write also drops every expired key. Expiry is otherwise lazy, on read, and a key that is never
+#: read again (a rate-limit counter for a client that left) would stay in memory for the life of the process.
+SWEEP_INTERVAL_SECONDS = 60
+
+
+# What Redis accepts as an integer: an optional minus sign and no leading zeros, with nothing around it.
+_INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)")
+
+
+def _parse_integer(raw: bytes) -> int:
+    """Read a stored counter as Redis does, refusing what ``int()`` would let through (spaces, underscores)."""
+    if _INTEGER.fullmatch(raw) is None:
+        raise ValueError("value is not an integer or out of range")
+    return int(raw)
+
 
 class MemoryState:
     """``StateProvider`` backed by a process-local dict with per-key TTL expiry.
+
+    An expired key is dropped when it is read, and every write sweeps the expired
+    keys at most once per :data:`SWEEP_INTERVAL_SECONDS`.
 
     Correct for the ``local`` profile (single process). Not shared across
     workers/replicas — the deployment fail-fast rejects using it under a
@@ -19,6 +38,16 @@ class MemoryState:
     def __init__(self) -> None:
         self._data: dict[str, tuple[bytes, float | None]] = {}
         self._lock = threading.Lock()
+        self._next_sweep = time.monotonic() + SWEEP_INTERVAL_SECONDS
+
+    def _sweep_if_due(self) -> None:
+        """Drop every expired key, at most once per :data:`SWEEP_INTERVAL_SECONDS`; call under the lock."""
+        now = time.monotonic()
+        if now < self._next_sweep:
+            return
+        self._next_sweep = now + SWEEP_INTERVAL_SECONDS
+        for key in [key for key, (_value, expiry) in self._data.items() if expiry is not None and expiry <= now]:
+            del self._data[key]
 
     @staticmethod
     def _is_expired(expiry: float | None) -> bool:
@@ -36,22 +65,30 @@ class MemoryState:
         return value
 
     def get(self, key: str) -> bytes | None:
+        """Return the value under ``key``, or ``None`` when absent or expired."""
         with self._lock:
             return self._live_value(key)
 
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
+        """Store ``value`` under ``key``, expiring after ``ttl_seconds`` when given."""
+        _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._data[key] = (value, expiry)
 
     def delete(self, key: str) -> None:
+        """Delete ``key`` if present."""
         with self._lock:
             self._data.pop(key, None)
 
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
+        """Add ``amount`` to the stored integer; keep the existing expiry unless ``ttl_seconds`` is given."""
+        _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             current_bytes = self._live_value(key)
-            current = int(current_bytes.decode()) if current_bytes is not None else 0
+            current = _parse_integer(current_bytes) if current_bytes is not None else 0
             new_value = current + amount
             if ttl_seconds is not None:
                 expiry: float | None = time.monotonic() + ttl_seconds
@@ -63,7 +100,10 @@ class MemoryState:
             return new_value
 
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
+        """Store ``value`` only when no unexpired value exists; return True when stored."""
+        _check_ttl(ttl_seconds)
         with self._lock:
+            self._sweep_if_due()
             if self._live_value(key) is not None:
                 return False
             expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
@@ -71,6 +111,7 @@ class MemoryState:
             return True
 
     def get_and_delete(self, key: str) -> bytes | None:
+        """Return the unexpired value under ``key`` and delete it."""
         with self._lock:
             value = self._live_value(key)
             if value is not None:
@@ -78,13 +119,18 @@ class MemoryState:
             return value
 
     def delete_prefix(self, prefix: str) -> int:
+        """Delete every key starting with ``prefix``; ``prefix`` must not be empty."""
+        _check_prefix(prefix)
         with self._lock:
             matching = [key for key in self._data if key.startswith(prefix)]
+            # An expired key the sweep has not dropped yet is not a key any more: Redis never counts it.
+            deleted = sum(1 for key in matching if self._live_value(key) is not None)
             for key in matching:
-                del self._data[key]
-            return len(matching)
+                self._data.pop(key, None)
+            return deleted
 
     def iter_keys(self, prefix: str) -> Iterator[str]:
+        """Return an iterator over a snapshot of the unexpired keys starting with ``prefix``."""
         with self._lock:
             # Snapshot live matching keys under the lock; ``list(self._data)`` guards
             # against the eviction that ``_live_value`` performs while scanning.
@@ -100,21 +146,23 @@ class MemoryState:
         tiers: tuple[tuple[int, int], ...],
         counter_ttl_seconds: int,
     ) -> TieredFailureOutcome:
+        """Count one occurrence and close the gate, atomically under the instance lock."""
         now = int(time.time())
         with self._lock:
+            self._sweep_if_due()
             # Already locked: return the current count without incrementing, so a
             # locked-out caller cannot keep inflating the counter.
             gate_bytes = self._live_value(gate_key)
             if gate_bytes is not None:
-                gate_until = int(gate_bytes.decode())
+                gate_until = _parse_integer(gate_bytes)
                 if gate_until > now:
                     counter_bytes = self._live_value(counter_key)
-                    count = int(counter_bytes.decode()) if counter_bytes is not None else 0
+                    count = _parse_integer(counter_bytes) if counter_bytes is not None else 0
                     return TieredFailureOutcome(count, gate_until, False)
                 self._data.pop(gate_key, None)  # expired gate
 
             counter_bytes = self._live_value(counter_key)
-            count = (int(counter_bytes.decode()) if counter_bytes is not None else 0) + 1
+            count = (_parse_integer(counter_bytes) if counter_bytes is not None else 0) + 1
             self._data[counter_key] = (str(count).encode(), time.monotonic() + counter_ttl_seconds)
 
             lock_seconds = 0
@@ -127,3 +175,13 @@ class MemoryState:
                 self._data[gate_key] = (str(gate_until).encode(), time.monotonic() + lock_seconds)
                 return TieredFailureOutcome(count, gate_until, True)
             return TieredFailureOutcome(count, None, False)
+
+
+def _check_ttl(ttl_seconds: int | None) -> None:
+    if ttl_seconds is not None and ttl_seconds <= 0:
+        raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
+
+
+def _check_prefix(prefix: str) -> None:
+    if not prefix:
+        raise ValueError("delete_prefix needs a non-empty prefix")

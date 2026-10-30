@@ -7,7 +7,24 @@ call stack.
 
 from typing import Any
 
-__all__ = ["require"]
+__all__ = ["not_installed", "require"]
+
+
+def not_installed(package: str, *, extra: str, feature: str) -> ImportError:
+    """Build the error that names the extra to install for a missing ``package``.
+
+    Args:
+        package: Distribution name, e.g. ``redis``.
+        extra: The JASIL extra providing it, e.g. ``redis``.
+        feature: Human-readable feature name for the message.
+
+    Returns:
+        The ``ImportError`` to raise.
+    """
+    return ImportError(
+        f"{feature} requires the '{package}' package, which is not installed. "
+        f"Install it with: pip install 'jasil[{extra}]'"
+    )
 
 
 def require(module: Any, *, package: str, extra: str, feature: str) -> Any:
@@ -23,8 +40,5 @@ def require(module: Any, *, package: str, extra: str, feature: str) -> Any:
         ImportError: When ``module`` is ``None``.
     """
     if module is None:
-        raise ImportError(
-            f"{feature} requires the '{package}' package, which is not installed. "
-            f"Install it with: pip install 'jasil[{extra}]'"
-        )
+        raise not_installed(package, extra=extra, feature=feature)
     return module

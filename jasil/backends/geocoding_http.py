@@ -9,18 +9,23 @@ Security (OWASP A10 — SSRF): the upstream host is operator-configured, so it i
 validated through :func:`jasil._core.network.host_rejection_reason` — the same
 address denylist and allowlist escape hatch — before the first request, and
 redirects are refused on every request so a permitted host cannot 3xx-pivot onto
-an internal target. The response body is read under a size cap, and failures are
+an internal target. The response body is read under a size cap, the whole request
+under a deadline a watchdog enforces by shutting its sockets down, and failures are
 logged without their message, which would carry the request URL and with it the
 API key.
 """
 
+import contextlib
+import functools
 import json
 import logging
+import socket
 import threading
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
-from urllib.parse import urlencode
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode, urlsplit
 
 import jasil._core.network as network
 from jasil.providers import GeocodedPlace
@@ -42,6 +47,107 @@ _MAX_RESPONSE_BYTES = 1024 * 1024
 # Read granularity while enforcing that cap.
 _READ_CHUNK_BYTES = 8192
 
+# Overall bound on one request, headers and body. The timeout above bounds each
+# read, and restarts with every byte, so an upstream dripping one byte at a time
+# would otherwise hold the caller for as long as the size cap allows. A watchdog
+# shuts the request's sockets down when it passes, which ends a blocked read.
+_DEADLINE_SECONDS = 30
+
+
+class _Deadline:
+    """The sockets one request opened, shut down together when its deadline passes.
+
+    Each socket is watched through a duplicate made before any TLS wrap: the wrap detaches the original from
+    its descriptor, so shutting that down would reach nothing, while the duplicate still names the connection.
+    A socket opened after the deadline (a slow connect hands it over late) is shut down as soon as it is
+    watched, so no read on it can start. :meth:`close` releases the duplicates once the request is over.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sockets: list[socket.socket] = []
+        self._expired = False
+
+    def watch(self, sock: socket.socket) -> None:
+        """Track a duplicate of ``sock``, shutting it down at once if the deadline has already passed."""
+        watched = sock.dup()
+        with self._lock:
+            self._sockets.append(watched)
+            expired = self._expired
+        if expired:
+            _shut_down(watched)
+
+    def expire(self) -> None:
+        """Mark the deadline passed and shut down every socket watched so far."""
+        with self._lock:
+            self._expired = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            _shut_down(sock)
+
+    def close(self) -> None:
+        """Release the duplicates; the connections themselves are closed by their owners."""
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            sock.close()
+
+
+def _shut_down(sock: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+
+
+_current_deadline: ContextVar[_Deadline | None] = ContextVar("jasil_geocoding_deadline", default=None)
+
+
+def _watch_current(sock: socket.socket) -> socket.socket:
+    """Hand ``sock`` to the deadline of the request being made in this context, if any."""
+    deadline = _current_deadline.get()
+    if deadline is not None:
+        deadline.watch(sock)
+    return sock
+
+
+@functools.cache
+def _watched_adapter() -> Any:
+    """Build, once, the ``requests`` adapter whose connections hand their socket to the current deadline.
+
+    Built on first use because ``requests`` is the optional ``geocoding`` extra.
+    """
+    from requests.adapters import HTTPAdapter
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+
+    class _WatchedHTTPConnection(HTTPConnection):
+        def _new_conn(self) -> socket.socket:
+            return _watch_current(super()._new_conn())
+
+    class _WatchedHTTPSConnection(HTTPSConnection):
+        def _new_conn(self) -> socket.socket:
+            return _watch_current(super()._new_conn())
+
+    class _WatchedHTTPPool(HTTPConnectionPool):
+        ConnectionCls = _WatchedHTTPConnection
+
+    class _WatchedHTTPSPool(HTTPSConnectionPool):
+        ConnectionCls = _WatchedHTTPSConnection
+
+    pool_classes = {"http": _WatchedHTTPPool, "https": _WatchedHTTPSPool}
+
+    class _WatchedAdapter(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = pool_classes
+
+        def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+            # A proxy gets a manager of its own, so it needs the watched pools too.
+            manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+            manager.pool_classes_by_scheme = pool_classes
+            return manager
+
+    return _WatchedAdapter
+
 
 def _failure_detail(error: Exception) -> str:
     """Describe a request failure without echoing its message.
@@ -61,11 +167,21 @@ def _failure_detail(error: Exception) -> str:
     return f"{type(error).__name__} (HTTP {status})" if status is not None else type(error).__name__
 
 
-def _first(data: dict, *names: str) -> str | None:
-    """Return the first non-empty string value among ``names`` in ``data``."""
+# Longest name taken from the upstream. A real place name is a few dozen characters, and the full line a service
+# composes ("display_name") a few hundred; anything longer is not a place.
+_MAX_NAME_CHARACTERS = 256
+_MAX_DISPLAY_NAME_CHARACTERS = 1024
+
+
+def _first(data: dict, *names: str, limit: int = _MAX_NAME_CHARACTERS) -> str | None:
+    """Return the first usable string value among ``names`` in ``data``.
+
+    The upstream is untrusted, so a value is usable only when it is non-empty, at most ``limit`` characters
+    and free of control characters; one that is not is treated as absent and the next name is tried.
+    """
     for name in names:
         value = data.get(name)
-        if isinstance(value, str) and value:
+        if isinstance(value, str) and value and len(value) <= limit and value.isprintable():
             return value
     return None
 
@@ -163,7 +279,7 @@ class HttpGeocoding:
                 region=_first(data, "state", "region", "province"),
                 country=_first(data, "country"),
                 country_code=_country_code(data.get("country_code")),
-                display_name=_first(payload, "display_name"),
+                display_name=_first(payload, "display_name", limit=_MAX_DISPLAY_NAME_CHARACTERS),
             )
         return place if any(vars(place).values()) else None
 
@@ -178,23 +294,27 @@ class HttpGeocoding:
             self._last_call = time.monotonic()
 
     @staticmethod
-    def _read_capped(response: "requests.Response") -> bytes:
-        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES`.
+    def _read_capped(response: "requests.Response", deadline: float) -> bytes:
+        """Read a response body, refusing one past :data:`_MAX_RESPONSE_BYTES` or past ``deadline``.
 
         Streamed rather than taken from ``response.content`` so an oversized body
         is abandoned partway instead of being buffered in full first.
 
         Args:
             response: The streamed response to drain.
+            deadline: The ``time.monotonic()`` value after which the transfer is abandoned.
 
         Returns:
             The body bytes.
 
         Raises:
             ValueError: When the body exceeds the cap.
+            TimeoutError: When the transfer is still running at ``deadline``.
         """
         body = bytearray()
         for chunk in response.iter_content(chunk_size=_READ_CHUNK_BYTES):
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"response body still arriving after {_DEADLINE_SECONDS} seconds")
             body.extend(chunk)
             if len(body) > _MAX_RESPONSE_BYTES:
                 raise ValueError(f"response body exceeded the {_MAX_RESPONSE_BYTES}-byte limit")
@@ -217,29 +337,53 @@ class HttpGeocoding:
         # decide that someone's whereabouts are acceptable to write to their log.
         logger.debug("Reverse-geocoding via %s", self._service)
         self._throttle()
+        deadline = time.monotonic() + _DEADLINE_SECONDS
+        watched = _Deadline()
+        finished = threading.Event()
+        watchdog = threading.Thread(target=_watch, args=(watched, finished), daemon=True)
+        token = _current_deadline.set(watched)
+        watchdog.start()
         try:
             # Imported lazily: ``requests`` is the optional `geocoding` extra, and
             # the composition root imports this module unconditionally for
             # ``NullGeocoding``.
             import requests
 
-            with requests.get(
-                self._build_url(latitude, longitude),
-                headers={"User-Agent": self._user_agent},
-                timeout=_TIMEOUT_SECONDS,
-                # A permitted host must not 3xx-pivot the request onto an
-                # internal target (SSRF defense in depth, OWASP A10).
-                allow_redirects=False,
-                stream=True,
-            ) as response:
-                response.raise_for_status()
-                return self._parse(json.loads(self._read_capped(response)))
+            # A session of its own, so its connections are the watched ones and none outlives the request.
+            with requests.Session() as session:
+                adapter = _watched_adapter()()
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+                with session.get(
+                    self._build_url(latitude, longitude),
+                    headers={"User-Agent": self._user_agent},
+                    timeout=_TIMEOUT_SECONDS,
+                    # A permitted host must not 3xx-pivot the request onto an
+                    # internal target (SSRF defense in depth, OWASP A10).
+                    allow_redirects=False,
+                    stream=True,
+                ) as response:
+                    response.raise_for_status()
+                    return self._parse(json.loads(self._read_capped(response, deadline)))
         except Exception as error:
             logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
             return None
+        finally:
+            finished.set()
+            watchdog.join()
+            watched.close()
+            _current_deadline.reset(token)
 
 
-def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()) -> str | None:
+def _watch(deadline: _Deadline, finished: threading.Event) -> None:
+    """Watchdog: expire ``deadline`` unless the request finishes within :data:`_DEADLINE_SECONDS`."""
+    if not finished.wait(_DEADLINE_SECONDS):
+        deadline.expire()
+
+
+def resolve_reverse_endpoint(
+    host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()
+) -> tuple[str | None, str | None]:
     """Validate an operator-configured host and build its reverse endpoint URL.
 
     Args:
@@ -247,18 +391,6 @@ def build_reverse_endpoint(host: str, *, use_https: bool, allowed_hosts: Sequenc
         use_https: Whether to address the host over HTTPS.
         allowed_hosts: Hostnames and CIDRs exempt from the SSRF address denylist,
             so a self-hosted instance on a private network stays reachable.
-
-    Returns:
-        The ``{scheme}://{host}/reverse`` URL, or ``None`` when the host failed
-        SSRF validation (the reason is logged).
-    """
-    return resolve_reverse_endpoint(host, use_https=use_https, allowed_hosts=allowed_hosts)[0]
-
-
-def resolve_reverse_endpoint(
-    host: str, *, use_https: bool, allowed_hosts: Sequence[str] = ()
-) -> tuple[str | None, str | None]:
-    """Like :func:`build_reverse_endpoint`, but also return why a host was refused.
 
     Returns:
         ``(url, None)`` for an accepted host, else ``(None, reason)``. The reason
@@ -274,5 +406,17 @@ def resolve_reverse_endpoint(
             reason,
         )
         return None, reason
-    scheme = "https" if use_https else "http"
-    return f"{scheme}://{host}/reverse", None
+    if not use_https:
+        # Cleartext carries the coordinates unencrypted, so it is for a self-hosted instance on a private
+        # network only, as for mail.
+        reason = network.non_public_rejection_reason(urlsplit(f"//{host}").hostname or "")
+        if reason is not None:
+            logger.warning(
+                "Reverse-geocoding host %r %s, and cleartext (+http) needs a private host; reverse geocoding is "
+                "disabled. Use the https scheme for a public instance.",
+                host,
+                reason,
+            )
+            return None, reason
+        return f"http://{host}/reverse", None
+    return f"https://{host}/reverse", None

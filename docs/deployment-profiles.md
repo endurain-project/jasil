@@ -41,6 +41,9 @@ Many replicas on separate nodes. Every capability must point at something they
 can share:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         profile=jasil.DeploymentProfile.DISTRIBUTED,
@@ -108,6 +111,11 @@ when the deployment is multi-node, where replicas run on separate nodes with no
 shared disk. Several processes of a `local` deployment share one host disk, so
 local storage stays valid there.
 
+**Audit sink.** `audit.external_sink_uri` must not be a `file://` directory when
+the deployment is multi-node. Audit maintenance runs on whichever node takes the
+lock, so each day's checkpoint copy would land on a different node's disk. Use an
+`s3://` sink there. The rule applies only while auditing is enabled.
+
 **Coordination lock.** The lock must not resolve to the in-process `noop` lock
 when more than one process could run the same scheduled job.
 
@@ -129,6 +137,7 @@ What each shape requires:
 | Lock | `noop` or `postgres-advisory` | `postgres-advisory` | `postgres-advisory` |
 | Mail | `memory`, or SMTP | SMTP | SMTP |
 | Storage | `local` | `local` on a shared volume, or S3 | S3 |
+| Audit sink, if any | `file` or S3 | `file` or S3 | S3 |
 | Jobs database | SQLite or a server database | PostgreSQL, MySQL 8.0.1+ or MariaDB 10.6+ | the same |
 
 The middle column needs Redis whenever state or events are used. That is not a
@@ -139,15 +148,22 @@ four web workers is four processes, and process-local memory cannot be shared
 between them, so tell JASIL how many you run:
 
 ```python
+import jasil.container
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
+platform = jasil.container.build_platform(jasil_settings.get_settings())
 # ValueError: JASIL's deployment wiring is inconsistent:
 #   - state_uri resolves to process-local memory, but this deployment runs
 #     multiple processes (web_workers=4 runs several API processes) that need a
 #     backend shared across them. ...
 ```
 
-The `custom` profile opts out of the state, lock and mail rules: it promises no
-defaults, so there is nothing for a setting to contradict.
+The `custom` profile promises no defaults, but it is held to the same state, lock
+and mail rules: they compare the URIs you set with the topology you declared, and
+a process-local backend contradicts several processes under any profile. A
+`custom` deployment that genuinely runs one process (`web_workers=1`, in-process
+jobs) may still use `memory://` and `noop://`.
 
 ### Job workers are processes too
 
@@ -157,6 +173,9 @@ web workers alone cannot see it, so the deployment declares how its job workers
 run:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.JasilSettings(
     job_worker_mode=jasil.JobWorkerMode.STANDALONE,  # or parse_job_worker_mode(env)
     jobs=jasil_settings.JobSettings(enabled=True),
@@ -199,11 +218,14 @@ for issue in check_deployment_consistency(settings):
 ```
 JASIL platform capabilities:
 Deployment profile: local (web_workers=1, job_worker_mode=in_process, multi_process=False, multi_node=False)
-  state   -> memory  (source: profile default)
-  storage -> local   (source: profile default)
-  events  -> memory  (source: profile default)
-  lock    -> noop    (source: profile default)
-  clock   -> system  (source: always the system clock)
+  state     -> memory  (source: profile default)
+  storage   -> local  (source: profile default)
+  events    -> memory  (source: profile default)
+  realtime  -> memory  (source: follows events_uri (profile default))
+  lock      -> noop  (source: profile default)
+  mail      -> disabled  (source: not configured)
+  geocoding -> disabled  (source: not configured)
+  clock     -> system  (source: always the system clock)
 ```
 
 The `source` column separates what you chose from what you inherited. A

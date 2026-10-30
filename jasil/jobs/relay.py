@@ -15,6 +15,7 @@ properties cover a crash mid-pass, which rolls the batch back and re-relays it o
 the next one — at-least-once, never at-most-once.
 """
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -26,6 +27,8 @@ from jasil.events import Event
 from jasil.jobs.models import EventOutbox
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.providers import ClockProvider
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -67,8 +70,18 @@ def relay_outbox_once(
         now = clock.now()
         for snapshot in snapshots:
             event = _event_from(snapshot)
-            for subscriber_id in registry.subscribers_for(event.event_type):
-                jobs_crud.enqueue_job(
+            subscribers = registry.subscribers_for(event.event_type)
+            if not subscribers:
+                # The publisher wrote the row because it saw a durable subscriber, so a relayer that knows none
+                # is missing a registration. The row is still stamped: left unrelayed it would block the batch.
+                logger.warning(
+                    "%s event %s has no durable subscriber registered in this process; marking it relayed with no "
+                    "jobs. Register every durable subscriber in each process that runs the relay",
+                    event.event_type,
+                    event.event_id,
+                )
+            for subscriber_id in subscribers:
+                jobs_crud.insert_job(
                     event,
                     subscriber_id,
                     queue=registry.queue_for(subscriber_id),

@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.13.0"
+version = "0.14.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -44,7 +44,7 @@ redis = [
 ]
 # S3-compatible object storage backend.
 s3 = [
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
 ]
 # PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
 # this extra exists so a host can pull a driver from the same declaration.
@@ -69,31 +69,37 @@ geocoding = [
 migrations = [
     "alembic>=1.20.0",
 ]
+# Ed25519 signing of audit checkpoints (jasil.audit); unsigned, hash-chained
+# checkpoints need nothing.
+audit = [
+    "cryptography>=46.0.0",
+]
 # Convenience: every optional backend at once.
 all = [
     "redis>=8.1.0",
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
     "psycopg[binary]>=3.3.6",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
     "alembic>=1.20.0",
+    "cryptography>=46.0.0",
 ]
 
 [dependency-groups]
 typecheck = [
     "mypy>=2.3.1",
-    "ty>=0.0.83",
+    "ty>=0.0.84",
     "types-requests>=2.33.0.20260906",
-    "boto3-stubs[s3]>=1.43.98",
+    "boto3-stubs[s3]>=1.43.105",
 ]
 lint = [
-    "ruff>=0.16.8",
+    "ruff>=0.16.9",
     "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.39.0",
-    "hypothesis>=6.168.0",
+    "faker>=40.40.0",
+    "hypothesis>=6.168.3",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
@@ -104,13 +110,15 @@ test = [
     "redis>=8.1.0",
     "fakeredis[lua]>=2.38.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
     "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.
     "alembic>=1.20.0",
+    # The audit checkpoint tests sign and verify with Ed25519.
+    "cryptography>=46.0.0",
 ]
 # Real database drivers for the CI database matrix. The default test run uses
 # in-memory SQLite (built into Python) and needs neither; set
@@ -228,8 +236,8 @@ omit = ["*/tests/*", "*/__pycache__/*"]
 [tool.coverage.report]
 # Ratcheted to just under the current figure: high enough that a real regression
 # fails the build, low enough not to trip on incidental churn. Every module is
-# above 80% except the Alembic ``env.py``, which Alembic executes rather than
-# imports. Raise it as the suite grows; never lower it to make a build pass.
+# held to the 80% floor in ``.github/scripts/check_module_coverage.py``. Raise it
+# as the suite grows; never lower it to make a build pass.
 fail_under = 97
 exclude_lines = [
     "pragma: no cover",
@@ -268,6 +276,7 @@ ignore_missing_imports = true
 # not statically typed; importers see their classes as ``Any``.
 [[tool.mypy.overrides]]
 module = [
+    "jasil.audit.models",
     "jasil.event_log.models",
     "jasil.jobs.models",
 ]
@@ -364,6 +373,7 @@ forbidden_modules = [
     "jasil.container",
     "jasil.jobs",
     "jasil.event_log",
+    "jasil.audit",
 ]
 
 # Only the composition root selects a backend. Everything else resolves
@@ -377,6 +387,7 @@ type = "forbidden"
 source_modules = [
     "jasil._core",
     "jasil.admin",
+    "jasil.audit",
     "jasil.capabilities",
     "jasil.correlation",
     "jasil.event_log",
@@ -405,6 +416,7 @@ ignore_imports = ["jasil.runtime -> jasil.container"]
 name = "The substrate reaches jobs only through the publisher"
 type = "forbidden"
 source_modules = [
+    "jasil.audit",
     "jasil.backends",
     "jasil.capabilities",
     "jasil.correlation",
@@ -432,6 +444,7 @@ forbidden_modules = [
     "jasil.capabilities",
     "jasil.container",
     "jasil.deps",
+    "jasil.audit",
     "jasil.event_log",
     "jasil.events",
     "jasil.jobs",
@@ -452,6 +465,7 @@ type = "forbidden"
 source_modules = [
     "jasil._core",
     "jasil.admin",
+    "jasil.audit",
     "jasil.backends",
     "jasil.capabilities",
     "jasil.container",

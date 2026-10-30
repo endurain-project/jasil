@@ -154,6 +154,42 @@ class TestProviderConformance:
         assert state.get("k") == b"value"
 
 
+class TestArgumentConformance:
+    """Arguments one backend would honour and the other misread are refused by both."""
+
+    @pytest.mark.parametrize("ttl", [0, -5])
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda state, ttl: state.set("k", b"v", ttl_seconds=ttl),
+            lambda state, ttl: state.set_if_absent("k", b"v", ttl_seconds=ttl),
+            lambda state, ttl: state.incr("k", ttl_seconds=ttl),
+        ],
+        ids=["set", "set_if_absent", "incr"],
+    )
+    def test_a_ttl_that_is_not_positive_is_refused(self, state, operation, ttl):
+        """Memory read it as already expired and Redis as no expiry: a computed TTL of 0 became a permanent key."""
+        with pytest.raises(ValueError, match="ttl_seconds must be positive"):
+            operation(state, ttl)
+
+        assert state.get("k") is None
+
+    def test_an_empty_prefix_is_refused_by_delete_prefix(self, state):
+        """On Redis it would delete every key in the database, the event stream included."""
+        state.set("k", b"v")
+
+        with pytest.raises(ValueError, match="prefix"):
+            state.delete_prefix("")
+
+        assert state.get("k") == b"v"
+
+    def test_incrementing_a_value_that_is_not_an_integer_is_a_value_error(self, state):
+        state.set("k", b"abc")
+
+        with pytest.raises(ValueError):
+            state.incr("k")
+
+
 class TestTieredFailureConformance:
     """The atomic lockout both backends implement — memory under a lock, Redis in Lua."""
 
@@ -269,6 +305,31 @@ class TestMemoryBackendExpiry:
 
         assert state.set_if_absent("lock", b"second") is True
 
+    def test_delete_prefix_counts_only_the_keys_that_were_still_alive(self, clock):
+        """Redis never lists an expired key, so the count must not include one the sweep has not dropped yet."""
+        state = MemoryState()
+        state.set("p:gone", b"x", ttl_seconds=10)
+        state.set("p:kept", b"x")
+
+        clock["now"] += 11
+
+        assert state.delete_prefix("p:") == 1
+        assert state.get("p:kept") is None
+
+    @pytest.mark.parametrize("stored", [b" 5", b"1_0", b"5 ", b"+5", b"05", b"\xd9\xa5", b"1.5", b""])
+    def test_incr_refuses_what_redis_would_not_parse(self, stored):
+        state = MemoryState()
+        state.set("k", stored)
+
+        with pytest.raises(ValueError, match="not an integer"):
+            state.incr("k")
+
+    def test_incr_parses_negative_integers(self):
+        state = MemoryState()
+        state.set("k", b"-3")
+
+        assert state.incr("k", 5) == 2
+
     def test_incr_preserves_an_existing_expiry(self, clock):
         """Re-arming the TTL on every increment would let a steady stream of
         failures keep a rate-limit window alive forever."""
@@ -295,6 +356,29 @@ class TestMemoryBackendExpiry:
         assert outcome.count == 2
         assert outcome.newly_locked is True
         assert outcome.locked_until_epoch > locked.locked_until_epoch
+
+    def test_a_write_sweeps_keys_that_expired_unread(self, clock):
+        """Rate-limit keys are written once and never read again; left in place they would grow without bound."""
+        state = MemoryState()
+        for n in range(100):
+            state.set(f"rate:{n}", b"1", ttl_seconds=10)
+        state.set("kept", b"1")
+
+        clock["now"] += 61
+        state.set("new", b"1")
+
+        assert sorted(state._data) == ["kept", "new"]
+
+    def test_the_sweep_runs_at_most_once_a_minute(self, clock):
+        state = MemoryState()
+        clock["now"] += 61
+        state.set("first", b"1")  # sweeps an empty store, and starts the next minute
+        state.set("short", b"1", ttl_seconds=1)
+
+        clock["now"] += 2
+        state.set("second", b"1")
+
+        assert "short" in state._data
 
     def test_expired_keys_are_not_listed(self, clock):
         state = MemoryState()
@@ -334,6 +418,80 @@ class TestRedisBackendErrorTranslation:
             failing_state.get("k")
 
         assert excinfo.value.__cause__ is not None
+
+    def test_incrementing_with_a_ttl_never_sends_a_separate_expire(self):
+        """INCRBY and EXPIRE travel together: a failure between two commands would leave a counter that never expires."""
+        sent: list[str] = []
+
+        class _Spy(fakeredis.FakeStrictRedis):
+            def expire(self, *args, **kwargs):
+                sent.append("expire")
+                return super().expire(*args, **kwargs)
+
+            def incrby(self, *args, **kwargs):
+                sent.append("incrby")
+                return super().incrby(*args, **kwargs)
+
+        client = _Spy(decode_responses=False)
+
+        assert RedisState(client).incr("k", ttl_seconds=30) == 1
+        assert sent == []
+        assert 0 < client.ttl("k") <= 30
+
+    def test_scanning_lists_a_key_once_and_skips_one_that_is_not_text(self):
+        class _Repeating(fakeredis.FakeStrictRedis):
+            def scan_iter(self, *args, **kwargs):
+                yield from list(super().scan_iter(*args, **kwargs)) * 2
+
+        client = _Repeating(decode_responses=False)
+        client.set("p:a", b"1")
+        client.set(b"p:\xff\xfe", b"1")
+
+        assert sorted(RedisState(client).iter_keys("p:")) == ["p:a"]
+
+    def test_a_key_holding_another_type_is_a_value_error_not_an_outage(self):
+        """Only a server that cannot serve is unavailable; a refused value is the caller's problem."""
+        client = fakeredis.FakeStrictRedis(decode_responses=False)
+        client.lpush("k", b"x")
+
+        with pytest.raises(ValueError, match="WRONGTYPE"):
+            RedisState(client).get("k")
+
+    def test_a_server_condition_is_still_an_outage(self):
+        from redis.exceptions import ReadOnlyError
+
+        class _Replica(fakeredis.FakeStrictRedis):
+            def set(self, *args, **kwargs):
+                raise ReadOnlyError("READONLY You can't write against a read only replica.")
+
+        with pytest.raises(StateBackendUnavailableError):
+            RedisState(_Replica(decode_responses=False)).set("k", b"v")
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.",
+            "BUSY Redis is busy running a script.",
+            "NOREPLICAS Not enough good replicas to write.",
+        ],
+    )
+    def test_a_server_condition_redis_py_leaves_unclassified_is_an_outage(self, message):
+        """redis-py gives these the plain ``ResponseError``; they say nothing about the key's value."""
+        from redis.exceptions import ResponseError
+
+        class _Refusing(fakeredis.FakeStrictRedis):
+            def set(self, *args, **kwargs):
+                raise ResponseError(message)
+
+        with pytest.raises(StateBackendUnavailableError):
+            RedisState(_Refusing(decode_responses=False)).set("k", b"v")
+
+    def test_incrementing_a_value_that_is_not_an_integer_is_a_value_error(self):
+        client = fakeredis.FakeStrictRedis(decode_responses=False)
+        client.set("k", b"text")
+
+        with pytest.raises(ValueError, match="not an integer"):
+            RedisState(client).incr("k")
 
     def test_the_memory_backend_never_raises_the_provider_error(self):
         assert MemoryState().get("absent") is None

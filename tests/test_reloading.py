@@ -7,6 +7,7 @@ credentials, and a bad configuration is logged once per change, never once per c
 
 import logging
 import threading
+import traceback
 from dataclasses import replace
 
 import pytest
@@ -45,6 +46,44 @@ class Source:
         if self.error is not None:
             raise self.error
         return self.value
+
+
+class TestAStaleRead:
+    def test_a_slow_older_read_never_replaces_a_newer_backend(self):
+        """The settings the operator replaced must not come back because their read finished last."""
+        from jasil._reloading import ReloadingBackend
+
+        first_read_started = threading.Event()
+        release_first_read = threading.Event()
+        reads = []
+        builds = []
+
+        def source():
+            reads.append(1)
+            if len(reads) == 1:
+                first_read_started.set()
+                release_first_read.wait(timeout=5)
+                return "A"
+            return "B"
+
+        def build(value):
+            builds.append(value)
+            return f"backend-{value}"
+
+        backend = ReloadingBackend("Test", source, build)
+        outcomes = []
+        slow = threading.Thread(target=lambda: outcomes.append(backend.resolve()))
+        slow.start()
+        assert first_read_started.wait(timeout=5)
+
+        newer = backend.resolve()
+        release_first_read.set()
+        slow.join(timeout=5)
+
+        assert builds == ["B"]
+        assert backend.current_backend() == "backend-B"
+        assert newer.backend == "backend-B"
+        assert outcomes[0].backend == "backend-B"
 
 
 def _mail(source, base: JasilSettings | None = None):
@@ -308,7 +347,9 @@ class TestSourceFailure:
 
         assert not isinstance(caught.value, MailNotConfiguredError)
         assert caught.value.permanent is False
-        assert isinstance(caught.value.__cause__, RuntimeError)
+        # The source's exception is the host's and may carry a secret, so it is not chained.
+        assert caught.value.__cause__ is None
+        assert caught.value.__suppress_context__ is True
 
     def test_mail_after_a_rejection_raises_instead_of_reusing_old_credentials(self):
         source = Source(GOOD_MAIL)
@@ -456,7 +497,7 @@ class TestConcurrency:
 
         def work():
             try:
-                barrier.wait()
+                barrier.wait(timeout=5)
                 for _ in range(20):
                     provider.send(MESSAGE)
             except BaseException as error:
@@ -498,7 +539,7 @@ class TestSecretsStayOutOfLogsAndErrors:
             mail_source.error = geo_source.error = RuntimeError(f"cannot reach store as {self.USERNAME}")
             with pytest.raises(MailError) as unavailable:
                 mail.send(MESSAGE)
-            texts.append(str(unavailable.value))
+            texts.append("".join(traceback.format_exception(unavailable.value)))
             geo.reverse(1.0, 2.0)
             mail_source.error = geo_source.error = None
             mail_source.value = replace(smtp, from_address="a@example.com")

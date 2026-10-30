@@ -32,7 +32,7 @@ def supports_skip_locked(bind: Any) -> bool:
     dialect = bind.dialect
     if dialect.name == "postgresql":
         return True
-    if dialect.name == "mysql":
+    if dialect.name in ("mysql", "mariadb"):
         # Populated on first connect; treat "unknown" as unsupported.
         version = getattr(dialect, "server_version_info", None)
         if not version:

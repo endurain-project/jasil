@@ -7,12 +7,31 @@ difference would only surface in production. ``test_the_migration_matches_the_mo
 is the guard for that.
 """
 
+import importlib.util
+import logging
+import threading
+import time
+from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import Column, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
 
 from jasil import migrations
+from jasil.audit import _postgres as audit_pg
 from jasil.orm import jasil_table_names, legacy_table_names
 
 pytest.importorskip("alembic", reason="migrations require the 'migrations' extra")
@@ -29,7 +48,7 @@ def engine(mapped_base, database_url):
 
 
 def _drop_everything(engine, mapped_base) -> None:
-    """Remove JASIL's tables and its Alembic version table, if present."""
+    """Remove JASIL's tables, its Alembic version table and the audit functions, if present."""
     mapped_base.metadata.drop_all(engine)
     with engine.begin() as connection:
         connection.exec_driver_sql(f"DROP TABLE IF EXISTS {migrations.VERSION_TABLE}")
@@ -37,6 +56,12 @@ def _drop_everything(engine, mapped_base) -> None:
         # only to an older revision.
         for name in sorted(legacy_table_names()):
             connection.exec_driver_sql(f"DROP TABLE IF EXISTS {name}")
+        # rev0006's PostgreSQL functions outlive the tables: left behind, they make a later
+        # test's plain ``create_all`` schema look partitioned to audit maintenance.
+        if engine.dialect.name == "postgresql":
+            schema = connection.execute(text("SELECT current_schema()")).scalar_one()
+            for statement in audit_pg.uninstall_statements(schema):
+                connection.exec_driver_sql(statement)
 
 
 def _drop_version_table(engine) -> None:
@@ -333,6 +358,112 @@ class TestDeadLetterNotified:
         assert {"dead_letter_notified_at", "dead_letter_notify_after", "dead_letter_attempts"} <= columns
 
 
+class TestRevisionTransactions:
+    """Each revision commits on its own, so no lock one takes is held through the next."""
+
+    @pytest.fixture
+    def failing_build(self, monkeypatch):
+        """Make the named index builds fail, as an interrupted ``CREATE INDEX CONCURRENTLY`` would."""
+        from jasil.migrations import _online
+
+        def fail(names, where="create_index"):
+            original = getattr(_online, where)
+
+            def build(name, *args, **kwargs):
+                if name in names:
+                    raise RuntimeError(f"build of {name} interrupted")
+                return original(name, *args, **kwargs)
+
+            monkeypatch.setattr(_online, where, build)
+            return lambda: monkeypatch.setattr(_online, where, original)
+
+        return fail
+
+    def test_a_failed_revision_keeps_the_ones_before_it(self, engine, failing_build):
+        failing_build({"idx_jasil_processing_jobs_dead_letter"})
+
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == "rev0003"
+
+    def test_a_fresh_install_that_failed_inside_its_second_revision_is_resumed(self, engine, failing_build):
+        """The first revision already created the prefixed tables, so the second must keep finding them."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL commits a revision's changes before building its index")
+        restore = failing_build({"idx_jasil_processing_jobs_worker_claim"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        assert migrations.db_revision(engine) == "rev0001"
+        restore()
+
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert "processing_jobs" not in inspect(engine).get_table_names()
+
+    def test_an_upgrade_that_failed_in_an_index_build_is_resumed(self, engine, failing_build):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL commits a revision's changes before building its index")
+        restore = failing_build({"idx_jasil_processing_jobs_dead_letter"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        columns = {c["name"] for c in inspect(engine).get_columns("jasil_processing_jobs")}
+        assert "dead_letter_notified_at" in columns  # committed before the build
+        assert migrations.db_revision(engine) == "rev0003"
+        restore()
+
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert _index_validity(engine, "idx_jasil_processing_jobs_dead_letter") is True
+
+    def test_an_index_a_failed_build_left_invalid_is_rebuilt(self, engine, failing_build):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL leaves an invalid index behind")
+        restore = failing_build({"idx_jasil_processing_jobs_dead_letter"}, where="_create_concurrently")
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrations.upgrade(engine)
+        restore()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX idx_jasil_processing_jobs_dead_letter ON jasil_processing_jobs "
+                    "(status, dead_letter_notified_at, dead_letter_notify_after)"
+                )
+            )
+            connection.execute(
+                text(
+                    "UPDATE pg_index SET indisvalid = false "
+                    "WHERE indexrelid = 'idx_jasil_processing_jobs_dead_letter'::regclass"
+                )
+            )
+
+        migrations.upgrade(engine)
+
+        assert _index_validity(engine, "idx_jasil_processing_jobs_dead_letter") is True
+
+    def test_the_jobs_table_indexes_are_built_concurrently_on_postgresql(self, engine):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("CONCURRENTLY is PostgreSQL's")
+
+        migrations.upgrade(engine)
+
+        for name in (
+            "idx_jasil_processing_jobs_queue_claim",
+            "idx_jasil_processing_jobs_worker_claim",
+            "idx_jasil_processing_jobs_dead_letter",
+        ):
+            assert _index_validity(engine, name) is True
+
+
+def _index_validity(engine, name: str) -> bool | None:
+    with engine.connect() as connection:
+        return connection.execute(
+            text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass(:name)"), {"name": name}
+        ).scalar()
+
+
 class TestOfflineSql:
     @pytest.mark.parametrize("span", ["rev0002:rev0003", "base:rev0003"])
     def test_the_prefix_rename_can_be_rendered_as_sql(self, span):
@@ -350,6 +481,63 @@ class TestOfflineSql:
         sql = config.output_buffer.getvalue()
         assert "RENAME TO jasil_event_log" in sql
         assert 'RENAME CONSTRAINT "uq_processing_jobs_event_subscriber"' in sql
+
+    def test_the_jobs_table_indexes_render_outside_the_revision_transaction(self):
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+
+        command.upgrade(config, "rev0003:rev0005", sql=True)
+
+        sql = config.output_buffer.getvalue()
+        build = sql.index("CREATE INDEX CONCURRENTLY idx_jasil_processing_jobs_dead_letter")
+        assert sql.rindex("COMMIT", 0, build) > sql.rindex("ADD COLUMN dead_letter_notified_at", 0, build)
+
+
+class TestOfflineAuditTrail:
+    """rev0006 qualifies its functions with the target schema, which ``--sql`` cannot ask a database for."""
+
+    def _render(self, span, *x_arguments):
+        import argparse
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+        config.cmd_opts = argparse.Namespace(x=list(x_arguments))
+        command.upgrade(config, span, sql=True) if span.startswith("rev0005") else command.downgrade(
+            config, span, sql=True
+        )
+        return config.output_buffer.getvalue()
+
+    def test_the_upgrade_renders_with_the_schema_given(self):
+        sql = self._render("rev0005:rev0006", "schema=audit_home")
+
+        assert '"audit_home".jasil_audit_ensure_partitions' in sql
+
+    def test_the_downgrade_renders_with_the_schema_given(self):
+        sql = self._render("rev0006:rev0005", "schema=audit_home")
+
+        assert '"audit_home".jasil_audit_ensure_partitions' in sql
+
+    def test_the_jobs_index_is_built_after_the_rest_commits(self):
+        """The audit trail and the new column commit first, so the concurrent build blocks no worker."""
+        sql = self._render("rev0005:rev0006", "schema=audit_home")
+
+        build = sql.index("CREATE INDEX CONCURRENTLY idx_jasil_processing_jobs_created")
+        committed = sql.rindex("COMMIT", 0, build)
+        assert committed > sql.index("ADD COLUMN event_timestamp")
+        assert committed > sql.index("CREATE TABLE jasil_audit_log")
+
+    def test_without_a_schema_it_says_how_to_give_one(self):
+        with pytest.raises(RuntimeError, match="-x schema="):
+            self._render("rev0005:rev0006")
 
 
 class TestAdoptExistingSchema:
@@ -497,6 +685,67 @@ class TestAdoptExistingSchema:
 
         assert migrations.adopt_existing_schema(engine) is True
         assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_a_missing_server_default_is_rejected(self, engine, mapped_base):
+        """A previous-release writer omits the newer columns and relies on their database default."""
+        metadata = _copied_jasil_metadata(mapped_base)
+        metadata.tables["jasil_processing_jobs"].c.queue.server_default = None
+        metadata.create_all(engine)
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError, match=r"jasil_processing_jobs\.queue: missing server default"
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_missing_check_constraint_is_rejected(self, engine, mapped_base):
+        if engine.dialect.name == "sqlite":  # SQLite cannot drop a constraint, so build the table without it
+            metadata = _copied_jasil_metadata(mapped_base)
+            table = metadata.tables["jasil_instance"]
+            table.constraints.remove(next(item for item in table.constraints if isinstance(item, CheckConstraint)))
+            metadata.create_all(engine)
+        else:  # the migrated schema, which otherwise matches head on every dialect
+            migrations.upgrade(engine)
+            _drop_version_table(engine)
+            with engine.begin() as connection:
+                # DROP CONSTRAINT on every server: MariaDB has no DROP CHECK, and MySQL 8.0.19+ takes this form.
+                connection.exec_driver_sql("ALTER TABLE jasil_instance DROP CONSTRAINT ck_jasil_instance_single")
+
+        with pytest.raises(
+            migrations.SchemaCompatibilityError,
+            match=r"jasil_instance: missing check constraint 'ck_jasil_instance_single'",
+        ):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_an_additional_unique_index_is_rejected(self, engine):
+        """It refuses writes JASIL makes: here, a second subscriber's job for the same event."""
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("CREATE UNIQUE INDEX uq_host_outbox_type ON jasil_event_outbox (event_type)")
+
+        with pytest.raises(migrations.SchemaCompatibilityError, match=r"unexpected index 'uq_host_outbox_type'"):
+            migrations.adopt_existing_schema(engine)
+
+        assert migrations.db_revision(engine) is None
+
+    def test_a_plain_postgresql_audit_log_is_rejected(self, engine, mapped_base):
+        """``create_all`` builds no partitions, triggers or functions, and ``upgrade`` would never add them."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("only PostgreSQL partitions the audit log")
+        mapped_base.metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError) as caught:
+            migrations.adopt_existing_schema(engine)
+
+        message = str(caught.value)
+        assert "jasil_audit_log: not partitioned" in message
+        assert "missing trigger 'jasil_audit_log_no_update_delete'" in message
+        assert "missing function 'jasil_audit_drop_partitions(timestamptz, timestamptz)'" in message
+        assert migrations.db_revision(engine) is None
 
     def test_an_existing_head_revision_is_not_restamped(self, engine):
         migrations.upgrade(engine)
@@ -657,6 +906,23 @@ class TestSchemaVerification:
 
         migrations.verify_schema_current(engine)
 
+    def test_a_database_behind_head_is_reported(self, engine):
+        migrations.upgrade(engine, "rev0005")
+
+        with pytest.raises(RuntimeError, match="'rev0005'"):
+            migrations.verify_schema_current(engine)
+
+    def test_a_database_a_newer_release_migrated_passes_with_a_warning(self, engine, caplog):
+        """During a rolling deploy the previous release restarts against the schema the next one migrated."""
+        migrations.upgrade(engine)
+        with engine.begin() as connection:
+            connection.execute(text("UPDATE jasil_alembic_version SET version_num = 'rev9999'"))
+
+        with caplog.at_level(logging.WARNING, logger="jasil.migrations"):
+            migrations.verify_schema_current(engine)
+
+        assert "rev9999" in caplog.text
+
 
 class TestHostIsolation:
     def test_host_tables_are_out_of_scope(self):
@@ -697,3 +963,167 @@ class TestRevisionSchemas:
 
         with pytest.raises(RuntimeError, match="unknown index"):
             ops.drop_index("idx_missing", table_name="jasil_event_log")
+
+
+class TestASchemaQualifiedBaseIsRefused:
+    """The migrations create JASIL's tables in the default schema; models in another one would never find them."""
+
+    @pytest.fixture
+    def host_schema(self, monkeypatch):
+        import jasil.orm
+
+        monkeypatch.setattr(jasil.orm, "get_active_base", lambda: SimpleNamespace(metadata=MetaData(schema="host")))
+
+    @pytest.mark.parametrize(
+        "run",
+        [migrations.upgrade, lambda engine: migrations.downgrade(engine, "base"), migrations.adopt_existing_schema],
+        ids=["upgrade", "downgrade", "adopt"],
+    )
+    def test_every_entry_point_refuses_it(self, engine, host_schema, run):
+        with pytest.raises(migrations.SchemaCompatibilityError, match="'host'"):
+            run(engine)
+
+        assert migrations.db_revision(engine) is None
+
+
+class _Connection:
+    """Records the statements a lock helper runs; ``acquired`` is what ``GET_LOCK`` answers."""
+
+    def __init__(self, dialect: str, acquired: int | None = 1) -> None:
+        self.dialect = type("Dialect", (), {"name": dialect})()
+        self.statements: list[str] = []
+        self.parameters: list[dict] = []
+        self._acquired = acquired
+
+    def execute(self, statement, parameters=None):
+        self.statements.append(str(statement))
+        self.parameters.append(parameters or {})
+        return type("Result", (), {"scalar": lambda _self: self._acquired})()
+
+    def in_transaction(self) -> bool:
+        return True
+
+    def rollback(self) -> None:
+        self.statements.append("ROLLBACK")
+
+
+class TestOneRunAtATime:
+    """Processes that upgrade at once (replicas starting together) must queue, not collide."""
+
+    def test_postgresql_holds_a_session_lock_across_the_revision_commits(self):
+        """Each revision commits on its own, so a transaction lock would be gone after the first one."""
+        connection = _Connection("postgresql")
+
+        with migrations._one_run_at_a_time(connection):
+            assert connection.statements == ["SELECT pg_advisory_lock(hashtext(:name))"]
+
+        # A transaction still open is the caller's: adoption stamps inside one and commits it itself.
+        assert connection.statements[-1] == "SELECT pg_advisory_unlock(hashtext(:name))"
+        assert "ROLLBACK" not in connection.statements
+
+    def test_postgresql_releases_the_lock_after_a_failed_run(self):
+        connection = _Connection("postgresql")
+
+        with pytest.raises(RuntimeError, match="boom"), migrations._one_run_at_a_time(connection):
+            raise RuntimeError("boom")
+
+        # The failed transaction is ended first, or the unlock could not run in it.
+        assert connection.statements[-2:] == ["ROLLBACK", "SELECT pg_advisory_unlock(hashtext(:name))"]
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_holds_a_session_lock_and_releases_it_even_when_the_run_fails(self, dialect):
+        connection = _Connection(dialect)
+
+        with pytest.raises(RuntimeError, match="boom"), migrations._one_run_at_a_time(connection):
+            raise RuntimeError("boom")
+
+        acquire, release = connection.statements
+        assert acquire.startswith("SELECT GET_LOCK(") and release.startswith("SELECT RELEASE_LOCK(")
+        assert "-1" not in acquire  # MariaDB answers NULL to a negative wait
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_waits_a_finite_time_for_the_lock(self, dialect):
+        """MariaDB answers NULL to a negative wait, so 'forever' has to be a number."""
+        connection = _Connection(dialect)
+
+        with migrations._one_run_at_a_time(connection):
+            pass
+
+        assert connection.parameters[0]["wait"] == migrations._MYSQL_LOCK_WAIT_SECONDS > 0
+
+    @pytest.mark.parametrize("answer", [0, None])
+    def test_mysql_refuses_to_run_without_the_lock(self, answer):
+        connection = _Connection("mysql", acquired=answer)
+
+        with pytest.raises(RuntimeError, match="migration lock"), migrations._one_run_at_a_time(connection):
+            pytest.fail("ran without the lock")
+
+    def test_sqlite_is_not_locked(self):
+        connection = _Connection("sqlite")
+
+        with migrations._one_run_at_a_time(connection):
+            pass
+
+        assert connection.statements == []
+
+    def test_an_upgrade_waits_for_one_already_running(self, engine):
+        if engine.dialect.name == "sqlite":
+            pytest.skip("SQLite takes a single process: JASIL refuses a multi-process SQLite deployment")
+        hold, release, waiting = _LOCK_PROBES[engine.dialect.name]
+        finished = threading.Event()
+        with engine.connect() as holder:
+            holder.execute(text(hold))
+            upgrading = threading.Thread(target=lambda: (migrations.upgrade(engine), finished.set()))
+            upgrading.start()
+            try:
+                assert _eventually(lambda: _scalar(engine, waiting) > 0), "the upgrade never waited for the lock"
+                assert not finished.is_set()
+            finally:
+                holder.execute(text(release))
+                holder.commit()
+                upgrading.join(timeout=30)
+
+        assert finished.is_set()
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+
+#: Per dialect: take the migration lock in another session, give it back, count the sessions waiting for it.
+_LOCK_PROBES = {
+    "postgresql": (
+        "SELECT pg_advisory_lock(hashtext('jasil_migrations'))",
+        "SELECT pg_advisory_unlock(hashtext('jasil_migrations'))",
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    ),
+    "mysql": (
+        "SELECT GET_LOCK(CONCAT('jasil_migrations', ':', MD5(COALESCE(DATABASE(), ''))), 0)",
+        "SELECT RELEASE_LOCK(CONCAT('jasil_migrations', ':', MD5(COALESCE(DATABASE(), ''))))",
+        "SELECT count(*) FROM information_schema.processlist WHERE state = 'User lock'",
+    ),
+}
+
+
+def _scalar(engine, sql: str):
+    with engine.connect() as connection:
+        return connection.execute(text(sql)).scalar()
+
+
+def _eventually(condition, timeout: float = 10.0) -> bool:
+    """Poll ``condition`` (a query, so the loop is paced by the database) until it holds or time runs out."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+    return True
+
+
+def test_the_wheel_smoke_script_expects_exactly_the_packaged_revisions():
+    """The smoke script gates the wheel and the publish job, so a stale revision name there blocks a release."""
+    root = Path(migrations.__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("smoke_import", root / ".github" / "scripts" / "smoke_import.py")
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+
+    packaged = {path.name for path in (Path(migrations.__file__).parent / "versions").glob("rev*.py")}
+
+    assert packaged == smoke.EXPECTED_REVISIONS

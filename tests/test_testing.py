@@ -40,6 +40,17 @@ class TestFixedClock:
         assert jasil_testing.memory_mail(platform).built[0]["Date"] == "Thu, 01 Jan 2026 12:00:00 +0000"
 
 
+class TestStorageRoot:
+    def test_an_explicit_local_path_in_the_settings_is_rooted_in_data_dir_instead(self, tmp_path):
+        """Otherwise a test writes outside its temporary directory and nothing is hermetic."""
+        elsewhere = tmp_path / "elsewhere"
+        configured = jasil_settings.JasilSettings(storage_uri=f"local://{elsewhere}")
+
+        platform = jasil_testing.install_test_platform(tmp_path / "data", settings=configured)
+
+        assert platform.storage._base.resolve() == (tmp_path / "data").resolve()
+
+
 class TestTestMail:
     def test_an_empty_mail_uri_is_recorded_too(self, tmp_path):
         """An empty value (an unset environment variable) means unset, as in the build."""
@@ -336,7 +347,8 @@ class TestPlatformClose:
 
         assert stopped == [True]
 
-    def test_it_closes_the_shared_redis_clients(self, tmp_path, monkeypatch):
+    def test_it_leaves_open_a_shared_redis_client_it_did_not_take(self, tmp_path, monkeypatch):
+        """Another platform in the process may still be using it."""
         closed = []
 
         class Client:
@@ -349,8 +361,9 @@ class TestPlatformClose:
 
         platform.close()
 
-        assert closed == [True]
-        assert redis_clients._shared_clients == {}
+        assert closed == []
+        assert list(redis_clients._shared_clients) == [("redis://c:6379/0", True)]
+        redis_clients.reset_shared_clients()
 
     def test_a_bus_that_fails_to_stop_does_not_break_shutdown(self, tmp_path, monkeypatch, caplog):
         """Shutdown must not mask whatever prompted it."""
@@ -375,7 +388,7 @@ class TestPlatformClose:
         redis_clients.get_shared_client("redis://c:6379/0", purpose="test")
 
         with caplog.at_level("WARNING"):
-            redis_clients.close_shared_clients()
+            redis_clients.release_shared_clients([("redis://c:6379/0", True)])
 
         assert redis_clients._shared_clients == {}
         assert "Failed to close the shared redis client" in caplog.text

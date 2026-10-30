@@ -22,18 +22,36 @@ from jasil.providers import LockProvider
 class FakeConnection:
     """Records the SQL it is asked to run, and whether it was closed or discarded."""
 
-    def __init__(self, *, acquired: bool = True, unlock_error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        acquired: bool = True,
+        unlock_error: Exception | None = None,
+        unlocked: bool = True,
+        acquire_error: Exception | None = None,
+    ) -> None:
+        self._acquire_error = acquire_error
         self._acquired = acquired
         self._unlock_error = unlock_error
+        self._unlocked = unlocked
         self.statements: list[tuple[str, dict]] = []
+        self.options: dict = {}
         self.closed = False
         self.invalidated = False
+
+    def execution_options(self, **options):
+        self.options.update(options)
+        return self
 
     def execute(self, statement, parameters=None):
         text = str(statement)
         self.statements.append((text, parameters or {}))
-        if "pg_advisory_unlock" in text and self._unlock_error is not None:
-            raise self._unlock_error
+        if "pg_advisory_unlock" in text:
+            if self._unlock_error is not None:
+                raise self._unlock_error
+            return FakeResult(self._unlocked)
+        if self._acquire_error is not None:
+            raise self._acquire_error
         return FakeResult(self._acquired)
 
     def close(self):
@@ -106,6 +124,16 @@ class TestAcquisition:
         assert "pg_try_advisory_lock" in text
         assert parameters == {"key": advisory_key("backfill")}
 
+    def test_a_failure_of_the_acquire_statement_discards_the_session(self):
+        """The server may have granted the lock before the client saw the error, and a pooled session keeps it."""
+        connection = FakeConnection(acquire_error=OSError("cancelled"))
+
+        with pytest.raises(OSError, match="cancelled"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass  # pragma: no cover - the acquire raises first
+
+        assert connection.invalidated is True
+        assert connection.closed is True
+
     def test_a_ttl_is_ignored(self):
         """A session advisory lock lives until unlock or disconnect; there is no TTL."""
         connection = FakeConnection()
@@ -120,6 +148,13 @@ class TestAcquisition:
             pass
 
         assert engine.connect_calls == 1
+
+    def test_the_lock_is_held_outside_a_transaction(self):
+        """An open transaction would sit idle for the whole body, and a server may end the session for it."""
+        connection = FakeConnection()
+
+        with PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            assert connection.options == {"isolation_level": "AUTOCOMMIT"}
 
 
 class TestRelease:
@@ -192,6 +227,29 @@ class TestReleaseFailure:
             lock.try_acquire("backfill"),
         ):
             raise ValueError("the real problem")
+
+
+class TestALockLostBeforeRelease:
+    """``pg_advisory_unlock`` returning false means this session no longer held the lock."""
+
+    def test_it_is_logged_and_the_session_discarded(self, caplog):
+        connection = FakeConnection(unlocked=False)
+
+        with caplog.at_level("ERROR"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass
+
+        assert "was no longer held" in caplog.text
+        assert connection.invalidated is True
+        assert connection.closed is True
+
+    def test_a_released_lock_logs_nothing(self, caplog):
+        connection = FakeConnection()
+
+        with caplog.at_level("WARNING"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass
+
+        assert caplog.text == ""
+        assert connection.invalidated is False
 
 
 class TestFromMainDatabase:

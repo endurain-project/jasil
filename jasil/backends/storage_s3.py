@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import math
+import tempfile
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -17,12 +18,26 @@ from typing import Any, BinaryIO, Concatenate
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import UUID, uuid4
 
-import boto3
+from jasil._core import optional_deps
+
+try:
+    import boto3
+except ModuleNotFoundError as error:
+    if error.name != "boto3":
+        raise
+    raise optional_deps.not_installed("boto3", extra="s3", feature="S3 storage") from error
 from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from jasil._core.storage_keys import UPLOAD_STAGING_AREA, check_area, check_listing_prefix, check_segment
+import jasil._core.network as network
+from jasil._core.storage_keys import (
+    UPLOAD_STAGING_AREA,
+    check_area,
+    check_key_length,
+    check_listing_prefix,
+    check_segment,
+)
 from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader, validate_stream_range
 from jasil.providers import (
     ObjectStat,
@@ -43,6 +58,13 @@ logger = logging.getLogger(__name__)
 _MISSING_OBJECT_CODES = frozenset({"404", "NoSuchKey", "NotFound"})
 _INVALID_RANGE_CODES = frozenset({"416", "InvalidRange", "RequestedRangeNotSatisfiable"})
 _MISSING_UPLOAD_CODES = frozenset({"404", "NoSuchUpload", "NotFound"})
+_OBJECT_EXISTS_CODES = frozenset({"412", "PreconditionFailed"})
+#: The longest expiry a Signature Version 4 presigned URL can carry: seven days.
+_MAX_URL_EXPIRY_SECONDS = 7 * 24 * 3600
+
+#: The client's socket timeouts. botocore defaults both to a minute; nothing else bounds a stalled endpoint.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 60
 _MULTIPART_PART_BYTES = 8 * 1024 * 1024
 _UPLOAD_MIN_PART_SIZE = 5 * 1024 * 1024
 _UPLOAD_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
@@ -99,17 +121,43 @@ def _read_part(source: BinaryIO, size: int) -> bytes:
     return b"".join(chunks)
 
 
+def _has_control_character(value: str) -> bool:
+    """True for a C0 control (other than tab) or DEL: none may appear in a header value, and key validation refuses them too."""
+    return any((ord(char) < 0x20 and char != "\t") or ord(char) == 0x7F for char in value)
+
+
 def _content_disposition(filename: str) -> str:
-    if not filename or "\r" in filename or "\n" in filename:
-        raise ValueError("download_as must be a non-empty filename without line breaks")
+    if not filename or _has_control_character(filename):
+        raise ValueError("download_as must be a non-empty filename without control characters")
     fallback = filename.encode("ascii", "replace").decode("ascii").replace("\\", "\\\\").replace('"', '\\"')
     encoded = quote(filename, safe="")
     return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def _validate_response_content_type(content_type: str) -> None:
-    if not content_type or "\r" in content_type or "\n" in content_type:
-        raise ValueError("content_type must be non-empty and contain no line breaks")
+    if not content_type or _has_control_character(content_type):
+        raise ValueError("content_type must be non-empty and contain no control characters")
+
+
+def _check_endpoint(endpoint_url: str) -> None:
+    """Refuse an ``endpoint_url`` that is not HTTPS, unless it is cleartext to a private host.
+
+    Request signatures, object contents and presigned URLs cross the connection, so cleartext is for an
+    S3-compatible store on the same private network only, as for mail and geocoding.
+
+    Raises:
+        ValueError: When the URL is not ``http(s)://host``, or is ``http://`` to a host that resolves to a public
+            address (or does not resolve).
+    """
+    endpoint = urlparse(endpoint_url)
+    if endpoint.scheme not in ("http", "https") or not endpoint.hostname:
+        raise ValueError("endpoint_url must be an https:// URL, or http:// to a private host")
+    if endpoint.username is not None or endpoint.password is not None:
+        raise ValueError("endpoint_url must not carry credentials")
+    if endpoint.scheme == "http":
+        reason = network.non_public_rejection_reason(endpoint.hostname)
+        if reason is not None:
+            raise ValueError(f"A cleartext http:// endpoint_url needs a private host; the host {reason}")
 
 
 class S3Storage:
@@ -139,19 +187,33 @@ class S3Storage:
             A configured ``S3Storage``.
 
         Raises:
-            ValueError: When the URI has no bucket.
+            ValueError: When the URI has no bucket, carries credentials, or has an ``endpoint_url`` that is not
+                an ``https://`` URL or an ``http://`` one whose host resolves only to private addresses.
         """
         parsed = urlparse(uri)
         bucket = parsed.netloc
         if not bucket:
-            raise ValueError(f"An s3 storage_uri is missing a bucket: {uri!r}")
+            raise ValueError("An s3 storage_uri is missing a bucket")
+        # The netloc would otherwise become the bucket name, credentials included, and surface in botocore's errors.
+        if "@" in bucket:
+            raise ValueError("An s3 storage_uri must not carry credentials")
         params = parse_qs(parsed.query)
+        endpoint_url = params.get("endpoint_url", [None])[0]
+        if endpoint_url is not None:
+            _check_endpoint(endpoint_url)
         try:
             client = boto3.client(
                 "s3",
                 region_name=params.get("region", [None])[0],
-                endpoint_url=params.get("endpoint_url", [None])[0],
-                config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+                endpoint_url=endpoint_url,
+                # SigV4, which presigned URLs do not default to: SigV2 query auth cannot fetch SSE-KMS objects
+                # and is refused by stores that speak only SigV4.
+                config=Config(
+                    retries={"max_attempts": 3, "mode": "standard"},
+                    signature_version="s3v4",
+                    connect_timeout=CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=READ_TIMEOUT_SECONDS,
+                ),
             )
         except BotoCoreError as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
@@ -163,7 +225,10 @@ class S3Storage:
         # local backend rejects it, and one contract has to hold on both.
         check_area(area)
         check_segment(key, "key")
-        return "/".join(part for part in (self._prefix, area, key) if part)
+        object_key = "/".join(part for part in (self._prefix, area, key) if part)
+        # The prefix and area count toward S3's limit as well; refused here it is the caller's error, not an outage.
+        check_key_length(object_key, "object key (prefix, area and key)")
+        return object_key
 
     def _validate_upload_session(self, session: UploadSession) -> str:
         try:
@@ -362,9 +427,42 @@ class S3Storage:
 
     @_translate_s3_errors
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
+        """Store ``data`` with one ``PutObject``; ``content_type`` becomes the object's ``Content-Type``."""
         extra = {"ContentType": content_type} if content_type else {}
         self._client.put_object(Bucket=self._bucket, Key=self._object_key(area, key), Body=data, **extra)
         return key
+
+    @_translate_s3_errors
+    def create(self, area: str, key: str, data: bytes, content_type: str | None = None) -> bool:
+        """Store ``data`` under ``area``/``key`` only if no object is there yet.
+
+        One conditional ``PutObject`` (``If-None-Match: *``), so no other writer can slip in between a check
+        and the write, and a bucket policy can deny every ``PutObject`` without it.
+
+        Args:
+            area: The storage area.
+            key: The key within the area.
+            data: The bytes to store.
+            content_type: The object's ``Content-Type``, if any.
+
+        Returns:
+            True when this call stored the object; False when an object was already there.
+
+        Raises:
+            ValueError: When ``area`` or ``key`` is not a valid storage address.
+            StorageBackendUnavailableError: When S3 fails, including a concurrent conditional write to the
+                same key (``409``), which a retry settles.
+        """
+        extra = {"ContentType": content_type} if content_type else {}
+        try:
+            self._client.put_object(
+                Bucket=self._bucket, Key=self._object_key(area, key), Body=data, IfNoneMatch="*", **extra
+            )
+        except ClientError as error:
+            if _error_code(error) in _OBJECT_EXISTS_CODES:
+                return False
+            raise
+        return True
 
     @_translate_s3_errors
     def save_stream(
@@ -376,6 +474,10 @@ class S3Storage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> int:
+        """Upload ``source`` as a multipart upload, or one ``PutObject`` when it is empty.
+
+        An upload that fails is aborted, so no partial object remains.
+        """
         object_key = self._object_key(area, key)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Storage stream max_bytes must not be negative")
@@ -443,6 +545,7 @@ class S3Storage:
         max_bytes: int | None = None,
         content_type: str | None = None,
     ) -> UploadSession:
+        """Start an S3 multipart upload and store a session manifest object that records its upload id."""
         object_key = self._object_key(area, key)
         if max_bytes is not None and max_bytes < 0:
             raise ValueError("Resumable upload max_bytes must not be negative")
@@ -498,6 +601,7 @@ class S3Storage:
         *,
         size: int,
     ) -> PartRef:
+        """Stage the part in a spooled temporary file and send it with ``UploadPart``; the validator is its ETag."""
         self._validate_upload_session(session)
         self._validate_part_number(session, part_number)
         reader = ExactSizeReader(source, size)
@@ -514,24 +618,34 @@ class S3Storage:
             staged_total = sum(part_size for number, (part_size, _) in uploaded.items() if number != part_number)
             if staged_total + size > session.max_bytes:
                 raise StorageSizeLimitError(f"Resumable upload exceeds max_bytes={session.max_bytes}")
-        try:
-            response = self._client.upload_part(
-                Bucket=self._bucket,
-                Key=object_key,
-                UploadId=state.upload_id,
-                PartNumber=part_number,
-                Body=reader,
-                ContentLength=size,
-            )
-        except ClientError as error:
-            if _error_code(error) in _MISSING_UPLOAD_CODES:
-                raise StorageUploadSessionError("Upload session is not active") from error
-            raise
-        reader.verify_complete()
+        # botocore rewinds the body to checksum it over plain HTTP and to resend it after a transient failure,
+        # which a read-once source cannot do. Staging the part also proves its size before any request is sent.
+        with tempfile.SpooledTemporaryFile(max_size=_MULTIPART_PART_BYTES) as body:
+            while chunk := reader.read(_MULTIPART_PART_BYTES):
+                try:
+                    body.write(chunk)
+                except OSError as error:
+                    raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+            reader.verify_complete()
+            body.seek(0)
+            try:
+                response = self._client.upload_part(
+                    Bucket=self._bucket,
+                    Key=object_key,
+                    UploadId=state.upload_id,
+                    PartNumber=part_number,
+                    Body=body,
+                    ContentLength=size,
+                )
+            except ClientError as error:
+                if _error_code(error) in _MISSING_UPLOAD_CODES:
+                    raise StorageUploadSessionError("Upload session is not active") from error
+                raise
         return PartRef(part_number=part_number, size=size, validator=response["ETag"])
 
     @_translate_s3_errors
     def complete_upload(self, session: UploadSession, parts: Sequence[PartRef]) -> int:
+        """Check the parts against those S3 lists, complete the multipart upload and delete the session manifest."""
         self._validate_upload_session(session)
         ordered, total = self._validate_completion_parts(session, parts)
         state = self._load_upload_state(session)
@@ -568,6 +682,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def abort_upload(self, session: UploadSession) -> None:
+        """Abort the multipart upload and delete the session manifest; return silently when there is no manifest."""
         state = self._load_upload_state(session, missing_ok=True)
         if state is None:
             return
@@ -590,10 +705,20 @@ class S3Storage:
 
     @_translate_s3_errors
     def cleanup_uploads(self, *, older_than_epoch: float) -> int:
+        """Abort the multipart uploads whose manifest was last modified before the cutoff, and delete the manifests.
+
+        Returns:
+            The number of sessions removed.
+
+        Raises:
+            ValueError: When ``older_than_epoch`` is not finite.
+            StorageBackendUnavailableError: After the pass, when any session could not be removed; the cause is
+                chained, and an invalid manifest is named in the log.
+        """
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
         removed = 0
-        first_error: Boto3Error | BotoCoreError | ClientError | None = None
+        first_error: Boto3Error | BotoCoreError | ClientError | StorageUploadSessionError | None = None
         start_after: str | None = None
         while True:
             request = {
@@ -609,7 +734,19 @@ class S3Storage:
                 if entry["LastModified"].timestamp() >= older_than_epoch:
                     continue
                 manifest_key = entry["Key"]
-                state = self._load_upload_state_by_key(manifest_key, missing_ok=True)
+                try:
+                    state = self._load_upload_state_by_key(manifest_key, missing_ok=True)
+                except StorageUploadSessionError as error:
+                    # Reported after the pass: listing order is stable, so stopping here would stop every pass here.
+                    logger.warning("Skipping invalid upload session manifest %s: %s", manifest_key, error)
+                    if first_error is None:
+                        first_error = error
+                    continue
+                except (Boto3Error, BotoCoreError, ClientError) as error:
+                    logger.warning("Could not read upload session manifest %s: %s", manifest_key, type(error).__name__)
+                    if first_error is None:
+                        first_error = error
+                    continue
                 if state is None:
                     continue
                 object_key = self._object_key(state.area, state.key)
@@ -619,8 +756,8 @@ class S3Storage:
                         Key=object_key,
                         UploadId=state.upload_id,
                     )
-                except ClientError as error:
-                    if _error_code(error) not in _MISSING_UPLOAD_CODES:
+                except (Boto3Error, BotoCoreError, ClientError) as error:
+                    if not (isinstance(error, ClientError) and _error_code(error) in _MISSING_UPLOAD_CODES):
                         if first_error is None:
                             first_error = error
                         continue
@@ -635,10 +772,11 @@ class S3Storage:
                 break
             start_after = contents[-1]["Key"]
         if first_error is not None:
-            raise first_error
+            raise StorageBackendUnavailableError("S3 storage backend is unavailable") from first_error
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
+        """Return the object bytes read through :meth:`open_stream`, or ``None`` when it does not exist."""
         try:
             stream = self.open_stream(area, key)
         except FileNotFoundError:
@@ -655,6 +793,7 @@ class S3Storage:
         offset: int = 0,
         length: int | None = None,
     ) -> BinaryIO:
+        """Open a ranged ``GetObject`` as a non-seekable reader; a range past the end of the object yields no bytes."""
         object_key = self._object_key(area, key)
         validate_stream_range(offset, length)
         if length == 0:
@@ -684,6 +823,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def stat(self, area: str, key: str) -> ObjectStat | None:
+        """Return the ``HeadObject`` size, modification time, content type and ETag."""
         try:
             response = self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
         except ClientError as error:
@@ -706,6 +846,13 @@ class S3Storage:
         content_type: str | None = None,
         expires_in: int = 3600,
     ) -> ServeRedirect:
+        """Return a :class:`ServeRedirect` to a presigned URL, after checking the object exists.
+
+        Raises:
+            FileNotFoundError: When the object does not exist.
+            ValueError: When ``expires_in`` is outside 1 second to 7 days, or ``download_as`` or
+            ``content_type`` is invalid.
+        """
         if self.stat(area, key) is None:
             raise FileNotFoundError(f"Storage object not found: {area}/{key}")
         return ServeRedirect(
@@ -720,6 +867,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def exists(self, area: str, key: str) -> bool:
+        """Return True when ``HeadObject`` finds the object."""
         try:
             self._client.head_object(Bucket=self._bucket, Key=self._object_key(area, key))
         except ClientError as error:
@@ -730,10 +878,12 @@ class S3Storage:
 
     @_translate_s3_errors
     def delete(self, area: str, key: str) -> None:
+        """Delete the object with ``DeleteObject``."""
         self._client.delete_object(Bucket=self._bucket, Key=self._object_key(area, key))
 
     @_translate_s3_errors
     def delete_prefix(self, area: str, prefix: str) -> int:
+        """Delete the object at ``prefix`` and every object listed under ``prefix/``, in batches."""
         root = self._object_key(area, prefix)
         count = 0
         try:
@@ -771,6 +921,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
+        """Copy the object server-side with the client's managed ``copy``."""
         check_segment(src_area, "source area")
         check_segment(src_key, "source key")
         check_segment(dst_area, "destination area")
@@ -793,9 +944,11 @@ class S3Storage:
             raise
 
     def list_keys(self, area: str, prefix: str = "") -> list[str]:
+        """Return the keys from :meth:`iter_objects`, sorted."""
         return sorted(key for key, _ in self.iter_objects(area, prefix))
 
     def iter_objects(self, area: str, prefix: str = "") -> Iterator[tuple[str, float]]:
+        """Lazily yield ``(key, modified_epoch)`` from a paginated ``ListObjectsV2`` under the area and prefix."""
         check_area(area)
         if prefix:
             check_listing_prefix(prefix)
@@ -816,6 +969,7 @@ class S3Storage:
 
     @_translate_s3_errors
     def check_writable(self) -> None:
+        """Put and delete an empty probe object under the configured prefix."""
         probe_key = "/".join(part for part in (self._prefix, ".jasil-write-probe", uuid4().hex) if part)
         self._client.put_object(Bucket=self._bucket, Key=probe_key, Body=b"")
         self._client.delete_object(Bucket=self._bucket, Key=probe_key)
@@ -830,6 +984,14 @@ class S3Storage:
         download_as: str | None = None,
         content_type: str | None = None,
     ) -> str:
+        """Return a presigned ``GetObject`` URL; the object is not checked.
+
+        Raises:
+            ValueError: When ``expires_in`` is outside 1 second to 7 days, or ``download_as`` or
+            ``content_type`` is invalid.
+        """
+        if not 1 <= expires_in <= _MAX_URL_EXPIRY_SECONDS:
+            raise ValueError(f"expires_in must be between 1 and {_MAX_URL_EXPIRY_SECONDS} seconds, not {expires_in}")
         params = {"Bucket": self._bucket, "Key": self._object_key(area, key)}
         if download_as is not None:
             params["ResponseContentDisposition"] = _content_disposition(download_as)

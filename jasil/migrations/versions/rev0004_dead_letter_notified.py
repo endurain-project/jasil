@@ -11,7 +11,9 @@ Rows already in ``dead_letter`` are stamped with the instant they were
 dead-lettered so the first sweep after the upgrade does not call back for failures
 that predate the hook. A job that a previous-release process dead-letters while the
 upgrade rolls out keeps NULL and is called back, as any other owed one.
-Previous-release processes neither read nor write the columns.
+Previous-release processes neither read nor write the columns. The index is built
+last; on PostgreSQL concurrently, after the columns and the stamp are committed, so a
+run that fails during the build is resumed by the next one.
 
 Revision ID: rev0004
 Revises: rev0003
@@ -23,6 +25,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
+from jasil.migrations import _online as online
 from jasil.migrations._names import PREFIX
 
 revision: str = "rev0004"
@@ -36,6 +39,18 @@ _JOBS = f"{PREFIX}processing_jobs"
 
 
 def upgrade() -> None:
+    if not online.resumed(_JOBS, "dead_letter_notified_at"):
+        _add_columns_and_stamp_dead_letters()
+    # Last: on PostgreSQL the build first commits the work above, so it can run without blocking the
+    # previous release's workers.
+    online.create_index(
+        "idx_jasil_processing_jobs_dead_letter",
+        _JOBS,
+        ["status", "dead_letter_notified_at", "dead_letter_notify_after"],
+    )
+
+
+def _add_columns_and_stamp_dead_letters() -> None:
     op.add_column(
         _JOBS,
         sa.Column(
@@ -72,11 +87,6 @@ def upgrade() -> None:
             nullable=True,
             comment="Most recent on_dead_letter callback failure (truncated for storage)",
         ),
-    )
-    op.create_index(
-        "idx_jasil_processing_jobs_dead_letter",
-        _JOBS,
-        ["status", "dead_letter_notified_at", "dead_letter_notify_after"],
     )
     jobs = sa.table(
         _JOBS,

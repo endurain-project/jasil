@@ -13,17 +13,22 @@ must not masquerade as one).
 
 import io
 import json
+import socket
 from dataclasses import replace
 from datetime import UTC, datetime
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 import boto3
+import botocore.endpoint
 import pytest
-from botocore.exceptions import ClientError, ReadTimeoutError
+from botocore.awsrequest import AWSResponse
+from botocore.config import Config
+from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
 
+import jasil._core.network as network
 import jasil.backends.storage_s3 as storage_s3
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
@@ -177,11 +182,54 @@ class TestFromUri:
         with pytest.raises(ValueError, match="missing a bucket"):
             S3Storage.from_uri("s3://")
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "s3://AKIAEXAMPLE:SuperSecret@my-bucket",
+            "s3://AKIAEXAMPLE@my-bucket/prefix",
+            "s3://my-bucket?endpoint_url=https://user:SuperSecret@minio.test",
+        ],
+    )
+    def test_credentials_in_the_uri_are_refused_without_being_echoed(self, uri):
+        """Credentials belong in the environment; a bucket named after them would also reach botocore's errors."""
+        with pytest.raises(ValueError, match="credentials") as refused:
+            S3Storage.from_uri(uri)
+
+        assert "SuperSecret" not in str(refused.value)
+
     def test_an_endpoint_url_selects_a_compatible_provider(self):
         """MinIO, R2 and Ceph are addressed this way."""
         storage = S3Storage.from_uri("s3://my-bucket?endpoint_url=https://minio.test")
 
         assert storage._client.meta.endpoint_url == "https://minio.test"
+
+    def test_the_client_has_explicit_timeouts(self):
+        """botocore's defaults are a minute each, and nothing else bounds a stalled endpoint."""
+        config = S3Storage.from_uri("s3://my-bucket")._client.meta.config
+
+        assert (config.connect_timeout, config.read_timeout) == (
+            storage_s3.CONNECT_TIMEOUT_SECONDS,
+            storage_s3.READ_TIMEOUT_SECONDS,
+        )
+
+    def test_a_cleartext_endpoint_on_a_private_network_is_accepted(self, monkeypatch):
+        _resolve_to(monkeypatch, "10.0.0.5")
+
+        storage = S3Storage.from_uri("s3://my-bucket?endpoint_url=http://minio:9000")
+
+        assert storage._client.meta.endpoint_url == "http://minio:9000"
+
+    def test_a_cleartext_endpoint_on_the_internet_is_refused(self, monkeypatch):
+        """Request signatures, object contents and presigned URLs would cross it unencrypted."""
+        _resolve_to(monkeypatch, "93.184.216.34")
+
+        with pytest.raises(ValueError, match="private"):
+            S3Storage.from_uri("s3://my-bucket?endpoint_url=http://s3.example.com")
+
+    @pytest.mark.parametrize("endpoint", ["ftp://minio.test", "minio.test", "https://"])
+    def test_an_endpoint_that_is_not_an_http_url_is_refused(self, endpoint):
+        with pytest.raises(ValueError, match="endpoint_url"):
+            S3Storage.from_uri(f"s3://my-bucket?endpoint_url={endpoint}")
 
     def test_the_region_is_honoured(self):
         assert S3Storage.from_uri("s3://my-bucket?region=eu-west-1")._client.meta.region_name == "eu-west-1"
@@ -196,6 +244,13 @@ class TestFromUri:
             S3Storage.from_uri("s3://my-bucket")
 
         assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
+
+
+def _resolve_to(monkeypatch, address: str) -> None:
+    def _fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 0))]
+
+    monkeypatch.setattr(network.socket, "getaddrinfo", _fake_getaddrinfo)
 
 
 class TestSave:
@@ -219,6 +274,41 @@ class TestSave:
         stub.add_response("put_object", {}, {"Bucket": BUCKET, "Key": f"{AREA}/{KEY}", "Body": b"bytes"})
 
         storage.save(AREA, KEY, b"bytes")
+
+
+class TestKeyLength:
+    def test_a_composed_key_over_1024_bytes_is_refused_before_any_request(self, storage, stub):
+        """The prefix and area count toward S3's limit too; refusing it is a ValueError, not an outage."""
+        key = "k" * (1024 - len(f"{PREFIX}/{AREA}/") + 1)
+
+        with pytest.raises(ValueError, match="1024 bytes"):
+            storage.save(AREA, key, b"x")
+
+
+class TestCreate:
+    def test_it_writes_only_if_no_object_is_there(self, storage, stub):
+        stub.add_response(
+            "put_object",
+            {},
+            {"Bucket": BUCKET, "Key": OBJECT_KEY, "Body": b"bytes", "IfNoneMatch": "*", "ContentType": "a/b"},
+        )
+
+        assert storage.create(AREA, KEY, b"bytes", content_type="a/b") is True
+
+    def test_an_object_already_there_is_reported_not_replaced(self, storage, stub):
+        stub.add_client_error("put_object", service_error_code="PreconditionFailed", http_status_code=412)
+
+        assert storage.create(AREA, KEY, b"bytes") is False
+
+    def test_a_conflicting_concurrent_write_is_a_backend_failure(self, storage, stub):
+        stub.add_client_error("put_object", service_error_code="ConditionalRequestConflict", http_status_code=409)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.create(AREA, KEY, b"bytes")
+
+    def test_an_invalid_key_is_refused_before_any_request(self, storage, stub):
+        with pytest.raises(ValueError):
+            storage.create(AREA, "../escape", b"bytes")
 
 
 class TestSaveStream:
@@ -830,6 +920,19 @@ class TestResumableUpload:
         with pytest.raises(StorageSizeLimitError, match="max_part_size=3"):
             _upload_part(storage, session, 1, b"four")
 
+    def test_a_part_that_cannot_be_staged_is_provider_neutral(self, storage, stub, monkeypatch):
+        class FullDisk(io.BytesIO):
+            def write(self, data):
+                raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(storage_s3.tempfile, "SpooledTemporaryFile", lambda **_kwargs: FullDisk())
+        _stub_manifest(stub)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            _upload_part(storage, _upload_session(), 1, b"part")
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
     def test_an_upload_part_failure_is_provider_neutral(self, storage, stub):
         _stub_manifest(stub)
         stub.add_client_error(
@@ -1009,6 +1112,134 @@ class TestResumableUpload:
 
         with pytest.raises(StorageBackendUnavailableError):
             storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+    def test_an_invalid_manifest_does_not_stop_the_sessions_after_it(self, storage, stub, caplog):
+        """Listing order is stable, so stopping at it would stop every later pass at the same place."""
+        second_session_id = "00000000000000000000000000000002"
+        second_manifest_key = f"{MANIFEST_ROOT}/{second_session_id}.json"
+        second_object_key = f"{PREFIX}/{AREA}/other.webp"
+        stub.add_response(
+            "list_objects_v2",
+            {
+                "Contents": [
+                    {"Key": MANIFEST_KEY, "LastModified": MODIFIED},
+                    {"Key": second_manifest_key, "LastModified": MODIFIED},
+                ],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Prefix": f"{MANIFEST_ROOT}/", "MaxKeys": 1000},
+        )
+        stub.add_response("get_object", {"Body": _body(b"not json")}, {"Bucket": BUCKET, "Key": MANIFEST_KEY})
+        _stub_manifest(stub, upload_id="upload-2", session_id=second_session_id, key="other.webp")
+        stub.add_response(
+            "abort_multipart_upload", {}, {"Bucket": BUCKET, "Key": second_object_key, "UploadId": "upload-2"}
+        )
+        stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": second_manifest_key})
+
+        with caplog.at_level("WARNING"), pytest.raises(StorageBackendUnavailableError) as failure:
+            storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+        assert MANIFEST_KEY in caplog.text
+        assert isinstance(failure.value.__cause__, StorageUploadSessionError)
+
+    @pytest.mark.parametrize("step", ["get_object", "abort_multipart_upload"])
+    def test_a_failing_manifest_read_or_abort_does_not_stop_the_sessions_after_it(self, storage, stub, step):
+        second_session_id = "00000000000000000000000000000002"
+        second_manifest_key = f"{MANIFEST_ROOT}/{second_session_id}.json"
+        second_object_key = f"{PREFIX}/{AREA}/other.webp"
+        stub.add_response(
+            "list_objects_v2",
+            {
+                "Contents": [
+                    {"Key": MANIFEST_KEY, "LastModified": MODIFIED},
+                    {"Key": second_manifest_key, "LastModified": MODIFIED},
+                ],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Prefix": f"{MANIFEST_ROOT}/", "MaxKeys": 1000},
+        )
+        if step == "get_object":
+            stub.add_client_error("get_object", service_error_code="SlowDown", http_status_code=503)
+        else:
+            _stub_manifest(stub)
+            stub.add_client_error("abort_multipart_upload", service_error_code="SlowDown", http_status_code=503)
+        _stub_manifest(stub, upload_id="upload-2", session_id=second_session_id, key="other.webp")
+        stub.add_response(
+            "abort_multipart_upload", {}, {"Bucket": BUCKET, "Key": second_object_key, "UploadId": "upload-2"}
+        )
+        stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": second_manifest_key})
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+        stub.assert_no_pending_responses()
+
+
+class _Raw(io.BytesIO):
+    """The raw body of a canned response, as botocore reads one off the wire."""
+
+    def stream(self, **_kwargs):
+        yield self.getvalue()
+
+
+class TestUploadPartThroughBotocore:
+    """``upload_part`` through botocore's own request pipeline, which ``Stubber`` short-circuits.
+
+    A ``before-send`` handler answers in place of the network, so the body is checksummed, signed and, on
+    a transient failure, rewound by botocore exactly as it would be against a real endpoint.
+    """
+
+    @pytest.fixture(params=["http://s3.test", "https://s3.test"])
+    def wire(self, request, monkeypatch):
+        client = boto3.client(
+            "s3",
+            region_name="us-east-1",
+            endpoint_url=request.param,
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+            config=Config(retries={"max_attempts": 3, "mode": "standard"}),
+        )
+        wire = type("Wire", (), {"puts": 0, "sent": [], "failures": 0})()
+
+        def answer(request, **_kwargs):
+            if request.method == "GET":
+                manifest = _manifest_body()
+                return AWSResponse(request.url, 200, {"Content-Length": str(len(manifest))}, _Raw(manifest))
+            wire.puts += 1
+            body = request.body
+            wire.sent.append(body.read() if hasattr(body, "read") else body)
+            if wire.failures:
+                wire.failures -= 1
+                raise EndpointConnectionError(endpoint_url=request.url)
+            return AWSResponse(request.url, 200, {"ETag": '"etag-1"'}, _Raw())
+
+        client.meta.events.register("before-send.s3", answer)
+        # botocore sleeps its retry backoff; a retry still happens, it just does not wait.
+        monkeypatch.setattr(botocore.endpoint.time, "sleep", lambda _seconds: None)
+        wire.storage = S3Storage(client, BUCKET, PREFIX)
+        return wire
+
+    def test_a_part_is_uploaded(self, wire):
+        part = _upload_part(wire.storage, _upload_session(), 1, b"part")
+
+        assert part == PartRef(part_number=1, size=4, validator='"etag-1"')
+        assert len(wire.sent) == 1
+
+    def test_a_transient_failure_is_retried_with_the_whole_part(self, wire):
+        wire.failures = 1
+
+        part = _upload_part(wire.storage, _upload_session(), 1, b"part")
+
+        assert part.validator == '"etag-1"'
+        assert len(wire.sent) == 2
+        assert wire.sent[0] == wire.sent[1]
+
+    @pytest.mark.parametrize(("data", "message"), [(b"par", "ended before"), (b"parts", "exceeds")])
+    def test_a_source_of_the_wrong_size_is_refused_before_anything_is_sent(self, wire, data, message):
+        with pytest.raises(ValueError, match=message):
+            _upload_part(wire.storage, _upload_session(), 1, data, size=4)
+
+        assert wire.puts == 0
 
 
 class TestGet:
@@ -1436,6 +1667,25 @@ class TestUrl:
 
         assert short != long
 
+    @pytest.mark.parametrize("expires_in", [0, -5, 604_801])
+    def test_an_expiry_signature_version_4_cannot_honour_is_refused(self, storage, expires_in):
+        with pytest.raises(ValueError, match="expires_in"):
+            storage.url(AREA, KEY, expires_in=expires_in)
+
+    def test_the_longest_expiry_signature_version_4_allows_is_accepted(self, storage):
+        assert storage.url(AREA, KEY, expires_in=604_800)
+
+    @pytest.mark.parametrize("uri", ["s3://blobs?region=eu-west-1", "s3://blobs?endpoint_url=https://s3.example.test"])
+    def test_a_uri_built_client_signs_with_signature_version_4(self, uri, monkeypatch):
+        """SigV2 query auth cannot fetch SSE-KMS objects and is refused by SigV4-only stores."""
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
+        monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+
+        url = S3Storage.from_uri(uri).url(AREA, KEY)
+
+        assert "X-Amz-Algorithm=AWS4-HMAC-SHA256" in url
+
     def test_download_headers_are_pinned_in_the_signature(self, storage):
         url = storage.url(
             AREA,
@@ -1455,8 +1705,13 @@ class TestUrl:
         [
             ({"download_as": "bad\r\nname.zip"}, "download_as"),
             ({"content_type": "text/plain\r\nX-Test: bad"}, "content_type"),
+            ({"download_as": "x\x00y"}, "download_as"),
+            ({"download_as": "x\x7fy"}, "download_as"),
+            ({"download_as": "x\x1b[31my"}, "download_as"),
+            ({"content_type": "text/html\x00"}, "content_type"),
+            ({"content_type": "text/\x0bhtml"}, "content_type"),
         ],
     )
-    def test_response_headers_refuse_line_breaks(self, storage, arguments, match):
+    def test_response_headers_refuse_control_characters(self, storage, arguments, match):
         with pytest.raises(ValueError, match=match):
             storage.url(AREA, KEY, **arguments)

@@ -3,17 +3,17 @@
 Exercised against fakeredis, like the stream bus, so the suite stays hermetic.
 Unlike the stream bus tests, most of these start the real subscriber thread:
 the fan-out across instances, the reconnect and the shutdown *are* the subject,
-and they only exist on that thread. Assertions wait on a condition with a
-deadline rather than sleeping a fixed time.
+and they only exist on that thread. Assertions wait on an event (a delivery, a
+log line) with a timeout rather than sleeping or polling.
 """
 
 import json
 import logging
 import threading
-import time
 
 import fakeredis
 import pytest
+import redis
 
 import jasil._core.redis_clients as redis_clients
 import jasil.backends.realtime_redis as realtime_redis
@@ -360,19 +360,46 @@ class TestLifecycle:
         assert realtime._subscribed.wait(timeout=DEADLINE_SECONDS)
 
 
+class _Logged(logging.Handler):
+    """Sets ``seen`` when the realtime backend logs a line containing ``text``, so a test waits on it."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self._text = text
+        self.seen = threading.Event()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._text in record.getMessage():
+            self.seen.set()
+
+
+@pytest.fixture
+def logged():
+    """Attach a :class:`_Logged` for ``text`` to the backend's logger for the test."""
+    attached = []
+
+    def attach(text: str) -> _Logged:
+        handler = _Logged(text)
+        realtime_redis.logger.addHandler(handler)
+        attached.append(handler)
+        return handler
+
+    yield attach
+    for handler in attached:
+        realtime_redis.logger.removeHandler(handler)
+
+
 class TestReconnect:
-    def test_the_subscriber_reconnects_after_the_connection_drops(self, server, make_realtime, caplog):
+    def test_the_subscriber_reconnects_after_the_connection_drops(self, server, make_realtime, caplog, logged):
         realtime = make_realtime()
         inbox = Inbox()
         realtime.subscribe(inbox)
         realtime.start()
+        dropped = logged("Realtime subscriber disconnected")
 
         with caplog.at_level(logging.INFO):
             server.connected = False
-            deadline = time.monotonic() + DEADLINE_SECONDS
-            while realtime._subscribed.is_set():
-                assert time.monotonic() < deadline, "the subscriber never noticed the drop"
-                time.sleep(0.01)
+            assert dropped.seen.wait(timeout=DEADLINE_SECONDS), "the subscriber never noticed the drop"
             server.connected = True
             assert realtime._subscribed.wait(timeout=DEADLINE_SECONDS)
 
@@ -382,7 +409,7 @@ class TestReconnect:
         assert "Realtime subscriber disconnected" in caplog.text
         assert "reconnected after" in caplog.text
 
-    def test_a_silent_connection_is_pinged_then_torn_down(self, server, make_realtime, caplog):
+    def test_a_silent_connection_is_pinged_then_torn_down(self, server, make_realtime, logged):
         """A half-open connection delivers nothing, so silence itself must trigger a reconnect.
 
         The PING is swallowed here, which is exactly the silence a dead
@@ -399,13 +426,10 @@ class TestReconnect:
             keepalive_seconds=0.05,
             subscriber_factory=lambda: Silent(server=server, decode_responses=True),
         )
+        torn_down = logged("no traffic")
         realtime.start()
 
-        with caplog.at_level(logging.WARNING):
-            deadline = time.monotonic() + DEADLINE_SECONDS
-            while "no traffic" not in caplog.text:
-                assert time.monotonic() < deadline, "a silent subscription was never torn down"
-                time.sleep(0.01)
+        assert torn_down.seen.wait(timeout=DEADLINE_SECONDS), "a silent subscription was never torn down"
 
     def test_a_failing_factory_is_retried(self, server, make_realtime):
         attempts = []
@@ -426,6 +450,16 @@ class TestReconnect:
 
         assert inbox.wait_for(1) == [("7", {})]
         assert len(attempts) == 3
+
+    def test_an_oversized_payload_from_another_publisher_is_not_delivered(self, make_realtime):
+        realtime = make_realtime(max_bytes=64)
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+
+        realtime._deliver(b'{"v":2,"key":"1","hint":{"x":"' + b"a" * 200 + b'"}}')
+        realtime._deliver(b'{"v":2,"key":"1","hint":{}}')
+
+        assert inbox.items == [("1", {})]
 
     def test_the_backoff_is_capped_and_jittered(self):
         realtime = RedisRealtime(None, reconnect_base_seconds=1.0, reconnect_max_seconds=8.0)
@@ -465,11 +499,22 @@ class TestFromUri:
         # Raw bytes, so a foreign payload on the server-wide channel cannot raise in the client.
         assert dedicated == [("redis://cache:6379/0", "realtime hint subscriber", {"decode_responses": False})]
 
-    def test_an_unreachable_server_fails_eagerly(self):
+    def test_an_unreachable_server_fails_eagerly(self, monkeypatch):
+        """The connectivity ping at build time, against a client that cannot reach its server (no socket opened)."""
+
+        class Unreachable:
+            @classmethod
+            def from_url(cls, url, **options):
+                return cls()
+
+            def ping(self):
+                raise redis.ConnectionError("Error 111 connecting to cache:6379. Connection refused.")
+
+        monkeypatch.setattr(redis, "Redis", Unreachable)
         redis_clients.reset_shared_clients()
         try:
             with pytest.raises(RuntimeError, match="realtime hints"):
-                RedisRealtime.from_uri("redis://127.0.0.1:1/0")
+                RedisRealtime.from_uri("redis://cache:6379/0")
         finally:
             redis_clients.reset_shared_clients()
 

@@ -14,4 +14,5 @@ class NoopLock:
 
     @contextmanager
     def try_acquire(self, name: str, ttl_seconds: int | None = None) -> Generator[bool]:
+        """Yield True without taking any lock; ``ttl_seconds`` is ignored."""
         yield True

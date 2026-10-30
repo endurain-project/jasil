@@ -57,13 +57,20 @@ return {count, 0, 0}
 """
 
 
+# What Redis says when it refuses a command because of the key's value rather than its own condition.
+_VALUE_REFUSALS = ("WRONGTYPE", "not an integer", "would overflow")
+
+
 def _translate_state_errors[**P, R](
     method: Callable[Concatenate["RedisState", P], R],
 ) -> Callable[Concatenate["RedisState", P], R]:
-    """Surface Redis outages from a ``RedisState`` method as a provider error.
+    """Surface Redis failures from a ``RedisState`` method as provider-neutral errors.
 
-    Keeps domain stores free of any Redis knowledge: they catch the neutral
-    ``StateBackendUnavailableError`` instead of a redis-py exception.
+    Keeps domain stores free of any Redis knowledge. Redis refusing a command for the key's value
+    (``WRONGTYPE``, an ``INCR`` of a non-integer or past the integer range) is a ``ValueError``, as the memory
+    backend raises. Everything else is ``StateBackendUnavailableError``: the ``ResponseError`` subclasses
+    redis-py uses for server conditions (a read-only replica, out of memory, a missing permission) and the
+    ones it leaves as a plain ``ResponseError`` (``MISCONF``, ``BUSY``, ``NOREPLICAS``).
     """
 
     @functools.wraps(method)
@@ -71,6 +78,8 @@ def _translate_state_errors[**P, R](
         try:
             return method(self, *args, **kwargs)
         except redis_clients.RedisError as err:
+            if type(err) is redis_clients.ResponseError and any(text in str(err) for text in _VALUE_REFUSALS):
+                raise ValueError(f"Redis refused the state operation: {err}") from err
             raise StateBackendUnavailableError("Redis state backend is unavailable") from err
 
     return wrapper
@@ -101,50 +110,71 @@ class RedisState:
 
     @_translate_state_errors
     def get(self, key: str) -> bytes | None:
+        """Return the value under ``key``, or ``None`` when absent or expired."""
         return self._client.get(key)
 
     @_translate_state_errors
     def set(self, key: str, value: bytes, ttl_seconds: int | None = None) -> None:
-        if ttl_seconds is not None and ttl_seconds > 0:
+        """Store ``value`` under ``key``, expiring after ``ttl_seconds`` when given."""
+        _check_ttl(ttl_seconds)
+        if ttl_seconds is not None:
             self._client.set(key, value, ex=ttl_seconds)
         else:
             self._client.set(key, value)
 
     @_translate_state_errors
     def delete(self, key: str) -> None:
+        """Delete ``key`` if present."""
         self._client.delete(key)
 
     @_translate_state_errors
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
+        """Add ``amount`` with ``INCRBY``; restart the expiry only when ``ttl_seconds`` is given."""
         # INCRBY is atomic and leaves any existing TTL untouched; only (re)set
         # expiry when the caller asks for one, mirroring the memory backend.
-        new_value = int(self._client.incrby(key, amount))
-        if ttl_seconds is not None and ttl_seconds > 0:
-            self._client.expire(key, ttl_seconds)
-        return new_value
+        _check_ttl(ttl_seconds)
+        if ttl_seconds is None:
+            return int(self._client.incrby(key, amount))
+        # One MULTI/EXEC, so a failure between the two cannot leave a counter that never expires.
+        with self._client.pipeline(transaction=True) as pipeline:
+            pipeline.incrby(key, amount)
+            pipeline.expire(key, ttl_seconds)
+            new_value, _ = pipeline.execute()
+        return int(new_value)
 
     @_translate_state_errors
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:
-        if ttl_seconds is not None and ttl_seconds > 0:
+        """Store ``value`` with ``SET NX``; return True when this call stored it."""
+        _check_ttl(ttl_seconds)
+        if ttl_seconds is not None:
             return bool(self._client.set(key, value, ex=ttl_seconds, nx=True))
         return bool(self._client.set(key, value, nx=True))
 
     @_translate_state_errors
     def get_and_delete(self, key: str) -> bytes | None:
+        """Return and delete the value with ``GETDEL``."""
         return self._client.getdel(key)
 
     @_translate_state_errors
     def delete_prefix(self, prefix: str) -> int:
+        """Delete every key starting with ``prefix``, matched literally; ``prefix`` must not be empty."""
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
         # in a caller's prefix would delete far beyond what it named.
+        _check_prefix(prefix)
         return redis_clients.delete_matching_keys(self._client, f"{redis_clients.glob_escape(prefix)}*")
 
     @_translate_state_errors
     def iter_keys(self, prefix: str) -> Iterator[str]:
+        """Scan the keys starting with ``prefix`` and return them as an iterator."""
         # Materialised eagerly so a mid-scan Redis failure is translated here
         # rather than leaking out of a half-consumed generator.
         pattern = f"{redis_clients.glob_escape(prefix)}*"
-        keys = [key.decode() if isinstance(key, bytes) else key for key in self._client.scan_iter(match=pattern)]
+        keys: dict[str, None] = {}  # SCAN may return a key more than once; order is kept
+        for key in self._client.scan_iter(match=pattern):
+            try:
+                keys[key.decode() if isinstance(key, bytes) else key] = None
+            except UnicodeDecodeError:
+                continue  # not a key this provider wrote: it only ever stores text names
         return iter(keys)
 
     @_translate_state_errors
@@ -155,6 +185,7 @@ class RedisState:
         tiers: tuple[tuple[int, int], ...],
         counter_ttl_seconds: int,
     ) -> TieredFailureOutcome:
+        """Count one occurrence and close the gate, atomically in a Lua script."""
         script_args = [str(int(time.time())), str(counter_ttl_seconds)]
         for threshold, tier_lock_seconds in tiers:
             script_args.extend((str(threshold), str(tier_lock_seconds)))
@@ -163,3 +194,13 @@ class RedisState:
         gate_until = int(result[1])
         newly_locked = bool(int(result[2]))
         return TieredFailureOutcome(count, gate_until or None, newly_locked)
+
+
+def _check_ttl(ttl_seconds: int | None) -> None:
+    if ttl_seconds is not None and ttl_seconds <= 0:
+        raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
+
+
+def _check_prefix(prefix: str) -> None:
+    if not prefix:
+        raise ValueError("delete_prefix needs a non-empty prefix")

@@ -36,7 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # Resolve uv from `[tool.uv] required-version` in pyproject.toml, so CI
           # and local development are held to the same floor and ceiling.
@@ -150,13 +150,13 @@ jobs:
       id-token: write
     steps:
       - name: Install uv
-        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           # This job never checks the repository out, so there is no
           # pyproject.toml to read `required-version` from. Any version inside
           # the range declared there will do; this one is pinned so a release
           # build is reproducible.
-          version: "0.13.5"
+          version: "0.13.6"
           enable-cache: false
 
       - name: Download build artifacts

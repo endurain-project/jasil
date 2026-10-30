@@ -48,6 +48,7 @@ nav:
   - Events & outbox: events-and-outbox.md
   - Durable jobs: durable-jobs.md
   - Observability: observability.md
+  - Audit trail: audit.md
   - Security:
     - Threat model: security/threat-model.md
     - Integration checklist: security/integration-checklist.md

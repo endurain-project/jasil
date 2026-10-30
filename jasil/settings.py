@@ -18,7 +18,7 @@ it once at startup::
 Every component reads the installed settings through :func:`get_settings`.
 
 **Shape.** Configuration is grouped by concern — :class:`JobSettings`,
-:class:`EventLogSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
+:class:`EventLogSettings`, :class:`AuditSettings`, :class:`GeocodingSettings`, :class:`MailSettings`,
 :class:`NetworkSettings`, :class:`StorageSettings` —
 rather than one flat list, so a host enabling durable jobs reads one small class.
 Only the values describing the *deployment shape* sit at the top level.
@@ -30,14 +30,25 @@ raise, because a Redis host or bucket name cannot be inferred. The one exception
 is ``realtime_uri``, which follows ``events_uri`` in every profile when unset.
 """
 
+import base64
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from jasil._core.limits import (
+    MAX_AUDIT_APP_NAME_LENGTH,
+    MAX_AUDIT_APP_VERSION_LENGTH,
+    MAX_AUDIT_RETENTION_DAYS,
+    MAX_JOB_BATCH_SIZE,
+    MAX_JOB_SECONDS,
+    MAX_PARTITION_DAYS_AHEAD,
+    MAX_RETENTION_DAYS,
+)
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
-from jasil.profile import DeploymentProfile, JobWorkerMode
+from jasil.profile import DeploymentProfile, JobWorkerMode, parse_job_worker_mode, parse_profile
 
 __all__ = [
+    "AuditSettings",
     "EventLogSettings",
     "GeocodingSettings",
     "JasilSettings",
@@ -68,25 +79,27 @@ class JobSettings:
             heartbeat, so this is *not* a cap on handler runtime (see
             ``max_runtime_seconds``). Must be at least three
             ``heartbeat_interval_seconds``.
-        batch_size: Maximum rows claimed or relayed per pass.
-        backoff_base_seconds: First retry delay; doubles per attempt.
-        backoff_max_seconds: Ceiling for the exponential backoff.
+        batch_size: Maximum rows claimed or relayed per pass, 1 to 1000.
+        backoff_base_seconds: First retry delay; doubles per attempt. At least 0.
+        backoff_max_seconds: Ceiling for the exponential backoff; not below
+            ``backoff_base_seconds``.
         defer_max_seconds: Furthest ahead a handler may defer itself with
             ``DeferJob``; a later ``retry_at`` is clamped to it.
         max_deferrals: Deferrals a job may take before a further ``DeferJob``
             is treated as an ordinary failure.
-        poll_interval_seconds: Idle wait between empty polls.
+        poll_interval_seconds: Idle wait between empty polls; greater than zero.
         max_runtime_seconds: The longest a single handler is kept leased. Past it
             the job is abandoned to the reaper, the handler is told to stop
             (``jasil.jobs.lease_lost``), and the rest of the worker's batch is
             released to run elsewhere. Must not be below ``lease_seconds``.
-        record_attempts: Write one ``job_attempts`` row per attempt to run a job:
+        record_attempts: Write one ``jasil_job_attempts`` row per attempt to run a job:
             which worker ran it, when, for how long, and how it ended. On by
             default; ``False`` skips every attempt write (job processing is
             unaffected) and the attempt-derived admin fields read ``None``.
         heartbeat_interval_seconds: Interval between worker heartbeats, each of
             which renews held leases and refreshes the worker-registry row.
-        max_attempts: Attempts before a job is dead-lettered.
+            Greater than zero.
+        max_attempts: Attempts before a job is dead-lettered; at least 1.
         retention_days: Age at which relayed outbox rows, completed jobs, their
             attempt history, and stopped and stale worker rows are pruned. A job
             that is pending, claimed or dead-lettered keeps its whole history.
@@ -107,6 +120,64 @@ class JobSettings:
     max_attempts: int = 5
     retention_days: int = 30
 
+    def __post_init__(self) -> None:
+        """Reject values the job pipeline cannot honour, where the host configures JASIL.
+
+        The timing rules keep a lease alive: one heartbeat renews leases and proves the worker alive, so the
+        lease has to outlast several missed beats, and a handler has to be allowed at least one lease.
+        ``lease_seconds >= 3 * heartbeat_interval_seconds`` is also the threshold
+        ``jasil.admin.get_workers_summary`` uses to call a worker stale, so a worker is flagged stale no later
+        than its leases start expiring.
+
+        Raises:
+            ValueError: When a numeric setting is out of range, or the timings cannot keep a lease alive.
+        """
+        for name in ("poll_interval_seconds", "heartbeat_interval_seconds"):
+            # Written so that NaN, for which every comparison is false, is refused too.
+            if not 0 < getattr(self, name) <= MAX_JOB_SECONDS:
+                raise ValueError(
+                    f"jobs.{name} must be greater than zero and at most {MAX_JOB_SECONDS}, not {getattr(self, name)}"
+                )
+        minimums = {
+            "batch_size": 1,
+            "max_attempts": 1,
+            "backoff_base_seconds": 0,
+            "defer_max_seconds": 0,
+            "max_deferrals": 0,
+        }
+        for name, minimum in minimums.items():
+            if getattr(self, name) < minimum:
+                raise ValueError(f"jobs.{name} must be at least {minimum}, not {getattr(self, name)}")
+        maximums = {
+            "batch_size": MAX_JOB_BATCH_SIZE,
+            "lease_seconds": MAX_JOB_SECONDS,
+            "max_runtime_seconds": MAX_JOB_SECONDS,
+            "backoff_base_seconds": MAX_JOB_SECONDS,
+            "backoff_max_seconds": MAX_JOB_SECONDS,
+            "defer_max_seconds": MAX_JOB_SECONDS,
+            "retention_days": MAX_RETENTION_DAYS,
+        }
+        for name, maximum in maximums.items():
+            if getattr(self, name) > maximum:
+                raise ValueError(f"jobs.{name} must be at most {maximum}, not {getattr(self, name)}")
+        if self.backoff_max_seconds < self.backoff_base_seconds:
+            raise ValueError(
+                f"jobs.backoff_max_seconds ({self.backoff_max_seconds}) must not be below "
+                f"jobs.backoff_base_seconds ({self.backoff_base_seconds})"
+            )
+        floor = 3 * self.heartbeat_interval_seconds
+        if self.lease_seconds < floor:
+            raise ValueError(
+                f"jobs.lease_seconds ({self.lease_seconds}) must be at least three heartbeat intervals "
+                f"({floor:g} s, from jobs.heartbeat_interval_seconds={self.heartbeat_interval_seconds:g}): "
+                "a worker is renewed on its heartbeat, and two missed beats must not expire a lease"
+            )
+        if self.max_runtime_seconds < self.lease_seconds:
+            raise ValueError(
+                f"jobs.max_runtime_seconds ({self.max_runtime_seconds}) must not be below "
+                f"jobs.lease_seconds ({self.lease_seconds})"
+            )
+
 
 @dataclass(frozen=True)
 class EventLogSettings:
@@ -120,6 +191,118 @@ class EventLogSettings:
 
     enabled: bool = False
     retention_days: int = 30
+
+    def __post_init__(self) -> None:
+        """Reject a retention no cutoff date can represent.
+
+        Raises:
+            ValueError: When ``retention_days`` exceeds the maximum.
+        """
+        if self.retention_days > MAX_RETENTION_DAYS:
+            raise ValueError(
+                f"event_log.retention_days must be at most {MAX_RETENTION_DAYS}, not {self.retention_days}"
+            )
+
+
+@dataclass(frozen=True)
+class AuditSettings:
+    """Audit-trail configuration (see :mod:`jasil.audit`).
+
+    The values are checked when the object is built, so a bad one fails where the host
+    configures JASIL rather than on the first audited request.
+
+    Attributes:
+        enabled: Write audit rows. When false :func:`jasil.audit.stage` and
+            :func:`jasil.audit.record_detached` validate their arguments and then do nothing,
+            and :func:`jasil.audit.run_audit_maintenance` is a no-op.
+        retention_days: Age at which whole daily partitions are dropped. ``<= 0`` keeps every
+            row. Must be at least ``retention_floor_days`` when positive, and at most 36500. The host maps its
+            deployment profile onto this value; JASIL only supplies the neutral default.
+        retention_floor_days: The youngest age the database-side guard will let
+            ``jasil_audit_drop_partitions`` drop, whatever the caller asks for. The value used is
+            the one baked into the function when migration ``rev0006`` ran; see
+            :func:`jasil.audit.retention_floor_sql` to change it. Must be between 1 and 36500.
+        legal_hold: Suspend all pruning.
+        partition_days_ahead: How many days of daily partitions the maintenance keeps created
+            ahead of today (PostgreSQL). A row whose day has no partition is rejected, so this is
+            the margin by which maintenance may stop running. Must be between 1 and 366.
+        checkpoint_window_minutes: Length of one tamper-evidence window. Must be at least 1 and divide a
+            day (1440 minutes) evenly, so that no window straddles two daily partitions.
+        checkpoint_grace_minutes: How long past its end a window waits before it is sealed, so a
+            transaction that inserted a row inside it but commits later is still counted.
+        signing_key: Ed25519 private key, base64 of the 32 raw bytes, used to sign checkpoints.
+            ``None`` writes unsigned, hash-chained checkpoints. Needs ``jasil[audit]``.
+        external_sink_uri: ``file:///directory`` or ``s3://bucket/prefix`` — a write-once copy of
+            every checkpoint, kept outside the database. ``None`` keeps checkpoints in the
+            database only.
+        max_details_bytes: Largest serialized ``details`` payload a row may carry. Must be at
+            least 1.
+        app_name: Stamped on every row as ``app_name``.
+        app_version: Stamped on every row as ``app_version``.
+    """
+
+    enabled: bool = True
+    retention_days: int = 90
+    retention_floor_days: int = 30
+    legal_hold: bool = False
+    partition_days_ahead: int = 7
+    checkpoint_window_minutes: int = 15
+    checkpoint_grace_minutes: int = 5
+    signing_key: str | None = field(default=None, repr=False)
+    external_sink_uri: str | None = field(default=None, repr=False)
+    max_details_bytes: int = 4096
+    app_name: str | None = None
+    app_version: str | None = None
+
+    def __post_init__(self) -> None:
+        """Reject values the audit machinery cannot honour.
+
+        Raises:
+            ValueError: When a numeric setting is out of range, ``retention_days`` is positive
+                but below ``retention_floor_days`` (every prune would be refused by the guard),
+                ``app_name`` / ``app_version`` is longer than its column, or ``signing_key`` is not
+                the base64 of 32 bytes.
+        """
+        minimums = {
+            "retention_floor_days": 1,
+            "partition_days_ahead": 1,
+            "checkpoint_window_minutes": 1,
+            "checkpoint_grace_minutes": 0,
+            "max_details_bytes": 1,
+        }
+        for name, minimum in minimums.items():
+            if getattr(self, name) < minimum:
+                raise ValueError(f"audit.{name} must be at least {minimum}, not {getattr(self, name)}")
+        maximums = {
+            "retention_days": MAX_AUDIT_RETENTION_DAYS,
+            "retention_floor_days": MAX_AUDIT_RETENTION_DAYS,
+            "partition_days_ahead": MAX_PARTITION_DAYS_AHEAD,
+        }
+        for name, maximum in maximums.items():
+            if getattr(self, name) > maximum:
+                raise ValueError(f"audit.{name} must be at most {maximum}, not {getattr(self, name)}")
+        if 1440 % self.checkpoint_window_minutes:
+            raise ValueError(
+                f"audit.checkpoint_window_minutes ({self.checkpoint_window_minutes}) must divide a day (1440) evenly"
+            )
+        for name, limit in (("app_name", MAX_AUDIT_APP_NAME_LENGTH), ("app_version", MAX_AUDIT_APP_VERSION_LENGTH)):
+            value = getattr(self, name)
+            if value is not None and len(value) > limit:
+                raise ValueError(f"audit.{name} is {len(value)} characters; the limit is {limit}")
+        if self.signing_key is not None:
+            # Checked here, without importing ``cryptography``, so a typo fails where the host configures JASIL
+            # instead of silently stopping the sealing (and the retention behind it) at the first window.
+            try:
+                length = len(base64.b64decode(self.signing_key, validate=True))
+            except ValueError:  # binascii.Error is a ValueError
+                length = -1
+            if length != 32:
+                raise ValueError("audit.signing_key must be the base64 of a 32-byte Ed25519 private key")
+        if 0 < self.retention_days < self.retention_floor_days:
+            raise ValueError(
+                f"audit.retention_days ({self.retention_days}) must be at least audit.retention_floor_days "
+                f"({self.retention_floor_days}), or <= 0 to keep every row"
+            )
 
 
 @dataclass(frozen=True)
@@ -136,13 +319,13 @@ class GeocodingSettings:
             :class:`NetworkSettings`). Unset disables the capability; so does
             any value that cannot be used, which is logged. Geocoding never
             fails the platform build.
-        rate_limit: Maximum requests per second; ``<= 0`` disables throttling.
+        rate_limit: Maximum requests per second, per process; ``<= 0`` disables throttling.
         api_key: API key, for the services requiring one (geocode.maps.co).
         user_agent: ``User-Agent`` sent upstream. Nominatim's usage policy
             requires an identifying value, so hosts should set their own.
     """
 
-    uri: str | None = None
+    uri: str | None = field(default=None, repr=False)
     rate_limit: float = 1.0
     api_key: str | None = field(default=None, repr=False)
     user_agent: str = "jasil (ReverseGeocoding)"
@@ -178,7 +361,7 @@ class MailSettings:
             name.
     """
 
-    uri: str | None = None
+    uri: str | None = field(default=None, repr=False)
     from_address: str = ""
     secure: bool = True
     username: str | None = None
@@ -274,17 +457,19 @@ class JasilSettings:
         events_stream: The Redis Stream key carrying best-effort events. Streams
             live in one Redis database, so two deployments sharing a database must
             use different streams (and consumer groups) or they would consume each
-            other's events. Ignored for ``memory://``. Must not be empty.
+            other's events. Ignored for ``memory://``. For Redis it must not be empty, which
+            ``build_platform`` checks.
         events_group: The Redis consumer group the event bus reads as. Replicas of
             one deployment share a group, so each event is handled once; two
             deployments reading the same stream must not. Ignored for
-            ``memory://``. Must not be empty.
+            ``memory://``. For Redis it must not be empty, which ``build_platform`` checks.
         realtime_channel: The Redis Pub/Sub channel carrying realtime hints.
             Pub/Sub channels are server-wide — the database number in the URI
             does not separate them — so two deployments sharing one Redis server
             must use different channels. Ignored for ``memory://``.
         jobs: Durable-job pipeline configuration.
         event_log: Event-observability trail configuration.
+        audit: Audit-trail configuration.
         geocoding: Reverse-geocoding backend configuration.
         mail: Outbound-mail backend configuration.
         network: Outbound-egress configuration.
@@ -296,20 +481,30 @@ class JasilSettings:
     job_worker_mode: JobWorkerMode = JobWorkerMode.IN_PROCESS
     enforce_deployment_consistency: bool = True
     data_dir: str = "data"
-    state_uri: str | None = None
-    storage_uri: str | None = None
-    events_uri: str | None = None
+    state_uri: str | None = field(default=None, repr=False)
+    storage_uri: str | None = field(default=None, repr=False)
+    events_uri: str | None = field(default=None, repr=False)
     lock_uri: str | None = None
-    realtime_uri: str | None = None
+    realtime_uri: str | None = field(default=None, repr=False)
     realtime_channel: str = "jasil:realtime"
     events_stream: str = "jasil:events"
     events_group: str = "jasil"
     jobs: JobSettings = field(default_factory=JobSettings)
     event_log: EventLogSettings = field(default_factory=EventLogSettings)
+    audit: AuditSettings = field(default_factory=AuditSettings)
     geocoding: GeocodingSettings = field(default_factory=GeocodingSettings)
     mail: MailSettings = field(default_factory=MailSettings)
     network: NetworkSettings = field(default_factory=NetworkSettings)
     storage: StorageSettings = field(default_factory=StorageSettings)
+
+    def __post_init__(self) -> None:
+        """Take ``profile`` and ``job_worker_mode`` as their names too, the way the parsers read them.
+
+        Raises:
+            ValueError: When either names no profile or mode.
+        """
+        object.__setattr__(self, "profile", parse_profile(self.profile))
+        object.__setattr__(self, "job_worker_mode", parse_job_worker_mode(self.job_worker_mode))
 
     def _resolve(self, name: str) -> str:
         """Return an explicit capability URI, or the profile's default.

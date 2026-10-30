@@ -96,6 +96,13 @@ class TestNonPublicAddresses:
             pytest.param("240.0.0.1", id="reserved"),
             pytest.param(IPV6_LOOPBACK, id="ipv6-loopback"),
             pytest.param("fc00::1", id="ipv6-unique-local"),
+            pytest.param("100.100.100.200", id="shared-address-space-cloud-metadata"),
+            pytest.param("100.64.0.1", id="shared-address-space"),
+            pytest.param("fec0::1", id="ipv6-site-local"),
+            pytest.param("2002:a00:1::", id="6to4-of-a-private-address"),
+            pytest.param("2002:a9fe:a9fe::", id="6to4-of-the-metadata-address"),
+            pytest.param("2002:808:808::", id="6to4-of-a-public-address"),
+            pytest.param("64:ff9b:1::a00:1", id="nat64-local-use"),
         ],
     )
     def test_a_non_public_address_is_refused(self, resolve, ip):
@@ -133,6 +140,9 @@ class TestAuthorityValidation:
             pytest.param("exa mple.com", id="space"),
             pytest.param("-example.com", id="leading-hyphen"),
             pytest.param("a" * 254, id="over-long-hostname"),
+            pytest.param("example.com\n", id="trailing-newline"),
+            pytest.param("\u0130" * 40, id="unicode-case-fold-letter"),
+            pytest.param("\u212a.example.com", id="kelvin-sign"),
         ],
     )
     def test_a_value_that_is_not_a_bare_authority_is_refused(self, host):
@@ -228,8 +238,24 @@ class TestAllowlist:
         assert caplog.records == []
 
 
-@pytest.mark.parametrize("address", ["64:ff9b:1::808:808", "2001:0:4136:e378:8000:63bf:3fff:fdd2"])
+@pytest.mark.parametrize(
+    "address",
+    ["64:ff9b:1::808:808", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "2002:808:808::1"],
+    ids=["nat64", "teredo", "6to4"],
+)
 def test_tunnelled_ipv6_ranges_are_not_private_for_cleartext(monkeypatch, address):
+    monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
+    addresses, reason = network.resolve_private_addresses("relay.internal")
+    assert addresses == [] and reason is not None
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["2001:1::1", "2001:1::2", "2001:3::1", "2001:4:112::1", "2001:20::1", "2001:30::1"],
+    ids=["pcp-anycast", "turn-anycast", "amt", "as112", "orchidv2", "drone-remote-id"],
+)
+def test_the_globally_reachable_corners_of_2001_are_not_private_for_cleartext(monkeypatch, address):
+    """Python before 3.12.4 calls these private; IANA marks them globally reachable."""
     monkeypatch.setattr(network.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", (address, 0, 0, 0))])
     addresses, reason = network.resolve_private_addresses("relay.internal")
     assert addresses == [] and reason is not None

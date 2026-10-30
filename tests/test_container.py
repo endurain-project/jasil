@@ -5,6 +5,7 @@ running on process-local memory across replicas, or failing to start. Redis is
 faked at the client boundary so no server is needed.
 """
 
+import dataclasses
 import logging
 
 import fakeredis
@@ -28,6 +29,9 @@ from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.profile import DeploymentProfile, JobWorkerMode
+
+#: Taken before the autouse fixture replaces it, for the tests of client ownership.
+REAL_GET_SHARED_CLIENT = redis_clients.get_shared_client
 
 
 @pytest.fixture(autouse=True)
@@ -325,14 +329,14 @@ class TestRealtimeResolution:
         assert isinstance(realtime, RedisRealtime)
         assert realtime._channel == "tenant-a:realtime"
 
-    def test_a_failed_build_releases_the_shared_clients(self, tmp_path, monkeypatch):
-        closed = []
-        monkeypatch.setattr(container.redis_clients, "close_shared_clients", lambda: closed.append(True))
+    def test_a_failed_build_releases_the_shared_clients_it_took(self, tmp_path, monkeypatch):
+        released = []
+        monkeypatch.setattr(container.redis_clients, "release_shared_clients", lambda keys: released.append(keys))
 
         with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
             container.build_platform(_settings(data_dir=str(tmp_path), realtime_uri="nats://bus"))
 
-        assert closed == [True]
+        assert len(released) == 1
 
     def test_close_stops_the_provider(self, tmp_path, monkeypatch):
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -343,7 +347,20 @@ class TestRealtimeResolution:
 
         assert stopped == [True]
 
-    def test_close_joins_a_started_redis_subscriber(self, tmp_path):
+    def test_close_gives_the_clients_back_even_when_the_realtime_provider_raises(self, tmp_path, monkeypatch):
+        platform = container.build_platform(_settings(data_dir=str(tmp_path)))
+        released = []
+        monkeypatch.setattr(container.redis_clients, "release_shared_clients", lambda keys: released.append(keys))
+        monkeypatch.setattr(platform.realtime, "stop", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        platform.close()  # does not raise
+
+        assert len(released) == 1
+
+    def test_close_joins_a_started_redis_subscriber(self, tmp_path, monkeypatch):
+        import jasil.backends.realtime_redis as realtime_redis
+
+        monkeypatch.setattr(realtime_redis, "_POLL_TIMEOUT_SECONDS", 0.02)  # how long stop waits for the poll
         server = fakeredis.FakeServer()
         realtime = RedisRealtime(fakeredis.FakeStrictRedis(server=server, decode_responses=True))
         base = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -362,6 +379,79 @@ class TestRealtimeResolution:
         platform.close()
 
         assert not thread.is_alive()
+
+
+class TestAUriIsNeverEchoed:
+    """A Redis URI carries its password; a malformed one must not end up in an error or a log line."""
+
+    SECRET = "S3CRETPW"
+
+    @pytest.mark.parametrize(
+        ("build", "setting"),
+        [
+            (container._build_state, "state_uri"),
+            (container._build_storage, "storage_uri"),
+            (container._build_events, "events_uri"),
+            (container._build_realtime, "realtime_uri"),
+            (container._build_lock, "lock_uri"),
+        ],
+    )
+    @pytest.mark.parametrize("uri", ["redis:/:S3CRETPW@cache:6379/0", "mysql://:S3CRETPW@db/x"])
+    def test_an_unsupported_uri_is_refused_without_its_secret(self, build, setting, uri):
+        arguments = (_settings(**{setting: uri}),) + ((None,) if build is container._build_events else ())
+
+        with pytest.raises(ValueError, match=setting) as excinfo:
+            build(*arguments)
+
+        assert self.SECRET not in str(excinfo.value)
+
+    def test_the_audit_sink_uri_is_not_echoed_either(self):
+        audit = settings.AuditSettings(external_sink_uri="ftp:/user:S3CRETPW@host")
+
+        with pytest.raises(ValueError, match="external_sink_uri") as excinfo:
+            container._build_audit_sink(_settings(audit=audit))
+
+        assert self.SECRET not in str(excinfo.value)
+
+    def test_the_settings_repr_hides_the_redis_uris(self):
+        rendered = repr(
+            _settings(
+                state_uri="redis://:S3CRETPW@c/0",
+                events_uri="redis://:S3CRETPW@c/1",
+                realtime_uri="redis://:S3CRETPW@c/2",
+            )
+        )
+
+        assert self.SECRET not in rendered
+
+    def test_the_settings_repr_hides_the_storage_and_audit_sink_uris(self):
+        rendered = repr(
+            _settings(
+                storage_uri="s3://bucket?endpoint_url=https://user:S3CRETPW@minio.internal",
+                audit=settings.AuditSettings(external_sink_uri="s3://sink?endpoint_url=https://u:S3CRETPW@minio"),
+            )
+        )
+
+        assert self.SECRET not in rendered
+
+    def test_the_settings_repr_hides_the_mail_and_geocoding_uris(self):
+        """A rejected URI carrying a mistyped credential is still a live settings object."""
+        rendered = repr(
+            _settings(
+                mail=settings.MailSettings(uri="smtps://user:S3CRETPW@relay.example.com"),
+                geocoding=settings.GeocodingSettings(uri="nominatim://user:S3CRETPW@geo.example.com"),
+            )
+        )
+
+        assert self.SECRET not in rendered
+
+    def test_the_startup_report_names_no_malformed_uri(self):
+        from jasil.capabilities import build_capability_report
+
+        report = build_capability_report(_settings(state_uri="redis:/:S3CRETPW@cache:6379/0")).render()
+
+        assert self.SECRET not in report
+        assert "state" in report
 
 
 class TestBuildPlatform:
@@ -398,7 +488,7 @@ class TestBuildPlatform:
         """It is shared process-wide; a mutation would be visible everywhere."""
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
 
-        with pytest.raises(Exception, match=r"frozen|immutable|cannot assign"):
+        with pytest.raises(dataclasses.FrozenInstanceError):
             platform.state = MemoryState()  # type: ignore[misc]
 
     def test_a_distributed_profile_without_uris_fails_fast(self):
@@ -535,13 +625,15 @@ class TestDeploymentConsistencyGate:
 class TestMailResolution:
     """A mail misconfiguration fails the build; an unset one never drops silently."""
 
-    @pytest.mark.parametrize("uri", ["memory:", " memory://", "memory://\n"])
+    @pytest.mark.parametrize(
+        "uri", ["memory:", " memory://", "memory://\n", "mem\nory://", "\x01memory://", "mem ory://"]
+    )
     def test_a_non_literal_memory_uri_is_refused(self, uri):
         with pytest.raises(ValueError, match="not a valid URI"):
             container._build_mail(_settings(mail=settings.MailSettings(uri=uri)), SystemClock())
 
     def test_a_multi_process_memory_uri_variant_cannot_slip_past_the_gate(self):
-        for uri in ("memory:", "Memory://"):
+        for uri in ("memory:", "Memory://", "mem\nory://", "\x01memory://"):
             s = _settings(web_workers=4, mail=settings.MailSettings(uri=uri))
             try:
                 container.build_platform(s)
@@ -711,3 +803,59 @@ class TestMailResolution:
 
     def test_the_password_is_not_in_the_settings_repr(self):
         assert "hunter2" not in repr(settings.MailSettings(username="u", password="hunter2"))
+
+
+class TestRedisClientOwnership:
+    """Several platforms in one process share Redis clients; each releases only what it took."""
+
+    @pytest.fixture
+    def clients(self, monkeypatch):
+        """Real shared-client bookkeeping over fakeredis connections that record being closed."""
+        created: dict[str, fakeredis.FakeStrictRedis] = {}
+
+        def create(uri, purpose, *, decode_responses=True):
+            client = fakeredis.FakeStrictRedis(decode_responses=decode_responses)
+            client.closed = False
+            client.close = lambda: setattr(client, "closed", True)
+            created[f"{uri}|{decode_responses}"] = client
+            return client
+
+        monkeypatch.setattr(redis_clients, "get_shared_client", REAL_GET_SHARED_CLIENT)
+        monkeypatch.setattr(redis_clients, "create_redis_client", create)
+        return created
+
+    @staticmethod
+    def _build(tmp_path, **extra):
+        return container.build_platform(
+            _settings(
+                state_uri="redis://cache:6379/0", events_uri="redis://cache:6379/1", data_dir=str(tmp_path), **extra
+            )
+        )
+
+    def test_closing_one_platform_leaves_the_clients_another_still_uses(self, tmp_path, clients):
+        first, second = self._build(tmp_path), self._build(tmp_path)
+
+        first.close()
+
+        assert clients and not any(client.closed for client in clients.values())
+        second.close()
+        assert all(client.closed for client in clients.values())
+
+    def test_closing_a_platform_twice_releases_its_clients_once(self, tmp_path, clients):
+        first, second = self._build(tmp_path), self._build(tmp_path)
+
+        first.close()
+        first.close()
+
+        assert not any(client.closed for client in clients.values())
+        second.close()
+
+    def test_a_failed_build_releases_only_what_it_took(self, tmp_path, clients):
+        running = self._build(tmp_path)
+
+        with pytest.raises(ValueError, match="external_sink_uri"):
+            self._build(tmp_path, audit=settings.AuditSettings(external_sink_uri="ftp://example.test/x"))
+
+        assert not any(client.closed for client in clients.values())
+        running.close()
+        assert all(client.closed for client in clients.values())
