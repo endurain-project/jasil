@@ -57,16 +57,20 @@ return {count, 0, 0}
 """
 
 
+# What Redis says when it refuses a command because of the key's value rather than its own condition.
+_VALUE_REFUSALS = ("WRONGTYPE", "not an integer", "would overflow")
+
+
 def _translate_state_errors[**P, R](
     method: Callable[Concatenate["RedisState", P], R],
 ) -> Callable[Concatenate["RedisState", P], R]:
     """Surface Redis failures from a ``RedisState`` method as provider-neutral errors.
 
-    Keeps domain stores free of any Redis knowledge. A plain ``ResponseError`` is Redis refusing the command
-    for the key's value (``WRONGTYPE``, an ``INCR`` of a non-integer), so it is a ``ValueError``, as the
-    memory backend raises. Everything else, including the ``ResponseError`` subclasses redis-py uses for
-    server conditions (a read-only replica, out of memory, a missing permission), is
-    ``StateBackendUnavailableError``.
+    Keeps domain stores free of any Redis knowledge. Redis refusing a command for the key's value
+    (``WRONGTYPE``, an ``INCR`` of a non-integer or past the integer range) is a ``ValueError``, as the memory
+    backend raises. Everything else is ``StateBackendUnavailableError``: the ``ResponseError`` subclasses
+    redis-py uses for server conditions (a read-only replica, out of memory, a missing permission) and the
+    ones it leaves as a plain ``ResponseError`` (``MISCONF``, ``BUSY``, ``NOREPLICAS``).
     """
 
     @functools.wraps(method)
@@ -74,7 +78,7 @@ def _translate_state_errors[**P, R](
         try:
             return method(self, *args, **kwargs)
         except redis_clients.RedisError as err:
-            if type(err) is redis_clients.ResponseError:
+            if type(err) is redis_clients.ResponseError and any(text in str(err) for text in _VALUE_REFUSALS):
                 raise ValueError(f"Redis refused the state operation: {err}") from err
             raise StateBackendUnavailableError("Redis state backend is unavailable") from err
 

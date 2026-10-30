@@ -412,5 +412,31 @@ class TestRedisBackendErrorTranslation:
         with pytest.raises(StateBackendUnavailableError):
             RedisState(_Replica(decode_responses=False)).set("k", b"v")
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "MISCONF Redis is configured to save RDB snapshots, but it's currently unable to persist to disk.",
+            "BUSY Redis is busy running a script.",
+            "NOREPLICAS Not enough good replicas to write.",
+        ],
+    )
+    def test_a_server_condition_redis_py_leaves_unclassified_is_an_outage(self, message):
+        """redis-py gives these the plain ``ResponseError``; they say nothing about the key's value."""
+        from redis.exceptions import ResponseError
+
+        class _Refusing(fakeredis.FakeStrictRedis):
+            def set(self, *args, **kwargs):
+                raise ResponseError(message)
+
+        with pytest.raises(StateBackendUnavailableError):
+            RedisState(_Refusing(decode_responses=False)).set("k", b"v")
+
+    def test_incrementing_a_value_that_is_not_an_integer_is_a_value_error(self):
+        client = fakeredis.FakeStrictRedis(decode_responses=False)
+        client.set("k", b"text")
+
+        with pytest.raises(ValueError, match="not an integer"):
+            RedisState(client).incr("k")
+
     def test_the_memory_backend_never_raises_the_provider_error(self):
         assert MemoryState().get("absent") is None
