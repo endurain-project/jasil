@@ -182,6 +182,21 @@ class TestFromUri:
         with pytest.raises(ValueError, match="missing a bucket"):
             S3Storage.from_uri("s3://")
 
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "s3://AKIAEXAMPLE:SuperSecret@my-bucket",
+            "s3://AKIAEXAMPLE@my-bucket/prefix",
+            "s3://my-bucket?endpoint_url=https://user:SuperSecret@minio.test",
+        ],
+    )
+    def test_credentials_in_the_uri_are_refused_without_being_echoed(self, uri):
+        """Credentials belong in the environment; a bucket named after them would also reach botocore's errors."""
+        with pytest.raises(ValueError, match="credentials") as refused:
+            S3Storage.from_uri(uri)
+
+        assert "SuperSecret" not in str(refused.value)
+
     def test_an_endpoint_url_selects_a_compatible_provider(self):
         """MinIO, R2 and Ceph are addressed this way."""
         storage = S3Storage.from_uri("s3://my-bucket?endpoint_url=https://minio.test")
@@ -1121,10 +1136,43 @@ class TestResumableUpload:
         )
         stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": second_manifest_key})
 
-        with caplog.at_level("WARNING"), pytest.raises(StorageUploadSessionError):
+        with caplog.at_level("WARNING"), pytest.raises(StorageBackendUnavailableError) as failure:
             storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
 
         assert MANIFEST_KEY in caplog.text
+        assert isinstance(failure.value.__cause__, StorageUploadSessionError)
+
+    @pytest.mark.parametrize("step", ["get_object", "abort_multipart_upload"])
+    def test_a_failing_manifest_read_or_abort_does_not_stop_the_sessions_after_it(self, storage, stub, step):
+        second_session_id = "00000000000000000000000000000002"
+        second_manifest_key = f"{MANIFEST_ROOT}/{second_session_id}.json"
+        second_object_key = f"{PREFIX}/{AREA}/other.webp"
+        stub.add_response(
+            "list_objects_v2",
+            {
+                "Contents": [
+                    {"Key": MANIFEST_KEY, "LastModified": MODIFIED},
+                    {"Key": second_manifest_key, "LastModified": MODIFIED},
+                ],
+                "IsTruncated": False,
+            },
+            {"Bucket": BUCKET, "Prefix": f"{MANIFEST_ROOT}/", "MaxKeys": 1000},
+        )
+        if step == "get_object":
+            stub.add_client_error("get_object", service_error_code="SlowDown", http_status_code=503)
+        else:
+            _stub_manifest(stub)
+            stub.add_client_error("abort_multipart_upload", service_error_code="SlowDown", http_status_code=503)
+        _stub_manifest(stub, upload_id="upload-2", session_id=second_session_id, key="other.webp")
+        stub.add_response(
+            "abort_multipart_upload", {}, {"Bucket": BUCKET, "Key": second_object_key, "UploadId": "upload-2"}
+        )
+        stub.add_response("delete_object", {}, {"Bucket": BUCKET, "Key": second_manifest_key})
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.cleanup_uploads(older_than_epoch=MODIFIED.timestamp() + 1)
+
+        stub.assert_no_pending_responses()
 
 
 class _Raw(io.BytesIO):

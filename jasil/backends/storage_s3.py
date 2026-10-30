@@ -140,6 +140,8 @@ def _check_endpoint(endpoint_url: str) -> None:
     endpoint = urlparse(endpoint_url)
     if endpoint.scheme not in ("http", "https") or not endpoint.hostname:
         raise ValueError("endpoint_url must be an https:// URL, or http:// to a private host")
+    if endpoint.username is not None or endpoint.password is not None:
+        raise ValueError("endpoint_url must not carry credentials")
     if endpoint.scheme == "http":
         reason = network.non_public_rejection_reason(endpoint.hostname)
         if reason is not None:
@@ -173,13 +175,16 @@ class S3Storage:
             A configured ``S3Storage``.
 
         Raises:
-            ValueError: When the URI has no bucket, or ``endpoint_url`` is not an ``https://`` URL or an
-                ``http://`` one whose host resolves only to private addresses.
+            ValueError: When the URI has no bucket, carries credentials, or has an ``endpoint_url`` that is not
+                an ``https://`` URL or an ``http://`` one whose host resolves only to private addresses.
         """
         parsed = urlparse(uri)
         bucket = parsed.netloc
         if not bucket:
             raise ValueError("An s3 storage_uri is missing a bucket")
+        # The netloc would otherwise become the bucket name, credentials included, and surface in botocore's errors.
+        if "@" in bucket:
+            raise ValueError("An s3 storage_uri must not carry credentials")
         params = parse_qs(parsed.query)
         endpoint_url = params.get("endpoint_url", [None])[0]
         if endpoint_url is not None:
@@ -695,7 +700,8 @@ class S3Storage:
 
         Raises:
             ValueError: When ``older_than_epoch`` is not finite.
-            StorageBackendUnavailableError: After the pass, when any session could not be removed.
+            StorageBackendUnavailableError: After the pass, when any session could not be removed; the cause is
+                chained, and an invalid manifest is named in the log.
         """
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
@@ -724,6 +730,11 @@ class S3Storage:
                     if first_error is None:
                         first_error = error
                     continue
+                except (Boto3Error, BotoCoreError, ClientError) as error:
+                    logger.warning("Could not read upload session manifest %s: %s", manifest_key, type(error).__name__)
+                    if first_error is None:
+                        first_error = error
+                    continue
                 if state is None:
                     continue
                 object_key = self._object_key(state.area, state.key)
@@ -733,8 +744,8 @@ class S3Storage:
                         Key=object_key,
                         UploadId=state.upload_id,
                     )
-                except ClientError as error:
-                    if _error_code(error) not in _MISSING_UPLOAD_CODES:
+                except (Boto3Error, BotoCoreError, ClientError) as error:
+                    if not (isinstance(error, ClientError) and _error_code(error) in _MISSING_UPLOAD_CODES):
                         if first_error is None:
                             first_error = error
                         continue
@@ -749,7 +760,7 @@ class S3Storage:
                 break
             start_after = contents[-1]["Key"]
         if first_error is not None:
-            raise first_error
+            raise StorageBackendUnavailableError("S3 storage backend is unavailable") from first_error
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
