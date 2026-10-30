@@ -63,9 +63,18 @@ def _path_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+# Windows reports a name no file can carry as ERROR_INVALID_NAME (a component past 255 characters) or
+# ERROR_FILENAME_EXCED_RANGE, where POSIX says ENAMETOOLONG.
+_WINDOWS_UNUSABLE_NAME_ERRORS = frozenset({123, 206})
+
+
 def _is_absent(error: OSError) -> bool:
     """True when ``error`` says the path does not exist, or its name is too long for any file to carry it."""
-    return isinstance(error, FileNotFoundError | NotADirectoryError) or error.errno == errno.ENAMETOOLONG
+    return (
+        isinstance(error, FileNotFoundError | NotADirectoryError)
+        or error.errno == errno.ENAMETOOLONG
+        or getattr(error, "winerror", None) in _WINDOWS_UNUSABLE_NAME_ERRORS
+    )
 
 
 def _translate_local_stream_error(error: Exception) -> None:

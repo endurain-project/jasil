@@ -1812,6 +1812,8 @@ class TestLocalStorageFilesystemFailures:
     @pytest.fixture
     def read_only(self):
         """Make directories unwritable for the test, restoring them afterwards."""
+        if os.name == "nt" or os.geteuid() == 0:
+            pytest.skip("needs POSIX permissions enforced on the caller")
         changed: list[tuple[Path, int]] = []
 
         def lock(path: Path, mode: int = 0o500) -> None:
