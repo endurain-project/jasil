@@ -28,6 +28,20 @@ class TestEnvelope:
 
         assert realtime_envelope.decode(encoded) == ("7", {"kind": "activity", "id": 3})
 
+    def test_a_payload_over_the_cap_is_ignored_before_it_is_parsed(self, caplog):
+        """Other publishers share the channel, so the receive side enforces the cap the send side does."""
+        raw = realtime_envelope.encode("k", {"x": "a" * 100}, max_bytes=10_000)
+
+        with caplog.at_level("WARNING"):
+            assert realtime_envelope.decode(raw, max_bytes=len(raw) - 1) is None
+        assert realtime_envelope.decode(raw, max_bytes=len(raw)) == ("k", {"x": "a" * 100})
+        assert "oversized" in caplog.text
+
+    def test_the_default_cap_applies_to_a_large_envelope(self):
+        raw = b'{"v":2,"key":"k","hint":{"x":"' + b"a" * 20_000 + b'"}}'
+
+        assert realtime_envelope.decode(raw) is None
+
     def test_the_wire_format_is_versioned_compact_json(self):
         assert realtime_envelope.encode("7", {"a": 1}) == b'{"v":2,"key":"7","hint":{"a":1}}'
 

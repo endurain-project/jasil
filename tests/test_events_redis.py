@@ -139,9 +139,11 @@ class TestConsumerGroup:
 
         assert [group["name"] for group in client.xinfo_groups(STREAM)] == [GROUP]
 
-    def test_creating_it_twice_is_a_no_op(self, bus):
+    def test_creating_it_twice_is_a_no_op(self, bus, client):
         """Every replica calls this at startup; only one of them can win."""
         bus._ensure_group()
+
+        assert [group["name"] for group in client.xinfo_groups(STREAM)] == [GROUP]
 
     def test_a_real_redis_error_is_not_swallowed(self, bus, monkeypatch):
         """Only BUSYGROUP means 'someone beat me to it'; anything else is a fault."""
@@ -201,8 +203,11 @@ class TestDispatch:
 
         assert _pending_count(client) == 0
 
-    def test_polling_an_empty_stream_does_nothing(self, bus):
+    def test_polling_an_empty_stream_does_nothing(self, bus, client):
         bus._poll_once()
+
+        assert client.xlen(STREAM) == 0
+        assert _pending_count(client) == 0
 
     def test_a_batch_is_dispatched_in_order(self, bus):
         seen = []
@@ -339,6 +344,71 @@ class TestFailureIsolation:
 
         assert len(polls) == 2
         assert "consumer poll failed" in caplog.text
+
+    def test_repeated_failures_back_off_and_log_a_traceback_once(self, bus, monkeypatch, caplog):
+        waits: list[float] = []
+        polls = []
+
+        def _failing():
+            polls.append(1)
+            if len(polls) <= 4:
+                raise redis.RedisError("connection lost")
+            bus._stop.set()
+
+        monkeypatch.setattr(bus, "_poll_once", _failing)
+        monkeypatch.setattr(bus._stop, "wait", lambda timeout=None: waits.append(timeout))
+
+        with caplog.at_level("DEBUG"):
+            bus._run(bus._stop)
+
+        assert len(waits) == 4
+        for wait, (low, high) in zip(waits, [(0.5, 1), (1, 2), (2, 4), (4, 8)], strict=True):
+            assert low <= wait <= high
+        errors = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(errors) == 1 and errors[0].exc_info is not None
+        assert "recovered after 4 failed poll(s)" in caplog.text
+
+
+class TestConsumerLifecycleGuards:
+    def test_two_starts_at_once_keep_one_consumer(self, bus, monkeypatch):
+        """The second caller waits for the first instead of passing the same check and starting a second thread."""
+        second_was_blocked = []
+        original = bus._ensure_group
+
+        def ensure_group_while_a_second_start_waits():
+            second = threading.Thread(target=bus.start)
+            second.start()
+            second.join(timeout=0.2)
+            second_was_blocked.append(second.is_alive())
+            original()
+
+        monkeypatch.setattr(bus, "_ensure_group", ensure_group_while_a_second_start_waits)
+        try:
+            bus.start()
+        finally:
+            bus.stop()
+
+        assert second_was_blocked == [True]
+
+    def test_a_handler_may_stop_the_bus_it_runs_on(self, bus):
+        outcome: list[object] = []
+        done = threading.Event()
+
+        def stopping_handler(event):
+            try:
+                bus.stop()
+                outcome.append("stopped")
+            except Exception as error:
+                outcome.append(error)
+            finally:
+                done.set()
+
+        bus.subscribe("activity.created", stopping_handler)
+        bus.start()
+        bus.publish(new_event("activity.created", {}, source="test"))
+
+        assert done.wait(timeout=5)
+        assert outcome == ["stopped"]
 
 
 class TestRecorderIntegration:

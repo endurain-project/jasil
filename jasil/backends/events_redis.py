@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 import jasil._core.identity as identity
 import jasil._core.redis_clients as redis_clients
-from jasil._core.threads import signal_and_join
+from jasil._core.threads import backoff_delay, signal_and_join
 from jasil.events import INITIAL_SCHEMA_VERSION, Event
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,10 @@ _DEFAULT_GROUP = "jasil"
 _STREAM_MAXLEN = 10_000
 _READ_BATCH = 10
 _BLOCK_MS = 1_000  # XREADGROUP block window; bounds how quickly stop() is observed
+# Pacing of the retries while Redis is unreachable: capped exponential backoff, so a long outage neither floods the
+# log nor has every replica reconnect in lockstep.
+_RETRY_BASE_SECONDS = 1.0
+_RETRY_MAX_SECONDS = 30.0
 
 
 def serialize_event(event: Event) -> dict[str, str]:
@@ -104,6 +108,7 @@ class RedisStreamEventBus:
         self._handlers: dict[str, list[Callable[[Event], None]]] = defaultdict(list)
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._recorder = recorder
 
     @classmethod
@@ -135,19 +140,25 @@ class RedisStreamEventBus:
 
     def start(self) -> None:
         """Create the consumer group (idempotent) and start the consumer thread."""
-        if self._thread is not None:
-            return
-        self._ensure_group()
-        # A fresh event per thread: a thread a timed-out stop left running keeps the one already set, so a
-        # restart cannot revive it beside the new consumer.
-        stop = self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, args=(stop,), name="event-bus-consumer", daemon=True)
-        self._thread.start()
+        with self._lock:
+            if self._thread is not None:
+                return
+            self._ensure_group()
+            # A fresh event per thread: a thread a timed-out stop left running keeps the one already set, so a
+            # restart cannot revive it beside the new consumer.
+            stop = self._stop = threading.Event()
+            self._thread = threading.Thread(target=self._run, args=(stop,), name="event-bus-consumer", daemon=True)
+            self._thread.start()
 
     def stop(self) -> None:
-        """Signal the consumer thread and wait briefly for it to finish."""
-        thread, self._thread = self._thread, None
-        signal_and_join(thread, self._stop)
+        """Signal the consumer thread and wait briefly for it to finish.
+
+        Safe to call from a handler: the loop then ends once the handler returns.
+        """
+        with self._lock:
+            thread, self._thread = self._thread, None
+            stop = self._stop
+        signal_and_join(thread, stop)
 
     def _ensure_group(self) -> None:
         try:
@@ -158,18 +169,27 @@ class RedisStreamEventBus:
 
     def _run(self, stop: threading.Event) -> None:
         group_missing = False
+        failures = 0
         while not stop.is_set():
             try:
                 if group_missing:
                     self._ensure_group()
                     group_missing = False
                 self._poll_once()
+                if failures:
+                    logger.info("Event bus consumer recovered after %d failed poll(s)", failures)
+                    failures = 0
             except redis_clients.RedisError as error:
                 # A Redis restarted without persistence, or flushed, loses the group; XADD recreates only the
                 # stream, so every read fails until the group is created again.
                 group_missing = isinstance(error, redis_clients.ResponseError) and str(error).startswith("NOGROUP")
-                logger.error("Event bus consumer poll failed", exc_info=error)
-                stop.wait(timeout=1.0)
+                # The first failure of a streak is the one worth a traceback; the repeats only say it goes on.
+                if failures == 0:
+                    logger.error("Event bus consumer poll failed", exc_info=error)
+                else:
+                    logger.debug("Event bus consumer poll failed again (%d in a row): %r", failures + 1, error)
+                stop.wait(timeout=backoff_delay(failures, base=_RETRY_BASE_SECONDS, maximum=_RETRY_MAX_SECONDS))
+                failures += 1
 
     def _poll_once(self) -> None:
         response = self._client.xreadgroup(

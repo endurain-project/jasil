@@ -27,7 +27,6 @@ not separate them. Two deployments sharing one Redis server must use different
 """
 
 import logging
-import random
 import threading
 import time
 from collections.abc import Callable
@@ -35,7 +34,7 @@ from typing import Any
 
 import jasil._core.realtime_envelope as realtime_envelope
 import jasil._core.redis_clients as redis_clients
-from jasil._core.threads import signal_and_join
+from jasil._core.threads import backoff_delay, signal_and_join
 
 logger = logging.getLogger(__name__)
 
@@ -169,19 +168,13 @@ class RedisRealtime:
             thread, self._thread = self._thread, None
             stop = self._stop
         try:
-            if thread is threading.current_thread():
-                # Called from a handler: joining oneself raises. The loop sees
-                # the event after the handler returns.
-                stop.set()
-            else:
-                signal_and_join(thread, stop)
+            signal_and_join(thread, stop)
         except Exception as error:  # pragma: no cover - shutdown must not raise
             logger.warning("Failed to stop the realtime subscriber: %r", error)
 
     def _reconnect_delay(self, failures: int) -> float:
         """Capped exponential backoff with equal jitter."""
-        delay = min(self._reconnect_max, self._reconnect_base * 2 ** min(failures, 32))
-        return delay * 0.5 + random.uniform(0.0, delay * 0.5)  # noqa: S311 - jitter, not security
+        return backoff_delay(failures, base=self._reconnect_base, maximum=self._reconnect_max)
 
     def _run(self, stop: threading.Event, subscribed: threading.Event) -> None:
         failures = 0
@@ -247,7 +240,7 @@ class RedisRealtime:
                 logger.debug("Ignoring an error closing the realtime subscriber: %r", error)
 
     def _deliver(self, data: Any) -> None:
-        decoded = realtime_envelope.decode(data)
+        decoded = realtime_envelope.decode(data, max_bytes=self._max_bytes)
         if decoded is None:
             return
         self._handlers.deliver(*decoded)

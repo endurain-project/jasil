@@ -451,6 +451,16 @@ class TestReconnect:
         assert inbox.wait_for(1) == [("7", {})]
         assert len(attempts) == 3
 
+    def test_an_oversized_payload_from_another_publisher_is_not_delivered(self, make_realtime):
+        realtime = make_realtime(max_bytes=64)
+        inbox = Inbox()
+        realtime.subscribe(inbox)
+
+        realtime._deliver(b'{"v":2,"key":"1","hint":{"x":"' + b"a" * 200 + b'"}}')
+        realtime._deliver(b'{"v":2,"key":"1","hint":{}}')
+
+        assert inbox.items == [("1", {})]
+
     def test_the_backoff_is_capped_and_jittered(self):
         realtime = RedisRealtime(None, reconnect_base_seconds=1.0, reconnect_max_seconds=8.0)
 

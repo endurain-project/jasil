@@ -101,16 +101,21 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
     return encoded
 
 
-def decode(raw: str | bytes) -> tuple[str, dict[str, Any]] | None:
+def decode(raw: str | bytes, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES) -> tuple[str, dict[str, Any]] | None:
     """Parse one envelope, or log and return ``None`` when it is unusable.
 
     Args:
         raw: The payload as received.
+        max_bytes: The cap on the payload. Anything over it is ignored without being parsed: other publishers
+            share the channel, so the receiver cannot rely on the sender having held to the cap.
 
     Returns:
-        ``(key, hint)``, or ``None`` for a malformed payload or an unknown
+        ``(key, hint)``, or ``None`` for an oversized or malformed payload or an unknown
         envelope version.
     """
+    if isinstance(raw, str | bytes) and len(raw) > max_bytes:
+        logger.warning("Ignoring an oversized realtime hint of %d bytes (the cap is %d)", len(raw), max_bytes)
+        return None
     try:
         envelope = json.loads(raw)
     except (TypeError, ValueError, RecursionError):  # nesting past the parser's depth is not a JSON error

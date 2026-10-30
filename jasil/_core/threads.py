@@ -1,4 +1,4 @@
-"""Shutdown handling for the library's daemon threads.
+"""Shutdown handling and retry pacing for the library's daemon threads.
 
 The Redis Streams consumer, the realtime subscriber, the worker heartbeat and the
 durable-job worker each run a loop on a daemon thread that watches a stop event.
@@ -8,9 +8,10 @@ timeout or a slow iteration would block shutdown indefinitely.
 """
 
 import logging
+import random
 import threading
 
-__all__ = ["STOP_JOIN_TIMEOUT_SECONDS", "signal_and_join"]
+__all__ = ["STOP_JOIN_TIMEOUT_SECONDS", "backoff_delay", "signal_and_join"]
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +37,30 @@ def signal_and_join(
         timeout: Seconds to wait before returning regardless.
 
     Returns:
-        True when no live thread remains, otherwise False.
+        True when no live thread remains, otherwise False. Stopping the thread from itself (a handler running
+        on it) only signals: the loop ends once the handler returns, so there is nothing to wait for and the
+        result is True.
     """
     stop.set()
-    if thread is None:
+    if thread is None or thread is threading.current_thread():
         return True
     thread.join(timeout=timeout)
     if thread.is_alive():
         logger.warning("Thread %r did not stop within %ss; continuing shutdown without it", thread.name, timeout)
         return False
     return True
+
+
+def backoff_delay(failures: int, *, base: float, maximum: float) -> float:
+    """Return how long to wait before retry number ``failures``: capped exponential backoff with equal jitter.
+
+    Args:
+        failures: Consecutive failures so far (0 for the first retry).
+        base: The delay after the first failure, before jitter.
+        maximum: The cap on the delay.
+
+    Returns:
+        A delay between half of the capped exponential and all of it.
+    """
+    delay = min(maximum, base * 2 ** min(failures, 32))
+    return delay * 0.5 + random.uniform(0.0, delay * 0.5)  # noqa: S311 - jitter, not security
