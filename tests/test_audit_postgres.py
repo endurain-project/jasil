@@ -30,7 +30,7 @@ TABLES = ("jasil_audit_log", "jasil_audit_actions", "jasil_audit_checkpoints", "
 # Retention prunes only what a sealed checkpoint allows; day-long windows seal months of history in one run.
 DAY_WINDOWS = jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(checkpoint_window_minutes=1440))
 FUNCTIONS = (
-    "jasil_audit_drop_partitions(timestamptz)",
+    "jasil_audit_drop_partitions(timestamptz, timestamptz)",
     "jasil_audit_ensure_partitions(integer)",
     "jasil_audit_forbid_mutation()",
 )
@@ -384,6 +384,30 @@ class TestDropPartitions:
         # The row is valid against the model JASIL validates every other prune row with.
         jasil_audit.RetentionPruneDetails.model_validate(row[5])
 
+    def test_the_prune_row_carries_the_instant_the_caller_gives(self, aged):
+        """Maintenance passes the platform clock, so the row belongs to the window that clock is sealing."""
+        engine, _ = aged
+        stamped = datetime(2031, 5, 6, 7, 8, 9, tzinfo=UTC)
+        with engine.begin() as connection:
+            _old_partition(connection, stamped.date())
+            connection.execute(
+                text("SELECT jasil_audit_drop_partitions(:c, :at)"),
+                {"c": datetime.now(UTC) - timedelta(days=90), "at": stamped},
+            )
+
+        assert (
+            _scalar(engine, "SELECT occurred_at FROM jasil_audit_log WHERE action_id = 'audit.retention.prune'")
+            == stamped
+        )
+
+    def test_without_an_instant_the_prune_row_is_stamped_by_the_database(self, aged):
+        engine, _ = aged
+        self._drop(engine, datetime.now(UTC) - timedelta(days=90))
+
+        stamped = _scalar(engine, "SELECT occurred_at FROM jasil_audit_log WHERE action_id = 'audit.retention.prune'")
+
+        assert abs(as_utc(stamped) - datetime.now(UTC)) < timedelta(minutes=5)
+
     def test_the_prune_row_id_is_a_uuid_v7(self, aged):
         engine, _ = aged
         self._drop(engine, datetime.now(UTC) - timedelta(days=90))
@@ -471,6 +495,9 @@ class TestDropPartitions:
         jasil_audit.run_audit_maintenance()
 
         assert f"jasil_audit_log_p{today - timedelta(days=99):%Y%m%d}" not in _partitions(engine)
+        # Stamped by the platform clock, like every other row, so it cannot fall into a window already sealed.
+        prune_at = _scalar(engine, "SELECT occurred_at FROM jasil_audit_log WHERE action_id = 'audit.retention.prune'")
+        assert as_utc(prune_at) == as_utc(clock.moment)
 
     def test_legal_hold_keeps_the_partitions(self, aged, action):
         engine, today = aged

@@ -396,7 +396,7 @@ def _postgres_audit_differences(connection: Any) -> list[str]:
         for name in (f"{table}_no_update_delete", f"{table}_no_truncate")
         if name not in triggers
     )
-    for signature in (f"{audit_pg.ENSURE_FUNCTION}(integer)", f"{audit_pg.DROP_FUNCTION}(timestamptz)"):
+    for signature in (f"{audit_pg.ENSURE_FUNCTION}(integer)", f"{audit_pg.DROP_FUNCTION}({audit_pg.DROP_ARGUMENTS})"):
         if connection.execute(text("SELECT to_regprocedure(:signature)"), {"signature": signature}).scalar() is None:
             differences.append(f"{table}: missing function {signature!r}")
     return differences

@@ -744,7 +744,7 @@ class TestAdoptExistingSchema:
         message = str(caught.value)
         assert "jasil_audit_log: not partitioned" in message
         assert "missing trigger 'jasil_audit_log_no_update_delete'" in message
-        assert "missing function 'jasil_audit_drop_partitions(timestamptz)'" in message
+        assert "missing function 'jasil_audit_drop_partitions(timestamptz, timestamptz)'" in message
         assert migrations.db_revision(engine) is None
 
     def test_an_existing_head_revision_is_not_restamped(self, engine):

@@ -214,9 +214,9 @@ The migration (`rev0006`, PostgreSQL 13 or newer) builds the log differently fro
   triggers are not inherited, so each partition gets its own `TRUNCATE` trigger.
 - `jasil_audit_ensure_partitions(days_ahead)` (`SECURITY DEFINER`) creates the partitions from yesterday to
   `days_ahead` from today.
-- `jasil_audit_drop_partitions(cutoff)` (`SECURITY DEFINER`, `search_path` pinned) refuses a cutoff younger than
+- `jasil_audit_drop_partitions(cutoff, prune_at)` (`SECURITY DEFINER`, `search_path` pinned; `prune_at` defaults to the database's `now()`) refuses a cutoff younger than
   `now() - <retention floor>`, drops **whole partitions only** (a partition is dropped only if it ends at or before
-  the cutoff), and inserts its own `audit.retention.prune` row. Retention never deletes row by row. Dropping a
+  the cutoff), and inserts its own `audit.retention.prune` row, stamped `prune_at`. Retention never deletes row by row. Dropping a
   partition is DDL, so the triggers do not stand in its way.
 - Both functions are closed to `PUBLIC`; [grant](#roles-and-grants) `EXECUTE` to the roles that need it.
 - Both wait at most 10 seconds for a lock (`lock_timeout`), then fail; maintenance logs the failure and
@@ -291,8 +291,8 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
 4. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
    checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
    `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
-   is pruned. On PostgreSQL call `jasil_audit_drop_partitions(cutoff)`, which writes the `audit.retention.prune` row
-   itself. On other dialects, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
+   is pruned. On PostgreSQL call `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
+   `audit.retention.prune` row itself, so the row belongs to the window that clock is sealing. On other dialects, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
    it, as a partition drop is) and write that row from Python.
 
 Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a partition problem
@@ -318,7 +318,7 @@ interval bounds how far behind they run.
 entirely. The hold binds JASIL's maintenance, not the database: `jasil_audit_drop_partitions` refuses only a cutoff
 inside the retention floor, so any role with `EXECUTE` on it can still drop older partitions while the hold is set.
 For a hold the database enforces, revoke that right for its duration
-(`REVOKE EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz) FROM <maintenance role>`) and grant it back
+(`REVOKE EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz, timestamptz) FROM <maintenance role>`) and grant it back
 afterwards; maintenance does not call it while `legal_hold` is set. `retention_floor_days` (30) is the database-side minimum described [above](#the-retention-floor); a
 positive `retention_days` below it is a configuration error. The host maps its own deployment profiles onto
 `retention_days`; JASIL supplies only the neutral default.

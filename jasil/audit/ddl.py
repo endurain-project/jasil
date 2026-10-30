@@ -68,7 +68,7 @@ def grants_sql(
         name: f"{_qualified(schema, name)}({arguments})"
         for name, arguments in (
             (pg.ENSURE_FUNCTION, "integer"),
-            (pg.DROP_FUNCTION, "timestamptz"),
+            (pg.DROP_FUNCTION, pg.DROP_ARGUMENTS),
         )
     }
     statements: list[str] = []

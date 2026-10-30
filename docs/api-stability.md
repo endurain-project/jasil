@@ -84,7 +84,7 @@ be able to read what a new one writes, or a rolling deploy breaks.
 The columns, indexes and constraints of `jasil_event_log`, `jasil_event_outbox`,
 `jasil_processing_jobs`, `jasil_job_workers`, `jasil_job_attempts`, `jasil_audit_log`,
 `jasil_audit_actions`, `jasil_audit_checkpoints`, and `jasil_instance`; and, on PostgreSQL, the names and
-signatures of `jasil_audit_ensure_partitions(integer)` and `jasil_audit_drop_partitions(timestamptz)`, the
+signatures of `jasil_audit_ensure_partitions(integer)` and `jasil_audit_drop_partitions(timestamptz, timestamptz)`, the
 append-only behaviour of `jasil_audit_log`, and that retention drops whole partitions. The partition names
 (`jasil_audit_log_pYYYYMMDD`) are covered too. Schema
 changes ship as Alembic revisions, and a revision must be forward-compatible with

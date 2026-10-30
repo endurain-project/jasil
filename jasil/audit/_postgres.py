@@ -34,6 +34,8 @@ INSTANCE = "jasil_instance"
 FORBID_FUNCTION = "jasil_audit_forbid_mutation"
 ENSURE_FUNCTION = "jasil_audit_ensure_partitions"
 DROP_FUNCTION = "jasil_audit_drop_partitions"
+#: The argument types of the drop function: the cutoff, and the instant the prune row is stamped with.
+DROP_ARGUMENTS = "timestamptz, timestamptz"
 #: The day a partition covers is the last eight digits of its name.
 partition_name_pattern = "_p([0-9]{8})$"
 _PLACEHOLDER = re.compile(r"@([A-Z_]+)@")
@@ -137,7 +139,7 @@ END
 $body$"""
 
 _DROP_TEMPLATE = """
-CREATE OR REPLACE FUNCTION @SCHEMA@.@DROP@(cutoff timestamptz) RETURNS integer
+CREATE OR REPLACE FUNCTION @SCHEMA@.@DROP@(cutoff timestamptz, prune_at timestamptz DEFAULT now()) RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -177,7 +179,7 @@ BEGIN
     END LOOP;
     IF dropped > 0 THEN
         INSERT INTO @SCHEMA@.@LOG@ (
-            id, action_id, category, severity, outcome, actor_type, actor_id, source,
+            id, occurred_at, action_id, category, severity, outcome, actor_type, actor_id, source,
             target_type, details, details_version, instance_id
         ) VALUES (
             encode(
@@ -188,6 +190,7 @@ BEGIN
                         FROM 1 FOR 6),
                     52, 1), 53, 1),
                 'hex')::uuid::text,
+            prune_at,
             'audit.retention.prune', 'system', 'medium', 'success', 'system', left(session_user::text, 64), 'worker',
             '@LOG@',
             jsonb_build_object('cutoff', cutoff, 'partitions_dropped', dropped,
@@ -228,11 +231,12 @@ def ensure_partitions_function(schema: str) -> str:
 
 
 def drop_partitions_function(schema: str, floor_days: int) -> str:
-    """Return ``jasil_audit_drop_partitions(cutoff)``, with ``floor_days`` baked in as the retention floor.
+    """Return ``jasil_audit_drop_partitions(cutoff, prune_at)``, with ``floor_days`` baked in as the retention floor.
 
     It refuses a cutoff younger than ``now()`` minus ``floor_days`` times 24 hours, whatever the session's
     ``TimeZone``, drops only partitions that end at or before the cutoff, and records the drop as an
-    ``audit.retention.prune`` row. It never deletes rows.
+    ``audit.retention.prune`` row stamped ``prune_at`` (the database's ``now()`` when omitted; maintenance passes
+    the platform clock's instant, as for every other row). It never deletes rows.
 
     Raises:
         ValueError: When ``floor_days`` is below 1 or above 36500.
@@ -258,7 +262,7 @@ def install_statements(schema: str, floor_days: int, days_ahead: int) -> list[st
     # Functions are executable by PUBLIC unless revoked, and these run with the owner's rights.
     statements += [
         f"REVOKE ALL ON FUNCTION {s}.{ENSURE_FUNCTION}(integer) FROM PUBLIC",
-        f"REVOKE ALL ON FUNCTION {s}.{DROP_FUNCTION}(timestamptz) FROM PUBLIC",
+        f"REVOKE ALL ON FUNCTION {s}.{DROP_FUNCTION}({DROP_ARGUMENTS}) FROM PUBLIC",
         f"SELECT {s}.{ENSURE_FUNCTION}({int(days_ahead)})",
     ]
     return statements
@@ -268,7 +272,7 @@ def uninstall_statements(schema: str) -> list[str]:
     """Return the statements that remove the functions, once the tables (and their triggers) are gone."""
     s = quote_ident(schema)
     return [
-        f"DROP FUNCTION IF EXISTS {s}.{DROP_FUNCTION}(timestamptz)",
+        f"DROP FUNCTION IF EXISTS {s}.{DROP_FUNCTION}({DROP_ARGUMENTS})",
         f"DROP FUNCTION IF EXISTS {s}.{ENSURE_FUNCTION}(integer)",
         f"DROP FUNCTION IF EXISTS {s}.{FORBID_FUNCTION}()",
     ]

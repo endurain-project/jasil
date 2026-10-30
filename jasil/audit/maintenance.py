@@ -30,6 +30,7 @@ import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil._core.pruning import bounded_delete
 from jasil._core.timestamps import as_utc
+from jasil.audit import _postgres as audit_pg
 from jasil.audit import checkpoints, service
 from jasil.audit.catalog import (
     CATALOG_SYNC,
@@ -241,7 +242,8 @@ def _partitioned(db: Session) -> bool:
     global _warned_plain
     if db.get_bind().dialect.name != "postgresql":
         return False
-    if db.scalar(text("SELECT to_regprocedure('jasil_audit_drop_partitions(timestamptz)')")) is not None:
+    signature = f"{audit_pg.DROP_FUNCTION}({audit_pg.DROP_ARGUMENTS})"
+    if db.scalar(text("SELECT to_regprocedure(:signature)"), {"signature": signature}) is not None:
         return True
     if not _warned_plain:
         logger.warning(
@@ -289,7 +291,11 @@ def _apply_retention(now: datetime) -> None:
             # make a cutoff at the floor look younger than the floor, and the prune be refused.
             database_now = as_utc(db.scalar(text("SELECT now()")))
             cutoff = min(cutoff, database_now - timedelta(days=settings.retention_floor_days))
-            dropped = db.execute(text("SELECT jasil_audit_drop_partitions(:cutoff)"), {"cutoff": cutoff}).scalar_one()
+            # The prune row is stamped with the platform clock, like every row sealing counts, so it can never
+            # land in a window an application clock ahead of the database has already sealed.
+            dropped = db.execute(
+                text(f"SELECT {audit_pg.DROP_FUNCTION}(:cutoff, :prune_at)"), {"cutoff": cutoff, "prune_at": now}
+            ).scalar_one()
             db.commit()
             if dropped:
                 logger.info("Audit retention: dropped %d partition(s) older than %s", dropped, cutoff.isoformat())

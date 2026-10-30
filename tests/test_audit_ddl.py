@@ -48,7 +48,7 @@ class TestGrants:
 
         assert 'GRANT SELECT, INSERT ON TABLE jasil_audit_log TO "app_mx"' in granted
         assert 'GRANT SELECT, INSERT ON TABLE jasil_audit_checkpoints TO "app_mx"' in granted
-        assert 'GRANT EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz) TO "app_mx"' in granted
+        assert 'GRANT EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz, timestamptz) TO "app_mx"' in granted
         assert 'GRANT EXECUTE ON FUNCTION jasil_audit_ensure_partitions(integer) TO "app_mx"' in granted
         assert not any("UPDATE ON TABLE jasil_audit_log" in s or "DELETE" in s for s in granted)
 
