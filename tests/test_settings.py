@@ -211,6 +211,30 @@ class TestJobSettingsValidation:
                 r"heartbeat_interval_seconds must be greater than zero",
                 id="no-interval",
             ),
+            pytest.param({"poll_interval_seconds": float("nan")}, r"poll_interval_seconds must be", id="nan-poll"),
+            pytest.param(
+                {"heartbeat_interval_seconds": float("inf")}, r"heartbeat_interval_seconds must be", id="inf-beat"
+            ),
+            pytest.param({"lease_seconds": 31_536_001}, r"jobs\.lease_seconds must be at most", id="endless-lease"),
+            pytest.param(
+                {"lease_seconds": 31_536_000, "max_runtime_seconds": 31_536_001},
+                r"jobs\.max_runtime_seconds must be at most",
+                id="endless-runtime",
+            ),
+            pytest.param(
+                {"backoff_base_seconds": 31_536_001, "backoff_max_seconds": 31_536_001},
+                r"jobs\.backoff_base_seconds must be at most",
+                id="endless-backoff-base",
+            ),
+            pytest.param(
+                {"backoff_max_seconds": 31_536_001}, r"jobs\.backoff_max_seconds must be at most", id="endless-backoff"
+            ),
+            pytest.param(
+                {"defer_max_seconds": 31_536_001}, r"jobs\.defer_max_seconds must be at most", id="endless-deferral"
+            ),
+            pytest.param(
+                {"retention_days": 36_501}, r"jobs\.retention_days must be at most 36500", id="huge-retention"
+            ),
         ],
     )
     def test_a_value_the_pipeline_cannot_honour_is_refused(self, values, message):
@@ -229,6 +253,19 @@ class TestJobSettingsValidation:
             heartbeat_interval_seconds=15,
             max_runtime_seconds=45,
         )
+
+
+class TestEventLogSettingsValidation:
+    def test_the_defaults_are_valid(self):
+        settings.EventLogSettings()
+
+    def test_retention_beyond_a_representable_cutoff_is_refused(self):
+        with pytest.raises(ValueError, match=r"event_log\.retention_days must be at most 36500"):
+            settings.EventLogSettings(retention_days=36_501)
+
+    @pytest.mark.parametrize("days", [-1, 0, 36_500])
+    def test_disabling_and_the_ceiling_are_accepted(self, days):
+        settings.EventLogSettings(retention_days=days)
 
 
 class TestCorrelationId:

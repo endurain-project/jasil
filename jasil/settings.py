@@ -38,7 +38,9 @@ from jasil._core.limits import (
     MAX_AUDIT_APP_VERSION_LENGTH,
     MAX_AUDIT_RETENTION_DAYS,
     MAX_JOB_BATCH_SIZE,
+    MAX_JOB_SECONDS,
     MAX_PARTITION_DAYS_AHEAD,
+    MAX_RETENTION_DAYS,
 )
 from jasil._core.mail_problems import MailProblem, MailProblemCode, mail_problems
 from jasil._core.registry import ConfigSlot
@@ -130,8 +132,11 @@ class JobSettings:
             ValueError: When a numeric setting is out of range, or the timings cannot keep a lease alive.
         """
         for name in ("poll_interval_seconds", "heartbeat_interval_seconds"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"jobs.{name} must be greater than zero, not {getattr(self, name)}")
+            # Written so that NaN, for which every comparison is false, is refused too.
+            if not 0 < getattr(self, name) <= MAX_JOB_SECONDS:
+                raise ValueError(
+                    f"jobs.{name} must be greater than zero and at most {MAX_JOB_SECONDS}, not {getattr(self, name)}"
+                )
         minimums = {
             "batch_size": 1,
             "max_attempts": 1,
@@ -142,8 +147,18 @@ class JobSettings:
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
                 raise ValueError(f"jobs.{name} must be at least {minimum}, not {getattr(self, name)}")
-        if self.batch_size > MAX_JOB_BATCH_SIZE:
-            raise ValueError(f"jobs.batch_size must be at most {MAX_JOB_BATCH_SIZE}, not {self.batch_size}")
+        maximums = {
+            "batch_size": MAX_JOB_BATCH_SIZE,
+            "lease_seconds": MAX_JOB_SECONDS,
+            "max_runtime_seconds": MAX_JOB_SECONDS,
+            "backoff_base_seconds": MAX_JOB_SECONDS,
+            "backoff_max_seconds": MAX_JOB_SECONDS,
+            "defer_max_seconds": MAX_JOB_SECONDS,
+            "retention_days": MAX_RETENTION_DAYS,
+        }
+        for name, maximum in maximums.items():
+            if getattr(self, name) > maximum:
+                raise ValueError(f"jobs.{name} must be at most {maximum}, not {getattr(self, name)}")
         if self.backoff_max_seconds < self.backoff_base_seconds:
             raise ValueError(
                 f"jobs.backoff_max_seconds ({self.backoff_max_seconds}) must not be below "
@@ -175,6 +190,17 @@ class EventLogSettings:
 
     enabled: bool = False
     retention_days: int = 30
+
+    def __post_init__(self) -> None:
+        """Reject a retention no cutoff date can represent.
+
+        Raises:
+            ValueError: When ``retention_days`` exceeds the maximum.
+        """
+        if self.retention_days > MAX_RETENTION_DAYS:
+            raise ValueError(
+                f"event_log.retention_days must be at most {MAX_RETENTION_DAYS}, not {self.retention_days}"
+            )
 
 
 @dataclass(frozen=True)

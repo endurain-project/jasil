@@ -32,8 +32,10 @@ __all__ = [
     "MAX_HANDLER_NAME_LENGTH",
     "MAX_IP_ADDRESS_LENGTH",
     "MAX_JOB_BATCH_SIZE",
+    "MAX_JOB_SECONDS",
     "MAX_PARTITION_DAYS_AHEAD",
     "MAX_REQUEST_ID_LENGTH",
+    "MAX_RETENTION_DAYS",
     "MAX_STORED_ERROR_LENGTH",
     "MAX_USER_AGENT_LENGTH",
     "MAX_WORKER_ID_LENGTH",
@@ -141,6 +143,14 @@ MAX_IP_ADDRESS_LENGTH = 45
 #: Most jobs a worker claims, or outbox rows the relay takes, in one pass: ``jobs.batch_size`` is validated
 #: against it. A claim binds every id it selected in one ``IN (...)``, and pruning deletes in batches this size.
 MAX_JOB_BATCH_SIZE = 1000
+
+#: Longest duration, in seconds, that a job-pipeline setting may hold (a year): leases, runtimes, backoff, deferral
+#: and the worker intervals. Anything longer is no real schedule and overflows ``timedelta`` arithmetic.
+MAX_JOB_SECONDS = 31_536_000
+
+#: Longest retention, in days (a century), for the job tables and the event log, so every cutoff stays a
+#: representable date. Audit retention has its own ceiling below.
+MAX_RETENTION_DAYS = 36_500
 
 #: How many days of audit partitions may be created ahead: ``audit.partition_days_ahead`` is validated
 #: against it, and ``jasil_audit_ensure_partitions`` refuses more.

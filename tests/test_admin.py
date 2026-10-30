@@ -155,6 +155,11 @@ class TestWorkersSummary:
         assert stopped.queues == ["maintenance"]
         assert stopped.metadata == {"zone": "a"}
 
+    @pytest.mark.parametrize("stale_after", [0, -1, float("nan"), float("inf"), 1e30])
+    def test_an_unusable_stale_threshold_is_refused(self, platform, db, stale_after):
+        with pytest.raises(ValueError, match="stale_after_seconds must be greater than zero and at most"):
+            jasil_admin.get_workers_summary(stale_after_seconds=stale_after)
+
     def test_an_empty_registry_summarizes_to_zero(self, platform, db):
         assert jasil_admin.get_workers_summary().total_workers == 0
 

@@ -74,14 +74,14 @@ fields.
 | `max_attempts` | `5` | Attempts before a job is dead-lettered; at least 1. |
 | `retention_days` | `30` | Age at which relayed outbox rows, completed jobs, their attempt history, and stopped/stale worker rows are pruned. A job's history goes after the job row itself is pruned; pending, claimed and dead-lettered jobs keep theirs. `<= 0` disables. |
 
-Every range above is checked when the object is built, so a value the pipeline cannot honour raises `ValueError` where you configure JASIL, not when a worker starts.
+Every range above is checked when the object is built, so a value the pipeline cannot honour raises `ValueError` where you configure JASIL, not when a worker starts. Durations (`lease_seconds`, `max_runtime_seconds`, `backoff_*_seconds`, `defer_max_seconds` and the two intervals) are at most one year (`31536000` seconds), and `retention_days` at most `36500`.
 
 ### `EventLogSettings`
 
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `False` | Record every event's lifecycle to `jasil_event_log`. |
-| `retention_days` | `30` | Age at which trail rows are pruned. `<= 0` disables. |
+| `retention_days` | `30` | Age at which trail rows are pruned. `<= 0` disables; at most `36500`. |
 
 Both `jobs.enabled` and `event_log.enabled` default to **off**, because both
 write to the database. A library should not start writing to your database

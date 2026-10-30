@@ -8,7 +8,7 @@ from sqlalchemy import CursorResult, and_, case, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from jasil._core.cursors import decode_cursor, encode_cursor
-from jasil._core.limits import check_limit
+from jasil._core.limits import MAX_JOB_SECONDS, check_limit
 from jasil._core.pruning import PRUNE_BATCH_SIZE, PRUNE_MAX_BATCHES
 from jasil._core.timestamps import age_seconds
 from jasil.jobs._worker_metadata import normalize_worker_metadata
@@ -103,8 +103,9 @@ def get_workers_summary(
     ``hours`` windows the per-worker attempt counts (attempts that *ended* in it).
     With ``record_attempts`` false those counts are ``None``, not ``0``.
     """
-    if stale_after_seconds <= 0:
-        raise ValueError("stale_after_seconds must be greater than zero")
+    # Written so that NaN, for which every comparison is false, is refused too.
+    if not 0 < stale_after_seconds <= MAX_JOB_SECONDS:
+        raise ValueError(f"stale_after_seconds must be greater than zero and at most {MAX_JOB_SECONDS}")
     check_limit(limit, maximum=MAX_WORKER_PAGE_SIZE, name="limit")
     stale_before = now - timedelta(seconds=stale_after_seconds)
     total_workers, stopped, stale, running = db.execute(
