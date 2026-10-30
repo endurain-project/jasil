@@ -336,12 +336,15 @@ schema the connection that runs the script creates tables in.
 
 ### When a migration fails
 
-On PostgreSQL and SQLite a failed revision rolls back and `upgrade()` resumes from
-it. MySQL commits each `CREATE`, `ALTER` and `DROP` on its own, so a revision that
-fails part-way leaves the statements before the failure applied and the revision
+On PostgreSQL a failed revision rolls back and `upgrade()` resumes from it. A
+revision that fails while building its indexes `CONCURRENTLY` keeps the changes it
+committed before the build, and `upgrade()` carries on from there. SQLite and MySQL
+commit each `CREATE`, `ALTER` and `DROP` on its own, so a revision that fails
+part-way leaves the statements before the failure applied and the revision
 unrecorded, and running it again fails on what already exists. Restore the
 database from the backup taken before the upgrade, or undo the failed revision's
-applied statements by hand, then run `upgrade()` again.
+applied statements by hand, then run `upgrade()` again. A SQLite development
+database is simply recreated.
 
 Downgrades drop columns with `ALTER TABLE ... DROP COLUMN`, which SQLite supports
 from 3.35. Check `sqlite3.sqlite_version` before downgrading a SQLite database.
