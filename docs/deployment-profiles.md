@@ -153,8 +153,11 @@ platform = jasil.container.build_platform(jasil_settings.get_settings())
 #     backend shared across them. ...
 ```
 
-The `custom` profile opts out of the state, lock and mail rules: it promises no
-defaults, so there is nothing for a setting to contradict.
+The `custom` profile promises no defaults, but it is held to the same state, lock
+and mail rules: they compare the URIs you set with the topology you declared, and
+a process-local backend contradicts several processes under any profile. A
+`custom` deployment that genuinely runs one process (`web_workers=1`, in-process
+jobs) may still use `memory://` and `noop://`.
 
 ### Job workers are processes too
 

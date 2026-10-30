@@ -58,7 +58,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from jasil.profile import (
-    DeploymentProfile,
     DeploymentTopology,
     JobWorkerMode,
     StateBackendKind,
@@ -322,9 +321,10 @@ def check_state_consistency(
 
     Returns:
         Human-readable issue messages; empty when consistent. The ``custom``
-        profile is exempt — it promises no defaults, so nothing can contradict one.
+        profile gets no exemption: it promises no defaults, but a declared multi-process
+        topology still contradicts a process-local backend.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not topology.multi_process:
+    if not topology.multi_process:
         return []
     issues: list[str] = []
     for source in state_sources:
@@ -428,10 +428,9 @@ def check_lock_consistency(
         lock_label: The setting backing the lock (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The
-        ``custom`` profile is exempt — it promises no defaults.
+        A single-item issue list when misconfigured; empty otherwise.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not topology.multi_process:
+    if not topology.multi_process:
         return []
     if not lock_uri.strip().lower().startswith("noop://"):
         return []
@@ -462,10 +461,9 @@ def check_mail_consistency(
         mail_label: The setting backing mail (for the message).
 
     Returns:
-        A single-item issue list when misconfigured; empty otherwise. The
-        ``custom`` profile is exempt — it promises no defaults.
+        A single-item issue list when misconfigured; empty otherwise.
     """
-    if topology.profile is DeploymentProfile.CUSTOM or not mail_uri or not topology.multi_process:
+    if not mail_uri or not topology.multi_process:
         return []
     # ``build_platform`` accepts only the literal ``scheme://`` form, so this is
     # the same test the builder applies.

@@ -395,7 +395,8 @@ class TestDeploymentConsistency:
         ("profile", "web_workers", "uri"),
         [
             pytest.param(LOCAL, 1, "memory://", id="single-process"),
-            pytest.param(CUSTOM, 4, "memory://", id="custom"),
+            pytest.param(CUSTOM, 1, "memory://", id="custom-single-process"),
+            pytest.param(CUSTOM, 4, "smtp://relay.test", id="custom-relay"),
             pytest.param(LOCAL, 4, "smtp://relay.test", id="relay"),
             pytest.param(LOCAL, 4, None, id="unset"),
             pytest.param(LOCAL, 4, "", id="empty"),
@@ -444,8 +445,8 @@ class TestDeploymentConsistency:
 
         assert issues == []
 
-    def test_the_custom_profile_opts_out(self):
-        """``custom`` promises no defaults, so nothing here can contradict one."""
+    def test_the_custom_profile_is_held_to_the_same_rules(self):
+        """``custom`` promises no defaults, but eight workers on process-local backends still contradict."""
         issues = check_deployment_consistency(
             JasilSettings(
                 profile=DeploymentProfile.CUSTOM,
@@ -457,7 +458,11 @@ class TestDeploymentConsistency:
             )
         )
 
-        assert issues == []
+        assert {label for label in ("state_uri", "events_uri", "lock_uri") if any(label in i for i in issues)} == {
+            "state_uri",
+            "events_uri",
+            "lock_uri",
+        }
 
 
 class TestStandaloneJobWorkers:
@@ -541,14 +546,23 @@ class TestStandaloneJobWorkers:
 
         assert len(issues) == 1 and "jobs.enabled is false" in issues[0]
 
-    def test_the_custom_profile_opts_out_of_wiring_rules_but_not_the_contradiction(self):
+    def test_the_custom_profile_gets_no_exemption_from_the_multi_process_rules(self):
+        """It promises no defaults, but a declared multi-process topology contradicts a process-local backend."""
         custom = _topology(CUSTOM, job_worker_mode=STANDALONE)
+        sources = (StateSource(label="state_uri", uri="memory://"),)
+
+        assert len(check_state_consistency(topology=custom, state_sources=sources)) == 1
+        assert len(check_lock_consistency(topology=custom, lock_uri="noop://", lock_label="l")) == 1
+        assert len(check_mail_consistency(topology=custom, mail_uri="memory://", mail_label="m")) == 1
+        assert len(check_job_worker_consistency(topology=custom, jobs_enabled=False)) == 1
+
+    def test_a_custom_single_process_deployment_may_use_process_local_backends(self):
+        custom = _topology(CUSTOM)
         sources = (StateSource(label="state_uri", uri="memory://"),)
 
         assert check_state_consistency(topology=custom, state_sources=sources) == []
         assert check_lock_consistency(topology=custom, lock_uri="noop://", lock_label="l") == []
         assert check_mail_consistency(topology=custom, mail_uri="memory://", mail_label="m") == []
-        assert len(check_job_worker_consistency(topology=custom, jobs_enabled=False)) == 1
 
 
 class TestRulesTakeATopology:
@@ -626,7 +640,8 @@ class TestRulesTakeATopology:
             pytest.param(_topology(), False, id="single-process"),
             pytest.param(_topology(web_workers=2), True, id="web-workers"),
             pytest.param(_topology(job_worker_mode=STANDALONE), True, id="standalone-workers"),
-            pytest.param(_topology(CUSTOM, 4), False, id="custom"),
+            pytest.param(_topology(CUSTOM, 4), True, id="custom-multi-process"),
+            pytest.param(_topology(CUSTOM), False, id="custom-single-process"),
         ],
     )
     def test_lock_follows_multi_process(self, topology, refused):
