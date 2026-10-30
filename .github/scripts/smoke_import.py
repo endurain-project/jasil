@@ -54,7 +54,7 @@ EXPECTED_REVISIONS = {
     "rev0003_prefix_table_names.py",
     "rev0004_dead_letter_notified.py",
     "rev0005_job_deferrals.py",
-    "rev0006_audit_trail.py",
+    "rev0006_audit_trail_and_job_columns.py",
 }
 
 

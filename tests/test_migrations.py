@@ -7,9 +7,11 @@ difference would only surface in production. ``test_the_migration_matches_the_mo
 is the guard for that.
 """
 
+import importlib.util
 import logging
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -1083,3 +1085,16 @@ def _eventually(condition, timeout: float = 10.0) -> bool:
         if time.monotonic() > deadline:
             return False
     return True
+
+
+def test_the_wheel_smoke_script_expects_exactly_the_packaged_revisions():
+    """The smoke script gates the wheel and the publish job, so a stale revision name there blocks a release."""
+    root = Path(migrations.__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("smoke_import", root / ".github" / "scripts" / "smoke_import.py")
+    assert spec is not None and spec.loader is not None
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+
+    packaged = {path.name for path in (Path(migrations.__file__).parent / "versions").glob("rev*.py")}
+
+    assert packaged == smoke.EXPECTED_REVISIONS
