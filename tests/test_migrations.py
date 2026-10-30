@@ -708,9 +708,9 @@ class TestAdoptExistingSchema:
         else:  # the migrated schema, which otherwise matches head on every dialect
             migrations.upgrade(engine)
             _drop_version_table(engine)
-            drop = "DROP CHECK" if engine.dialect.name == "mysql" else "DROP CONSTRAINT"
             with engine.begin() as connection:
-                connection.exec_driver_sql(f"ALTER TABLE jasil_instance {drop} ck_jasil_instance_single")
+                # DROP CONSTRAINT on every server: MariaDB has no DROP CHECK, and MySQL 8.0.19+ takes this form.
+                connection.exec_driver_sql("ALTER TABLE jasil_instance DROP CONSTRAINT ck_jasil_instance_single")
 
         with pytest.raises(
             migrations.SchemaCompatibilityError,
@@ -992,10 +992,12 @@ class _Connection:
     def __init__(self, dialect: str, acquired: int | None = 1) -> None:
         self.dialect = type("Dialect", (), {"name": dialect})()
         self.statements: list[str] = []
+        self.parameters: list[dict] = []
         self._acquired = acquired
 
     def execute(self, statement, parameters=None):
         self.statements.append(str(statement))
+        self.parameters.append(parameters or {})
         return type("Result", (), {"scalar": lambda _self: self._acquired})()
 
     def in_transaction(self) -> bool:
@@ -1035,7 +1037,19 @@ class TestOneRunAtATime:
         with pytest.raises(RuntimeError, match="boom"), migrations._one_run_at_a_time(connection):
             raise RuntimeError("boom")
 
-        assert connection.statements == ["SELECT GET_LOCK(:name, -1)", "SELECT RELEASE_LOCK(:name)"]
+        acquire, release = connection.statements
+        assert acquire.startswith("SELECT GET_LOCK(") and release.startswith("SELECT RELEASE_LOCK(")
+        assert "-1" not in acquire  # MariaDB answers NULL to a negative wait
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_mysql_waits_a_finite_time_for_the_lock(self, dialect):
+        """MariaDB answers NULL to a negative wait, so 'forever' has to be a number."""
+        connection = _Connection(dialect)
+
+        with migrations._one_run_at_a_time(connection):
+            pass
+
+        assert connection.parameters[0]["wait"] == migrations._MYSQL_LOCK_WAIT_SECONDS > 0
 
     @pytest.mark.parametrize("answer", [0, None])
     def test_mysql_refuses_to_run_without_the_lock(self, answer):
@@ -1081,8 +1095,8 @@ _LOCK_PROBES = {
         "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
     ),
     "mysql": (
-        "SELECT GET_LOCK('jasil_migrations', 0)",
-        "SELECT RELEASE_LOCK('jasil_migrations')",
+        "SELECT GET_LOCK(CONCAT('jasil_migrations', ':', MD5(COALESCE(DATABASE(), ''))), 0)",
+        "SELECT RELEASE_LOCK(CONCAT('jasil_migrations', ':', MD5(COALESCE(DATABASE(), ''))))",
         "SELECT count(*) FROM information_schema.processlist WHERE state = 'User lock'",
     ),
 }

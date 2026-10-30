@@ -120,6 +120,15 @@ def _config(connection: Any = None) -> Any:
 #: Name of the database lock a migration run holds; see :func:`_one_run_at_a_time`.
 _RUN_LOCK = "jasil_migrations"
 
+#: How long a MySQL or MariaDB run waits for the lock another run holds. Finite because MariaDB does not take a
+#: negative timeout as "forever" (``GET_LOCK`` then returns NULL), and so that a hung migration cannot block the
+#: others for good.
+_MYSQL_LOCK_WAIT_SECONDS = 3600
+
+#: MySQL lock names are server-wide, so the database's name is part of the lock's: two databases on one server
+#: do not queue behind each other. Hashed to stay inside the 64-character limit.
+_MYSQL_LOCK_NAME = "CONCAT(:name, ':', MD5(COALESCE(DATABASE(), '')))"
+
 
 @contextmanager
 def _one_run_at_a_time(connection: Any) -> Generator[None]:
@@ -131,7 +140,7 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
     and JASIL refuses a multi-process SQLite deployment.
 
     Raises:
-        RuntimeError: When MySQL does not grant the lock.
+        RuntimeError: When MySQL or MariaDB does not grant the lock within the wait.
     """
     from sqlalchemy import text
 
@@ -149,12 +158,15 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
         finally:
             connection.execute(text("SELECT pg_advisory_unlock(hashtext(:name))"), {"name": _RUN_LOCK})
     elif dialect in ("mysql", "mariadb"):
-        if connection.execute(text("SELECT GET_LOCK(:name, -1)"), {"name": _RUN_LOCK}).scalar() != 1:
+        acquired = connection.execute(
+            text(f"SELECT GET_LOCK({_MYSQL_LOCK_NAME}, :wait)"), {"name": _RUN_LOCK, "wait": _MYSQL_LOCK_WAIT_SECONDS}
+        ).scalar()
+        if acquired != 1:
             raise RuntimeError("MySQL did not grant the JASIL migration lock")
         try:
             yield
         finally:
-            connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": _RUN_LOCK})
+            connection.execute(text(f"SELECT RELEASE_LOCK({_MYSQL_LOCK_NAME})"), {"name": _RUN_LOCK})
     else:
         yield
 
