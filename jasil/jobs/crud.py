@@ -21,7 +21,7 @@ single worker is still correct. Callers pass an explicit ``now`` (from the
 
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -257,7 +257,7 @@ def claim_jobs(
     if record_attempts:
         _open_attempts(job_ids, worker_id=worker_id, now=now, db=db)
     db.commit()
-    claimed = (
+    claimed: Sequence[ProcessingJob] = (
         db.execute(
             select(ProcessingJob).where(
                 ProcessingJob.id.in_(job_ids),
@@ -578,7 +578,7 @@ def renew_leases(
     )
     # No ``UPDATE ... RETURNING``: MySQL and MariaDB do not support it. Same
     # transaction, so the rows read back are the ones just renewed.
-    ids = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
+    ids: set[str] = set(db.execute(select(ProcessingJob.id).where(*held)).scalars().all())
     db.commit()
     return ids
 
@@ -934,7 +934,7 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
     )
     if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
         id_stmt = id_stmt.with_for_update(skip_locked=True)
-    job_ids = list(db.execute(id_stmt).scalars().all())
+    job_ids: list[str] = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
         db.commit()
         return 0
@@ -1124,7 +1124,7 @@ def get_jobs_summary(
         for status_counts in (queue_counts[queue],)
     ]
     oldest_pending = min(queue_oldest.values(), default=None)
-    dead_letter_jobs = (
+    dead_letter_jobs: Sequence[ProcessingJob] = (
         db.execute(
             select(ProcessingJob)
             .where(ProcessingJob.status == STATUS_DEAD_LETTER)
@@ -1307,7 +1307,9 @@ def claim_dead_letter_callbacks(
         statement = statement.where(ProcessingJob.updated_at >= dead_after)
     if job_ids is not None:
         statement = statement.where(ProcessingJob.id.in_(list(job_ids)))
-    rows = db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
+    rows: Sequence[ProcessingJob] = (
+        db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
+    )
     lease_until = now + timedelta(seconds=lease_seconds)
     jobs: list[DeadLetterJob] = []
     for row in rows:

@@ -19,10 +19,11 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select, text, update
+from sqlalchemy.engine import ScalarResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -114,7 +115,8 @@ def _sync_catalog() -> CatalogSyncResult:
     registered = {action.id: action for action in get_catalog()}
     added = updated = deprecated = 0
     with jasil_orm.get_sessionmaker()() as db:
-        existing = {row.id: row for row in db.scalars(select(AuditActionRecord))}
+        stored: ScalarResult[AuditActionRecord] = db.scalars(select(AuditActionRecord))
+        existing = {row.id: row for row in stored}
         for action in registered.values():
             row = existing.get(action.id)
             if row is None:
@@ -212,7 +214,7 @@ def _record_retention_change() -> None:
     settings = get_settings().audit
     with jasil_orm.get_sessionmaker()() as db:
         service.ensure_instance_id(service.engine_of(db))
-        row = db.scalars(select(Instance).where(Instance.id == 1)).one()
+        row: Instance = db.scalars(select(Instance).where(Instance.id == 1)).one()
         if row.retention_days is not None and (
             row.retention_days != settings.retention_days or row.legal_hold != settings.legal_hold
         ):
@@ -259,7 +261,7 @@ def _ensure_partitions() -> None:
         if not _partitioned(db):
             return
         service.ensure_instance_id(service.engine_of(db))
-        furthest = db.execute(
+        furthest: date = db.execute(
             text("SELECT jasil_audit_ensure_partitions(:days)"), {"days": get_settings().audit.partition_days_ahead}
         ).scalar_one()
         service.note_maintenance(db, furthest_partition_date=furthest)

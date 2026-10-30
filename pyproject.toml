@@ -44,7 +44,7 @@ redis = [
 ]
 # S3-compatible object storage backend.
 s3 = [
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
 ]
 # PostgreSQL advisory locks. JASIL never creates the engine (the host owns it);
 # this extra exists so a host can pull a driver from the same declaration.
@@ -59,7 +59,7 @@ jobs = [
 ]
 # FastAPI `Depends` helpers exposing the platform providers to routes.
 fastapi = [
-    "fastapi>=0.141.1",
+    "fastapi>=0.142.1",
 ]
 # HTTP reverse-geocoding backend (nominatim / photon / geocode.maps.co).
 geocoding = [
@@ -77,10 +77,10 @@ audit = [
 # Convenience: every optional backend at once.
 all = [
     "redis>=8.1.0",
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
     "psycopg[binary]>=3.3.6",
     "apscheduler>=3.11.3",
-    "fastapi>=0.141.1",
+    "fastapi>=0.142.1",
     "requests>=2.34.2",
     "alembic>=1.20.0",
     "cryptography>=46.0.0",
@@ -89,17 +89,17 @@ all = [
 [dependency-groups]
 typecheck = [
     "mypy>=2.3.1",
-    "ty>=0.0.83",
+    "ty>=0.0.84",
     "types-requests>=2.33.0.20260906",
-    "boto3-stubs[s3]>=1.43.98",
+    "boto3-stubs[s3]>=1.43.105",
 ]
 lint = [
-    "ruff>=0.16.8",
+    "ruff>=0.16.9",
     "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.39.0",
-    "hypothesis>=6.168.0",
+    "faker>=40.40.0",
+    "hypothesis>=6.168.3",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
@@ -110,9 +110,9 @@ test = [
     "redis>=8.1.0",
     "fakeredis[lua]>=2.38.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.98",
+    "boto3>=1.43.105",
     "apscheduler>=3.11.3",
-    "fastapi>=0.141.1",
+    "fastapi>=0.142.1",
     "requests>=2.34.2",
     "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.

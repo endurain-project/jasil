@@ -35,6 +35,7 @@ from itertools import groupby
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.engine import ScalarResult
 from sqlalchemy.orm import Session
 
 import jasil.orm as jasil_orm
@@ -125,7 +126,8 @@ def _window_rows(db: Session, start: datetime, end: datetime) -> Iterator[Any]:
         .order_by(AuditLog.occurred_at)
         .execution_options(yield_per=_FETCH_SIZE)
     )
-    for _, group in groupby(db.scalars(statement), key=lambda row: as_utc(row.occurred_at)):
+    rows: ScalarResult[AuditLog] = db.scalars(statement)
+    for _, group in groupby(rows, key=lambda row: as_utc(row.occurred_at)):
         yield from sorted(group, key=lambda row: row.id)
 
 
@@ -423,14 +425,11 @@ def _pruning_horizon(db: Session, verifiers: Mapping[str, Any], instance_id: str
     """
     from jasil.audit.models import AuditCheckpoint
 
+    stored: ScalarResult[AuditCheckpoint] = db.scalars(
+        select(AuditCheckpoint).where(AuditCheckpoint.retention_days > 0, AuditCheckpoint.legal_hold.is_(False))
+    )
     candidates = sorted(
-        (
-            (horizon, checkpoint)
-            for checkpoint in db.scalars(
-                select(AuditCheckpoint).where(AuditCheckpoint.retention_days > 0, AuditCheckpoint.legal_hold.is_(False))
-            )
-            if (horizon := retention_horizon(checkpoint)) is not None
-        ),
+        ((horizon, checkpoint) for checkpoint in stored if (horizon := retention_horizon(checkpoint)) is not None),
         key=lambda candidate: candidate[0],
         reverse=True,
     )

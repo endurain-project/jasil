@@ -19,6 +19,7 @@ portable SQL so the same code runs on PostgreSQL, MySQL and SQLite.
 """
 
 from collections import defaultdict
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select, update
@@ -321,7 +322,7 @@ def _recent_failures(db: Session, limit: int) -> list[event_log_schema.EventLogF
     Returns:
         Recent failures, newest first.
     """
-    rows = (
+    rows: Sequence[EventLog] = (
         db.execute(
             select(EventLog)
             .where(EventLog.status.in_((_STATUS_FAILED, _STATUS_DEAD_LETTER)))

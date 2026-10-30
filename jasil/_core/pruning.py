@@ -47,7 +47,7 @@ def bounded_delete(
             # Concurrent prunes step over each other's claimed page rather
             # than blocking on it.
             id_stmt = id_stmt.with_for_update(skip_locked=True)
-        ids = list(db.execute(id_stmt).scalars().all())
+        ids: list[str] = list(db.execute(id_stmt).scalars().all())
         if not ids:
             break
         db.execute(delete(model).where(model.id.in_(ids)))

@@ -15,6 +15,7 @@ sessions.
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.engine import ScalarResult
 from sqlalchemy.sql.elements import ColumnElement, SQLColumnExpression
 
 import jasil.orm as jasil_orm
@@ -107,7 +108,7 @@ def list_entries(
         select(AuditLog).where(*conditions).order_by(AuditLog.occurred_at.desc(), AuditLog.id.desc()).limit(limit + 1)
     )
     with jasil_orm.get_sessionmaker()() as db:
-        rows = list(db.scalars(statement))
+        rows: list[AuditLog] = list(db.scalars(statement))
     entries = [AuditEntry.model_validate(row) for row in rows[:limit]]
     next_cursor = encode_cursor(entries[-1].occurred_at, entries[-1].id) if len(rows) > limit else None
     return AuditPage(entries=entries, next_cursor=next_cursor)
@@ -196,7 +197,5 @@ def list_catalog() -> list[AuditActionInfo]:
     from jasil.audit.models import AuditActionRecord
 
     with jasil_orm.get_sessionmaker()() as db:
-        return [
-            AuditActionInfo.model_validate(row)
-            for row in db.scalars(select(AuditActionRecord).order_by(AuditActionRecord.id))
-        ]
+        records: ScalarResult[AuditActionRecord] = db.scalars(select(AuditActionRecord).order_by(AuditActionRecord.id))
+        return [AuditActionInfo.model_validate(row) for row in records]

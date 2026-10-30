@@ -156,7 +156,7 @@ def get_workers_summary(
                 and_(JobWorker.started_at == cursor_started_at, JobWorker.instance_id < cursor_instance_id),
             )
         )
-    rows = list(
+    rows: list[JobWorker] = list(
         db.execute(statement.order_by(JobWorker.started_at.desc(), JobWorker.instance_id.desc()).limit(limit + 1))
         .scalars()
         .all()
@@ -263,7 +263,7 @@ def prune_worker_records_before(cutoff: datetime, *, db: Session, batch_size: in
         and_(JobWorker.stopped_at.is_(None), JobWorker.last_heartbeat_at < cutoff),
     )
     for _ in range(PRUNE_MAX_BATCHES):
-        instance_ids = list(
+        instance_ids: list[str] = list(
             db.execute(select(JobWorker.instance_id).where(old_record).limit(batch_size)).scalars().all()
         )
         if not instance_ids:
