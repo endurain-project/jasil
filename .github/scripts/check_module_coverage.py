@@ -28,13 +28,7 @@ FLOOR = 80.0
 
 #: Modules held to a lower floor, each for a reason that is not "we did not get
 #: to it". Keep this list short, and justify every entry.
-EXEMPTIONS = {
-    # Alembic *executes* env.py through its own runner rather than importing it,
-    # so the online/offline branches never run under pytest. The revisions it
-    # drives are covered by tests/test_migrations.py, which asserts the migrated
-    # schema matches the models column-for-column.
-    "jasil/migrations/env.py": 60.0,
-}
+EXEMPTIONS: dict[str, float] = {}
 
 
 def _coverage_data() -> dict:

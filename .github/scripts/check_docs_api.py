@@ -33,7 +33,26 @@ _FROM_IMPORT = re.compile(r"^\s*from\s+(jasil[\w.]*)\s+import\s+(\(?[^\n)]+\)?)"
 
 
 def _sources() -> list[pathlib.Path]:
-    return [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").glob("*.md"))]
+    return [REPO_ROOT / "README.md", *sorted((REPO_ROOT / "docs").rglob("*.md"))]
+
+
+# A fenced ``python`` block, and the ``jasil.<name>`` references in it that are not part of an import line.
+_PYTHON_BLOCK = re.compile(r"```python\n(.*?)```", re.DOTALL)
+_BARE_USE = re.compile(r"(?<![\w.])jasil\.\w+")
+_IMPORT_LINE = re.compile(r"^\s*(?:import|from)\s+jasil", re.MULTILINE)
+# ``import jasil`` or ``import jasil.sub`` (no alias) binds the name ``jasil``; so does ``from`` nothing.
+_BINDS_JASIL = re.compile(r"^\s*import\s+jasil(?:\.[\w.]+)?\s*(?:,|$)", re.MULTILINE)
+
+
+def _unbound_uses(text: str) -> list[str]:
+    """Return the snippets that use ``jasil.<name>`` without importing ``jasil``, so a copy-paste raises ``NameError``."""
+    problems = []
+    for block in _PYTHON_BLOCK.findall(text):
+        code = "\n".join(line for line in block.splitlines() if not _IMPORT_LINE.match(line))
+        uses = sorted(set(_BARE_USE.findall(code)))
+        if uses and not _BINDS_JASIL.search(block):
+            problems.append(", ".join(uses[:3]))
+    return problems
 
 
 def _imported_names(spec: str) -> list[str]:
@@ -55,6 +74,9 @@ def _check(path: pathlib.Path, failures: list[str]) -> int:
     text = path.read_text(encoding="utf-8")
     where = path.relative_to(REPO_ROOT).as_posix()
     checked = 0
+
+    for used in _unbound_uses(text):
+        failures.append(f"{where}: a snippet uses {used} without `import jasil`")
 
     for module_name, names in _FROM_IMPORT.findall(text):
         module = _resolve(module_name, failures, where)

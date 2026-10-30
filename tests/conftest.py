@@ -11,7 +11,9 @@ NOTHING``, ``FOR UPDATE SKIP LOCKED``) differ per dialect and SQLite exercises
 neither.
 """
 
+import ipaddress
 import os
+import socket
 
 import pytest
 from sqlalchemy import create_engine
@@ -41,6 +43,28 @@ def _no_cloud_metadata():
     """
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dns():
+    """Fail any lookup of a name that a test has not faked; an IP literal is answered here, not by the resolver.
+
+    Answering a literal needs no round trip, but asking the system resolver to would make a test depend on the
+    machine it runs on. A test that needs a name patches ``getaddrinfo`` itself, after this, and wins.
+    A private ``MonkeyPatch``, like the fixture above, so a test's own ``monkeypatch`` keeps its teardown order.
+    """
+
+    def literal_only(host, port=None, *_args, **_kwargs):
+        try:
+            address = ipaddress.ip_address(str(host).split("%")[0])
+        except ValueError:
+            raise AssertionError(f"a test resolved {host!r} through the real resolver; fake getaddrinfo") from None
+        family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, "", (str(host), port or 0))]
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(socket, "getaddrinfo", literal_only)
         yield
 
 

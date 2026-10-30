@@ -562,6 +562,54 @@ class TestSmtpTransport:
             ours.close()
             theirs.close()
 
+    def test_a_failed_tls_wrap_closes_the_raw_socket(self, monkeypatch):
+        """The wrap detaches nothing on failure, so the descriptor would otherwise leak until garbage collection."""
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
+        ours, theirs = socket.socketpair()
+
+        class Context:
+            def wrap_socket(self, raw, server_hostname):
+                raise ssl.SSLError("handshake failed")
+
+        connection = mail_smtp._tracked(REAL_SMTP_SSL)(local_hostname="localhost", context=Context())
+        monkeypatch.setattr(type(connection), "_dial", lambda self, host, port, timeout: ours)
+        connection._host = "relay.test"
+        try:
+            with pytest.raises(ssl.SSLError):
+                connection._get_socket("relay.test", 465, 30)
+
+            assert ours.fileno() == -1
+        finally:
+            connection.watched.close()
+            theirs.close()
+
+    def test_dialling_without_a_deadline_is_a_plain_create_connection(self, monkeypatch):
+        dialled = []
+        monkeypatch.setattr(socket, "create_connection", lambda *args: dialled.append(args) or "connected")
+        connection = mail_smtp._tracked(REAL_SMTP)(local_hostname="localhost", timeout=30)
+
+        assert connection._dial("relay.test", 587, 12) == "connected"
+        assert dialled == [(("relay.test", 587), 12, None)]
+
+    def test_dialling_under_a_deadline_binds_the_source_address_and_returns_the_first_connection(self, monkeypatch):
+        entries = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"192.0.2.{n}", 587)) for n in (1, 2)]
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: entries)
+        bound, connected = [], []
+        monkeypatch.setattr(socket.socket, "bind", lambda self, address: bound.append(address))
+        monkeypatch.setattr(socket.socket, "connect", lambda self, address: connected.append(address[0]))
+        connection = mail_smtp._tracked(REAL_SMTP)(
+            local_hostname="localhost", timeout=30, source_address=("192.0.2.9", 0)
+        )
+        connection.deadline = mail_smtp.time.monotonic() + 60
+
+        candidate = connection._dial("relay.test", 587, 30)
+        try:
+            assert connected == ["192.0.2.1"]  # the first address answered, so the second is never tried
+            assert bound == [("192.0.2.9", 0)]
+        finally:
+            candidate.close()
+
     @pytest.mark.parametrize("value", ["a@-bad-.com", "a@bad-.com", "a@a..com"])
     def test_a_malformed_domain_is_refused(self, value):
         with pytest.raises(ValueError, match="valid email"):
