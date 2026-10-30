@@ -185,7 +185,8 @@ def get_workers_summary(
             .where(JobAttempt.worker_id.in_(instance_ids), JobAttempt.finished_at >= window_start)
             .group_by(JobAttempt.worker_id, JobAttempt.outcome)
         ).all():
-            outcomes.setdefault(worker_id, {})[outcome] = int(count)
+            if outcome is not None:  # the column is nullable only while an attempt is open, and these are finished
+                outcomes.setdefault(worker_id, {})[outcome] = int(count)
             if finished is not None and (worker_id not in last_finished or finished > last_finished[worker_id]):
                 last_finished[worker_id] = finished
     workers: list[WorkerInfo] = []
