@@ -437,12 +437,7 @@ def _close_open(job_attempts: dict[str, int], *, worker_id: str, outcome: str, n
         db.execute(
             update(JobAttempt)
             .where(
-                or_(
-                    *(
-                        and_(JobAttempt.job_id == job_id, JobAttempt.attempt == attempt)
-                        for job_id, attempt in job_attempts.items()
-                    )
-                ),
+                _claims_match(JobAttempt.job_id, JobAttempt.attempt, job_attempts),
                 JobAttempt.worker_id == worker_id,
                 JobAttempt.finished_at.is_(None),
             )
@@ -615,15 +610,22 @@ def release_leases(
     return released.rowcount
 
 
+def _claims_match(job_id_column: Any, attempt_column: Any, job_attempts: dict[str, int]) -> Any:
+    """Match each ``{job_id: attempt}`` pair, with one term per distinct attempt rather than per job.
+
+    A term per job makes the condition as deep as the batch, which SQLite's expression-depth limit refuses at
+    about a thousand jobs. Attempt numbers are few (at most ``max_attempts``), so this stays small.
+    """
+    by_attempt: dict[int, list[str]] = {}
+    for job_id, attempt in job_attempts.items():
+        by_attempt.setdefault(attempt, []).append(job_id)
+    return or_(*(and_(attempt_column == attempt, job_id_column.in_(ids)) for attempt, ids in by_attempt.items()))
+
+
 def _held_claims(job_attempts: dict[str, int], *, worker_id: str) -> list[Any]:
     """Match the claims ``worker_id`` still holds, each at the attempt it took."""
     return [
-        or_(
-            *(
-                and_(ProcessingJob.id == job_id, ProcessingJob.attempts == attempts)
-                for job_id, attempts in job_attempts.items()
-            )
-        ),
+        _claims_match(ProcessingJob.id, ProcessingJob.attempts, job_attempts),
         ProcessingJob.status == STATUS_CLAIMED,
         ProcessingJob.locked_by == worker_id,
     ]

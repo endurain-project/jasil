@@ -18,6 +18,7 @@ import jasil.container as container
 import jasil.jobs._worker_registry as worker_registry
 import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease, lease_lost
+from jasil._core.limits import MAX_JOB_BATCH_SIZE
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.mail_memory import MemoryMail
 from jasil.events import new_event
@@ -737,6 +738,29 @@ class TestReleasingLeases:
 
     def test_nothing_to_release_is_a_no_op(self, db):
         assert jobs_crud.release_leases({}, worker_id="w1", now=T0, db=db) == 0
+
+
+class TestAFullBatch:
+    """A claim condition with one term per job exceeds SQLite's expression depth near a thousand held jobs."""
+
+    def test_the_largest_batch_can_be_renewed_and_released(self, db):
+        for number in range(MAX_JOB_BATCH_SIZE):
+            jobs_crud.enqueue_job(
+                new_event("activity.created", {"id": number}, source="test"),
+                "s",
+                max_attempts=3,
+                now=T0,
+                db=db,
+                commit=False,
+            )
+        db.commit()
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=MAX_JOB_BATCH_SIZE, lease_seconds=LEASE, now=T0, db=db)
+        held = {job.id: job.attempts for job in claimed}
+
+        renewed = jobs_crud.renew_leases(held, worker_id="w1", lease_seconds=LEASE, now=T0, db=db)
+        released = jobs_crud.release_leases(held, worker_id="w1", now=T0, db=db)
+
+        assert (len(held), len(renewed), released) == (MAX_JOB_BATCH_SIZE,) * 3
 
 
 class _RenewsAfterTheSelect:
