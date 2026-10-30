@@ -1,5 +1,6 @@
 """Local-filesystem ``StorageProvider`` backend."""
 
+import errno
 import hashlib
 import json
 import logging
@@ -60,6 +61,11 @@ _UPLOAD_MAX_PARTS = 10_000
 
 def _path_digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _is_absent(error: OSError) -> bool:
+    """True when ``error`` says the path does not exist, or its name is too long for any file to carry it."""
+    return isinstance(error, FileNotFoundError | NotADirectoryError) or error.errno == errno.ENAMETOOLONG
 
 
 def _translate_local_stream_error(error: Exception) -> None:
@@ -210,10 +216,14 @@ class LocalStorage:
             self._check_plain_key_conflicts(area, key, path)
             return path
         path = self._resolve(area, key)
+        self._write_object_identities(area, key, path)
+        return path
+
+    def _write_object_identities(self, area: str, key: str, path: Path) -> None:
+        """Make sure the area and key identity files beside an opaque object exist; idempotent."""
         area_file = self._resolve_area(area).parent / _OBJECT_AREA_FILE
         self._write_identity(area_file, area)
         self._write_identity(path.parent / _OBJECT_KEY_FILE, key)
-        return path
 
     def _check_plain_key_conflicts(self, area: str, key: str, path: Path) -> None:
         """Reject file/directory conflicts across plain and opaque objects."""
@@ -306,11 +316,17 @@ class LocalStorage:
                     raise
         _sync_directory(destination.parent)
 
-    def _discard_replaced_object(self, area: str, key: str) -> None:
-        """Remove the prior representation after a new object is committed."""
+    def _finish_commit(self, area: str, key: str) -> None:
+        """Settle a freshly committed object: keep its identity and remove the prior representation.
+
+        An opaque object's identity files are written before its payload, so a delete running in between
+        removes them and the payload would be published without any; writing them again, now that the payload
+        is in place, leaves a committed object that can always be read.
+        """
         if area in self._plain_areas:
             self._remove_opaque_object(area, key, best_effort=True)
         else:
+            self._write_object_identities(area, key, self._resolve(area, key))
             self._remove_legacy_object(area, key)
 
     def _remove_opaque_object(self, area: str, key: str, *, best_effort: bool) -> None:
@@ -346,9 +362,9 @@ class LocalStorage:
     def _is_regular_file(path: Path) -> bool:
         try:
             return stat.S_ISREG(path.stat().st_mode)
-        except (FileNotFoundError, NotADirectoryError):
-            return False
         except OSError as error:
+            if _is_absent(error):
+                return False
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     def _current_object_path(self, area: str, key: str) -> Path | None:
@@ -381,10 +397,9 @@ class LocalStorage:
             if stat.S_ISREG(path.stat().st_mode):
                 path.unlink()
                 self._prune_empty_directories(path.parent)
-        except (FileNotFoundError, NotADirectoryError):
-            return
-        except OSError:
-            logger.warning("Failed to remove a migrated legacy local storage object")
+        except OSError as error:
+            if not _is_absent(error):
+                logger.warning("Failed to remove a migrated legacy local storage object")
 
     def _prune_empty_directories(self, directory: Path) -> None:
         try:
@@ -525,10 +540,7 @@ class LocalStorage:
         """Write ``data`` to a temporary file and move it over the object; ``content_type`` is ignored."""
         path = self._prepare_object(area, key)
         self._write_object_bytes(area, path, data)
-        if area in self._plain_areas:
-            self._discard_replaced_object(area, key)
-        else:
-            self._remove_legacy_object(area, key)
+        self._finish_commit(area, key)
         return key
 
     def save_stream(
@@ -585,7 +597,7 @@ class LocalStorage:
             if area in self._plain_areas:
                 self._prune_empty_directories(path.parent)
             raise
-        self._discard_replaced_object(area, key)
+        self._finish_commit(area, key)
         return total
 
     def begin_upload(
@@ -748,7 +760,7 @@ class LocalStorage:
             if session.area in self._plain_areas:
                 self._prune_empty_directories(destination_path.parent)
             raise
-        self._discard_replaced_object(session.area, session.key)
+        self._finish_commit(session.area, session.key)
         try:
             shutil.rmtree(session_directory)
         except OSError:
@@ -932,10 +944,9 @@ class LocalStorage:
             if stat.S_ISREG(legacy_path.stat().st_mode):
                 legacy_path.unlink()
                 self._prune_empty_directories(legacy_path.parent)
-        except (FileNotFoundError, NotADirectoryError):
-            return
         except OSError as error:
-            raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
+            if not _is_absent(error):
+                raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     def delete_prefix(self, area: str, prefix: str) -> int:
         """Delete the object at ``prefix`` and every object under ``prefix/``, one at a time."""

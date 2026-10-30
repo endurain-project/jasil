@@ -231,6 +231,24 @@ class TestLocalStorage:
     def legacy_storage(self, tmp_path):
         return LocalStorage(str(tmp_path), url_prefix="/media", legacy_layout=True)
 
+    def test_a_key_component_too_long_for_the_filesystem_is_simply_absent_from_the_legacy_layout(
+        self, legacy_storage, tmp_path, caplog
+    ):
+        """No file can have that name, so probing for a legacy copy is not an outage."""
+        (tmp_path / "thumbnails").mkdir()  # the filesystem only reports a long name inside an existing directory
+        key = "x" * 300
+
+        assert legacy_storage.get("thumbnails", key) is None
+        assert legacy_storage.exists("thumbnails", key) is False
+        assert legacy_storage.stat("thumbnails", key) is None
+        legacy_storage.delete("thumbnails", key)
+
+        legacy_storage.save("thumbnails", key, b"bytes")
+        assert legacy_storage.get("thumbnails", key) == b"bytes"
+        legacy_storage.delete("thumbnails", key)
+        assert legacy_storage.get("thumbnails", key) is None
+        assert "Failed to remove" not in caplog.text
+
     def test_a_blob_round_trips(self, storage):
         storage.save("thumbnails", "1.webp", b"bytes")
 
@@ -668,6 +686,38 @@ class TestLocalStorage:
         with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
             storage.get("thumbnails", "original.webp")
         assert storage.list_keys("thumbnails") == []
+
+    def test_listing_refuses_a_symlinked_area_identity(self, storage, tmp_path):
+        storage.save("thumbnails", "original.webp", b"original")
+        area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
+        area_file.unlink()
+        outside = tmp_path / "outside-area"
+        outside.write_text("thumbnails")
+        area_file.symlink_to(outside)
+
+        with pytest.raises(StorageBackendUnavailableError, match="area identity path is unsafe"):
+            storage.list_keys("thumbnails")
+
+    def test_listing_refuses_an_area_identity_naming_another_area(self, storage):
+        storage.save("thumbnails", "original.webp", b"original")
+        area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
+        area_file.write_text("avatars")
+
+        with pytest.raises(StorageBackendUnavailableError, match="area identity does not match"):
+            storage.list_keys("thumbnails")
+
+    def test_a_plain_area_never_follows_a_symlink_out_of_the_base_directory(self, tmp_path):
+        base = tmp_path / "data"
+        outside = tmp_path / "outside"
+        base.mkdir()
+        outside.mkdir()
+        (base / "activity_files").symlink_to(outside, target_is_directory=True)
+        storage = LocalStorage(str(base), plain_areas=frozenset({"activity_files"}))
+
+        with pytest.raises(ValueError, match="escapes base directory"):
+            storage.save("activity_files", "a.fit", b"x")
+
+        assert list(outside.iterdir()) == []
 
     def test_a_symlinked_area_identity_blocks_new_writes(self, storage, tmp_path):
         storage.save("thumbnails", "original.webp", b"original")
@@ -1627,6 +1677,46 @@ class TestLocalStorageDurability:
         storage.begin_upload("avatars", "1.bin")
 
         assert (False, True) in synced and (True, True) in synced
+
+
+class TestLocalStorageConcurrentDelete:
+    """A delete that runs between a writer's preparation and its install must not leave an unreadable payload."""
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path), url_prefix="/media")
+
+    @pytest.mark.parametrize(
+        "write",
+        [
+            pytest.param(lambda storage: storage.save("thumbnails", "1.webp", b"new"), id="save"),
+            pytest.param(
+                lambda storage: storage.save_stream("thumbnails", "1.webp", io.BytesIO(b"new")), id="save_stream"
+            ),
+        ],
+    )
+    def test_the_object_a_writer_published_stays_readable(self, storage, monkeypatch, write):
+        storage.save("thumbnails", "1.webp", b"old")
+        install = LocalStorage._install
+
+        payload = storage._resolve("thumbnails", "1.webp")
+
+        def delete_then_install(temporary_path, destination):
+            if destination == payload and not deleted:
+                deleted.append(True)
+                storage.delete("thumbnails", "1.webp")
+            install(temporary_path, destination)
+
+        deleted: list[bool] = []
+
+        monkeypatch.setattr(LocalStorage, "_install", staticmethod(delete_then_install))
+
+        write(storage)
+
+        monkeypatch.undo()
+        assert storage.get("thumbnails", "1.webp") == b"new"
+        assert storage.exists("thumbnails", "1.webp")
+        assert storage.list_keys("thumbnails") == ["1.webp"]
 
 
 class TestLocalStorageFilesystemFailures:
