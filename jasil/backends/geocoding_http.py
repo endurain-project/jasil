@@ -133,10 +133,18 @@ def _watched_adapter() -> Any:
     class _WatchedHTTPSPool(HTTPSConnectionPool):
         ConnectionCls = _WatchedHTTPSConnection
 
+    pool_classes = {"http": _WatchedHTTPPool, "https": _WatchedHTTPSPool}
+
     class _WatchedAdapter(HTTPAdapter):
         def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
             super().init_poolmanager(*args, **kwargs)
-            self.poolmanager.pool_classes_by_scheme = {"http": _WatchedHTTPPool, "https": _WatchedHTTPSPool}
+            self.poolmanager.pool_classes_by_scheme = pool_classes
+
+        def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+            # A proxy gets a manager of its own, so it needs the watched pools too.
+            manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+            manager.pool_classes_by_scheme = pool_classes
+            return manager
 
     return _WatchedAdapter
 

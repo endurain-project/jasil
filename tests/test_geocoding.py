@@ -565,6 +565,16 @@ class TestTheWatchdog:
         assert "Timeout" not in caplog.text
 
 
+class TestTheWatchedAdapter:
+    def test_a_proxied_connection_is_watched_too(self):
+        """``requests`` builds a separate manager per proxy, and it must not fall back to unwatched pools."""
+        adapter = geocoding_http._watched_adapter()()
+
+        proxy_manager = adapter.proxy_manager_for("http://proxy.test:3128")
+
+        assert proxy_manager.pool_classes_by_scheme == adapter.poolmanager.pool_classes_by_scheme
+
+
 class TestThrottling:
     def test_no_rate_limit_means_no_wait(self, monkeypatch):
         slept = []
