@@ -50,12 +50,19 @@ def _no_cloud_metadata():
 def _no_real_dns():
     """Fail any lookup of a name that a test has not faked; an IP literal is answered here, not by the resolver.
 
+    ``localhost`` is the exception and goes to the resolver: the database jobs connect to a service by that name.
+
     Answering a literal needs no round trip, but asking the system resolver to would make a test depend on the
     machine it runs on. A test that needs a name patches ``getaddrinfo`` itself, after this, and wins.
     A private ``MonkeyPatch``, like the fixture above, so a test's own ``monkeypatch`` keeps its teardown order.
     """
 
-    def literal_only(host, port=None, *_args, **_kwargs):
+    real = socket.getaddrinfo
+
+    def literal_only(host, port=None, *args, **kwargs):
+        if str(host).lower() == "localhost":
+            # The database CI jobs name their service this way, and a loopback name needs no network.
+            return real(host, port, *args, **kwargs)
         try:
             address = ipaddress.ip_address(str(host).split("%")[0])
         except ValueError:
