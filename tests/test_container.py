@@ -604,13 +604,15 @@ class TestDeploymentConsistencyGate:
 class TestMailResolution:
     """A mail misconfiguration fails the build; an unset one never drops silently."""
 
-    @pytest.mark.parametrize("uri", ["memory:", " memory://", "memory://\n"])
+    @pytest.mark.parametrize(
+        "uri", ["memory:", " memory://", "memory://\n", "mem\nory://", "\x01memory://", "mem ory://"]
+    )
     def test_a_non_literal_memory_uri_is_refused(self, uri):
         with pytest.raises(ValueError, match="not a valid URI"):
             container._build_mail(_settings(mail=settings.MailSettings(uri=uri)), SystemClock())
 
     def test_a_multi_process_memory_uri_variant_cannot_slip_past_the_gate(self):
-        for uri in ("memory:", "Memory://"):
+        for uri in ("memory:", "Memory://", "mem\nory://", "\x01memory://"):
             s = _settings(web_workers=4, mail=settings.MailSettings(uri=uri))
             try:
                 container.build_platform(s)

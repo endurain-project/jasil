@@ -110,11 +110,11 @@ def mail_problems(mail: _MailConfig) -> list[MailProblem]:
         problems.append(MailProblem(code, field, message))
 
     # The URI is never echoed: it is operator input and may carry a mistyped
-    # credential. ``urlsplit`` quietly strips whitespace and accepts ``memory:``;
-    # require the literal form so what is built is what the consistency check inspected.
+    # credential. ``urlsplit`` quietly strips whitespace and control characters, wherever they sit, and
+    # accepts ``memory:``; require the literal form so what is built is what the consistency check inspected.
     parts = None
     port = hostname = None
-    if mail.uri != mail.uri.strip() or "://" not in mail.uri:
+    if not mail.uri.isprintable() or " " in mail.uri or "://" not in mail.uri:
         add(MailProblemCode.INVALID_URI, "mail.uri", "mail.uri is not a valid URI")
     else:
         try:
