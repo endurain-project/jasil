@@ -59,7 +59,7 @@ jobs = [
 ]
 # FastAPI `Depends` helpers exposing the platform providers to routes.
 fastapi = [
-    "fastapi>=0.142.1",
+    "fastapi>=0.141.1",
 ]
 # HTTP reverse-geocoding backend (nominatim / photon / geocode.maps.co).
 geocoding = [
@@ -80,7 +80,7 @@ all = [
     "boto3>=1.43.105",
     "psycopg[binary]>=3.3.6",
     "apscheduler>=3.11.3",
-    "fastapi>=0.142.1",
+    "fastapi>=0.141.1",
     "requests>=2.34.2",
     "alembic>=1.20.0",
     "cryptography>=46.0.0",
@@ -112,7 +112,7 @@ test = [
     # The remaining backends and integrations are all exercised by the suite.
     "boto3>=1.43.105",
     "apscheduler>=3.11.3",
-    "fastapi>=0.142.1",
+    "fastapi>=0.141.1",
     "requests>=2.34.2",
     "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.
