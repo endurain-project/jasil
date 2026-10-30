@@ -18,6 +18,7 @@ intercepts the requests.
 import contextlib
 import itertools
 import socket
+import ssl
 import threading
 
 import pytest
@@ -509,6 +510,42 @@ class TestTheWatchdog:
         deadline.watch(sock)
 
         assert released.wait(5)
+
+    def test_expiring_releases_a_tls_handshake_that_detached_the_watched_socket(self):
+        """Wrapping a socket in TLS detaches the original, so the deadline must hold a duplicate of it."""
+        ours, theirs = socket.socketpair()
+        deadline = geocoding_http._Deadline()
+        deadline.watch(ours)
+        released = threading.Event()
+
+        def handshake():
+            with contextlib.suppress(OSError):
+                ssl.create_default_context().wrap_socket(ours, server_hostname="geo.test")
+            released.set()
+
+        threading.Thread(target=handshake, daemon=True).start()
+        try:
+            theirs.recv(1)  # the ClientHello is out, so the handshake is now blocked reading
+
+            deadline.expire()
+
+            assert released.wait(5)
+        finally:
+            theirs.close()
+            deadline.close()
+
+    def test_closing_releases_the_duplicates_and_leaves_the_original_open(self):
+        ours, theirs = socket.socketpair()
+        deadline = geocoding_http._Deadline()
+        deadline.watch(ours)
+        watched = deadline._sockets[0]
+
+        deadline.close()
+
+        assert watched.fileno() == -1
+        assert ours.fileno() != -1
+        ours.close()
+        theirs.close()
 
     def test_an_upstream_that_never_answers_is_cut_off_at_the_deadline(self, monkeypatch, caplog):
         """Headers come before the body loop, so a deadline checked between body reads never sees them."""

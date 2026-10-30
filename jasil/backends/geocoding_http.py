@@ -57,8 +57,10 @@ _DEADLINE_SECONDS = 30
 class _Deadline:
     """The sockets one request opened, shut down together when its deadline passes.
 
+    Each socket is watched through a duplicate made before any TLS wrap: the wrap detaches the original from
+    its descriptor, so shutting that down would reach nothing, while the duplicate still names the connection.
     A socket opened after the deadline (a slow connect hands it over late) is shut down as soon as it is
-    watched, so no read on it can start.
+    watched, so no read on it can start. :meth:`close` releases the duplicates once the request is over.
     """
 
     def __init__(self) -> None:
@@ -67,12 +69,13 @@ class _Deadline:
         self._expired = False
 
     def watch(self, sock: socket.socket) -> None:
-        """Track ``sock``, shutting it down at once if the deadline has already passed."""
+        """Track a duplicate of ``sock``, shutting it down at once if the deadline has already passed."""
+        watched = sock.dup()
         with self._lock:
-            self._sockets.append(sock)
+            self._sockets.append(watched)
             expired = self._expired
         if expired:
-            _shut_down(sock)
+            _shut_down(watched)
 
     def expire(self) -> None:
         """Mark the deadline passed and shut down every socket watched so far."""
@@ -82,12 +85,17 @@ class _Deadline:
         for sock in sockets:
             _shut_down(sock)
 
+    def close(self) -> None:
+        """Release the duplicates; the connections themselves are closed by their owners."""
+        with self._lock:
+            sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            sock.close()
+
 
 def _shut_down(sock: socket.socket) -> None:
-    # The plain-socket method, on purpose: ``SSLSocket.shutdown`` also tears down TLS state the blocked
-    # thread is still using.
     with contextlib.suppress(OSError):
-        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        sock.shutdown(socket.SHUT_RDWR)
 
 
 _current_deadline: ContextVar[_Deadline | None] = ContextVar("jasil_geocoding_deadline", default=None)
@@ -345,6 +353,7 @@ class HttpGeocoding:
         finally:
             finished.set()
             watchdog.join()
+            watched.close()
             _current_deadline.reset(token)
 
 
