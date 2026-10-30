@@ -47,7 +47,7 @@ fields.
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
 | `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
-| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Ignored for `memory://`. |
+| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Must not be empty for Redis, checked when the platform is built; ignored for `memory://`. |
 | `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
@@ -104,10 +104,10 @@ checkpoint maintenance seals a window, so an invalid key makes that maintenance 
 | `partition_days_ahead` | `7` | Days of daily partitions maintenance keeps created ahead of today (PostgreSQL). A row whose day has none is rejected, so this is the margin by which maintenance may stop. Between `1` and `366`. |
 | `checkpoint_window_minutes` | `15` | Length of a tamper-evidence window. At least `1`, and it must divide a day (1440). |
 | `checkpoint_grace_minutes` | `5` | How long past its end a window waits before it is sealed. Longer than your longest audited transaction plus replica clock skew. |
-| `signing_key` | `None` | Ed25519 private key, base64 of the 32 raw bytes. `None` writes unsigned, hash-chained checkpoints. Needs `jasil[audit]`. Not shown in `repr`. |
+| `signing_key` | `None` | Ed25519 private key, base64 of the 32 raw bytes. `None` writes unsigned, hash-chained checkpoints. A value that is not base64 of 32 bytes raises `ValueError` when the settings are built. Needs `jasil[audit]`. Not shown in `repr`. |
 | `external_sink_uri` | `None` | `file:///directory` or `s3://bucket/prefix`: a write-once copy of every checkpoint kept outside the database. |
 | `max_details_bytes` | `4096` | Largest serialized `details` payload a row may carry. At least `1`. |
-| `app_name`, `app_version` | `None` | Stamped on every row. |
+| `app_name`, `app_version` | `None` | Stamped on every row. At most `100` and `50` characters; a longer value raises `ValueError` when the settings are built. |
 
 ### `GeocodingSettings`
 
@@ -161,7 +161,7 @@ Each capability resolves its backend by URI scheme, independently of the profile
 | Capability | Schemes |
 |---|---|
 | `state_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
-| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>` |
+| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>[/<prefix>][?region=...&endpoint_url=...]` |
 | `events_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
 | `lock_uri` | `noop://`, `postgres-advisory://` |
 

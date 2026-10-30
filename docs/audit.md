@@ -179,7 +179,10 @@ registers only JASIL's own actions.
 `request_id` is not part of it: it is always read from [`jasil.correlation`](configuration.md#correlation-ids), so
 there is one source of truth.
 
-`set_context()` stores it in a `ContextVar`, so every thread and every asyncio task has its own. A host that
+`set_context()` stores it in a `ContextVar`, so every thread and every asyncio task has its own. A value lives as
+long as its thread or task, though: a worker thread reused across requests keeps the previous request's actor until
+the next call, so set the context at the start of every request (`set_context(None)` for an anonymous one) or use
+`audit_context(...)` per request. A host that
 already carries this information installs a reader instead, with `jasil_audit.configure_provider(callable)`. Workers and CLI
 commands, which have no request middleware, use the block form:
 

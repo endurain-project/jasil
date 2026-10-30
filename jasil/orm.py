@@ -179,6 +179,9 @@ def map_models(base: type[DeclarativeBase] | None = None) -> None:
     Raises:
         RuntimeError: If called again with a different base, also after :func:`reset`: the model modules
             stay bound to the base they were first imported against.
+
+    A call that fails part-way (a table name the host's metadata already defines, say) leaves the models that
+    were already imported mapped into ``base``; fix the cause and restart the process rather than calling it again.
     """
     global _active_base, _bound_base
     target = base if base is not None else Base
@@ -200,7 +203,9 @@ def map_models(base: type[DeclarativeBase] | None = None) -> None:
         # rather than on the first query.
         target.registry.configure()
     except Exception:
-        _active_base = None  # let the host fix the problem and retry
+        # Not a state to retry from: the modules that already imported keep their tables in the host's metadata
+        # and a retry would redefine them. The host fixes the problem and restarts the process.
+        _active_base = None
         raise
 
 

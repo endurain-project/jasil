@@ -41,6 +41,9 @@ Many replicas on separate nodes. Every capability must point at something they
 can share:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         profile=jasil.DeploymentProfile.DISTRIBUTED,
@@ -145,6 +148,9 @@ four web workers is four processes, and process-local memory cannot be shared
 between them, so tell JASIL how many you run:
 
 ```python
+import jasil.container
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(jasil_settings.JasilSettings(web_workers=4))
 platform = jasil.container.build_platform(jasil_settings.get_settings())
 # ValueError: JASIL's deployment wiring is inconsistent:
@@ -167,6 +173,9 @@ web workers alone cannot see it, so the deployment declares how its job workers
 run:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.JasilSettings(
     job_worker_mode=jasil.JobWorkerMode.STANDALONE,  # or parse_job_worker_mode(env)
     jobs=jasil_settings.JobSettings(enabled=True),

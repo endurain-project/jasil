@@ -457,11 +457,12 @@ class JasilSettings:
         events_stream: The Redis Stream key carrying best-effort events. Streams
             live in one Redis database, so two deployments sharing a database must
             use different streams (and consumer groups) or they would consume each
-            other's events. Ignored for ``memory://``. Must not be empty.
+            other's events. Ignored for ``memory://``. For Redis it must not be empty, which
+            ``build_platform`` checks.
         events_group: The Redis consumer group the event bus reads as. Replicas of
             one deployment share a group, so each event is handled once; two
             deployments reading the same stream must not. Ignored for
-            ``memory://``. Must not be empty.
+            ``memory://``. For Redis it must not be empty, which ``build_platform`` checks.
         realtime_channel: The Redis Pub/Sub channel carrying realtime hints.
             Pub/Sub channels are server-wide — the database number in the URI
             does not separate them — so two deployments sharing one Redis server

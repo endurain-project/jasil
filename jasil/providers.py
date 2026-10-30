@@ -231,10 +231,12 @@ class StateProvider(Protocol):
         """Return an iterator over the live keys that start with ``prefix``.
 
         Args:
-            prefix: The key prefix, matched literally; an empty prefix matches every key.
+            prefix: The key prefix, matched literally; an empty prefix matches every key. On Redis that is
+                every key in the database, the event stream and other applications' keys included, so name a
+                prefix.
 
         Returns:
-            An iterator over the matching keys, in no guaranteed order.
+            An iterator over the matching keys, each once, in no guaranteed order.
 
         Raises:
             StateBackendUnavailableError: When the backing store is unreachable.
@@ -770,7 +772,7 @@ class EventRecorder(Protocol):
     ``record_processing`` is False, for a synchronous single-process dispatch
     where the intermediate state is never observed) and *completed* / *failed* on
     exit, re-raising any handler exception so the bus keeps its own error
-    semantics (propagate in-process, leave pending on Redis Streams).
+    semantics (propagate in-process, logged and acked on Redis Streams).
 
     Implementations may additionally offer ``record_queued_in(event, db)``, which
     stages the ``queued`` row on the caller's session so it commits or rolls back
@@ -899,6 +901,9 @@ class GeocodedPlace:
         country_code: ISO 3166-1 alpha-2 code, upper-case.
         display_name: The upstream's own single-line description of the place,
             for the services that supply one.
+
+    The upstream is untrusted: a backend leaves a field ``None`` rather than pass on a value longer than 256
+    characters (1024 for ``display_name``) or containing a control character.
     """
 
     locality: str | None = None

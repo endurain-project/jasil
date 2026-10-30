@@ -53,9 +53,21 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
   assembled. A name that resolves publicly at startup and privately afterwards
   is not caught. What *is* caught is the case that matters for an
   operator-supplied setting: a host that was already internal when configured.
+- The reverse direction matters more for the cleartext `+http` forms: a host that
+  was private when configured is checked once, and every later request re-resolves
+  the name. If its record later points at a public address, the coordinates travel
+  unencrypted to it. Mail re-resolves and dials the address it validated on every
+  send; geocoding does not, so keep `+http` for an address you control.
 - `socket.getaddrinfo` takes no timeout, so resolution is bounded by your
   resolver configuration rather than by JASIL. At startup this shows up as a
   slow boot rather than a hung request.
+- `urllib3` logs each request line at `DEBUG`, query string included, and
+  geocode.maps.co takes its `api_key` and the coordinates there. JASIL keeps them out
+  of its own log lines, but a host that turns the root logger to `DEBUG` writes them. Keep
+  `urllib3` at `INFO` or above in production.
+- The text an upstream returns is untrusted: a place name longer than 256
+  characters (1024 for `display_name`) or containing a control character is
+  dropped, not passed on.
 
 ## Outbound mail
 
@@ -121,6 +133,13 @@ pair.
 
 A conformance suite runs the same rules against both backends, so they cannot
 drift apart.
+
+**Limit.** The symlink and base-directory checks run on the path before the
+operation, and the operation then walks the path again. They hold against a storage
+tree that is static or changed in advance, not against a process with write access
+to the tree that swaps a path component for a symlink in between. Write access to
+the data directory is already the operator's trust boundary, so keep it to JASIL's
+own process.
 
 ## Pattern injection into the state store (CWE-77)
 
@@ -227,6 +246,11 @@ hash-chained checkpoints over fixed windows, copied to a write-once sink, make a
 when it must bind every role ([Retention](../audit.md#retention)). The S3 sink writes each checkpoint with a
 conditional `PutObject`; only a bucket policy requiring that condition stops another holder of its credentials from
 replacing one.
+
+**Yours: default privileges.** `grants_sql` revokes on the four tables, not on the daily partitions, which are
+separate tables created by `jasil_audit_ensure_partitions`. A role that inherits `ALTER DEFAULT PRIVILEGES ... GRANT
+SELECT ON TABLES` for the audit schema can read a partition directly although it is refused the parent. Do not let
+default privileges cover the audit schema, or revoke on the partitions after they are created.
 
 **Yours.** Nothing stops the table owner or a database superuser: they can disable the triggers and rewrite rows,
 checkpoints and chain together, and if they delete a period's checkpoints the application re-seals and signs the

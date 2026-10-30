@@ -37,7 +37,7 @@ modules:
 | `jasil.deps` | `get_platform`, `get_state`, `get_storage`, `get_events`, `get_lock`, `get_clock`, `get_mail`, `get_realtime`, `get_geocoding`, and the order they resolve a platform in. |
 | `jasil.jobs.service` | `start_job_worker`, `run_job_worker`, `stop_job_worker`, `schedule_job_maintenance`, `build_runner`. |
 | `jasil.retention` | `prune_expired_records`, `schedule_retention_maintenance`. |
-| `jasil.audit` | Every name in its `__all__`: the catalog (`AuditAction`, `AuditCatalog`, `Category`, `Severity`, `Outcome`, `get_catalog`, the built-in actions and their details models), the context (`AuditContext`, `ActorType`, `Source`, `set_context`, `get_context`, `audit_context`, `configure_provider`, `reset_context`), the write paths (`stage`, `stage_many`, `record_detached`, `AuditRecord`, `get_audit_health`), the query surface (`list_entries`, `get_entry`, `summary`, `list_catalog`, `verify_checkpoints` and the schemas they return), maintenance (`run_audit_maintenance`, `schedule_audit_maintenance`, `sync_catalog`) and the SQL helpers (`grants_sql`, `retention_floor_sql`). The underscore modules (`jasil.audit._postgres`) are private. A host's architecture test should treat `jasil.audit` as public surface. |
+| `jasil.audit` | Every name in its `__all__` except `reset`: the catalog (`AuditAction`, `AuditCatalog`, `Category`, `Severity`, `Outcome`, `get_catalog`, the built-in actions and their details models), the context (`AuditContext`, `ActorType`, `Source`, `set_context`, `get_context`, `audit_context`, `configure_provider`, `reset_context`), the write paths (`stage`, `stage_many`, `record_detached`, `AuditRecord`, `get_audit_health`), the query surface (`list_entries`, `get_entry`, `summary`, `list_catalog`, `verify_checkpoints` and the schemas they return), maintenance (`run_audit_maintenance`, `schedule_audit_maintenance`, `sync_catalog`) and the SQL helpers (`grants_sql`, `retention_floor_sql`). The underscore modules (`jasil.audit._postgres`) are private. A host's architecture test should treat `jasil.audit` as public surface. |
 | `jasil.jobs` | `lease_lost`, `DeferJob`. |
 | `jasil.jobs.registry` | `JobHandlerRegistry` (including its queue registration contract and the `on_dead_letter` callback contract: at-least-once within 10 deliveries and a 7-day window, delivered by the scheduled sweep, idempotent), `DeadLetterCallback`, `DEFAULT_QUEUE`, `MAX_QUEUE_NAME_LENGTH`, `MAX_SUBSCRIBER_ID_LENGTH`, `validate_queue_name`, and the process-wide `registry`. |
 | `jasil.jobs.reconciliation` | `DurableSubscriberNet`, `undeclared_subscribers`, `assert_nets_complete`. |
@@ -108,9 +108,9 @@ These may change in any release, including a patch.
 ### Private modules
 
 `jasil._core` is internal, and the leading underscore is the notice. It holds
-vendored helpers (the SSRF guard, the config slot, the reloading providers behind
-`RuntimeSources`) whose signatures serve JASIL's
-needs, not yours.
+vendored helpers (the SSRF guard, the config slot) whose signatures serve JASIL's
+needs, not yours. The reloading providers behind `RuntimeSources` are in
+`jasil._reloading`, private for the same reason.
 
 Anything else prefixed with `_`, at any level.
 
@@ -135,16 +135,26 @@ These are importable, some from a module's `__all__`, but they serve JASIL's
 wiring and tests:
 
 - `jasil.orm.get_active_base` and `jasil.orm.mapper_registry`.
-- The `reset()` functions of `jasil.orm`, `jasil.settings` and `jasil.correlation`.
-  A host's tests call `jasil.testing.reset_all`, which is covered.
+- The `reset()` functions of `jasil.orm`, `jasil.settings`, `jasil.correlation` and
+  `jasil.audit`. A host's tests call `jasil.testing.reset_all`, which is covered.
+- The limit constants and helpers a public module imports from `jasil._core`:
+  `MAX_AUDIT_*`, `MAX_JOB_BATCH_SIZE`, `MAX_PARTITION_DAYS_AHEAD` and
+  `MAX_RETENTION_DAYS` in `jasil.settings`, `MAX_DASHBOARD_*` and `check_limit` in
+  `jasil.admin`, `MAX_KEY_LENGTH` in `jasil.providers`, and `SMTP_PORTS`,
+  `SMTP_SEND_DEADLINE_SECONDS` and `resolve_reverse_endpoint` in `jasil.container`.
+  Their values are described in the configuration page; the names are not covered.
+- `jasil.testing.DEFAULT_NOW`, `jasil.jobs.registry.normalize_queue_selector` and
+  `JobHandler`, and the `profile`, `web_workers` and `job_worker_mode` fields of
+  `DeploymentTopology`, which is read through `multi_process` and `multi_node`.
 - `jasil.jobs.service.relay_outbox_scheduled`, `reap_expired_jobs_scheduled` and
   `deliver_dead_letters_scheduled`. Register them with `schedule_job_maintenance`,
   which is covered, rather than by name.
 
 ### Backend classes
 
-The classes under `jasil.backends` (`MemoryState`, `RedisState`, `LocalStorage`,
-`S3Storage`, `SmtpMail` and the rest), with their constructors and any method
+The classes in the `jasil.backends` modules (`MemoryState`, `RedisState`,
+`LocalStorage`, `S3Storage`, `SmtpMail` and the rest; none is exported from the
+package itself), with their constructors and any method
 beyond the protocol they implement. A backend is chosen by its URI scheme, which
 is covered, and used through its provider protocol, which is covered too. The two
 test doubles `jasil.testing` re-exports, `MemoryMail` and `InProcessRealtime`, are

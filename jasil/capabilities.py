@@ -416,10 +416,10 @@ def check_lock_consistency(
     The coordination lock makes scheduled and backfill work single-runner across
     processes. Whenever the topology is multi-process, an in-process ``noop://``
     lock coordinates nothing, so every process would run every interval job (the
-    retention prune, a backfill, an upstream sync). The profile-aware default
-    already resolves to ``postgres-advisory://`` under ``distributed``, so this
-    trips on an explicit ``lock_uri="noop://"`` override, or on a ``local``
-    default paired with several processes. A single-process deployment has
+    retention prune, a backfill, an upstream sync). Only the ``local`` profile has
+    a default lock (``noop://``); ``distributed`` and ``custom`` must set one. So
+    this trips on an explicit ``lock_uri="noop://"``, or on the ``local`` default
+    paired with several processes. A single-process deployment has
     nothing to coordinate, so ``noop`` stays valid there.
 
     Args:
@@ -485,8 +485,9 @@ def check_job_worker_consistency(
 
     ``job_worker_mode=standalone`` tells every process that other processes
     consume durable jobs, which makes the other rules stricter. With
-    ``jobs.enabled`` false the jobs layer is dormant, so no such consumer can
-    exist and the declaration would only impose constraints nothing justifies.
+    ``jobs.enabled`` false the publisher writes no durable jobs, so there is
+    nothing for such a consumer to run and the declaration would only impose
+    constraints nothing justifies.
 
     Args:
         topology: The deployment topology.

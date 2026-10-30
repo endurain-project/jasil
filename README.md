@@ -57,6 +57,7 @@ pip install "jasil[all]"             # every optional backend
 | `geocoding` | HTTP reverse geocoding |
 | `migrations` | Packaged Alembic revisions |
 | `audit` | Ed25519 signing of audit checkpoints |
+| `all` | Every optional backend above |
 
 ### Verifying a release
 

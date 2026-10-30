@@ -36,12 +36,14 @@ how long it took, and why it failed:
 | `processing` | A consumer picked it up. |
 | `completed` | Handlers succeeded. |
 | `failed` | A handler raised. |
-| `dead_letter` | Abandoned after retries. |
+| `dead_letter` | Reserved: JASIL never writes it. A durable job that is dead-lettered is tracked in `jasil_processing_jobs` and `jasil_job_attempts`, and the Redis bus acks a failed entry after one attempt. |
 
 !!! note "Best-effort by design"
-    Every write opens its own short-lived session and swallows any storage error.
-    A database hiccup degrades observability rather than breaking event
-    processing — the trail is never the source of truth.
+    Every write opens its own short-lived session and swallows any storage error,
+    except the `queued` row staged beside the outbox row, which joins the
+    producer's transaction in a savepoint. A database hiccup degrades
+    observability rather than breaking event processing — the trail is never the
+    source of truth.
 
 Because the durable route bypasses the bus, an event handed to the outbox is
 recorded `queued` explicitly. Otherwise the dashboard would go dark exactly when
@@ -206,7 +208,7 @@ migrations.verify_schema_current(engine)  # fail fast if not migrated
 
 | Function | Use |
 |---|---|
-| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. Each revision commits on its own, and on PostgreSQL the indexes on `jasil_processing_jobs` are built `CONCURRENTLY`, so the previous release's workers keep claiming jobs while it runs. If a run fails, run it again: it resumes from the last revision that committed, and finishes or rebuilds an interrupted index build. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
+| `upgrade(engine)` | Create or upgrade to head. Run at deploy time. Each revision commits on its own, and on PostgreSQL the indexes on `jasil_processing_jobs` are built `CONCURRENTLY`, so the previous release's workers keep claiming jobs while it runs. The `ALTER TABLE ... ADD COLUMN` statements still take a brief exclusive lock on that table, and if a long transaction holds it every claim queues behind them, so run the upgrade when none is open. If a run fails, run it again: it resumes from the last revision that committed, and finishes or rebuilds an interrupted index build. On PostgreSQL and MySQL, processes upgrading at once take turns on a database lock, and the later ones find nothing left to do; SQLite serves a single process and is not locked. |
 | `downgrade(engine, "base")` | Drop JASIL's tables. |
 | `adopt_existing_schema(engine)` | Validate and adopt unversioned JASIL tables at head or an earlier revision. |
 | `head_revision()` | The newest revision shipped in this package. |

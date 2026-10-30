@@ -6,7 +6,12 @@ and worker all run on every process and coordinate through ``SELECT ... FOR
 UPDATE SKIP LOCKED`` plus compare-and-set claims and the idempotent job fan-out
 (dedup on ``event_id + subscriber_id``), so replicas scale horizontally without a
 single-runner lock — duplicate work is skipped or deduplicated rather than
-serialized. All of this is inert unless durable jobs are enabled.
+serialized.
+
+``jobs.enabled`` gates only what the publisher writes: with it false no durable
+job or outbox row is produced. None of the functions here reads it, so a host starts the
+worker and registers the maintenance only in the deployments that enable durable
+jobs (and have migrated the tables); otherwise they poll for work that never comes.
 """
 
 import logging

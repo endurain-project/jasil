@@ -439,7 +439,11 @@ infrastructure beyond the database you already have; the lock name is hashed to 
 signed 64-bit key because `pg_advisory_lock` keys are `bigint`. The lock is held on
 a connection in autocommit mode, so no transaction sits open (and idle) while the
 guarded work runs, and `idle_in_transaction_session_timeout` cannot end the
-session and release the lock underneath it.
+session and release the lock underneath it. That connection comes from your
+engine's pool and stays checked out for the whole body, so a pool that is
+exhausted makes `try_acquire` wait for `pool_timeout` and then raise instead of
+yielding `False`, and a body that opens sessions from the same engine competes
+with the lock for a slot. Size the pool for one extra connection per lock held.
 
 The lock lasts as long as that connection. If the connection drops while the
 guarded work runs (a database restart, a failover, a network cut), PostgreSQL
@@ -450,15 +454,18 @@ interrupted: JASIL sees the loss only when it releases the lock, and logs it at
 ## ClockProvider
 
 `SystemClock` returns timezone-aware UTC. It exists so time can be injected in
-tests without patching `datetime` globally — every module that needs "now" takes
-it from the platform.
+tests without patching `datetime` globally — the modules that stamp or compare
+rows take "now" from the platform. The two state backends are the exception:
+`MemoryState` and `RedisState` read the process clock for expiry and for the
+lockout gate in `record_tiered_failure`, so a test of their expiry patches the
+clock the backend module reads.
 
 ## GeocodingProvider
 
 | Backend | Notes |
 |---|---|
 | `NullGeocoding` | Resolves nothing. Selected when geocoding is unconfigured or misconfigured. |
-| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co, chosen by the `geocoding.uri` scheme. Requires the `geocoding` extra. |
+| `HttpGeocoding` | Nominatim, Photon, or geocode.maps.co, chosen by the `geocoding.uri` scheme: `nominatim://`, `photon://` or `geocode://`, and `nominatim+http://` or `photon+http://` for a cleartext instance on a private network. Requires the `geocoding` extra. |
 
 `reverse(latitude, longitude)` returns a `GeocodedPlace` or `None`. Its fields are
 administrative levels, filled the same way whichever service answered:
