@@ -19,11 +19,12 @@ from collections.abc import Sequence
 logger = logging.getLogger(__name__)
 
 # RFC 1123 hostname syntax: labels of 1-63 alphanumeric/hyphen characters,
-# separated by dots. Hyphens may not start or end a label.
+# separated by dots. Hyphens may not start or end a label. ASCII-only, so case folding cannot admit letters
+# such as the Kelvin sign, and matched with ``fullmatch`` because ``$`` also accepts a trailing newline.
 _HOSTNAME_RE = re.compile(
-    r"^(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)"  # first label
-    r"(?:\.(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?))*$",  # more
-    re.IGNORECASE,
+    r"(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)"  # first label
+    r"(?:\.(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?))*",  # more
+    re.IGNORECASE | re.ASCII,
 )
 
 # Reasons a destination is refused. Phrased to read correctly after a host value.
@@ -52,7 +53,7 @@ def is_valid_hostname(value: str) -> bool:
     Returns:
         True when ``value`` conforms to RFC 1123 hostname syntax.
     """
-    return len(value) <= 253 and _HOSTNAME_RE.match(value) is not None
+    return len(value) <= 253 and _HOSTNAME_RE.fullmatch(value) is not None
 
 
 def _is_private_or_reserved(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:

@@ -136,6 +136,9 @@ class TestAuthorityValidation:
             pytest.param("exa mple.com", id="space"),
             pytest.param("-example.com", id="leading-hyphen"),
             pytest.param("a" * 254, id="over-long-hostname"),
+            pytest.param("example.com\n", id="trailing-newline"),
+            pytest.param("\u0130" * 40, id="unicode-case-fold-letter"),
+            pytest.param("\u212a.example.com", id="kelvin-sign"),
         ],
     )
     def test_a_value_that_is_not_a_bare_authority_is_refused(self, host):
