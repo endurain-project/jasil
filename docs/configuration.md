@@ -5,6 +5,7 @@ JASIL never reads environment variables or secret files. The host builds a
 secrets manager — and installs it once at startup:
 
 ```python
+import jasil
 import jasil.settings as jasil_settings
 
 jasil_settings.configure(

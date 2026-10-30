@@ -131,6 +131,9 @@ publish("order.created", {"order_id": 42}, source="api:create_order", db=db)
 Change the profile and point the capability URIs at real infrastructure:
 
 ```python
+import jasil
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         profile=jasil.DeploymentProfile.DISTRIBUTED,

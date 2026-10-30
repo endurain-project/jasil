@@ -169,8 +169,10 @@ def build_platform(
     Raises:
         ValueError: When a capability URI uses an unsupported scheme, is unset
             under a profile that has no default for it, when the resolved
-            wiring contradicts the deployment topology, or when ``mail`` is
-            configured incorrectly.
+            wiring contradicts the deployment topology, when ``mail`` is
+            configured incorrectly, or when a host that must be private (cleartext
+            mail) does not resolve yet. That last one is transient: a later build
+            may succeed, so retry it rather than treating it as a settings error.
         RuntimeError: When a selected Redis backend cannot be reached.
     """
     settings = settings if settings is not None else get_settings()
