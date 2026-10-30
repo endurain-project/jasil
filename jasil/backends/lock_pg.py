@@ -69,8 +69,14 @@ class PgAdvisoryLock:
         connection = self._engine.connect().execution_options(isolation_level="AUTOCOMMIT")
         acquired = False
         try:
-            result = connection.execute(text("SELECT pg_try_advisory_lock(CAST(:key AS bigint))"), {"key": key})
-            acquired = bool(result.scalar())
+            try:
+                result = connection.execute(text("SELECT pg_try_advisory_lock(CAST(:key AS bigint))"), {"key": key})
+                acquired = bool(result.scalar())
+            except BaseException:
+                # The server may have granted the lock before the client saw this fail, and a pooled session would
+                # keep it: dropped rather than returned, as when the unlock fails.
+                connection.invalidate()
+                raise
             yield acquired
         finally:
             if acquired:

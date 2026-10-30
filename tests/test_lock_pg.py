@@ -22,7 +22,15 @@ from jasil.providers import LockProvider
 class FakeConnection:
     """Records the SQL it is asked to run, and whether it was closed or discarded."""
 
-    def __init__(self, *, acquired: bool = True, unlock_error: Exception | None = None, unlocked: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        acquired: bool = True,
+        unlock_error: Exception | None = None,
+        unlocked: bool = True,
+        acquire_error: Exception | None = None,
+    ) -> None:
+        self._acquire_error = acquire_error
         self._acquired = acquired
         self._unlock_error = unlock_error
         self._unlocked = unlocked
@@ -42,6 +50,8 @@ class FakeConnection:
             if self._unlock_error is not None:
                 raise self._unlock_error
             return FakeResult(self._unlocked)
+        if self._acquire_error is not None:
+            raise self._acquire_error
         return FakeResult(self._acquired)
 
     def close(self):
@@ -113,6 +123,16 @@ class TestAcquisition:
         text, parameters = connection.statements[0]
         assert "pg_try_advisory_lock" in text
         assert parameters == {"key": advisory_key("backfill")}
+
+    def test_a_failure_of_the_acquire_statement_discards_the_session(self):
+        """The server may have granted the lock before the client saw the error, and a pooled session keeps it."""
+        connection = FakeConnection(acquire_error=OSError("cancelled"))
+
+        with pytest.raises(OSError, match="cancelled"), PgAdvisoryLock(FakeEngine(connection)).try_acquire("backfill"):
+            pass  # pragma: no cover - the acquire raises first
+
+        assert connection.invalidated is True
+        assert connection.closed is True
 
     def test_a_ttl_is_ignored(self):
         """A session advisory lock lives until unlock or disconnect; there is no TTL."""
