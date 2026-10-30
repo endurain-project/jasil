@@ -116,6 +116,19 @@ class Event:
     max_attempts: int | None = None
     deferral_count: int = 0
 
+    def __post_init__(self) -> None:
+        """Refuse a payload or metadata that is not a dict.
+
+        Both are written to JSON columns that accept any JSON value, and read back with ``dict(...)``, so a
+        list stored today would fail the outbox relay's read on every pass and stall everything queued behind it.
+
+        Raises:
+            TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
+        """
+        for name in ("payload", "metadata"):
+            if not isinstance(getattr(self, name), dict):
+                raise TypeError(f"{name} must be a dict, not {type(getattr(self, name)).__name__}")
+
     @property
     def attempt(self) -> int | None:
         """The 1-based attempt a durable handler is running; ``None`` when ``max_attempts`` is unset (not a durable delivery)."""
@@ -158,6 +171,7 @@ def new_event(
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
             than the column it is persisted in.
+        TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
     """
     resolved_event_id = event_id or str(uuid.uuid4())
     check_length(resolved_event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)

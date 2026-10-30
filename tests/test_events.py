@@ -140,6 +140,23 @@ def _event_at(version: int, payload: dict) -> Event:
     return new_event("thing.happened", payload, source="test", schema_version=version)
 
 
+class TestEnvelopeContentTypes:
+    """A payload that is not a dict would be stored, then fail every time the outbox relay reads it."""
+
+    @pytest.mark.parametrize("payload", [["not", "a", "dict"], "text", None, 7])
+    def test_a_payload_that_is_not_a_dict_is_refused(self, payload):
+        with pytest.raises(TypeError, match="payload must be a dict"):
+            new_event("activity.created", payload, source="test")
+
+    def test_metadata_that_is_not_a_dict_is_refused(self):
+        with pytest.raises(TypeError, match="metadata must be a dict"):
+            new_event("activity.created", {}, source="test", metadata=["x"])  # type: ignore[arg-type]
+
+    def test_an_envelope_built_by_hand_is_checked_too(self):
+        with pytest.raises(TypeError, match="payload must be a dict"):
+            Event(event_id="e", event_type="t", source="s", timestamp="2026-01-01T00:00:00+00:00", payload=[])
+
+
 class TestParsePayload:
     def test_a_current_version_payload_validates_directly(self):
         event = _event_at(3, {"name": "n", "added_in_v2": "a", "added_in_v3": "b"})
