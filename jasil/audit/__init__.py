@@ -8,7 +8,8 @@ workers. No bus, outbox or Redis is involved.
 * Declare actions in the catalog (:func:`get_catalog`, :class:`AuditAction`).
 * Set who is acting with :func:`set_context` (or :func:`audit_context` in a worker or CLI command).
 * Write with :func:`stage` inside a transaction, or :func:`record_detached` where there is none.
-* Run :func:`run_audit_maintenance` on a schedule; read with :func:`list_entries` and friends.
+* Run :func:`run_audit_maintenance` on a schedule (:func:`configure_retention_source` for a retention the host
+  edits at run time); read with :func:`list_entries` and friends.
 
 Importing this package is safe at any point: the models are imported on first use, so it works before
 :func:`jasil.orm.map_models`. Everything exported here is public API; the underscore modules and
@@ -17,6 +18,7 @@ Importing this package is safe at any point: the models are imported on first us
 
 import jasil.audit.catalog as _catalog
 import jasil.audit.context as _context
+import jasil.audit.retention as _retention
 import jasil.audit.service as _service
 from jasil.audit.catalog import (
     CATALOG_SYNC,
@@ -53,6 +55,7 @@ from jasil.audit.maintenance import (
     sync_catalog,
 )
 from jasil.audit.query import get_entry, list_catalog, list_entries, summary, verify_checkpoints
+from jasil.audit.retention import AuditRetention, configure_retention_source
 from jasil.audit.schema import (
     ActionCount,
     AuditActionInfo,
@@ -91,6 +94,7 @@ __all__ = [
     "AuditHealth",
     "AuditPage",
     "AuditRecord",
+    "AuditRetention",
     "AuditSummary",
     "CatalogSyncDetails",
     "CatalogSyncResult",
@@ -108,6 +112,7 @@ __all__ = [
     "WindowVerification",
     "audit_context",
     "configure_provider",
+    "configure_retention_source",
     "get_audit_health",
     "get_catalog",
     "get_context",
@@ -136,9 +141,10 @@ reset_context = _context.reset
 def reset() -> None:
     """Restore the audit module to its start state: built-in catalog only, no context, no observers.
 
-    Also forgets the cached instance id and the health counters. For tests; production configures once
-    at startup and never resets.
+    Also removes the retention source and forgets the cached instance id and the health counters. For tests;
+    production configures once at startup and never resets.
     """
     _catalog.reset()
     _context.reset()
+    _retention.reset()
     _service.reset()
