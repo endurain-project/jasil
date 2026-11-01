@@ -159,6 +159,16 @@ class TestEnvelopeContentTypes:
         with pytest.raises(TypeError, match="metadata must be a dict"):
             new_event("activity.created", {}, source="test", metadata=["x"])  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("request_id", [123, ["req-1"], b"req-1"])
+    def test_a_request_id_that_is_not_a_string_is_refused(self, request_id):
+        """A durable handler runs under it as its correlation id, and an audit row could not store anything else."""
+        with pytest.raises(TypeError, match="request_id must be a str"):
+            new_event("activity.created", {}, source="test", metadata={META_REQUEST_ID: request_id})
+
+    @pytest.mark.parametrize("metadata", [{}, {META_REQUEST_ID: None}, {META_REQUEST_ID: "req-1"}])
+    def test_a_string_or_absent_request_id_is_accepted(self, metadata):
+        assert new_event("activity.created", {}, source="test", metadata=metadata).metadata == metadata
+
     def test_an_envelope_built_by_hand_is_checked_too(self):
         with pytest.raises(TypeError, match="payload must be a dict"):
             Event(event_id="e", event_type="t", source="s", timestamp="2026-01-01T00:00:00+00:00", payload=[])

@@ -19,6 +19,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 ### Changed
 
 - An audit row staged in a durable job handler now says `system`/`worker` with the handler's `event_id`, and carries the originating request id, where it used to say `anonymous`/`api` with no event or request id (or whatever the host's providers returned in the worker thread). A handler that set `set_context(...)` / `set_correlation_id(...)` itself must use `audit_context(...)` / `correlation_scope(...)` instead: the runner's scopes win over both.
+- `new_event`, and so every publish, raises `TypeError` when `metadata["request_id"]` (`META_REQUEST_ID`) is neither a string nor `None`. Such a value would have become a durable handler's correlation id and failed every audit row it staged. Envelopes rebuilt from stored rows are not checked, so a row written before this release is still handled.
 - Migration `rev0007` adds `jasil_processing_jobs.continuations` and `budget_offset` (both default 0). The budget against `max_attempts` is now `attempts - deferrals - budget_offset`, used by failures, the reaper and `Event.retry_count`; a continuation sets `budget_offset` to `attempts - deferrals`. Without continuations nothing changes. Run the migration before deploying; processes of the previous release neither read nor write the columns, and would count the claims before a job's last continuation as attempts.
 
 No breaking changes: `ContinueJob` is opt-in, and a job that never continues behaves exactly as before.

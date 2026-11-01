@@ -175,13 +175,14 @@ def new_event(
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
             than the column it is persisted in.
-        TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
+        TypeError: When ``payload`` or ``metadata`` is not a ``dict``, or the
+            ``metadata`` :data:`META_REQUEST_ID` is neither a ``str`` nor ``None``.
     """
     resolved_event_id = event_id or str(uuid.uuid4())
     check_length(resolved_event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)
     check_length(event_type, field="event_type", limit=MAX_EVENT_TYPE_LENGTH)
     check_length(source, field="source", limit=MAX_SOURCE_LENGTH)
-    return Event(
+    event = Event(
         event_id=resolved_event_id,
         event_type=event_type,
         source=source,
@@ -191,3 +192,9 @@ def new_event(
         retry_count=retry_count,
         schema_version=schema_version,
     )
+    # Checked here, not in Event, so a stored envelope is still rebuilt and handled rather than wedging its reader:
+    # a durable handler runs under this id as its correlation id, which audit rows store as text.
+    request_id = event.metadata.get(META_REQUEST_ID)
+    if request_id is not None and not isinstance(request_id, str):
+        raise TypeError(f"metadata {META_REQUEST_ID} must be a str, not {type(request_id).__name__}")
+    return event
