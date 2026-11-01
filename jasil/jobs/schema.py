@@ -95,8 +95,9 @@ class DeadLetterJob(BaseModel):
         source: Where the originating event came from.
         attempts: Claims made before dead-lettering, deferred ones included.
         deferrals: Of those, the claims the handler deferred with ``DeferJob``; they
-            do not count against ``max_attempts``, so the attempts spent are
-            ``attempts - deferrals``.
+            do not count against ``max_attempts``.
+        continuations: Of those, the claims the handler ended with ``ContinueJob``;
+            each restarts the count against ``max_attempts``.
         max_attempts: The attempt ceiling that was reached.
         last_error: The final failure reason.
         created_at: When the job was enqueued.
@@ -115,6 +116,7 @@ class DeadLetterJob(BaseModel):
     source: str
     attempts: int
     deferrals: int = 0
+    continuations: int = 0
     max_attempts: int
     last_error: str | None
     created_at: datetime
@@ -222,6 +224,8 @@ class JobDetail(BaseModel):
         attempts: Claims made so far, deferred ones included.
         deferrals: Of those, the claims the handler deferred with ``DeferJob``;
             they do not count against ``max_attempts``.
+        continuations: Of those, the claims the handler ended with ``ContinueJob``;
+            each restarts the count against ``max_attempts``.
         max_attempts: The attempt ceiling.
         locked_by: The worker holding it now, while claimed.
         last_error: The most recent failure reason.
@@ -247,6 +251,7 @@ class JobDetail(BaseModel):
     status: str
     attempts: int
     deferrals: int = 0
+    continuations: int = 0
     max_attempts: int
     locked_by: str | None
     last_error: str | None

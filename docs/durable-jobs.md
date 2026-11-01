@@ -44,7 +44,8 @@ queued work.
 The handler must **raise** on failure. That is what drives retry. Returning
 normally completes the job. A handler that is only *waiting* (a rate limit that
 clears in a few minutes) raises [`DeferJob`](#deferring-a-job) instead, which
-reschedules the job without failing it.
+reschedules the job without failing it. A handler that made progress and has work
+left raises [`ContinueJob`](#continuing-a-job) to requeue itself for the rest.
 
 Every registration has a named queue. Existing calls use `default`; select one
 when the subscriber is registered when independent worker capacity matters:
@@ -77,9 +78,10 @@ job row by the same comparison that dead-letters the job:
 | `event.max_attempts` | The ceiling stamped on the job when it was enqueued. A later change to the `max_attempts` setting does not alter jobs already queued. |
 | `event.is_last_attempt` | `True` when a failure now dead-letters the job (`attempt >= max_attempts`). |
 | `event.deferral_count` | How many earlier runs of this job the handler [deferred](#deferring-a-job). They are not attempts, so they are not in `attempt` or `retry_count`. `0` on a first run. |
+| `event.continuation_count` | How many earlier runs of this job the handler [continued](#continuing-a-job). Each restarts the attempt count, so `attempt` counts only the runs since the last one. `0` on a first run. |
 
 Use `event.is_last_attempt` rather than comparing `retry_count` with a setting.
-A replay (`replay_dead_letter_job`) restarts both counts.
+A replay (`replay_dead_letter_job`) restarts all three counts.
 
 ### Deferring a job
 
@@ -125,6 +127,46 @@ Guard rails, so a bad value cannot park or spin a job:
 The handler's side effects before it raises are not rolled back, so the handler
 stays idempotent, as for any retry. Do not sleep in a handler to wait out a
 condition: that holds a lease and a worker slot. Defer instead.
+
+### Continuing a job
+
+A handler that works through a large backlog in bounded passes (rate-limited
+sends, a paginated export, a large import) does one pass, then requeues itself
+for the rest, so the worker stays free for other jobs in between. Raise
+`ContinueJob` once the pass has settled something:
+
+```python
+from jasil.jobs import ContinueJob
+
+
+def send_campaign(event):
+    sent = send_next_batch(event.payload["campaign_id"], limit=25)
+    if sent == 25:
+        raise ContinueJob(delay_seconds=2, reason=f"sent {sent}, more to send")
+```
+
+The runner returns the job to `pending`, available `delay_seconds` from now
+(default `0`), with its lease cleared and `last_error` set to `reason`. A
+continuation is neither a failure nor a deferral:
+
+- It does not count against `jobs.max_deferrals`, so a long run is not cut short
+  by the guard meant for a stuck handler.
+- It restarts the failure budget: `max_attempts` bounds the failures since the
+  last continuation, not the length of the run. The next run is attempt 1 again.
+- The delay is clamped to between 0 and `jobs.defer_max_seconds`, with no jitter.
+  A delay that is not a finite number raises `ValueError` from `ContinueJob`
+  itself, which fails the attempt.
+- After `jobs.max_continuations` continuations (default 10 000) the next
+  `ContinueJob` is treated as an ordinary failure, so a handler that continues
+  without making progress cannot loop forever. `0` disables continuation.
+- Like any write by the runner it applies only while the worker still owns the
+  claim; a lost claim is logged and changes nothing.
+
+It is recorded as a `continued` [attempt](observability.md#job-attempts) and
+logged at `INFO` (`available_at`, `reason` and `continuations` in the log
+context). Use `DeferJob`, not `ContinueJob`, when the pass made no progress
+because something is in the way. The side effects of each pass must be
+idempotent, as for any retry.
 
 ### Reacting to a dead letter
 
@@ -208,6 +250,7 @@ enqueue ──▶ pending ──claim──▶ claimed ──success────
               ▲                   │
               │                   ├──failure, attempts left──▶ pending, after a backoff
               │                   ├──deferred (DeferJob)─────▶ pending, at retry_at; not an attempt
+              │                   ├──continued (ContinueJob)─▶ pending, after its delay; budget restarts
               │                   ├──released, never started─▶ pending at once; attempt refunded
               │                   ├──failure, ceiling hit────▶ dead_letter
               │                   └──lease expired───────────▶ pending | dead_letter
@@ -275,7 +318,10 @@ Only real attempts count. A run the handler [deferred](#deferring-a-job) with
 `DeferJob` is neither a failure nor an attempt: `jasil_processing_jobs.attempts`
 still counts every claim (it identifies the claim), `deferrals` counts the
 deferred ones, and the budget spent against `max_attempts`, and the exponent of
-the backoff above, is `attempts - deferrals`. The reaper uses the same budget.
+the backoff above, is `attempts - deferrals - budget_offset`. A run the handler
+[continued](#continuing-a-job) sets `budget_offset` to `attempts - deferrals`, so
+only the claims after the last continuation count; `continuations` counts the
+continued runs. The reaper uses the same budget.
 
 ### Lease reclamation
 

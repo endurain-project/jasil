@@ -59,7 +59,10 @@ class ProcessingJob(Base):
         attempts: Claims so far, deferred ones included; incremented when the job is claimed.
         deferrals: Claims the handler deferred with ``DeferJob``. ``attempts``
             keeps counting every claim (it fences the claim); the budget spent
-            against ``max_attempts`` is ``attempts - deferrals``.
+            against ``max_attempts`` is ``attempts - deferrals - budget_offset``.
+        continuations: Claims the handler ended with ``ContinueJob``.
+        budget_offset: ``attempts - deferrals`` as of the last continuation, so
+            the failure budget counts only claims made since then.
         max_attempts: Attempt ceiling before the job is dead-lettered.
         available_at: Earliest instant the job may be claimed (backoff gate).
         locked_by: The worker holding the current lease, when claimed.
@@ -177,6 +180,20 @@ class ProcessingJob(Base):
         default=0,
         server_default="0",
         comment="Claims the handler deferred with DeferJob; they do not count against max_attempts",
+    )
+    continuations: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="Claims the handler ended with ContinueJob",
+    )
+    budget_offset: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="attempts - deferrals at the last ContinueJob; the failure budget counts claims after it",
     )
     max_attempts: Mapped[int] = mapped_column(
         Integer,

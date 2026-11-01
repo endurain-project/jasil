@@ -18,7 +18,7 @@ def defer_seconds(
     jitter: bool = True,
 ) -> float:
     """
-    Compute how long a deferred job waits.
+    Compute how long a deferred or continued job waits.
 
     The request is clamped to ``[0, max_seconds]``; when ``jitter`` is set up to
     10% of it is added, so jobs deferred to the same instant (a shared rate limit)

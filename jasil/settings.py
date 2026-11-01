@@ -84,9 +84,12 @@ class JobSettings:
         backoff_max_seconds: Ceiling for the exponential backoff; not below
             ``backoff_base_seconds``.
         defer_max_seconds: Furthest ahead a handler may defer itself with
-            ``DeferJob``; a later ``retry_at`` is clamped to it.
+            ``DeferJob``, or wait between passes with ``ContinueJob``; a later
+            instant is clamped to it.
         max_deferrals: Deferrals a job may take before a further ``DeferJob``
             is treated as an ordinary failure.
+        max_continuations: Continuations a job may take before a further
+            ``ContinueJob`` is treated as an ordinary failure. At least 0.
         poll_interval_seconds: Idle wait between empty polls; greater than zero.
         max_runtime_seconds: The longest a single handler is kept leased. Past it
             the job is abandoned to the reaper, the handler is told to stop
@@ -115,6 +118,7 @@ class JobSettings:
     backoff_max_seconds: int = 3600
     defer_max_seconds: int = 86400
     max_deferrals: int = 100
+    max_continuations: int = 10_000
     poll_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
@@ -144,6 +148,7 @@ class JobSettings:
             "backoff_base_seconds": 0,
             "defer_max_seconds": 0,
             "max_deferrals": 0,
+            "max_continuations": 0,
         }
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
