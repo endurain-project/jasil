@@ -288,7 +288,8 @@ the runtime role as `maintenance_role` is the explicit way to choose the former.
 separate function from [`prune_expired_records`](observability.md#retention) with its own lock
 (`jasil_audit_maintenance`), so neither can block the other. Under the platform's `LockProvider`, in order:
 
-1. **Record a retention change**: if `audit.retention_days` or `audit.legal_hold` differs from what the last run
+1. **Record a retention change**: if `audit.retention_days` or `audit.legal_hold` (or what the
+   [retention source](#retention-the-host-edits-at-run-time) returns) differs from what the last run
    stored in `jasil_instance`, stage `audit.retention.change` (the first run only records the baseline).
 2. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL).
 3. **Seal the checkpoints** that are due.
@@ -326,6 +327,33 @@ For a hold the database enforces, revoke that right for its duration
 afterwards; maintenance does not call it while `legal_hold` is set. `retention_floor_days` (30) is the database-side minimum described [above](#the-retention-floor); a
 positive `retention_days` below it is a configuration error. The host maps its own deployment profiles onto
 `retention_days`; JASIL supplies only the neutral default.
+
+#### Retention the host edits at run time
+
+When an administrator changes retention while the system runs (a value in the host's own database, edited from a
+settings page), install a source instead of reconfiguring JASIL:
+
+```python
+import jasil.audit as jasil_audit
+
+
+def current_retention() -> jasil_audit.AuditRetention:
+    return jasil_audit.AuditRetention(retention_days=load_retention_days(), legal_hold=load_legal_hold())
+
+
+jasil_audit.configure_retention_source(current_retention)  # None reads audit.retention_days / legal_hold again
+```
+
+`load_retention_days` and `load_legal_hold` stand for the host's own lookups. While a source is installed,
+`audit.retention_days` and `audit.legal_hold` are ignored. `run_audit_maintenance` calls the source once per run,
+under its lock (a replica that does not hold the lock never calls it), and uses that one value for every step: the
+retention-change record, the `retention_days` and `legal_hold` each sealed checkpoint records, and the prune. The
+write path never calls it. Keep it cheap; it may raise.
+
+The value is validated as `AuditSettings` is: a positive `retention_days` below `retention_floor_days`, or above
+36500, is refused. When the source raises or returns a refused value, the error is logged, no checkpoint is sealed and
+nothing is pruned, and only the partitions step runs; the next run with a valid value catches up. On PostgreSQL the
+floor baked into `jasil_audit_drop_partitions` by the migration still applies whatever the source returns.
 
 ## Tamper evidence
 

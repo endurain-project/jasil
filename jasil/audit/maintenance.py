@@ -32,7 +32,7 @@ import jasil.runtime as platform_runtime
 from jasil._core.pruning import bounded_delete
 from jasil._core.timestamps import as_utc
 from jasil.audit import _postgres as audit_pg
-from jasil.audit import checkpoints, service
+from jasil.audit import checkpoints, retention, service
 from jasil.audit.catalog import (
     CATALOG_SYNC,
     RETENTION_CHANGE,
@@ -43,7 +43,7 @@ from jasil.audit.catalog import (
     get_catalog,
 )
 from jasil.audit.context import ActorType, AuditContext, Source, audit_context
-from jasil.settings import get_settings
+from jasil.settings import AuditSettings, get_settings
 
 if TYPE_CHECKING:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -180,13 +180,15 @@ def run_audit_maintenance() -> None:
     newest sealed checkpoint allows, so while sealing fails or is catching up it prunes less or nothing.
     Idempotent, and a no-op while another replica holds the lock or ``audit.enabled`` is false.
 
-    Retention is skipped while ``audit.legal_hold`` is set or ``audit.retention_days`` is ``<= 0``.
+    Retention is skipped while ``audit.legal_hold`` is set or ``audit.retention_days`` is ``<= 0``. When a source
+    is installed with :func:`jasil.audit.configure_retention_source`, it is called once, under the lock, and
+    supplies both for every step of the run; if it raises or returns a value the settings would refuse, the
+    error is logged and only the partitions step runs.
 
     Returns:
         None.
     """
-    settings = get_settings().audit
-    if not settings.enabled:
+    if not get_settings().audit.enabled:
         return
     platform = platform_runtime.get_active_platform()
     with platform.lock.try_acquire(_LOCK_NAME) as acquired:
@@ -194,12 +196,20 @@ def run_audit_maintenance() -> None:
             logger.debug("Audit maintenance: another replica holds the lock; skipping")
             return
         now = platform.clock.now()
-        steps: tuple[tuple[str, Callable[[], object]], ...] = (
-            ("retention settings", _record_retention_change),
-            ("partitions", _ensure_partitions),
-            ("checkpoints", lambda: checkpoints.seal_pending_windows(now)),
-            ("retention", lambda: _apply_retention(now)),
-        )
+        steps: tuple[tuple[str, Callable[[], object]], ...]
+        try:
+            settings = retention.effective_settings()
+        except Exception:
+            # Sealing records the retention and pruning applies it, so neither may run on a value never accepted.
+            logger.exception("Audit maintenance: the retention source failed; only the partitions step runs")
+            steps = (("partitions", _ensure_partitions),)
+        else:
+            steps = (
+                ("retention settings", lambda: _record_retention_change(settings)),
+                ("partitions", _ensure_partitions),
+                ("checkpoints", lambda: checkpoints.seal_pending_windows(now, settings)),
+                ("retention", lambda: _apply_retention(now, settings)),
+            )
         for name, step in steps:
             try:
                 step()
@@ -207,11 +217,10 @@ def run_audit_maintenance() -> None:
                 logger.exception("Audit maintenance step %r failed", name)
 
 
-def _record_retention_change() -> None:
-    """Stage ``audit.retention.change`` when the retention settings differ from the last run's."""
+def _record_retention_change(settings: AuditSettings) -> None:
+    """Stage ``audit.retention.change`` when the retention in ``settings`` differs from the last run's."""
     from jasil.audit.models import Instance
 
-    settings = get_settings().audit
     with jasil_orm.get_sessionmaker()() as db:
         service.ensure_instance_id(service.engine_of(db))
         row: Instance = db.scalars(select(Instance).where(Instance.id == 1)).one()
@@ -268,8 +277,7 @@ def _ensure_partitions() -> None:
         db.commit()
 
 
-def _apply_retention(now: datetime) -> None:
-    settings = get_settings().audit
+def _apply_retention(now: datetime, settings: AuditSettings) -> None:
     if settings.legal_hold:
         logger.info("Audit retention: legal hold is set; nothing is pruned")
         return

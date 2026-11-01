@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 import jasil.audit as jasil_audit
 import jasil.audit.maintenance as maintenance
+import jasil.audit.retention as jasil_audit_retention
 import jasil.runtime as runtime
 from jasil.audit import AuditAction, Category, Outcome, Severity
 from jasil.audit.models import AuditActionRecord, AuditCheckpoint, AuditLog, Instance
@@ -225,7 +226,7 @@ class TestRetention:
         jasil_audit.run_audit_maintenance()  # seals up to 50 days ago under a 90-day retention
         audit_env.configure(retention_days=30)
         audit_env.clock.moment = T0
-        monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now: 1 / 0)
+        monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now, settings: 1 / 0)
 
         jasil_audit.run_audit_maintenance()
 
@@ -240,7 +241,7 @@ class TestRetention:
             db.commit()
         audit_env.clock.moment = T0 + timedelta(days=1)
 
-        maintenance._apply_retention(T0 + timedelta(days=1))
+        maintenance._apply_retention(T0 + timedelta(days=1), jasil_audit_retention.effective_settings())
 
         assert self._targets(session_factory) == before
 
@@ -354,6 +355,112 @@ class TestRetentionChange:
         assert (change.actor_type, change.severity) == ("system", "high")
 
 
+class TestRetentionSource:
+    @pytest.fixture(autouse=True)
+    def _old_and_new(self, actions, audit_env, session_factory):
+        audit_env.configure(checkpoint_window_minutes=1440)
+        _write(audit_env, actions[0], T0 - timedelta(days=100))
+        _write(audit_env, actions[1], T0 - timedelta(days=10))
+
+    def _targets(self, session_factory) -> list[str]:
+        return [row.action_id for row in _rows(session_factory, AuditLog, AuditLog.occurred_at)]
+
+    def test_the_source_replaces_the_settings_for_every_step(self, audit_env, session_factory):
+        jasil_audit.run_audit_maintenance()  # the baseline: 90 days, no hold
+        jasil_audit.configure_retention_source(lambda: jasil_audit.AuditRetention(retention_days=5, legal_hold=False))
+        audit_env.configure(retention_floor_days=1)
+        audit_env.clock.moment = T0 + timedelta(days=2)
+
+        jasil_audit.run_audit_maintenance()
+
+        (change,) = [row for row in _rows(session_factory, AuditLog) if row.action_id == "audit.retention.change"]
+        assert change.details["retention_days_after"] == 5
+        newest = _rows(session_factory, AuditCheckpoint, AuditCheckpoint.window_start.desc())[0]
+        assert (newest.retention_days, newest.legal_hold) == (5, False)
+        assert "shop.order.cancel" not in self._targets(session_factory)
+
+    def test_it_is_called_once_per_run(self, audit_env):
+        calls = []
+
+        def source():
+            calls.append(1)
+            return jasil_audit.AuditRetention(retention_days=90)
+
+        jasil_audit.configure_retention_source(source)
+
+        jasil_audit.run_audit_maintenance()
+
+        assert len(calls) == 1
+
+    def test_its_legal_hold_suspends_pruning(self, session_factory):
+        jasil_audit.configure_retention_source(lambda: jasil_audit.AuditRetention(retention_days=90, legal_hold=True))
+
+        jasil_audit.run_audit_maintenance()
+
+        assert "shop.order.place" in self._targets(session_factory)
+        assert all(checkpoint.legal_hold for checkpoint in _rows(session_factory, AuditCheckpoint))
+
+    @pytest.mark.parametrize("retention_days", [5, 40_000])
+    def test_a_value_the_settings_would_refuse_prunes_and_seals_nothing(
+        self, retention_days, audit_env, session_factory, monkeypatch, caplog
+    ):
+        partitions = []
+        monkeypatch.setattr(maintenance, "_ensure_partitions", lambda: partitions.append(1))
+        jasil_audit.configure_retention_source(lambda: jasil_audit.AuditRetention(retention_days=retention_days))
+
+        with caplog.at_level(logging.ERROR):
+            jasil_audit.run_audit_maintenance()
+
+        assert "shop.order.place" in self._targets(session_factory)
+        assert _rows(session_factory, AuditCheckpoint) == []
+        assert _rows(session_factory, Instance)[0].retention_days is None  # no baseline recorded either
+        assert partitions == [1]  # independent of retention, so it still runs
+        assert "retention source" in caplog.text
+
+    def test_a_raising_source_skips_the_retention_steps(self, session_factory, monkeypatch, caplog):
+        partitions = []
+        monkeypatch.setattr(maintenance, "_ensure_partitions", lambda: partitions.append(1))
+
+        def source():
+            raise RuntimeError("settings table unreachable")
+
+        jasil_audit.configure_retention_source(source)
+
+        with caplog.at_level(logging.ERROR):
+            jasil_audit.run_audit_maintenance()
+
+        assert "shop.order.place" in self._targets(session_factory)
+        assert _rows(session_factory, AuditCheckpoint) == []
+        assert partitions == [1]
+        assert "retention source" in caplog.text
+
+    def test_none_restores_the_settings(self, audit_env, session_factory):
+        jasil_audit.configure_retention_source(lambda: jasil_audit.AuditRetention(retention_days=90, legal_hold=True))
+        jasil_audit.configure_retention_source(None)
+
+        jasil_audit.run_audit_maintenance()
+
+        assert "shop.order.place" not in self._targets(session_factory)
+
+    def test_another_replica_holding_the_lock_does_not_call_it(self, audit_env):
+        runtime.set_active_platform(replace(audit_env.platform, lock=HeldLock()))
+        calls = []
+        jasil_audit.configure_retention_source(lambda: calls.append(1) or jasil_audit.AuditRetention(90))
+
+        jasil_audit.run_audit_maintenance()
+
+        assert calls == []
+
+    def test_reset_all_removes_it(self, session_factory):
+        import jasil.testing as jasil_testing
+
+        jasil_audit.configure_retention_source(lambda: jasil_audit.AuditRetention(retention_days=90, legal_hold=True))
+
+        jasil_testing.reset_all()
+
+        assert jasil_audit_retention.effective_settings() == jasil_audit_retention.get_settings().audit
+
+
 class TestRun:
     def test_it_runs_every_step_in_order_under_its_own_lock(self, actions, audit_env, session_factory):
         lock = RecordingLock()
@@ -431,7 +538,7 @@ class TestRun:
         self, actions, audit_env, session_factory, monkeypatch, caplog
     ):
         _write(audit_env, actions[0], T0 - timedelta(days=100))
-        monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now: 1 / 0)
+        monkeypatch.setattr(maintenance.checkpoints, "seal_pending_windows", lambda now, settings: 1 / 0)
 
         with caplog.at_level(logging.INFO):
             jasil_audit.run_audit_maintenance()
@@ -442,7 +549,7 @@ class TestRun:
 
     def test_a_failing_retention_step_does_not_undo_the_others(self, actions, audit_env, session_factory, monkeypatch):
         _write(audit_env, actions[0], T0 - timedelta(minutes=40))
-        monkeypatch.setattr(maintenance, "_apply_retention", lambda now: 1 / 0)
+        monkeypatch.setattr(maintenance, "_apply_retention", lambda now, settings: 1 / 0)
 
         jasil_audit.run_audit_maintenance()
 

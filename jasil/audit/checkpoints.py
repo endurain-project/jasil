@@ -42,10 +42,10 @@ import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil._core import optional_deps
 from jasil._core.timestamps import as_utc
-from jasil.audit import service
+from jasil.audit import retention, service
 from jasil.audit.schema import VerificationReport, VerificationStatus, WindowVerification
 from jasil.providers import AuditSink, AuditSinkConflictError
-from jasil.settings import AuditSettings, get_settings
+from jasil.settings import AuditSettings
 
 logger = logging.getLogger(__name__)
 
@@ -320,7 +320,7 @@ def _window_end(start: datetime, window: timedelta) -> datetime:
     return datetime.fromtimestamp((as_utc(start).timestamp() // span + 1) * span, UTC)
 
 
-def seal_pending_windows(now: datetime | None = None) -> int:
+def seal_pending_windows(now: datetime | None = None, settings: AuditSettings | None = None) -> int:
     """
     Seal every window that has passed its grace period.
 
@@ -332,6 +332,8 @@ def seal_pending_windows(now: datetime | None = None) -> int:
 
     Args:
         now: The instant to seal up to; the platform clock when omitted.
+        settings: The audit settings to seal under, whose ``retention_days`` and ``legal_hold`` each checkpoint
+            records; :func:`jasil.audit.retention.effective_settings` when omitted.
 
     Returns:
         How many checkpoints were written.
@@ -343,7 +345,8 @@ def seal_pending_windows(now: datetime | None = None) -> int:
     """
     from jasil.audit.models import AuditCheckpoint, AuditLog
 
-    settings = get_settings().audit
+    if settings is None:
+        settings = retention.effective_settings()
     now = now or service.now()
     window = timedelta(minutes=settings.checkpoint_window_minutes)
     grace = timedelta(minutes=settings.checkpoint_grace_minutes)
