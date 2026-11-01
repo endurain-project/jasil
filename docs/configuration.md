@@ -67,8 +67,9 @@ fields.
 | `batch_size` | `20` | Maximum rows claimed or relayed per pass, 1 to 1000. |
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. At least 0. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. Not below `backoff_base_seconds`. |
-| `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`; a later `retry_at` is clamped to it (jitter included). |
+| `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`, or wait between passes with [`ContinueJob`](durable-jobs.md#continuing-a-job); a later instant is clamped to it (jitter included). |
 | `max_deferrals` | `100` | Deferrals a job may take, at least 0. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
+| `max_continuations` | `10000` | Continuations a job may take, at least 0. The next `ContinueJob` is then an ordinary failure, so a job cannot continue forever. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls; greater than zero. |
 | `record_attempts` | `True` | Write one `jasil_job_attempts` row per attempt to run a job: worker, timing, outcome, error. `False` skips every attempt write and the attempt-derived admin fields read `None`. See [Job attempts](observability.md#job-attempts). |
 | `heartbeat_interval_seconds` | `15.0` | Interval between worker heartbeats. Each beat renews the leases the worker holds and refreshes its registry row. The default stale threshold is three intervals. Greater than zero. |

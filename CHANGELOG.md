@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [Unreleased]
+
+### Added
+
+- **`ContinueJob`.** A durable handler that made progress and has work left raises `jasil.jobs.ContinueJob(delay_seconds=0.0, reason=None)` to requeue itself for the rest, for work drained in bounded passes such as rate-limited sends, paginated exports or large imports. The job returns to `pending`, available `delay_seconds` from now (clamped to between 0 and `jobs.defer_max_seconds`, no jitter), with its lease cleared and `last_error` set to the reason. It does not count against `jobs.max_deferrals`, and it restarts the failure budget, so `max_attempts` bounds the failures since the last continuation rather than the length of a long run. After the new `jobs.max_continuations` (default `10000`) continuations the next `ContinueJob` is an ordinary failure. Applied only while the worker still owns the claim. Recorded as a `continued` attempt outcome and logged at `INFO`. A `delay_seconds` that is not a finite number raises `ValueError`. See [Continuing a job](docs/durable-jobs.md#continuing-a-job).
+- `Event.continuation_count`, and `continuations` on `JobDetail` and the admin `DeadLetterJob`.
+- `jasil.jobs.crud.mark_job_continued`.
+
+### Changed
+
+- Migration `rev0007` adds `jasil_processing_jobs.continuations` and `budget_offset` (both default 0). The budget against `max_attempts` is now `attempts - deferrals - budget_offset`, used by failures, the reaper and `Event.retry_count`; a continuation sets `budget_offset` to `attempts - deferrals`. Without continuations nothing changes. Run the migration before deploying; processes of the previous release neither read nor write the columns, and would count the claims before a job's last continuation as attempts.
+
+No breaking changes: `ContinueJob` is opt-in, and a job that never continues behaves exactly as before.
+
 ## [0.14.0] - 2026-10-30
 
 This release adds the audit trail and hardens the substrate around it: durable jobs, publishing, migrations, storage, the event buses and the outbound calls. The audit trail writes nothing until the host calls its API, and every addition is optional. The breaking changes are listed under **Upgrading**.
