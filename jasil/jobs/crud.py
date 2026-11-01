@@ -43,6 +43,7 @@ from jasil.events import Event
 from jasil.jobs._attempts import (
     OUTCOME_ABANDONED,
     OUTCOME_COMPLETED,
+    OUTCOME_CONTINUED,
     OUTCOME_DEAD_LETTER,
     OUTCOME_DEFERRED,
     OUTCOME_FAILED,
@@ -63,6 +64,10 @@ STATUS_DEAD_LETTER = "dead_letter"
 STATUS_DEFERRED = "deferred"
 #: Not a stored status: what :func:`mark_job_deferred` returns when the job has used its deferrals.
 STATUS_DEFERRALS_EXHAUSTED = "deferrals_exhausted"
+#: Not a stored status: what :func:`mark_job_continued` returns for a job it requeued.
+STATUS_CONTINUED = "continued"
+#: Not a stored status: what :func:`mark_job_continued` returns when the job has used its continuations.
+STATUS_CONTINUATIONS_EXHAUSTED = "continuations_exhausted"
 
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
@@ -773,13 +778,16 @@ def mark_job_failed(
     truncated = fit_length(error_message, MAX_STORED_ERROR_LENGTH)
     status = ""
     attempt_state = db.execute(
-        select(ProcessingJob.attempts, ProcessingJob.deferrals, ProcessingJob.max_attempts).where(*ownership)
+        select(
+            ProcessingJob.attempts, ProcessingJob.deferrals, ProcessingJob.budget_offset, ProcessingJob.max_attempts
+        ).where(*ownership)
     ).one_or_none()
     if attempt_state is not None:
-        # A deferred claim is not an attempt, so it neither spends the budget nor
-        # lengthens the backoff.
-        claims, deferrals, max_attempts = attempt_state
-        attempts = claims - deferrals
+        # A deferred claim is not an attempt, and the claims up to the last
+        # continuation are behind it, so neither spends the budget nor lengthens
+        # the backoff.
+        claims, deferrals, budget_offset, max_attempts = attempt_state
+        attempts = claims - deferrals - budget_offset
         if attempts >= max_attempts:
             new_status = STATUS_DEAD_LETTER
             values: dict[str, Any] = {"completed_at": now}
@@ -911,11 +919,103 @@ def mark_job_deferred(
     return status
 
 
+def mark_job_continued(
+    job_id: str,
+    reason: str,
+    *,
+    worker_id: str,
+    attempt: int,
+    available_at: datetime,
+    max_continuations: int,
+    now: datetime,
+    db: Session,
+    duration_ms: int | None = None,
+    record_attempt: bool = True,
+) -> str:
+    """
+    Return a claimed job that made progress to ``pending`` for ``available_at``, restarting its failure budget.
+
+    Not a failure and not a deferral: the job's ``continuations`` counter goes up
+    and ``budget_offset`` becomes ``attempts - deferrals``, so this claim and every
+    one before it drop out of the ``max_attempts`` budget (``attempts`` itself keeps
+    counting, as it fences the claim). Written only while the caller still owns
+    that exact claim. The attempt row is closed ``continued`` in the same
+    transaction, or ``superseded`` when the handler asked after its job had been
+    taken from it.
+
+    A job that already continued ``max_continuations`` times is left untouched and
+    :data:`STATUS_CONTINUATIONS_EXHAUSTED` is returned: the caller then fails it
+    like any other exception, so a job cannot continue forever.
+
+    ``available_at`` is used as given: clamping is the caller's, which knows the
+    configured ceiling.
+
+    Args:
+        job_id: The job being continued.
+        reason: What the pass did or what is left, kept as ``last_error`` (truncated for storage).
+        worker_id: Worker that owns the claim.
+        attempt: Claim generation being continued.
+        available_at: Earliest instant the job may be claimed again.
+        max_continuations: Continuations a job may take.
+        now: Current instant.
+        db: Active database session.
+        duration_ms: Handler wall time, recorded on the attempt.
+        record_attempt: Close the claim's ``job_attempts`` row.
+
+    Returns:
+        :data:`STATUS_CONTINUED` when requeued, :data:`STATUS_CONTINUATIONS_EXHAUSTED`
+        when the job has used its continuations, or the empty string when
+        ownership was lost or the job was not found.
+    """
+    ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
+    truncated = fit_length(reason, MAX_STORED_ERROR_LENGTH)
+    status = ""
+    continuations = db.execute(select(ProcessingJob.continuations).where(*ownership)).scalar_one_or_none()
+    if continuations is not None:
+        if continuations >= max_continuations:
+            db.rollback()  # nothing was written; end the read transaction
+            return STATUS_CONTINUATIONS_EXHAUSTED
+        continued = cast(
+            CursorResult[Any],
+            db.execute(
+                update(ProcessingJob)
+                .where(*ownership)
+                .values(
+                    status=STATUS_PENDING,
+                    continuations=ProcessingJob.continuations + 1,
+                    budget_offset=ProcessingJob.attempts - ProcessingJob.deferrals,
+                    available_at=available_at,
+                    last_error=truncated,
+                    updated_at=now,
+                    locked_by=None,
+                    locked_at=None,
+                    lease_expires_at=None,
+                )
+            ),
+        )
+        if continued.rowcount == 1:
+            status = STATUS_CONTINUED
+    if record_attempt:
+        _finish_attempt(
+            db,
+            job_id=job_id,
+            worker_id=worker_id,
+            attempt=attempt,
+            now=now,
+            outcome=OUTCOME_CONTINUED,
+            duration_ms=duration_ms,
+            error=truncated,
+            owned=bool(status),
+        )
+    db.commit()
+    return status
+
+
 def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> int:
     """
     Return jobs whose lease expired (a crashed worker) to a runnable state.
 
-    Exhausted rows (``attempts - deferrals >= max_attempts``) are dead-lettered; the rest are
+    Exhausted rows (``attempts - deferrals - budget_offset >= max_attempts``) are dead-lettered; the rest are
     made ``pending`` and immediately available again. Their ``on_dead_letter`` callbacks are owed
     to the scheduled sweep.
 
@@ -951,7 +1051,8 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
                 ProcessingJob.lease_expires_at < now,
-                ProcessingJob.attempts - ProcessingJob.deferrals >= ProcessingJob.max_attempts,
+                ProcessingJob.attempts - ProcessingJob.deferrals - ProcessingJob.budget_offset
+                >= ProcessingJob.max_attempts,
             )
             .values(
                 status=STATUS_DEAD_LETTER,
@@ -976,7 +1077,8 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
                 ProcessingJob.id.in_(job_ids),
                 ProcessingJob.status == STATUS_CLAIMED,
                 ProcessingJob.lease_expires_at < now,
-                ProcessingJob.attempts - ProcessingJob.deferrals < ProcessingJob.max_attempts,
+                ProcessingJob.attempts - ProcessingJob.deferrals - ProcessingJob.budget_offset
+                < ProcessingJob.max_attempts,
             )
             .values(
                 status=STATUS_PENDING,
@@ -1197,6 +1299,8 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
                 status=STATUS_PENDING,
                 attempts=0,
                 deferrals=0,
+                continuations=0,
+                budget_offset=0,
                 available_at=now,
                 updated_at=now,
                 last_error=None,
@@ -1249,10 +1353,11 @@ def event_from_row(row: ProcessingJob) -> Event:
         timestamp=envelope_timestamp(row),
         payload=dict(row.payload),
         metadata=dict(row.job_metadata) if row.job_metadata else {},
-        retry_count=row.attempts - row.deferrals,
+        retry_count=row.attempts - row.deferrals - row.budget_offset,
         schema_version=row.schema_version,
         max_attempts=row.max_attempts,
         deferral_count=row.deferrals,
+        continuation_count=row.continuations,
     )
 
 

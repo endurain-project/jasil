@@ -197,6 +197,9 @@ class TestJobSettingsValidation:
             pytest.param({"defer_max_seconds": -1}, r"defer_max_seconds must be at least 0", id="negative-defer"),
             pytest.param({"max_deferrals": -1}, r"max_deferrals must be at least 0", id="negative-deferrals"),
             pytest.param(
+                {"max_continuations": -1}, r"max_continuations must be at least 0", id="negative-continuations"
+            ),
+            pytest.param(
                 {"lease_seconds": 44, "heartbeat_interval_seconds": 15},
                 r"at least three heartbeat intervals \(45 s",
                 id="lease-below-three-beats",
@@ -249,6 +252,7 @@ class TestJobSettingsValidation:
             backoff_max_seconds=0,
             defer_max_seconds=0,
             max_deferrals=0,
+            max_continuations=0,
             lease_seconds=45,
             heartbeat_interval_seconds=15,
             max_runtime_seconds=45,

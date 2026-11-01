@@ -19,7 +19,7 @@ import jasil.correlation as correlation
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
 from jasil.events import META_REQUEST_ID, new_event
-from jasil.jobs.defer import DeferJob
+from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -212,8 +212,8 @@ class TestJobRunner:
 
     @pytest.mark.parametrize(
         "outcome",
-        [None, RuntimeError("handler failed"), DeferJob(T0 + timedelta(minutes=5))],
-        ids=["completed", "failed", "deferred"],
+        [None, RuntimeError("handler failed"), DeferJob(T0 + timedelta(minutes=5)), ContinueJob()],
+        ids=["completed", "failed", "deferred", "continued"],
     )
     def test_both_scopes_end_with_the_handler(self, runner, registry, db, outcome):
         correlation.set_correlation_id("ambient")
