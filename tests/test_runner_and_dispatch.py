@@ -14,9 +14,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import update
 
+import jasil.audit as jasil_audit
+import jasil.correlation as correlation
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
-from jasil.events import new_event
+from jasil.events import META_REQUEST_ID, new_event
+from jasil.jobs.defer import DeferJob
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
@@ -139,6 +142,112 @@ class TestJobRunner:
 
         assert seen[0].event_type == "activity.created"
         assert seen[0].payload == {"id": 1}
+
+    def _record_context(self, registry, outcome=None):
+        """Register a handler that records the audit context and correlation id it runs under."""
+        seen = []
+
+        def handler(event):
+            seen.append((jasil_audit.get_context(), correlation.get_correlation_id()))
+            if outcome is not None:
+                raise outcome
+
+        registry.register("activity.created", "s", handler)
+        return seen
+
+    def test_the_handler_runs_as_the_system_in_a_worker_for_its_event(self, runner, registry, db):
+        seen = self._record_context(registry)
+        job = self._enqueue(db)
+
+        runner.run_once()
+
+        assert seen[0][0] == jasil_audit.AuditContext(
+            actor_type=jasil_audit.ActorType.SYSTEM, source=jasil_audit.Source.WORKER, event_id=job.event_id
+        )
+
+    def test_the_handler_context_wins_over_an_installed_audit_provider(self, runner, registry, db):
+        """A provider that only knows about requests must not attribute a handler's rows to a user."""
+        jasil_audit.configure_provider(lambda: jasil_audit.AuditContext(actor_type="user", actor_id="42"))
+        seen = self._record_context(registry)
+        job = self._enqueue(db)
+
+        runner.run_once()
+
+        assert seen[0][0] == jasil_audit.AuditContext(actor_type="system", source="worker", event_id=job.event_id)
+
+    def test_a_handler_can_name_its_own_actor_on_top_of_the_runners_context(self, runner, registry, db):
+        seen = []
+
+        def handler(event):
+            with jasil_audit.audit_context(actor_type="user", actor_id="42"):
+                seen.append(jasil_audit.get_context())
+
+        registry.register("activity.created", "s", handler)
+        job = self._enqueue(db)
+
+        runner.run_once()
+
+        assert (seen[0].actor_id, seen[0].source, seen[0].event_id) == ("42", "worker", job.event_id)
+
+    def test_the_handler_sees_the_originating_request_id_over_an_installed_provider(self, runner, registry, db):
+        correlation.configure_provider(lambda: "from-the-worker-thread")
+        seen = self._record_context(registry)
+        event = new_event("activity.created", {"id": 1}, source="test", metadata={META_REQUEST_ID: "req-7"})
+        jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        assert seen[0][1] == "req-7"
+
+    def test_a_job_without_a_request_id_runs_with_none(self, runner, registry, db):
+        """A worker thread's leftover id or a request-scoped provider must not be stamped on the handler's rows."""
+        correlation.set_correlation_id("leftover")
+        correlation.configure_provider(lambda: "from-the-worker-thread")
+        seen = self._record_context(registry)
+        self._enqueue(db)
+
+        runner.run_once()
+
+        assert seen[0][1] is None
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [None, RuntimeError("handler failed"), DeferJob(T0 + timedelta(minutes=5))],
+        ids=["completed", "failed", "deferred"],
+    )
+    def test_both_scopes_end_with_the_handler(self, runner, registry, db, outcome):
+        correlation.set_correlation_id("ambient")
+        seen = self._record_context(registry, outcome)
+        self._enqueue(db)
+
+        runner.run_once()
+
+        assert seen[0][0].source == "worker"
+        assert jasil_audit.get_context() == jasil_audit.AuditContext()
+        assert correlation.get_correlation_id() == "ambient"
+
+    def test_both_scopes_end_when_the_claim_was_lost(self, runner, registry, db, monkeypatch):
+        correlation.set_correlation_id("ambient")
+        seen = self._record_context(registry)
+        self._enqueue(db)
+        monkeypatch.setattr(jobs_crud, "mark_job_completed", lambda *args, **kwargs: False)
+
+        runner.run_once()
+
+        assert seen
+        assert jasil_audit.get_context() == jasil_audit.AuditContext()
+        assert correlation.get_correlation_id() == "ambient"
+
+    def test_both_scopes_end_when_the_handler_exits(self, runner, registry, db):
+        correlation.set_correlation_id("ambient")
+        self._record_context(registry, SystemExit(3))
+        self._enqueue(db)
+
+        with pytest.raises(SystemExit):
+            runner.run_once()
+
+        assert jasil_audit.get_context() == jasil_audit.AuditContext()
+        assert correlation.get_correlation_id() == "ambient"
 
     def test_the_handler_sees_the_publish_timestamp_not_the_enqueue_time(self, runner, registry, db):
         """The envelope's ``timestamp`` is when the event was first published, whenever its job was enqueued."""

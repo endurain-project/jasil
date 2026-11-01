@@ -192,7 +192,8 @@ with jasil_audit.audit_context(actor_type="system", source="worker"):
 ```
 
 A `with audit_context(...)` block wins over an installed provider, so a scheduled job can attribute its rows to the
-system in a host whose provider only knows about requests. With no context set the row says `anonymous`/`api`. That is wrong for anything but an unauthenticated request:
+system in a host whose provider only knows about requests. Durable job handlers already run in one, as the system in
+a worker for the event that queued them (see [Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)). With no context set the row says `anonymous`/`api`. That is wrong for anything but an unauthenticated request:
 set the context in every entry point.
 
 ## Storage

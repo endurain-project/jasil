@@ -322,3 +322,57 @@ class TestCorrelationId:
         correlation.reset()
 
         assert correlation.get_correlation_id() is None
+
+
+class TestCorrelationScope:
+    def test_the_scope_wins_over_an_installed_provider(self):
+        correlation.configure_provider(lambda: "from-host")
+
+        with correlation.correlation_scope("from-job"):
+            assert correlation.get_correlation_id() == "from-job"
+
+        assert correlation.get_correlation_id() == "from-host"
+
+    def test_the_scope_wins_over_the_context_var(self):
+        correlation.set_correlation_id("from-request")
+
+        with correlation.correlation_scope("from-job"):
+            assert correlation.get_correlation_id() == "from-job"
+
+        assert correlation.get_correlation_id() == "from-request"
+
+    def test_a_scope_of_none_hides_the_ambient_id(self):
+        """A job with no request id must not pick up whatever id the thread or the provider has."""
+        correlation.configure_provider(lambda: "from-host")
+
+        with correlation.correlation_scope(None):
+            assert correlation.get_correlation_id() is None
+
+    def test_the_provider_is_not_called_inside_a_scope(self):
+        calls = []
+        correlation.configure_provider(lambda: calls.append(1) or "from-host")
+
+        with correlation.correlation_scope("from-job"):
+            correlation.get_correlation_id()
+
+        assert calls == []
+
+    def test_scopes_nest(self):
+        with correlation.correlation_scope("outer"):
+            with correlation.correlation_scope("inner"):
+                assert correlation.get_correlation_id() == "inner"
+            assert correlation.get_correlation_id() == "outer"
+
+    def test_the_scope_is_restored_when_the_block_raises(self):
+        correlation.set_correlation_id("from-request")
+
+        with pytest.raises(RuntimeError), correlation.correlation_scope("from-job"):
+            raise RuntimeError("handler failed")
+
+        assert correlation.get_correlation_id() == "from-request"
+
+    def test_reset_clears_an_open_scope(self):
+        with correlation.correlation_scope("from-job"):
+            correlation.reset()
+
+            assert correlation.get_correlation_id() is None

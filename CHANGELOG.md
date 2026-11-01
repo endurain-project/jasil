@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [Unreleased]
+
+### Added
+
+- **Durable job handlers run in an audit context and under their request id.** The runner opens `audit_context(actor_type="system", source="worker", event_id=...)` around every handler, so an audit row staged in a handler names the event that caused it instead of an anonymous API call, and a `correlation_scope` with the `request_id` the event carried, so the handler's audit rows and events trace back to the originating request even in a host that installed a correlation provider. Both scopes win over an installed provider and close however the handler ends. A handler that knows who it acts for opens its own `audit_context(...)` on top. See [Durable jobs](docs/durable-jobs.md#the-context-a-handler-runs-in).
+- **`jasil.correlation.correlation_scope(value)`.** A block whose correlation id wins over an installed provider and over `set_correlation_id`; `None` means the block has no id. See [Configuration](docs/configuration.md#correlation-ids).
+
+### Changed
+
+- An audit row staged in a durable job handler now says `system`/`worker` with the handler's `event_id`, and carries the originating request id, where it used to say `anonymous`/`api` with no event or request id (or whatever the host's providers returned in the worker thread). A handler that set `set_context(...)` / `set_correlation_id(...)` itself must use `audit_context(...)` / `correlation_scope(...)` instead: the runner's scopes win over both.
+
 ## [0.14.0] - 2026-10-30
 
 This release adds the audit trail and hardens the substrate around it: durable jobs, publishing, migrations, storage, the event buses and the outbound calls. The audit trail writes nothing until the host calls its API, and every addition is optional. The breaking changes are listed under **Upgrading**.
