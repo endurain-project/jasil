@@ -35,7 +35,9 @@ visible to every other handler.
 
 Event types and payload shapes are **owned by the publishing domain**, not
 defined here. JASIL only knows the envelope. The one metadata key it defines is
-`META_REQUEST_ID`; everything else in `metadata` is yours to name.
+`META_REQUEST_ID`; everything else in `metadata` is yours to name. Its value is
+a string or absent: `new_event` (and so every publish) raises `TypeError` for
+anything else, because a durable handler runs under it as its correlation id.
 
 ### What not to put in one
 

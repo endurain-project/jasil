@@ -67,6 +67,32 @@ name raises before persistence. Registering a `subscriber_id` again replaces its
 handler, queue and callback, and moves it to the new event type if it was
 registered under another one.
 
+### The context a handler runs in
+
+The runner opens two scopes around every handler, closed however the handler
+ends (returning, raising, deferring, continuing, or the worker losing its claim):
+
+- **Audit context:** `actor_type=system`, `source=worker`, `event_id` set to the
+  event that queued the job, and every other field empty. An audit row staged in
+  the handler is attributed to that event instead of to an anonymous API call.
+- **Correlation id:** the `request_id` the event carried in its metadata, or
+  `None` when it carried none. Audit rows and events written in the handler carry
+  the id of the request that started the chain.
+
+Both scopes win over an installed provider and over `set_context` /
+`set_correlation_id`, which know nothing about the request a queued job came
+from. A handler that knows who it acts for opens its own block on top; it keeps
+`source` and `event_id`:
+
+```python
+import jasil.audit as jasil_audit
+
+
+def render_invoice(event):
+    with jasil_audit.audit_context(actor_type="user", actor_id=event.payload["user_id"]):
+        ...
+```
+
 ### Attempt counts
 
 A durable handler's `Event` carries the attempt it is running, computed from the

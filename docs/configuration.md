@@ -339,3 +339,13 @@ correlation.set_correlation_id(request_id)
 
 A provider that raises is treated as "no id" rather than propagating — a
 correlation id is diagnostic metadata and must never break publishing.
+
+Work that runs outside the request it belongs to opens a scope, which wins over
+both the provider and the context variable until the block ends. `None` means
+the block has no id. Durable job handlers already run in one, under the request id
+of the event that queued them (see [Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)):
+
+```python
+with correlation.correlation_scope(request_id):
+    ...
+```
