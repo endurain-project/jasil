@@ -54,8 +54,10 @@ def upgrade() -> None:
         schema = bind.execute(sa.text("SELECT DATABASE()")).scalar_one()
         today = bind.execute(sa.text("SELECT UTC_DATE()")).scalar_one()
         days = set(bind.execute(sa.text("SELECT DISTINCT DATE(occurred_at) FROM jasil_audit_log")).scalars())
-        days |= {today - timedelta(days=1), today}
         audit = get_settings().audit
+        # The whole horizon at once: a rebuild that runs past midnight must not leave a day without a partition
+        # for the writes queued behind it.
+        days |= {today + timedelta(days=offset) for offset in range(-1, audit.partition_days_ahead + 1)}
         for statement in audit_mysql.install_statements(
             schema, audit.retention_floor_days, audit.partition_days_ahead, sorted(days)
         ):

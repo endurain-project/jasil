@@ -43,9 +43,12 @@ DROP_PROCEDURE = "jasil_audit_drop_partitions"
 TRIGGERS = (f"{LOG}_no_update", f"{LOG}_no_delete")
 #: Maintenance's statements: whether the routines are installed, create partitions, drop them (``prune_at`` may be
 #: NULL, which stamps the prune row with the server's clock), and the UTC clock the retention floor is measured on.
+#: ``information_schema.ROUTINES`` lists only the routines an account may run, and the runtime account may run only
+#: the ensure procedure, so either one being listed means they are installed.
 INSTALLED_SQL = (
     "SELECT 1 FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() "
-    "AND ROUTINE_NAME = 'jasil_audit_drop_partitions' AND ROUTINE_TYPE = 'PROCEDURE'"
+    "AND ROUTINE_NAME IN ('jasil_audit_ensure_partitions', 'jasil_audit_drop_partitions') "
+    "AND ROUTINE_TYPE = 'PROCEDURE' LIMIT 1"
 )
 ENSURE_CALL = f"CALL {ENSURE_PROCEDURE}(:days)"
 DROP_CALL = f"CALL {DROP_PROCEDURE}(:cutoff, :prune_at)"

@@ -552,6 +552,24 @@ class TestAccounts:
             connection.commit()
             assert connection.execute(text(audit_mysql.ENSURE_CALL), {"days": 9}).scalar() is not None
 
+    def test_maintenance_as_the_runtime_account_still_creates_partitions(self, accounts, action, caplog):
+        """The runtime account sees only the routine it may execute; that must not read as a plain table."""
+        import jasil.audit.maintenance as maintenance
+
+        maintenance._warned_plain = False
+        jasil_orm.configure_sessionmaker(sessionmaker(bind=accounts[ACCOUNTS[0]], expire_on_commit=False))
+        jasil_testing.install_test_platform(
+            ".",
+            clock=SystemClock(),
+            settings=jasil_settings.JasilSettings(audit=jasil_settings.AuditSettings(partition_days_ahead=12)),
+        )
+
+        with caplog.at_level("WARNING"):
+            jasil_audit.run_audit_maintenance()
+
+        assert "is a plain table" not in caplog.text
+        assert f"p{datetime.now(UTC).date() + timedelta(days=12):%Y%m%d}" in _partitions(accounts[ACCOUNTS[1]])
+
     def test_the_reader_account_can_read_but_not_write(self, accounts):
         assert self._as(accounts, ACCOUNTS[1], "SELECT COUNT(*) FROM jasil_audit_log") == [(0,)]
         with pytest.raises(DBAPIError, match="denied"):
