@@ -39,6 +39,11 @@ through.
       uses its own `jasil_alembic_version` table and never touches yours.
 - [ ] On MySQL, note that `DATETIME` stores whole seconds and rounds. Do not
       compare a timestamp JASIL persisted for equality with the value you passed.
+- [ ] On MySQL and MariaDB, run migration `rev0008` as the account that should
+      own the audit procedures, with `log_bin_trust_function_creators=1` (or
+      `SUPER`) when binary logging is on, and give the application only the
+      table grants `grants_sql(..., dialect="mysql")` lists: a database-wide
+      privilege overrides them.
 - [ ] Upgrade through JASIL's packaged revisions before rolling out queue-aware
       code. The queue column is non-null and has a database-side `default`
       default so previous-release writers remain valid during the rollout.

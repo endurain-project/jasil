@@ -31,6 +31,7 @@ from sqlalchemy import (
 )
 
 from jasil import migrations
+from jasil.audit import _mysql as audit_mysql
 from jasil.audit import _postgres as audit_pg
 from jasil.orm import jasil_table_names, legacy_table_names
 
@@ -56,11 +57,15 @@ def _drop_everything(engine, mapped_base) -> None:
         # only to an older revision.
         for name in sorted(legacy_table_names()):
             connection.exec_driver_sql(f"DROP TABLE IF EXISTS {name}")
-        # rev0006's PostgreSQL functions outlive the tables: left behind, they make a later
-        # test's plain ``create_all`` schema look partitioned to audit maintenance.
+        # The audit routines (rev0006 on PostgreSQL, rev0008 on MySQL) outlive the tables: left behind,
+        # they make a later test's plain ``create_all`` schema look partitioned to audit maintenance.
         if engine.dialect.name == "postgresql":
             schema = connection.execute(text("SELECT current_schema()")).scalar_one()
             for statement in audit_pg.uninstall_statements(schema):
+                connection.exec_driver_sql(statement)
+        if engine.dialect.name in ("mysql", "mariadb"):
+            schema = connection.execute(text("SELECT DATABASE()")).scalar_one()
+            for statement in audit_mysql.uninstall_statements(schema):
                 connection.exec_driver_sql(statement)
 
 
@@ -540,6 +545,32 @@ class TestOfflineAuditTrail:
             self._render("rev0005:rev0006")
 
 
+class TestOfflineMysqlAuditTrail:
+    """rev0008 partitions the audit log by the days its rows fall on, which ``--sql`` cannot read."""
+
+    def _render(self, url: str) -> str:
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", url)
+        config.output_buffer = io.StringIO()
+        command.upgrade(config, "rev0007:rev0008", sql=True)
+        return config.output_buffer.getvalue()
+
+    @pytest.mark.parametrize("url", ["mysql+pymysql://offline/none", "mariadb+pymysql://offline/none"])
+    def test_it_refuses_to_render_for_mysql_and_says_why(self, url):
+        with pytest.raises(RuntimeError, match="cannot be rendered as SQL for MySQL"):
+            self._render(url)
+
+    def test_it_renders_nothing_for_postgresql(self):
+        sql = self._render("postgresql://offline/none")
+
+        assert "jasil_audit_log" not in sql
+        assert "rev0008" in sql  # only the version stamp
+
+
 class TestAdoptExistingSchema:
     def test_an_empty_database_is_not_stamped_and_can_be_upgraded(self, engine):
         assert migrations.adopt_existing_schema(engine) is False
@@ -747,6 +778,44 @@ class TestAdoptExistingSchema:
         assert "missing function 'jasil_audit_drop_partitions(timestamptz, timestamptz)'" in message
         assert migrations.db_revision(engine) is None
 
+    def test_a_plain_mysql_audit_log_is_adopted_at_the_revision_before_its_protections(self, engine, mapped_base):
+        """rev0006 and rev0007 built a plain table on MySQL; ``upgrade`` then partitions and protects it."""
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        mapped_base.metadata.create_all(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == "rev0007"
+
+        migrations.upgrade(engine)
+        assert migrations.adopt_existing_schema(engine) is False
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_a_mysql_audit_log_with_part_of_its_protections_matches_no_revision(self, engine):
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TRIGGER jasil_audit_log_no_delete")
+
+        with pytest.raises(migrations.SchemaCompatibilityError) as caught:
+            migrations.adopt_existing_schema(engine)
+
+        message = str(caught.value)
+        assert "(closest revision rev0008)" in message
+        assert "jasil_audit_log: missing trigger 'jasil_audit_log_no_delete'" in message
+        assert migrations.db_revision(engine) is None
+
+    def test_a_protected_mysql_audit_log_is_adopted_at_the_head(self, engine):
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
     def test_an_existing_head_revision_is_not_restamped(self, engine):
         migrations.upgrade(engine)
 
@@ -949,7 +1018,7 @@ class TestRevisionSchemas:
             migrations.upgrade(engine, revision)
             _drop_version_table(engine)
             with engine.connect() as connection:
-                differences, _ = migrations._schema_differences(connection, inspect(connection), metadata)
+                differences, _ = migrations._schema_differences(connection, inspect(connection), metadata, revision)
             assert differences == [], revision
 
     def test_an_unsupported_downgrade_operation_is_refused(self, mapped_base):

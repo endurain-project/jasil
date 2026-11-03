@@ -4,10 +4,10 @@ Owned by JASIL, scheduled by the host: JASIL never starts a scheduler. Call :fun
 yourself, or register it with :func:`schedule_audit_maintenance`. It is separate from
 :func:`jasil.retention.prune_expired_records` and takes its own lock, so neither can block the other.
 
-Retention here is not a ``DELETE``. On PostgreSQL the log is range-partitioned by day and expiry drops
-whole partitions through ``jasil_audit_drop_partitions``, which also refuses to go younger than the
-retention floor and writes its own ``audit.retention.prune`` row. Other dialects (test environments)
-``DELETE`` the rows instead and record the prune the same way. Either way retention reaches no further than
+Retention here is not a ``DELETE``. On PostgreSQL, MySQL and MariaDB the log is range-partitioned by day and
+expiry drops whole partitions through ``jasil_audit_drop_partitions``, which also refuses to go younger than the
+retention floor and writes its own ``audit.retention.prune`` row. SQLite (development and tests) and a plain
+table ``DELETE`` the rows instead and record the prune the same way. Either way retention reaches no further than
 the newest sealed checkpoint allows, so it never removes rows that were never sealed, and never a window
 verification would not excuse.
 
@@ -20,6 +20,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from types import ModuleType
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select, text, update
@@ -31,6 +32,7 @@ import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 from jasil._core.pruning import bounded_delete
 from jasil._core.timestamps import as_utc
+from jasil.audit import _mysql as audit_mysql
 from jasil.audit import _postgres as audit_pg
 from jasil.audit import checkpoints, retention, service
 from jasil.audit.catalog import (
@@ -172,10 +174,10 @@ def run_audit_maintenance() -> None:
     """
     Run the audit maintenance steps once, under a lock shared by every replica.
 
-    In order: record a change to the retention settings; create the next partitions (PostgreSQL); seal the
-    checkpoints that are due; apply retention. The catalog is left to :func:`sync_catalog`, which only the
-    application that registers every action may call: a maintenance process registering fewer would
-    deprecate the rest. Each step runs on its own
+    In order: record a change to the retention settings; create the next partitions (PostgreSQL, MySQL,
+    MariaDB); seal the checkpoints that are due; apply retention. The catalog is left to
+    :func:`sync_catalog`, which only the application that registers every action may call: a maintenance
+    process registering fewer would deprecate the rest. Each step runs on its own
     sessions and a failure in one is logged and does not skip the others. Retention prunes only what the
     newest sealed checkpoint allows, so while sealing fails or is catching up it prunes less or nothing.
     Idempotent, and a no-op while another replica holds the lock or ``audit.enabled`` is false.
@@ -243,35 +245,40 @@ def _record_retention_change(settings: AuditSettings) -> None:
         db.commit()
 
 
-def _partitioned(db: Session) -> bool:
-    """Whether the log was built by migration ``rev0006`` on PostgreSQL, with its partition functions.
+#: The partition routines each dialect's migration installs: ``rev0006`` on PostgreSQL, ``rev0008`` on MySQL/MariaDB.
+_ROUTINES: dict[str, ModuleType] = {"postgresql": audit_pg, "mysql": audit_mysql, "mariadb": audit_mysql}
 
-    A schema built by ``create_all`` (or on another dialect) is a plain table: there are no partitions to
-    manage, and retention is a ``DELETE``. A PostgreSQL schema that is plain is logged once, because it also
-    lacks the append-only triggers and the retention floor.
+
+def _partition_routines(db: Session) -> ModuleType | None:
+    """The DDL module whose partition routines the database has installed, or None for a plain table.
+
+    A schema built by ``create_all`` (or on SQLite) is a plain table: there are no partitions to manage, and
+    retention is a ``DELETE``. A PostgreSQL, MySQL or MariaDB schema that is plain is logged once, because it
+    also lacks the append-only triggers and the retention floor.
     """
     global _warned_plain
-    if db.get_bind().dialect.name != "postgresql":
-        return False
-    signature = f"{audit_pg.DROP_FUNCTION}({audit_pg.DROP_ARGUMENTS})"
-    if db.scalar(text("SELECT to_regprocedure(:signature)"), {"signature": signature}) is not None:
-        return True
+    routines = _ROUTINES.get(db.get_bind().dialect.name)
+    if routines is None:
+        return None
+    if db.scalar(text(routines.INSTALLED_SQL)) is not None:
+        return routines
     if not _warned_plain:
         logger.warning(
-            "jasil_audit_log is a plain table (migration rev0006 has not run): it is not partitioned, and nothing "
-            "keeps it append-only or enforces the retention floor"
+            "jasil_audit_log is a plain table (the audit migrations have not run): it is not partitioned, and "
+            "nothing keeps it append-only or enforces the retention floor"
         )
         _warned_plain = True
-    return False
+    return None
 
 
 def _ensure_partitions() -> None:
     with jasil_orm.get_sessionmaker()() as db:
-        if not _partitioned(db):
+        routines = _partition_routines(db)
+        if routines is None:
             return
         service.ensure_instance_id(service.engine_of(db))
         furthest: date = db.execute(
-            text("SELECT jasil_audit_ensure_partitions(:days)"), {"days": get_settings().audit.partition_days_ahead}
+            text(routines.ENSURE_CALL), {"days": get_settings().audit.partition_days_ahead}
         ).scalar_one()
         service.note_maintenance(db, furthest_partition_date=furthest)
         db.commit()
@@ -296,16 +303,15 @@ def _apply_retention(now: datetime, settings: AuditSettings) -> None:
             logger.info("Audit retention: no sealed checkpoint allows a prune yet; nothing is pruned")
             return
         cutoff = min(now - timedelta(days=settings.retention_days), horizon)
-        if _partitioned(db):
-            # The function's floor is measured on the database's clock; an application clock ahead of it would
+        routines = _partition_routines(db)
+        if routines is not None:
+            # The routine's floor is measured on the database's clock; an application clock ahead of it would
             # make a cutoff at the floor look younger than the floor, and the prune be refused.
-            database_now = as_utc(db.scalar(text("SELECT now()")))
+            database_now = as_utc(db.scalar(text(routines.NOW_SQL)))
             cutoff = min(cutoff, database_now - timedelta(days=settings.retention_floor_days))
             # The prune row is stamped with the platform clock, like every row sealing counts, so it can never
             # land in a window an application clock ahead of the database has already sealed.
-            dropped = db.execute(
-                text(f"SELECT {audit_pg.DROP_FUNCTION}(:cutoff, :prune_at)"), {"cutoff": cutoff, "prune_at": now}
-            ).scalar_one()
+            dropped = db.execute(text(routines.DROP_CALL), {"cutoff": cutoff, "prune_at": now}).scalar_one()
             db.commit()
             if dropped:
                 logger.info("Audit retention: dropped %d partition(s) older than %s", dropped, cutoff.isoformat())
