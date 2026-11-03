@@ -1,8 +1,11 @@
 """The SQL helpers a host runs itself: role grants and the retention floor."""
 
+from datetime import date
+
 import pytest
 
 import jasil.audit as jasil_audit
+from jasil.audit import _mysql as mysql
 from jasil.audit import _postgres as pg
 
 
@@ -95,7 +98,7 @@ class TestGrants:
 
 class TestRetentionFloor:
     def test_it_bakes_the_floor_into_the_function(self):
-        statement = jasil_audit.retention_floor_sql(45, schema="public")
+        [statement] = jasil_audit.retention_floor_sql(45, schema="public")
 
         assert statement.startswith("CREATE OR REPLACE FUNCTION")
         assert "floor_days constant integer := 45;" in statement
@@ -106,7 +109,9 @@ class TestRetentionFloor:
             jasil_audit.retention_floor_sql(30)
 
     def test_it_follows_the_schema(self):
-        assert '"audit".jasil_audit_drop_partitions' in jasil_audit.retention_floor_sql(30, schema="audit")
+        [statement] = jasil_audit.retention_floor_sql(30, schema="audit")
+
+        assert '"audit".jasil_audit_drop_partitions' in statement
 
     def test_a_floor_beyond_the_longest_retention_is_refused(self):
         with pytest.raises(ValueError, match="at most 36500"):
@@ -118,7 +123,7 @@ class TestRetentionFloor:
             jasil_audit.retention_floor_sql(floor_days, schema="public")
 
     def test_the_function_is_security_definer_with_a_pinned_search_path(self):
-        statement = jasil_audit.retention_floor_sql(30, schema="public")
+        [statement] = jasil_audit.retention_floor_sql(30, schema="public")
 
         assert "SECURITY DEFINER" in statement
         assert "SET search_path = pg_catalog" in statement
@@ -204,3 +209,128 @@ class TestMigrationStatements:
     def test_a_floor_below_one_day_cannot_be_installed(self):
         with pytest.raises(ValueError, match="at least 1"):
             pg.install_statements("public", 0, 7)
+
+
+def _mysql_grants(**kwargs) -> list[str]:
+    return jasil_audit.grants_sql("app_rt", "app_ro", dialect="mysql", **kwargs)
+
+
+class TestMysqlGrants:
+    def test_the_runtime_role_can_only_insert_into_the_log_and_add_partitions(self):
+        granted = [s for s in _mysql_grants() if "`app_rt`" in s]
+
+        assert granted == [
+            "GRANT INSERT ON TABLE jasil_audit_log TO `app_rt`",
+            "GRANT SELECT, INSERT ON TABLE jasil_instance TO `app_rt`",
+            "GRANT SELECT, INSERT, UPDATE ON TABLE jasil_audit_actions TO `app_rt`",
+            "GRANT EXECUTE ON PROCEDURE jasil_audit_ensure_partitions TO `app_rt`",
+        ]
+
+    def test_the_reader_role_can_only_select(self):
+        granted = [s for s in _mysql_grants() if "`app_ro`" in s]
+
+        assert sorted(granted) == sorted(
+            f"GRANT SELECT ON TABLE {table} TO `app_ro`"
+            for table in ("jasil_audit_log", "jasil_audit_actions", "jasil_audit_checkpoints", "jasil_instance")
+        )
+
+    def test_a_maintenance_role_may_run_both_procedures(self):
+        granted = [s for s in _mysql_grants(maintenance_role="app_mx") if "`app_mx`" in s]
+
+        assert "GRANT EXECUTE ON PROCEDURE jasil_audit_drop_partitions TO `app_mx`" in granted
+        assert "GRANT EXECUTE ON PROCEDURE jasil_audit_ensure_partitions TO `app_mx`" in granted
+        assert "GRANT SELECT, INSERT ON TABLE jasil_audit_checkpoints TO `app_mx`" in granted
+
+    def test_nothing_ever_grants_a_change_drop_or_truncate_of_the_log(self):
+        for statement in _mysql_grants(maintenance_role="app_mx"):
+            if "TABLE jasil_audit_log " in statement:
+                assert not {"UPDATE", "DELETE", "DROP", "ALTER", "ALL"} & set(statement.replace(",", " ").split())
+
+    def test_it_only_grants(self):
+        """MariaDB has no ``REVOKE IF EXISTS``, and revoking what was never granted fails."""
+        assert all(s.startswith("GRANT ") for s in _mysql_grants(maintenance_role="app_mx"))
+
+    def test_a_database_qualifies_every_object(self):
+        statements = _mysql_grants(schema="audit")
+
+        assert "GRANT INSERT ON TABLE `audit`.jasil_audit_log TO `app_rt`" in statements
+        assert "GRANT EXECUTE ON PROCEDURE `audit`.jasil_audit_ensure_partitions TO `app_rt`" in statements
+
+    def test_names_are_quoted_as_identifiers(self):
+        statements = jasil_audit.grants_sql("a`; DROP TABLE x; --", "ro", schema="d`b", dialect="mysql")
+
+        assert "TO `a``; DROP TABLE x; --`" in " ".join(statements)
+        assert "`d``b`.jasil_audit_log" in " ".join(statements)
+
+    def test_the_role_rules_hold_for_mysql_too(self):
+        with pytest.raises(ValueError, match="must differ"):
+            jasil_audit.grants_sql("same", "same", dialect="mysql")
+        with pytest.raises(ValueError, match="must not be empty"):
+            jasil_audit.grants_sql("", "ro", dialect="mysql")
+
+    @pytest.mark.parametrize("dialect", ["mariadb", "sqlite", ""])
+    def test_an_unknown_dialect_is_refused(self, dialect):
+        with pytest.raises(ValueError, match="'postgresql' or 'mysql'"):
+            jasil_audit.grants_sql("app_rt", "app_ro", dialect=dialect)
+        with pytest.raises(ValueError, match="'postgresql' or 'mysql'"):
+            jasil_audit.retention_floor_sql(30, schema="public", dialect=dialect)
+
+
+class TestMysqlRetentionFloor:
+    def test_it_replaces_the_procedure_with_the_floor_baked_in(self):
+        drop, create = jasil_audit.retention_floor_sql(45, schema="jasil", dialect="mysql")
+
+        assert drop == "DROP PROCEDURE IF EXISTS `jasil`.jasil_audit_drop_partitions"
+        assert create.startswith("CREATE PROCEDURE `jasil`.jasil_audit_drop_partitions(")
+        assert "DECLARE floor_days INT DEFAULT 45;" in create
+        assert "SQL SECURITY DEFINER" in create
+
+    @pytest.mark.parametrize(("floor_days", "message"), [(0, "at least 1"), (36_501, "at most 36500")])
+    def test_the_floor_is_bounded(self, floor_days, message):
+        with pytest.raises(ValueError, match=message):
+            jasil_audit.retention_floor_sql(floor_days, schema="jasil", dialect="mysql")
+
+    def test_every_placeholder_is_filled(self):
+        for statement in (mysql.ensure_partitions_procedure("jasil"), mysql.drop_partitions_procedure("jasil", 30)):
+            assert "@" not in statement.replace("@@SESSION", "").replace("@jasil_audit_ddl", "")
+
+    @pytest.mark.parametrize(
+        "statement", [mysql.ensure_partitions_procedure("jasil"), mysql.drop_partitions_procedure("jasil", 30)]
+    )
+    def test_the_procedures_wait_for_a_lock_for_ten_seconds_at_most(self, statement):
+        assert "GET_LOCK(lock_name, 10)" in statement
+        assert "SET SESSION lock_wait_timeout = 10;" in statement
+
+
+class TestMysqlMigrationStatements:
+    def test_installing_clears_a_failed_run_then_creates_the_triggers_before_rebuilding_the_table(self):
+        statements = mysql.install_statements("jasil", 30, 7, [date(2026, 11, 2), date(2026, 11, 3)])
+
+        assert statements[:4] == mysql.uninstall_statements("jasil")
+        assert [s.split()[1] for s in statements[4:8]] == ["TRIGGER", "TRIGGER", "PROCEDURE", "PROCEDURE"]
+        assert statements[8].startswith("ALTER TABLE jasil_audit_log PARTITION BY RANGE COLUMNS(occurred_at)")
+        assert statements[-1] == "CALL `jasil`.jasil_audit_ensure_partitions(7)"
+
+    def test_installing_bakes_in_the_floor(self):
+        assert any("DECLARE floor_days INT DEFAULT 45;" in s for s in mysql.install_statements("jasil", 45, 7, []))
+
+    def test_the_triggers_reject_update_and_delete(self):
+        triggers = mysql.trigger_ddl()
+
+        assert any("BEFORE UPDATE ON jasil_audit_log" in s and "append-only: UPDATE" in s for s in triggers)
+        assert any("BEFORE DELETE ON jasil_audit_log" in s and "append-only: DELETE" in s for s in triggers)
+
+    def test_uninstalling_drops_everything_it_installed(self):
+        dropped = " ".join(mysql.uninstall_statements("jasil"))
+
+        for name in (*mysql.TRIGGERS, mysql.ENSURE_PROCEDURE, mysql.DROP_PROCEDURE):
+            assert f"`jasil`.{name}" in dropped
+
+    def test_each_day_gets_a_partition_ending_at_the_next_midnight(self):
+        clause = mysql.partition_clause([date(2026, 2, 28), date(2026, 3, 1)])
+
+        assert clause == (
+            "PARTITION BY RANGE COLUMNS(occurred_at) ("
+            "PARTITION p20260228 VALUES LESS THAN ('2026-03-01 00:00:00'), "
+            "PARTITION p20260301 VALUES LESS THAN ('2026-03-02 00:00:00'))"
+        )

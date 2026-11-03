@@ -86,7 +86,9 @@ The columns, indexes and constraints of `jasil_event_log`, `jasil_event_outbox`,
 `jasil_audit_actions`, `jasil_audit_checkpoints`, and `jasil_instance`; and, on PostgreSQL, the names and
 signatures of `jasil_audit_ensure_partitions(integer)` and `jasil_audit_drop_partitions(timestamptz, timestamptz)`, the
 append-only behaviour of `jasil_audit_log`, and that retention drops whole partitions. The partition names
-(`jasil_audit_log_pYYYYMMDD`) are covered too. Schema
+(`jasil_audit_log_pYYYYMMDD`) are covered too. On MySQL and MariaDB the same holds for the procedures
+`jasil_audit_ensure_partitions(days_ahead)` and `jasil_audit_drop_partitions(cutoff, prune_at)`, each returning its
+result as a one-row result set, and for the partition names (`pYYYYMMDD`). Schema
 changes ship as Alembic revisions, and a revision must be forward-compatible with
 the previous release: during a rolling deploy the old code runs against the new
 schema. The one exception is the `jasil_` prefix rename (`rev0003`, 0.9.0), which

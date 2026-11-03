@@ -36,6 +36,11 @@ ENSURE_FUNCTION = "jasil_audit_ensure_partitions"
 DROP_FUNCTION = "jasil_audit_drop_partitions"
 #: The argument types of the drop function: the cutoff, and the instant the prune row is stamped with.
 DROP_ARGUMENTS = "timestamptz, timestamptz"
+#: Maintenance's statements: whether the routines are installed, create partitions, drop them, the database clock.
+INSTALLED_SQL = f"SELECT to_regprocedure('{DROP_FUNCTION}({DROP_ARGUMENTS})')"
+ENSURE_CALL = f"SELECT {ENSURE_FUNCTION}(:days)"
+DROP_CALL = f"SELECT {DROP_FUNCTION}(:cutoff, :prune_at)"
+NOW_SQL = "SELECT now()"
 #: The day a partition covers is the last eight digits of its name.
 partition_name_pattern = "_p([0-9]{8})$"
 _PLACEHOLDER = re.compile(r"@([A-Z_]+)@")

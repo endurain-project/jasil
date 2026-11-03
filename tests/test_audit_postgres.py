@@ -450,7 +450,8 @@ class TestDropPartitions:
         engine, _ = aged
         zone, days = _floor_spanning_a_longer_day(datetime.now(UTC))
         with engine.begin() as connection:
-            connection.execute(text(jasil_audit.retention_floor_sql(days, schema="public")))
+            for statement in jasil_audit.retention_floor_sql(days, schema="public"):
+                connection.execute(text(statement))
 
         with engine.begin() as connection:
             connection.exec_driver_sql(f"SET LOCAL TIME ZONE '{zone}'")
@@ -462,7 +463,8 @@ class TestDropPartitions:
     def test_the_floor_can_be_changed_with_the_documented_statement(self, aged):
         engine, _ = aged
         with engine.begin() as connection:
-            connection.execute(text(jasil_audit.retention_floor_sql(120, schema="public")))
+            for statement in jasil_audit.retention_floor_sql(120, schema="public"):
+                connection.execute(text(statement))
 
         with pytest.raises(DBAPIError, match="floor of 120 days"), engine.begin() as connection:
             connection.execute(text("SELECT jasil_audit_drop_partitions(now() - interval '100 days')"))

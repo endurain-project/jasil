@@ -6,6 +6,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 What counts as a breaking change — and what does not — is defined in [API stability](docs/api-stability.md). In short: the `jasil` namespace, the capability provider protocols, the event envelope, the capability URI schemes, and the database schema of JASIL's own tables are covered by SemVer; anything under `jasil._core`, log message text, and the wording of error messages are not.
 
+## [Unreleased]
+
+### Added
+
+- **The audit trail on MySQL and MariaDB gets PostgreSQL's guarantees.** Migration `rev0008` (MySQL 8.0.1+, MariaDB 10.6+) partitions `jasil_audit_log` by UTC day (`RANGE COLUMNS(occurred_at)`, partitions `pYYYYMMDD`), rejects `UPDATE` and `DELETE` with triggers, and adds the `SQL SECURITY DEFINER` procedures `jasil_audit_ensure_partitions(days_ahead)` and `jasil_audit_drop_partitions(cutoff, prune_at)`, which drop whole partitions, refuse a cutoff inside the retention floor baked in from `audit.retention_floor_days`, and record the prune. `run_audit_maintenance` creates and drops partitions through them, as on PostgreSQL, and logs once when a MySQL audit log is still a plain table. `adopt_existing_schema` reports a MySQL audit log missing any of them, and adopts a plain one at `rev0007`. See [Audit trail](docs/audit.md#on-mysql-and-mariadb).
+- **`dialect="mysql"` on `grants_sql` and `retention_floor_sql`**, for MySQL and MariaDB. The MySQL grants only grant: MariaDB cannot revoke a privilege that was never granted. See [Roles and grants](docs/audit.md#roles-and-grants).
+
+### Changed
+
+- **Breaking:** `retention_floor_sql` returns `list[str]`, the statements to run in order (one on PostgreSQL), because MySQL needs `DROP PROCEDURE` before `CREATE PROCEDURE`. Run each one where you ran the single statement.
+- SQLite is documented as a development and test database for the audit trail; MySQL and MariaDB are no longer.
+
+### Upgrading
+
+- On MySQL and MariaDB, run migration `rev0008` as the account that should own the audit procedures. With binary logging on (the MySQL 8 default) creating its triggers needs `SUPER` or `log_bin_trust_function_creators=1`, or the revision fails. Partitioning rebuilds the audit log, blocking writes to it while its rows are copied. It cannot be rendered with `--sql`. Processes of the previous release only insert into the log and are unaffected. Then grant the accounts with `grants_sql(..., dialect="mysql")`. Other databases are unchanged.
+
 ## [0.15.0] - 2026-11-01
 
 ### Added
