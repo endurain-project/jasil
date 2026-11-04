@@ -608,8 +608,10 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   before it rebuilds the table and records nothing. DDL is not transactional there, so a revision that failed
   part-way can be run again: it replaces what the failed run created.
 - It cannot be rendered as SQL (`--sql`) for MySQL or MariaDB: the partitions depend on the rows in the table.
-- `adopt_existing_schema` adopts a plain MySQL audit log (`create_all`, or a database at `rev0006` or `rev0007`) at
-  `rev0007`, so the next `upgrade` partitions and protects it.
+- `adopt_existing_schema` adopts a plain MySQL audit log from a database at `rev0006` or `rev0007` (built by those
+  migrations, or by `create_all` with JASIL 0.15 or earlier) at `rev0007`, so the next `upgrade` partitions and
+  protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
+  `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
 - Processes of the previous release only insert into the log, so they are unaffected. Downgrading to `rev0007`
   removes the partitioning, the triggers and the procedures and keeps the rows.
 

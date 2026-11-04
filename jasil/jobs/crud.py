@@ -27,15 +27,12 @@ from datetime import datetime, timedelta
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, and_, func, insert, or_, select, update
-from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 import jasil._core.pruning as pruning
 import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.schema as jobs_schema
-from jasil._core.dialects import supports_skip_locked
+from jasil._core.dialects import insert_ignoring_conflict, supports_skip_locked
 from jasil._core.limits import MAX_STORED_ERROR_LENGTH, fit_length
 from jasil._core.sessions import commit_or_flush
 from jasil._core.timestamps import age_seconds, as_utc
@@ -69,6 +66,8 @@ STATUS_CONTINUED = "continued"
 #: Not a stored status: what :func:`mark_job_continued` returns when the job has used its continuations.
 STATUS_CONTINUATIONS_EXHAUSTED = "continuations_exhausted"
 
+#: The unique constraint that makes a durable subscriber an idempotent consumer: a duplicate enqueue is a silent
+#: no-op on every supported database, not an ``IntegrityError`` the relay would have to catch.
 _CONFLICT_KEYS = ["event_id", "subscriber_id"]
 
 
@@ -109,7 +108,7 @@ def insert_job(
         "created_at": now,
         "updated_at": now,
     }
-    db.execute(_insert_ignoring_duplicate(values, db))
+    db.execute(insert_ignoring_conflict(ProcessingJob, values, conflict_columns=_CONFLICT_KEYS, db=db))
     commit_or_flush(db, commit)
     return job_id
 
@@ -1556,42 +1555,4 @@ def delete_completed_jobs_before(cutoff: datetime, *, db: Session, batch_size: i
         ProcessingJob.completed_at < cutoff,
         db=db,
         batch_size=batch_size,
-    )
-
-
-def _insert_ignoring_duplicate(values: dict, db: Session):
-    """
-    Build a dialect-appropriate "insert, or do nothing if it exists" statement.
-
-    The ``(event_id, subscriber_id)`` unique constraint is what makes a durable
-    subscriber an idempotent consumer, so a duplicate enqueue must be a silent
-    no-op on **every** supported database — not an ``IntegrityError`` the relay
-    would have to catch.
-
-    Args:
-        values: Column values for the new row.
-        db: Active database session (used only for dialect detection).
-
-    Returns:
-        An executable insert statement that ignores a duplicate
-        ``(event_id, subscriber_id)``.
-
-    Raises:
-        RuntimeError: On a dialect with no supported conflict clause, rather
-            than emitting a plain INSERT that would raise on the second enqueue.
-    """
-    dialect = db.bind.dialect.name if db.bind is not None else ""
-    if dialect == "postgresql":  # pragma: no cover - exercised on Postgres, not in SQLite tests
-        return pg_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect == "sqlite":
-        return sqlite_insert(ProcessingJob).values(**values).on_conflict_do_nothing(index_elements=_CONFLICT_KEYS)
-    if dialect in ("mysql", "mariadb"):  # pragma: no cover - exercised on MySQL, not in SQLite tests
-        # MySQL has no ON CONFLICT DO NOTHING. Assigning a column to *itself*
-        # is the standard no-op form; ``INSERT IGNORE`` would also swallow
-        # unrelated errors such as truncation.
-        statement = mysql_insert(ProcessingJob).values(**values)
-        return statement.on_duplicate_key_update(event_id=ProcessingJob.event_id)
-    raise RuntimeError(
-        f"JASIL's durable jobs need an insert-or-ignore clause, which dialect {dialect!r} does not provide. "
-        "Supported: postgresql, mysql, mariadb, sqlite."
     )

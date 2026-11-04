@@ -472,6 +472,8 @@ class EventOutbox(Base):
     __table_args__ = (
         # The relay scans unrelayed rows oldest-first.
         Index("idx_jasil_event_outbox_relayed", "relayed_at", "created_at"),
+        # One row per event: publishing an id already staged is a no-op.
+        Index("uq_jasil_event_outbox_event_id", "event_id", unique=True),
     )
 
     id: Mapped[str] = mapped_column(

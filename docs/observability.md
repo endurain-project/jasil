@@ -235,6 +235,16 @@ starts instead of refusing.
 
     Processes of the previous release are unaffected and keep running while it applies.
 
+!!! note "Revision `rev0009`: one outbox row per event id"
+    Adds the unique index `uq_jasil_event_outbox_event_id` on `jasil_event_outbox.event_id`, which makes
+    publishing an id that is already staged a no-op (see
+    [Publishing with a known id](events-and-outbox.md#publishing-with-a-known-id)). Building it fails if the
+    outbox already holds two rows with the same `event_id`, which only a host that wrote rows with
+    `jasil.jobs.outbox.add_to_outbox` directly can have: remove the duplicates and run it again. On PostgreSQL the
+    index is built `CONCURRENTLY`, so producers keep writing; a failed build leaves an invalid index that the next
+    run drops and builds again. Processes of the previous release always mint a fresh UUIDv4 and keep running
+    while it applies.
+
 !!! note "One schema: the connection's default"
     The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
     `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`, because the models would then look
@@ -286,7 +296,9 @@ first exact match (the newest, if two describe the same schema). It returns
 requires the metadata GIN index and its PostgreSQL-specific definition, and an
 audit log partitioned with its append-only triggers and both `jasil_audit_*`
 functions, as `rev0006` builds it: one made by `create_all` is refused, because
-`upgrade()` would never add them afterwards.
+`upgrade()` would never add them afterwards. On MySQL and MariaDB a plain audit log
+is adopted at `rev0007`, but only with the outbox as it was then: a schema
+`create_all` builds with this release is refused too.
 
 Adopting an older revision leaves the database behind head, so always call
 `upgrade()` next: it applies the revisions after the recorded one. That is how a
@@ -329,7 +341,8 @@ install. Create JASIL's tables with `upgrade()` first if that applies to you.
 
 Set `transaction_per_migration=True` in your `env.py` too. On PostgreSQL `rev0002`,
 `rev0004` and `rev0006` commit their other changes before building their
-`jasil_processing_jobs` indexes `CONCURRENTLY`; inside one transaction for the whole
+`jasil_processing_jobs` indexes `CONCURRENTLY`, and `rev0009` commits before building
+its `jasil_event_outbox` index the same way; inside one transaction for the whole
 run, that commit would also commit every revision before them.
 
 To render the SQL instead of running it (`alembic upgrade --sql`), pass

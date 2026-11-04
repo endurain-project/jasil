@@ -237,6 +237,27 @@ that ignores the signal mid-side-effect, and a handler abandoned past
 double-charge, double-send, or double-count, that is a correctness bug in the
 handler, not in the queue.
 
+## Caller-supplied event ids
+
+A producer may pass its own `event_id`, and the outbox keeps one row per id. An
+id an attacker chooses or can guess lets one producer's event suppress another's
+of the same type: if the attacker publishes first, the legitimate event reuses
+the id and is refused, a denial of that event. A deterministic id is
+guessable, so an id handed back as a `202` polling handle must not be what
+authorizes reading the operation.
+
+**Mitigations.** A reused id is accepted only when the stored row has the same
+`event_type` and payload; otherwise it raises `ValueError` and the unit of work
+rolls back. An id is at most 36 characters of lowercase `a-z`, `0-9`, `.`, `_`
+and `-`, so it compares the same under every database collation and cannot carry
+a line break or control character into a log line. The error names the field and
+never echoes the payload. On the bus route, where nothing dedups, a reused id
+never rewrites the event-log row of a durable event or of another event type.
+
+**Yours.** Never pass untrusted input, such as an `Idempotency-Key` header, as
+`event_id`. Derive it server-side, namespaced per tenant or user (for example
+`uuid5` over tenant, event type and key), and authorize status lookups by owner.
+
 ## Tampering with the audit trail
 
 **Guarded.** `jasil_audit_log` is append-only for every role but its owner: `UPDATE`, `DELETE` and `TRUNCATE` are

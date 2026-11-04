@@ -13,8 +13,14 @@ JASIL owns, not one carrying a caller's uncommitted work.
 The recording helpers write the event lifecycle: ``record_published`` /
 ``mark_processing`` / ``mark_completed`` / ``mark_failed`` for bus-delivered
 events (via the recorder in :mod:`jasil.event_log.recorder`), and ``record_queued``
-for events handed to the durable job queue (via the publish facade). The
-``get_event_log_summary`` helper powers the admin dashboard. Every query here is
+for events handed to the durable job queue (via the publish facade).
+
+The row's primary key is the event id, which a producer may reuse. A reused id keeps the first row:
+``record_published`` ignores the duplicate, and the ``mark_*`` transitions update only a row of the same
+``event_type`` that is not ``queued``, so a bus event never rewrites another event's row or a durable event's
+terminal ``queued`` row.
+
+The ``get_event_log_summary`` helper powers the admin dashboard. Every query here is
 portable SQL so the same code runs on PostgreSQL, MySQL and SQLite.
 """
 
@@ -22,11 +28,12 @@ from collections import defaultdict
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, func, select, update
 from sqlalchemy.orm import Session
 
 import jasil._core.pruning as pruning
 import jasil.event_log.schema as event_log_schema
+from jasil._core.dialects import insert_ignoring_conflict
 from jasil._core.limits import (
     MAX_HANDLER_NAME_LENGTH,
     MAX_STORED_ERROR_LENGTH,
@@ -46,9 +53,20 @@ _STATUS_FAILED = "failed"
 _STATUS_DEAD_LETTER = "dead_letter"
 
 
+def _bus_row(event: Event) -> tuple[ColumnElement[bool], ...]:
+    """The conditions selecting the row a bus transition may update: this event's, and not a durable ``queued`` one."""
+    return (
+        EventLog.id == event.event_id,
+        EventLog.event_type == event.event_type,
+        EventLog.status != _STATUS_QUEUED,
+    )
+
+
 def record_published(event: Event, db: Session, *, now: datetime) -> None:
     """
-    Insert the initial ``published`` row for a freshly published event.
+    Insert the initial ``published`` row for a freshly published event, unless its id already has one.
+
+    A reused id writes nothing, so the row keeps the first event's type, source and payload.
 
     Args:
         event: The event envelope being published.
@@ -58,18 +76,17 @@ def record_published(event: Event, db: Session, *, now: datetime) -> None:
     Returns:
         None.
     """
-    db.add(
-        EventLog(
-            id=event.event_id,
-            event_type=event.event_type,
-            event_source=event.source,
-            event_payload=event.payload,
-            event_metadata=event.metadata or None,
-            status=_STATUS_PUBLISHED,
-            retry_count=event.retry_count,
-            created_at=now,
-        )
-    )
+    values = {
+        "id": event.event_id,
+        "event_type": event.event_type,
+        "event_source": event.source,
+        "event_payload": event.payload,
+        "event_metadata": event.metadata or None,
+        "status": _STATUS_PUBLISHED,
+        "retry_count": event.retry_count,
+        "created_at": now,
+    }
+    db.execute(insert_ignoring_conflict(EventLog, values, conflict_columns=["id"], db=db))
     db.commit()
 
 
@@ -109,12 +126,12 @@ def record_queued(event: Event, db: Session, *, now: datetime, commit: bool = Tr
     commit_or_flush(db, commit)
 
 
-def mark_processing(event_id: str, worker_id: str, db: Session, *, now: datetime) -> None:
+def mark_processing(event: Event, worker_id: str, db: Session, *, now: datetime) -> None:
     """
     Transition an event to ``processing`` when a consumer picks it up.
 
     Args:
-        event_id: The event_id (primary key).
+        event: The event whose row is updated; a row of another ``event_type`` or a ``queued`` one is left alone.
         worker_id: The process/consumer handling the event.
         db: Active database session.
         now: The platform clock's instant, stored as ``processed_at``.
@@ -124,7 +141,7 @@ def mark_processing(event_id: str, worker_id: str, db: Session, *, now: datetime
     """
     db.execute(
         update(EventLog)
-        .where(EventLog.id == event_id)
+        .where(*_bus_row(event))
         .values(
             status=_STATUS_PROCESSING,
             worker_id=fit_length(worker_id, MAX_WORKER_ID_LENGTH),
@@ -135,13 +152,13 @@ def mark_processing(event_id: str, worker_id: str, db: Session, *, now: datetime
 
 
 def mark_completed(
-    event_id: str, handler_name: str | None, processing_time_ms: int, db: Session, *, now: datetime
+    event: Event, handler_name: str | None, processing_time_ms: int, db: Session, *, now: datetime
 ) -> None:
     """
     Transition an event to ``completed`` after its handlers succeed.
 
     Args:
-        event_id: The event_id (primary key).
+        event: The event whose row is updated; a row of another ``event_type`` or a ``queued`` one is left alone.
         handler_name: The subscriber(s) that processed the event.
         processing_time_ms: Handler execution time in milliseconds.
         db: Active database session.
@@ -152,7 +169,7 @@ def mark_completed(
     """
     db.execute(
         update(EventLog)
-        .where(EventLog.id == event_id)
+        .where(*_bus_row(event))
         .values(
             status=_STATUS_COMPLETED,
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),
@@ -164,7 +181,7 @@ def mark_completed(
 
 
 def mark_failed(
-    event_id: str,
+    event: Event,
     handler_name: str | None,
     error_message: str,
     processing_time_ms: int,
@@ -176,7 +193,7 @@ def mark_failed(
     Transition an event to ``failed`` when a handler raises.
 
     Args:
-        event_id: The event_id (primary key).
+        event: The event whose row is updated; a row of another ``event_type`` or a ``queued`` one is left alone.
         handler_name: The subscriber(s) that processed the event.
         error_message: The failure reason (truncated for storage).
         processing_time_ms: Handler execution time in milliseconds.
@@ -188,7 +205,7 @@ def mark_failed(
     """
     db.execute(
         update(EventLog)
-        .where(EventLog.id == event_id)
+        .where(*_bus_row(event))
         .values(
             status=_STATUS_FAILED,
             handler_name=fit_length(handler_name, MAX_HANDLER_NAME_LENGTH),

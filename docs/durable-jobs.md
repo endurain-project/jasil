@@ -379,6 +379,12 @@ overlaps with another replica's.
 This is a database constraint rather than relay logic on purpose: it holds under
 concurrency, restarts, and manual intervention.
 
+The outbox has the same guarantee one step earlier: `event_id` is unique in
+`jasil_event_outbox`, so publishing an id that is already staged writes nothing
+(see [Publishing with a known id](events-and-outbox.md#publishing-with-a-known-id)).
+Both hold only while the rows exist: relayed outbox rows and completed jobs are
+pruned after `jobs.retention_days`, after which the same id is a new event.
+
 ## Reconciliation nets
 
 Durable is not the same as guaranteed. A Redis-Streams consumer can drop a

@@ -32,6 +32,7 @@ layer only knows the generic envelope.
 
 import copy
 import logging
+import re
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from functools import partial
@@ -44,8 +45,10 @@ import jasil.jobs.registry as jobs_registry
 import jasil.runtime as platform_runtime
 from jasil._core.after_commit import run_after_commit
 from jasil._core.limits import check_length
+from jasil._core.sessions import commit_or_flush
 from jasil.events import (
     INITIAL_SCHEMA_VERSION,
+    MAX_EVENT_ID_LENGTH,
     MAX_EVENT_TYPE_LENGTH,
     MAX_SOURCE_LENGTH,
     META_REQUEST_ID,
@@ -57,6 +60,12 @@ from jasil.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
+# An explicit event id is lowercase ASCII, like a queue name (``jasil.jobs.registry``), so equality means the same
+# on SQLite, PostgreSQL and MySQL: MySQL's default ``utf8mb4_0900_ai_ci`` collation folds case and accents and
+# MariaDB's ``_general_ci`` ignores trailing spaces, either of which would make two different ids one row. The id
+# also reaches log lines and may be returned in URLs, so it carries no control characters.
+_EVENT_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]*\Z")
+
 
 def _mint(
     event_type: str,
@@ -64,8 +73,14 @@ def _mint(
     source: str,
     metadata: dict | None,
     schema_version: int = INITIAL_SCHEMA_VERSION,
+    event_id: str | None = None,
 ) -> Event:
-    """Build the event envelope on the platform clock, stamping the ambient request id for correlation."""
+    """Build the event envelope on the platform clock, stamping the ambient request id for correlation.
+
+    Raises:
+        ValueError: When ``event_id`` is not a valid explicit id (see :func:`_check_event_id`).
+    """
+    _check_event_id(event_id)
     merged: dict = {}
     request_id = correlation.get_correlation_id()
     if request_id:
@@ -78,6 +93,7 @@ def _mint(
         source=source,
         metadata=merged,
         schema_version=schema_version,
+        event_id=event_id,
         now=platform_runtime.get_active_platform().clock.now(),
     )
 
@@ -90,7 +106,7 @@ def _stage_in_outbox(
     now: datetime,
     commit: bool,
 ) -> None:
-    """Write one event to the outbox, recording it ``queued`` in the event_log.
+    """Write one event to the outbox, recording it ``queued`` in the event_log when the row is new.
 
     The event_log row is terminal for a durable event: the bus records its own
     lifecycle, the outbox path does not go through the bus, and per-subscriber
@@ -103,7 +119,9 @@ def _stage_in_outbox(
     # the module every producer imports.
     import jasil.jobs.outbox as jobs_outbox
 
-    if recorder is not None:
+    # The row goes in first: a reused id writes nothing, and then records nothing either. Both are flushed before
+    # the commit so they land together, or stay together in the caller's transaction.
+    if jobs_outbox.add_to_outbox(event, now=now, db=db, commit=False) is not None and recorder is not None:
         # Prefer the session-aware method so the queued row rides the caller's
         # transaction; third-party recorders that lack it keep the legacy
         # own-session write.
@@ -112,7 +130,7 @@ def _stage_in_outbox(
             record_in(event, db)
         else:
             recorder.record_queued(event)
-    jobs_outbox.add_to_outbox(event, now=now, db=db, commit=commit)
+    commit_or_flush(db, commit)
 
 
 def _publish_on_bus(
@@ -121,14 +139,19 @@ def _publish_on_bus(
     source: str,
     metadata_of: Callable[[dict], dict | None],
     schema_version: int,
-) -> None:
-    """Build, mint and dispatch one event on the bus, logging and swallowing any failure."""
+    event_id_of: Callable[[dict], str | None],
+) -> str | None:
+    """Build, mint and dispatch one event on the bus, logging and swallowing any failure.
+
+    Returns:
+        The event's id, or ``None`` when minting or dispatching it failed.
+    """
     try:
-        event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+        event = _mint(event_type, payload, source, metadata_of(payload), schema_version, event_id_of(payload))
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, _describe(err))
-        return
-    _dispatch_event(event)
+        return None
+    return event.event_id if _dispatch_event(event) else None
 
 
 def _describe(error: Exception) -> str:
@@ -145,6 +168,33 @@ def _no_metadata(_payload: dict) -> dict | None:
     return None
 
 
+def _no_event_id(_payload: dict) -> str | None:
+    return None
+
+
+def _check_event_id(event_id: str | None) -> None:
+    """Refuse an explicit event id that is not portable, before any route is taken.
+
+    ``None`` is fine: one is generated. The empty string is refused rather than replaced by a generated id, as
+    ``new_event`` would.
+
+    Raises:
+        ValueError: When ``event_id`` is not a string, is empty, is longer than its column, or does not start
+            with a lowercase letter or digit and contain only a-z, 0-9, '.', '_' or '-'.
+    """
+    if event_id is None:
+        return
+    if not isinstance(event_id, str):
+        raise ValueError("event_id must be a string")
+    if event_id == "":
+        raise ValueError("event_id must not be empty; pass None to have one generated")
+    check_length(event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)
+    if _EVENT_ID_PATTERN.fullmatch(event_id) is None:
+        raise ValueError(
+            "event_id must start with a lowercase letter or digit and contain only a-z, 0-9, '.', '_', or '-'"
+        )
+
+
 def _check_identifiers(event_type: str, source: str) -> None:
     """Refuse an ``event_type`` or ``source`` too long for its column, before any route is taken.
 
@@ -158,13 +208,24 @@ def _check_identifiers(event_type: str, source: str) -> None:
     check_length(source, field="source", limit=MAX_SOURCE_LENGTH)
 
 
-def _dispatch_event(event: Event) -> None:
-    """Dispatch an already-minted event on the bus, logging and swallowing failure."""
+def _dispatch_event(event: Event) -> bool:
+    """Dispatch an already-minted event on the bus, logging and swallowing failure.
+
+    Returns:
+        True when the bus accepted the event, False when dispatching failed.
+    """
     try:
         platform_runtime.get_active_platform().events.publish(event)
         logger.debug("Dispatched %s (%s) on the event bus", event.event_type, event.event_id)
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event.event_type, _describe(err))
+        return False
+    return True
+
+
+def _dispatch_after_commit(event: Event) -> None:
+    """Dispatch an event once its session commits, where there is no caller left to report the outcome to."""
+    _dispatch_event(event)
 
 
 def _stage_batch(
@@ -174,18 +235,24 @@ def _stage_batch(
     metadata_of: Callable[[dict], dict | None],
     schema_version: int,
     db: Any,
-) -> None:
+    event_id_of: Callable[[dict], str | None],
+) -> list[str]:
     """Stage one outbox row per payload on ``db`` without committing.
 
     A failure is logged and re-raised so the caller's unit of work rolls back as
     a whole — no partial domain change, no orphaned event.
+
+    Returns:
+        The event id of each payload, in order; a reused id is returned like a new one.
     """
     try:
         platform = platform_runtime.get_active_platform()
         now = platform.clock.now()
+        event_ids = []
         for payload in payloads:
-            event = _mint(event_type, payload, source, metadata_of(payload), schema_version)
+            event = _mint(event_type, payload, source, metadata_of(payload), schema_version, event_id_of(payload))
             _stage_in_outbox(platform.recorder, event, db=db, now=now, commit=False)
+            event_ids.append(event.event_id)
     except Exception as err:
         logger.error(
             "Failed to stage %d %s event(s) in the domain transaction: %s",
@@ -194,6 +261,7 @@ def _stage_batch(
             _describe(err),
         )
         raise
+    return event_ids
 
 
 def publish(
@@ -204,8 +272,15 @@ def publish(
     metadata: dict | None = None,
     db: Any = None,
     schema_version: int = INITIAL_SCHEMA_VERSION,
-) -> None:
+    event_id: str | None = None,
+) -> str | None:
     """Publish a domain event through the active platform, best-effort.
+
+    A reused id: on the durable route the outbox keeps one row per ``event_id``, so publishing an id that is
+    already there writes nothing, records nothing and returns the id, as long as the ``event_type`` and payload
+    are the same. A different ``event_type`` or payload under the same id is an error, which this function logs
+    and swallows like any other failure; so is a payload that is not JSON-native (dict, list, str, int, float,
+    bool or ``None``), which cannot be compared with the stored one.
 
     Args:
         event_type: The domain-owned channel, e.g. ``order.created``.
@@ -216,24 +291,31 @@ def publish(
         db: The producer's SQLAlchemy session. When provided and durable jobs are
             enabled for this event type, the event is written to the outbox using
             this session (durable delivery); otherwise it is ignored.
+        schema_version: Payload schema version.
+        event_id: Id for the event, so a producer can answer with it or publish the same event idempotently
+            (see "A reused id" above); ``None`` generates a UUID. An explicit id starts with a lowercase letter or
+            digit, contains only a-z, 0-9, '.', '_' or '-', and is at most ``MAX_EVENT_ID_LENGTH`` characters,
+            which a UUID string satisfies; anything else is refused.
 
     Returns:
-        None. Delivery failures are logged and swallowed so a publish never
-        breaks the producer. The domain row remains the source of truth and each
-        subscriber's reconciliation net recovers anything missed.
+        The event's id, or ``None`` when publishing failed. Delivery failures (including an invalid
+        ``event_id``, or a reused one with a different ``event_type`` or payload) are logged and swallowed so a
+        publish never breaks the producer. The domain row remains the source of truth and each subscriber's
+        reconciliation net recovers anything missed.
     """
     try:
         platform = platform_runtime.get_active_platform()
-        event = _mint(event_type, payload, source, metadata, schema_version)
+        event = _mint(event_type, payload, source, metadata, schema_version, event_id)
         if db is not None and _durable_delivery_enabled(event_type):
             _stage_in_outbox(platform.recorder, event, db=db, now=platform.clock.now(), commit=True)
             # Which route an event took is the first thing anyone asks when it
             # appears not to have been processed, and nothing else records it.
             logger.debug("Staged %s (%s) in the outbox for durable delivery", event_type, event.event_id)
-        else:
-            _dispatch_event(event)
+            return event.event_id
+        return event.event_id if _dispatch_event(event) else None
     except Exception as err:
         logger.error("Failed to publish event %s: %s", event_type, _describe(err))
+        return None
 
 
 def publish_committing(
@@ -245,7 +327,8 @@ def publish_committing(
     db: Any,
     commit: Callable[[], None],
     schema_version: int = INITIAL_SCHEMA_VERSION,
-) -> None:
+    event_id: str | None = None,
+) -> str | None:
     """Publish a domain event atomically around the caller's domain commit.
 
     Unlike :func:`publish` (which the caller invokes *after* it has already
@@ -270,23 +353,37 @@ def publish_committing(
         metadata: Optional correlation context; merged with the ambient request id.
         db: The producer's SQLAlchemy session (holds the uncommitted domain change).
         commit: Zero-arg callable that commits the caller's unit of work.
+        schema_version: Payload schema version.
+        event_id: Id for the event, so a producer can answer with it or publish the same event idempotently
+            (a reused id is described under Returns); ``None`` generates a UUID. An explicit id starts with a
+            lowercase letter or digit, contains only a-z, 0-9, '.', '_' or '-', and is at most
+            ``MAX_EVENT_ID_LENGTH`` characters, which a UUID string satisfies; anything else is refused.
 
     Returns:
-        None.
+        The event's id, or ``None`` when the event could not be published on the best-effort route. On the
+        durable route a failure raises instead, so the id is always returned. A reused id (the outbox keeps one
+        row per ``event_id``) writes nothing, records nothing and returns the id, provided the ``event_type`` and
+        payload are the same.
 
     Raises:
-        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
-            anything is committed or staged.
+        ValueError: When ``event_type`` or ``source`` is longer than its column, or ``event_id`` is invalid (see
+            ``event_id`` above), on either route and before anything is committed or staged; or, on the durable
+            route, when ``event_id`` is already in the outbox with a different ``event_type`` or payload.
+        TypeError: On the durable route, when ``event_id`` is already in the outbox and the payload is not
+            JSON-native (dict, list, str, int, float, bool or ``None``), so it cannot be compared with the
+            stored one.
     """
-    publish_many_committing(
+    _check_event_id(event_id)
+    return publish_many_committing(
         event_type,
         [payload],
         source=source,
         metadata_for=lambda _payload: metadata,
+        event_id_for=lambda _payload: event_id,
         db=db,
         commit=commit,
         schema_version=schema_version,
-    )
+    )[0]
 
 
 def _durable_delivery_enabled(event_type: str) -> bool:
@@ -305,10 +402,11 @@ def publish_many_committing(
     *,
     source: str,
     metadata_for: Callable[[dict], dict | None] | None = None,
+    event_id_for: Callable[[dict], str | None] | None = None,
     db: Any,
     commit: Callable[[], None],
     schema_version: int = INITIAL_SCHEMA_VERSION,
-) -> None:
+) -> list[str | None]:
     """Publish many same-type events atomically around one domain commit.
 
     The batch counterpart of :func:`publish_committing`, for producers that
@@ -323,29 +421,44 @@ def publish_many_committing(
             so the caller's unit of work is committed exactly once either way.
         source: Origin label, e.g. ``api:bulk_delete``.
         metadata_for: Optional per-payload correlation metadata builder.
+        event_id_for: Optional per-payload event id builder, returning ``None`` for a generated id. An id that
+            is not a valid ``event_id`` (see :func:`publish_committing`) is refused: it raises on the durable
+            route and skips only that event, logged, on the best-effort route. A builder that raises behaves
+            like a raising ``metadata_for``.
         db: The producer's SQLAlchemy session (holds the uncommitted change).
         commit: Zero-arg callable that commits the caller's unit of work.
+        schema_version: Payload schema version.
 
     Returns:
-        None.
+        One entry per payload, in payload order: the event's id, or ``None`` for an event that could not be
+        published on the best-effort route (its failure is logged). On the durable route a failure raises
+        instead, so every entry is an id; a reused id (see :func:`publish_committing`) is returned like a new
+        one. An empty batch returns ``[]``.
 
     Raises:
         ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
-            anything is committed or staged.
+            anything is committed or staged; or, on the durable route, when an id is invalid or already in the
+            outbox with a different ``event_type`` or payload.
+        TypeError: On the durable route, when an id is already in the outbox and its payload is not JSON-native
+            (dict, list, str, int, float, bool or ``None``), so it cannot be compared with the stored one.
     """
     _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
+    event_id_of = event_id_for if event_id_for is not None else _no_event_id
     if db is not None and _durable_delivery_enabled(event_type):
         # Atomic path: stage every outbox row inside the caller's transaction.
-        _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
+        event_ids: list[str | None] = list(
+            _stage_batch(event_type, payloads, source, metadata_of, schema_version, db, event_id_of)
+        )
         commit()
-    else:
-        # Best-effort path: the domain change is the source of truth, so commit it
-        # first, then dispatch each event on the bus (swallowing failures — the
-        # subscriber's reconciliation net recovers anything dropped).
-        commit()
-        for payload in payloads:
-            _publish_on_bus(event_type, payload, source, metadata_of, schema_version)
+        return event_ids
+    # Best-effort path: the domain change is the source of truth, so commit it
+    # first, then dispatch each event on the bus (swallowing failures — the
+    # subscriber's reconciliation net recovers anything dropped).
+    commit()
+    return [
+        _publish_on_bus(event_type, payload, source, metadata_of, schema_version, event_id_of) for payload in payloads
+    ]
 
 
 def publish_on_commit(
@@ -356,7 +469,8 @@ def publish_on_commit(
     metadata: dict | None = None,
     db: Any,
     schema_version: int = INITIAL_SCHEMA_VERSION,
-) -> None:
+    event_id: str | None = None,
+) -> str | None:
     """Publish a domain event tied to ``db``'s commit, without owning the commit.
 
     The caller stages the event and whoever owns the transaction commits whenever
@@ -391,22 +505,36 @@ def publish_on_commit(
         metadata: Optional correlation context; merged with the ambient request id.
         db: The producer's SQLAlchemy session (holds the uncommitted change).
         schema_version: Payload schema version.
+        event_id: Id for the event, so a producer can answer with it or publish the same event idempotently
+            (a reused id is described under Returns); ``None`` generates a UUID. An explicit id starts with a
+            lowercase letter or digit, contains only a-z, 0-9, '.', '_' or '-', and is at most
+            ``MAX_EVENT_ID_LENGTH`` characters, which a UUID string satisfies; anything else is refused.
 
     Returns:
-        None.
+        The event's id, or ``None`` when the best-effort route could not mint the event (the failure is
+        logged). On that route the id is returned when the event is minted, before the commit that dispatches
+        it. On the durable route a failure raises instead, so the id is always returned; a reused id (the outbox
+        keeps one row per ``event_id``) writes nothing, records nothing and returns the id, provided the
+        ``event_type`` and payload are the same.
 
     Raises:
-        ValueError: When ``event_type`` or ``source`` is longer than its column, on either route and before
-            anything is committed or staged.
+        ValueError: When ``event_type`` or ``source`` is longer than its column, or ``event_id`` is invalid (see
+            ``event_id`` above), on either route and before anything is staged; or, on the durable route, when
+            ``event_id`` is already in the outbox with a different ``event_type`` or payload.
+        TypeError: On the durable route, when ``event_id`` is already in the outbox and the payload is not
+            JSON-native (dict, list, str, int, float, bool or ``None``), so it cannot be compared with the
+            stored one.
     """
-    publish_many_on_commit(
+    _check_event_id(event_id)
+    return publish_many_on_commit(
         event_type,
         [payload],
         source=source,
         metadata_for=lambda _payload: metadata,
+        event_id_for=lambda _payload: event_id,
         db=db,
         schema_version=schema_version,
-    )
+    )[0]
 
 
 def publish_many_on_commit(
@@ -415,9 +543,10 @@ def publish_many_on_commit(
     *,
     source: str,
     metadata_for: Callable[[dict], dict | None] | None = None,
+    event_id_for: Callable[[dict], str | None] | None = None,
     db: Any,
     schema_version: int = INITIAL_SCHEMA_VERSION,
-) -> None:
+) -> list[str | None]:
     """Publish many same-type events tied to ``db``'s commit.
 
     The batch counterpart of :func:`publish_on_commit`, with the same delivery
@@ -430,16 +559,26 @@ def publish_many_on_commit(
         payloads: One payload per event.
         source: Origin label, e.g. ``api:bulk_delete``.
         metadata_for: Optional per-payload correlation metadata builder.
+        event_id_for: Optional per-payload event id builder, returning ``None`` for a generated id. An id that
+            is not a valid ``event_id`` (see :func:`publish_committing`) is refused: it raises on the durable
+            route and skips only that event, logged, on the best-effort route. A builder that raises behaves
+            like a raising ``metadata_for``.
         db: The producer's SQLAlchemy session (holds the uncommitted change).
         schema_version: Payload schema version.
 
     Returns:
-        None.
+        One entry per payload, in payload order: the event's id, or ``None`` for an event the best-effort route
+        could not mint (its failure is logged). On that route an id is returned when the event is minted, before
+        the commit that dispatches it. On the durable route a failure raises instead, so every entry is an id; a
+        reused id (see :func:`publish_on_commit`) is returned like a new one. An empty batch returns ``[]``.
 
     Raises:
         ValueError: When ``db`` is ``None``, or ``event_type`` or ``source`` is longer than its column, on
-            either route and before anything is staged.
-        TypeError: When ``db`` is not a synchronous ``Session``.
+            either route and before anything is staged; or, on the durable route, when an id is invalid or
+            already in the outbox with a different ``event_type`` or payload.
+        TypeError: When ``db`` is not a synchronous ``Session``; or, on the durable route, when an id is already
+            in the outbox and its payload is not JSON-native (dict, list, str, int, float, bool or ``None``), so
+            it cannot be compared with the stored one.
     """
     if db is None:
         raise ValueError("publish_on_commit/publish_many_on_commit require the producer's session as `db`")
@@ -448,16 +587,23 @@ def publish_many_on_commit(
             f"publish_on_commit/publish_many_on_commit need a synchronous sqlalchemy.orm.Session, got {type(db).__name__}"
         )
     if not payloads:
-        return
+        return []
     _check_identifiers(event_type, source)
     metadata_of = metadata_for if metadata_for is not None else _no_metadata
+    event_id_of = event_id_for if event_id_for is not None else _no_event_id
     if _durable_delivery_enabled(event_type):
-        _stage_batch(event_type, payloads, source, metadata_of, schema_version, db)
-        return
+        return list(_stage_batch(event_type, payloads, source, metadata_of, schema_version, db, event_id_of))
+    event_ids: list[str | None] = []
     for payload in payloads:
         try:
             # A copy: the event is the one published now, whatever the caller does to the dict before committing.
-            event = _mint(event_type, copy.deepcopy(payload), source, metadata_of(payload), schema_version)
-            run_after_commit(db, partial(_dispatch_event, event))
+            event = _mint(
+                event_type, copy.deepcopy(payload), source, metadata_of(payload), schema_version, event_id_of(payload)
+            )
+            run_after_commit(db, partial(_dispatch_after_commit, event))
         except Exception as err:
             logger.error("Failed to publish event %s: %s", event_type, _describe(err))
+            event_ids.append(None)
+        else:
+            event_ids.append(event.event_id)
+    return event_ids
