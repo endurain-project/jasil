@@ -419,6 +419,52 @@ class TestEventOutboxUniqueEventId:
             metadata.drop_all(engine)
 
 
+class TestInstanceRowSeed:
+    """rev0010 creates the ``jasil_instance`` row, so the first audit write never has to."""
+
+    @staticmethod
+    def _instance_ids(engine) -> list[str]:
+        with engine.connect() as connection:
+            return list(connection.execute(text("SELECT instance_id FROM jasil_instance")).scalars())
+
+    def test_the_upgrade_creates_the_one_row(self, engine):
+        migrations.upgrade(engine)
+
+        (instance_id,) = self._instance_ids(engine)
+        assert len(instance_id) == 36
+
+    def test_a_row_that_exists_is_kept(self, engine):
+        migrations.upgrade(engine, "rev0009")
+        with engine.begin() as connection:
+            connection.execute(text("INSERT INTO jasil_instance (id, instance_id) VALUES (1, 'existing')"))
+
+        migrations.upgrade(engine)
+
+        assert self._instance_ids(engine) == ["existing"]
+
+    def test_the_id_survives_a_downgrade_and_upgrade(self, engine):
+        migrations.upgrade(engine)
+        before = self._instance_ids(engine)
+
+        migrations.downgrade(engine, "rev0009")
+        migrations.upgrade(engine)
+
+        assert self._instance_ids(engine) == before
+
+    def test_the_upgrade_renders_as_sql(self):
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+
+        command.upgrade(config, "rev0009:rev0010", sql=True)
+
+        assert "INSERT INTO jasil_instance" in config.output_buffer.getvalue()
+
+
 class TestRevisionTransactions:
     """Each revision commits on its own, so no lock one takes is held through the next."""
 

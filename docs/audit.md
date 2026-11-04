@@ -81,9 +81,11 @@ startup.
 is flushed whenever the session next flushes (autoflush, an explicit flush, or commit), and becomes durable when
 the caller commits. A storage error therefore surfaces from that flush or commit, which is exactly where the
 caller's transaction fails. The first audited write in a process reads the deployment's
-[instance id](#storage) on that same session, without flushing it. Only a deployment's very first write, before
-`jasil_instance` holds its row, creates it on a short session of its own on the same engine; call
-`jasil_audit.sync_catalog()` at startup to do that outside a request.
+[instance id](#storage) on that same session, without flushing it. A database migrated with `rev0010` or later already holds the
+`jasil_instance` row. For one built with `create_all`, the deployment's very first write creates it on a short
+session of its own on the same engine. On SQLite that session cannot get the write lock while the caller's
+transaction holds it, and fails with `database is locked`, so call `jasil_audit.ensure_instance_id(engine)` once
+at startup (`jasil_audit.sync_catalog()` does it too), and in a test suite after `create_all`.
 
 `stage_many(db, [AuditRecord(...), ...])` validates every record before adding any, so one bad record stages
 nothing (and [`capture_audit`](#testing) captures nothing).
@@ -203,7 +205,7 @@ set the context in every entry point.
 | `jasil_audit_log` | The trail. Append-only. |
 | `jasil_audit_actions` | The catalog, as last synchronized. |
 | `jasil_audit_checkpoints` | The sealed, chained [checkpoints](#tamper-evidence). |
-| `jasil_instance` | One row: a random UUID generated on first use, stamped on every audit row as `instance_id`, and the retention settings maintenance last saw. |
+| `jasil_instance` | One row: a random UUID, created by migration `rev0010` (or on first use in a database built with `create_all`), stamped on every audit row as `instance_id`, and the retention settings maintenance last saw. |
 
 `jasil_audit_log` rows have a UUIDv7 `id` (time-ordered) and an `occurred_at` that together form the primary key.
 `occurred_at` is taken from the platform clock when the row is staged. Indexes: `(occurred_at)`,
@@ -614,6 +616,10 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
 - Processes of the previous release only insert into the log, so they are unaffected. Downgrading to `rev0007`
   removes the partitioning, the triggers and the procedures and keeps the rows.
+
+Migration `rev0010` creates the `jasil_instance` row if it is missing, so the first audited write has nothing to
+create. A row that exists keeps its id, and downgrading leaves the row. Processes of the previous release read the
+row and create it only when it is missing, so they are unaffected during a rolling deploy.
 
 ## For the host's architecture tests
 

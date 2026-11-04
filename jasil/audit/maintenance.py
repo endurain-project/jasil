@@ -117,6 +117,9 @@ def _sync_catalog() -> CatalogSyncResult:
     registered = {action.id: action for action in get_catalog()}
     added = updated = deprecated = 0
     with jasil_orm.get_sessionmaker()() as db:
+        # Before this session writes: on SQLite it would then hold the write lock the instance row's own
+        # session needs, so the row is created first.
+        service.ensure_instance_id(service.engine_of(db))
         stored: ScalarResult[AuditActionRecord] = db.scalars(select(AuditActionRecord))
         existing = {row.id: row for row in stored}
         for action in registered.values():

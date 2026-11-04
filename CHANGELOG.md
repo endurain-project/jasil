@@ -8,6 +8,23 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-04
+
+This release fixes the first audit write on a fresh SQLite database failing with `database is locked`. Migration `rev0010` creates the `jasil_instance` row, and `ensure_instance_id` is now public.
+
+### Added
+
+- **`jasil.audit.ensure_instance_id(engine)`** is public. Call it once at startup, or after `create_all` in a test suite, so the first audited write finds the `jasil_instance` row. See [Audit trail](docs/audit.md#the-two-write-paths).
+- **Migration `rev0010`** creates the `jasil_instance` row if it is missing and keeps one that exists. A database migrated to it never creates the row on the first audited write. Previous-release processes are unaffected during a rolling deploy, and the downgrade leaves the row.
+
+### Fixed
+
+- The first audit write on a fresh SQLite database no longer fails with `database is locked` from `sync_catalog()`, which now creates the instance row before its own session writes. A `create_all` database whose first write is a `stage()` after another write in the same transaction still needs `ensure_instance_id` first. ([#50](https://github.com/endurain-project/jasil/issues/50))
+
+### Upgrading
+
+- Run migration `rev0010`. It only inserts the `jasil_instance` row when it is missing, so nothing is locked or rebuilt, and processes of the previous release keep working while it applies. A database built with `create_all` runs no migration: call `jasil.audit.ensure_instance_id(engine)` once at startup.
+
 ## [0.16.0] - 2026-11-04
 
 This release brings the audit trail's guarantees to MySQL and MariaDB, lets a service switch off the capabilities it does not use, and lets a publisher choose the id of the events it publishes. One change is breaking: `retention_floor_sql` returns a list. Migrations `rev0008` and `rev0009` need attention before you deploy; see **Upgrading**.
