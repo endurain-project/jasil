@@ -451,7 +451,7 @@ class TestInstanceRowSeed:
 
         assert self._instance_ids(engine) == before
 
-    def test_the_upgrade_renders_as_sql(self):
+    def test_the_sql_script_seeds_nothing_because_its_id_would_be_shared(self):
         import io
 
         from alembic import command
@@ -462,7 +462,7 @@ class TestInstanceRowSeed:
 
         command.upgrade(config, "rev0009:rev0010", sql=True)
 
-        assert "INSERT INTO jasil_instance" in config.output_buffer.getvalue()
+        assert "jasil_instance" not in config.output_buffer.getvalue()
 
 
 class TestRevisionTransactions:

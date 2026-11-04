@@ -23,7 +23,7 @@ This release fixes the first audit write on a fresh SQLite database failing with
 
 ### Upgrading
 
-- Run migration `rev0010`. It only inserts the `jasil_instance` row when it is missing, so nothing is locked or rebuilt, and processes of the previous release keep working while it applies. A database built with `create_all` runs no migration: call `jasil.audit.ensure_instance_id(engine)` once at startup.
+- Run migration `rev0010`. It only inserts the `jasil_instance` row when it is missing, so nothing is locked or rebuilt, and processes of the previous release keep working while it applies. A script rendered with `--sql` seeds nothing, because its id would be shared by every database it runs on. A database built with `create_all` runs no migration: call `jasil.audit.ensure_instance_id(engine)` once at startup.
 
 ## [0.16.0] - 2026-11-04
 

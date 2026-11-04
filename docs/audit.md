@@ -618,7 +618,7 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   removes the partitioning, the triggers and the procedures and keeps the rows.
 
 Migration `rev0010` creates the `jasil_instance` row if it is missing, so the first audited write has nothing to
-create. A row that exists keeps its id, and downgrading leaves the row. Processes of the previous release read the
+create. A row that exists keeps its id, and downgrading leaves the row. A script rendered with `--sql` seeds nothing: its id would be one literal shared by every database it runs on, so those databases create the row on their first audited write. Processes of the previous release read the
 row and create it only when it is missing, so they are unaffected during a rolling deploy.
 
 ## For the host's architecture tests
