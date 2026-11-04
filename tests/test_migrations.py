@@ -31,6 +31,7 @@ from sqlalchemy import (
 )
 
 from jasil import migrations
+from jasil.audit import _mysql as audit_mysql
 from jasil.audit import _postgres as audit_pg
 from jasil.orm import jasil_table_names, legacy_table_names
 
@@ -56,11 +57,15 @@ def _drop_everything(engine, mapped_base) -> None:
         # only to an older revision.
         for name in sorted(legacy_table_names()):
             connection.exec_driver_sql(f"DROP TABLE IF EXISTS {name}")
-        # rev0006's PostgreSQL functions outlive the tables: left behind, they make a later
-        # test's plain ``create_all`` schema look partitioned to audit maintenance.
+        # The audit routines (rev0006 on PostgreSQL, rev0008 on MySQL) outlive the tables: left behind,
+        # they make a later test's plain ``create_all`` schema look partitioned to audit maintenance.
         if engine.dialect.name == "postgresql":
             schema = connection.execute(text("SELECT current_schema()")).scalar_one()
             for statement in audit_pg.uninstall_statements(schema):
+                connection.exec_driver_sql(statement)
+        if engine.dialect.name in ("mysql", "mariadb"):
+            schema = connection.execute(text("SELECT DATABASE()")).scalar_one()
+            for statement in audit_mysql.uninstall_statements(schema):
                 connection.exec_driver_sql(statement)
 
 
@@ -358,6 +363,62 @@ class TestDeadLetterNotified:
         assert {"dead_letter_notified_at", "dead_letter_notify_after", "dead_letter_attempts"} <= columns
 
 
+class TestEventOutboxUniqueEventId:
+    """rev0009 makes a reused ``event_id`` a no-op by indexing it uniquely."""
+
+    @staticmethod
+    def _event_id_indexes(engine) -> dict[str, bool]:
+        return {
+            index["name"]: bool(index["unique"])
+            for index in inspect(engine).get_indexes("jasil_event_outbox")
+            if index["column_names"] == ["event_id"]
+        }
+
+    def test_the_upgrade_indexes_event_id_uniquely(self, engine):
+        migrations.upgrade(engine)
+
+        assert self._event_id_indexes(engine) == {"uq_jasil_event_outbox_event_id": True}
+
+    def test_the_downgrade_removes_the_index(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0008")
+
+        assert self._event_id_indexes(engine) == {}
+        assert migrations.db_revision(engine) == "rev0008"
+
+    def test_a_database_at_rev0008_is_adopted_there_and_then_upgraded(self, engine):
+        migrations.upgrade(engine, "rev0008")
+        _drop_version_table(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == "rev0008"
+
+        migrations.upgrade(engine)
+        assert self._event_id_indexes(engine) == {"uq_jasil_event_outbox_event_id": True}
+
+    def test_online_create_index_can_be_unique(self, engine):
+        from alembic.operations import Operations
+        from alembic.runtime.migration import MigrationContext
+
+        from jasil.migrations import _online
+
+        metadata = MetaData()
+        Table("host_scratch", metadata, Column("id", Integer, primary_key=True), Column("code", String(20)))
+        metadata.create_all(engine)
+        try:
+            with engine.connect() as connection:
+                context = MigrationContext.configure(connection)
+                # A revision runs inside the context's transaction, which the PostgreSQL build commits early.
+                with Operations.context(context), context.begin_transaction():
+                    _online.create_index("uq_host_scratch_code", "host_scratch", ["code"], unique=True)
+
+            indexes = inspect(engine).get_indexes("host_scratch")
+            assert [(index["name"], bool(index["unique"])) for index in indexes] == [("uq_host_scratch_code", True)]
+        finally:
+            metadata.drop_all(engine)
+
+
 class TestRevisionTransactions:
     """Each revision commits on its own, so no lock one takes is held through the next."""
 
@@ -497,6 +558,21 @@ class TestOfflineSql:
         build = sql.index("CREATE INDEX CONCURRENTLY idx_jasil_processing_jobs_dead_letter")
         assert sql.rindex("COMMIT", 0, build) > sql.rindex("ADD COLUMN dead_letter_notified_at", 0, build)
 
+    def test_the_outbox_event_id_index_renders_unique_and_concurrent(self):
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", "postgresql://offline/none")
+        config.output_buffer = io.StringIO()
+
+        command.upgrade(config, "rev0008:rev0009", sql=True)
+
+        assert "CREATE UNIQUE INDEX CONCURRENTLY uq_jasil_event_outbox_event_id ON jasil_event_outbox (event_id)" in (
+            config.output_buffer.getvalue()
+        )
+
 
 class TestOfflineAuditTrail:
     """rev0006 qualifies its functions with the target schema, which ``--sql`` cannot ask a database for."""
@@ -538,6 +614,32 @@ class TestOfflineAuditTrail:
     def test_without_a_schema_it_says_how_to_give_one(self):
         with pytest.raises(RuntimeError, match="-x schema="):
             self._render("rev0005:rev0006")
+
+
+class TestOfflineMysqlAuditTrail:
+    """rev0008 partitions the audit log by the days its rows fall on, which ``--sql`` cannot read."""
+
+    def _render(self, url: str) -> str:
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", url)
+        config.output_buffer = io.StringIO()
+        command.upgrade(config, "rev0007:rev0008", sql=True)
+        return config.output_buffer.getvalue()
+
+    @pytest.mark.parametrize("url", ["mysql+pymysql://offline/none", "mariadb+pymysql://offline/none"])
+    def test_it_refuses_to_render_for_mysql_and_says_why(self, url):
+        with pytest.raises(RuntimeError, match="cannot be rendered as SQL for MySQL"):
+            self._render(url)
+
+    def test_it_renders_nothing_for_postgresql(self):
+        sql = self._render("postgresql://offline/none")
+
+        assert "jasil_audit_log" not in sql
+        assert "rev0008" in sql  # only the version stamp
 
 
 class TestAdoptExistingSchema:
@@ -747,6 +849,59 @@ class TestAdoptExistingSchema:
         assert "missing function 'jasil_audit_drop_partitions(timestamptz, timestamptz)'" in message
         assert migrations.db_revision(engine) is None
 
+    def test_a_plain_mysql_audit_log_is_adopted_at_the_revision_before_its_protections(self, engine):
+        """rev0006 and rev0007 built a plain table on MySQL; ``upgrade`` then partitions and protects it."""
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        migrations.upgrade(engine, "rev0007")
+        _drop_version_table(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == "rev0007"
+
+        migrations.upgrade(engine)
+        assert migrations.adopt_existing_schema(engine) is False
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_a_mysql_create_all_schema_is_rejected(self, engine, mapped_base):
+        """``create_all`` builds rev0009's outbox index beside an audit log without rev0008's protections."""
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        mapped_base.metadata.create_all(engine)
+
+        with pytest.raises(migrations.SchemaCompatibilityError) as caught:
+            migrations.adopt_existing_schema(engine)
+
+        message = str(caught.value)
+        assert "(closest revision rev0007)" in message
+        assert "jasil_event_outbox: unexpected index 'uq_jasil_event_outbox_event_id'" in message
+        assert migrations.db_revision(engine) is None
+
+    def test_a_mysql_audit_log_with_part_of_its_protections_matches_no_revision(self, engine):
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+        with engine.begin() as connection:
+            connection.exec_driver_sql("DROP TRIGGER jasil_audit_log_no_delete")
+
+        with pytest.raises(migrations.SchemaCompatibilityError) as caught:
+            migrations.adopt_existing_schema(engine)
+
+        message = str(caught.value)
+        assert f"(closest revision {migrations.head_revision()})" in message
+        assert "jasil_audit_log: missing trigger 'jasil_audit_log_no_delete'" in message
+        assert migrations.db_revision(engine) is None
+
+    def test_a_protected_mysql_audit_log_is_adopted_at_the_head(self, engine):
+        if engine.dialect.name not in ("mysql", "mariadb"):
+            pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
+        migrations.upgrade(engine)
+        _drop_version_table(engine)
+
+        assert migrations.adopt_existing_schema(engine) is True
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
     def test_an_existing_head_revision_is_not_restamped(self, engine):
         migrations.upgrade(engine)
 
@@ -949,7 +1104,7 @@ class TestRevisionSchemas:
             migrations.upgrade(engine, revision)
             _drop_version_table(engine)
             with engine.connect() as connection:
-                differences, _ = migrations._schema_differences(connection, inspect(connection), metadata)
+                differences, _ = migrations._schema_differences(connection, inspect(connection), metadata, revision)
             assert differences == [], revision
 
     def test_an_unsupported_downgrade_operation_is_refused(self, mapped_base):

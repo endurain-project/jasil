@@ -21,8 +21,12 @@ import jasil.jobs.registry as jobs_registry
 import jasil.publisher as publisher
 import jasil.runtime as runtime
 import jasil.settings as settings
+import jasil.testing as jasil_testing
+from jasil.event_log.models import EventLog
+from jasil.event_log.recorder import EventLogRecorder
 from jasil.events import META_REQUEST_ID
 from jasil.jobs.models import EventOutbox
+from jasil.testing import FixedClock as ClockForRecorder
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -192,6 +196,30 @@ class TestCorrelation:
         publisher.publish("activity.created", {}, source="test")
 
         assert META_REQUEST_ID not in platform.events.published[0].metadata
+
+
+class TestDisabledEventBus:
+    """``events_uri=none://`` drops best-effort events silently; the durable route never touches the bus."""
+
+    def test_a_best_effort_publish_logs_no_error(self, tmp_path, caplog):
+        jasil_testing.install_test_platform(tmp_path, settings=settings.JasilSettings(events_uri="none://"))
+
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {"id": 1}, source="test")
+
+        assert caplog.records == []
+
+    def test_a_durable_event_is_still_staged_in_the_outbox(self, tmp_path, db):
+        jasil_testing.install_test_platform(
+            tmp_path,
+            settings=settings.JasilSettings(events_uri="none://", jobs=settings.JobSettings(enabled=True)),
+        )
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+        publisher.publish("activity.created", {"id": 1}, source="test", db=db)
+
+        assert db.query(EventOutbox).count() == 1
 
 
 class TestFailuresAreSwallowed:
@@ -737,3 +765,597 @@ class TestPublishOnCommitMintFailure:
 
         assert [e.payload["n"] for e in platform.events.published] == [2]
         assert "Failed to publish event a.one" in caplog.text
+
+
+def _register_durable(event_type: str = "activity.created") -> None:
+    _enable_durable_jobs()
+    jobs_registry.registry.register(event_type, "s", lambda _e: None)
+
+
+def _queued_rows(db) -> int:
+    return db.query(EventLog).filter(EventLog.status == "queued").count()
+
+
+class TestAnExplicitEventId:
+    def test_it_reaches_the_bus(self, platform):
+        publisher.publish("activity.created", {}, source="test", event_id="evt-1")
+
+        assert [event.event_id for event in platform.events.published] == ["evt-1"]
+
+    def test_it_reaches_the_outbox(self, platform, db):
+        _register_durable()
+
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1")
+
+        assert db.query(EventOutbox).one().event_id == "evt-1"
+
+    def test_a_builder_supplies_one_per_payload(self, platform, db):
+        publisher.publish_many_committing(
+            "activity.deleted",
+            [{"id": 1}, {"id": 2}],
+            source="test",
+            event_id_for=lambda payload: f"evt-{payload['id']}",
+            db=db,
+            commit=lambda: None,
+        )
+
+        assert [event.event_id for event in platform.events.published] == ["evt-1", "evt-2"]
+
+    def test_no_id_still_mints_a_uuid(self, platform):
+        returned = publisher.publish("activity.created", {}, source="test")
+
+        assert returned == platform.events.published[0].event_id
+        assert len(returned) == 36
+
+
+class TestPublishReturnsTheEventId:
+    def test_publish_on_the_bus(self, platform):
+        assert publisher.publish("activity.created", {}, source="test", event_id="evt-1") == "evt-1"
+
+    def test_publish_on_the_durable_route(self, platform, db):
+        _register_durable()
+
+        assert publisher.publish("activity.created", {}, source="test", db=db, event_id="evt-1") == "evt-1"
+
+    def test_publish_returns_none_when_the_bus_failed(self, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=ExplodingBus()))
+
+        assert publisher.publish("activity.created", {}, source="test") is None
+
+    def test_publish_returns_none_when_the_platform_is_missing(self, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", None)
+
+        assert publisher.publish("activity.created", {}, source="test") is None
+
+    def test_publish_committing_on_the_bus(self, platform, db):
+        returned = publisher.publish_committing(
+            "activity.created", {}, source="test", db=db, commit=lambda: None, event_id="evt-1"
+        )
+
+        assert returned == "evt-1"
+
+    def test_publish_committing_on_the_durable_route(self, platform, db):
+        _register_durable()
+
+        returned = publisher.publish_committing(
+            "activity.created", {}, source="test", db=db, commit=db.commit, event_id="evt-1"
+        )
+
+        assert returned == "evt-1"
+
+    def test_publish_committing_returns_none_when_the_dispatch_failed(self, monkeypatch, db):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=ExplodingBus()))
+
+        assert publisher.publish_committing("activity.created", {}, source="test", db=db, commit=lambda: None) is None
+
+    def test_publish_on_commit_on_the_bus_returns_the_id_before_the_commit(self, platform, db):
+        returned = publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1")
+
+        assert returned == "evt-1"
+        assert platform.events.published == []
+
+    def test_publish_on_commit_on_the_durable_route(self, platform, db):
+        _register_durable()
+
+        assert publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1") == "evt-1"
+
+    def test_publish_many_committing_on_the_bus_returns_the_ids_in_payload_order(self, platform, db):
+        returned = publisher.publish_many_committing(
+            "activity.deleted",
+            [{"id": 1}, {"id": 2}],
+            source="test",
+            event_id_for=lambda payload: f"evt-{payload['id']}",
+            db=db,
+            commit=lambda: None,
+        )
+
+        assert returned == ["evt-1", "evt-2"]
+
+    def test_publish_many_committing_has_none_for_a_failed_dispatch(self, monkeypatch, db):
+        bus = RecordingBus()
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=bus))
+
+        def _fail_the_first(event):
+            if event.payload["id"] == 1:
+                raise RuntimeError("transient")
+            bus.published.append(event)
+
+        bus.publish = _fail_the_first
+
+        returned = publisher.publish_many_committing(
+            "activity.deleted",
+            [{"id": 1}, {"id": 2}],
+            source="test",
+            event_id_for=lambda payload: f"evt-{payload['id']}",
+            db=db,
+            commit=lambda: None,
+        )
+
+        assert returned == [None, "evt-2"]
+
+    def test_publish_many_committing_has_none_for_a_mint_failure(self, platform, db):
+        def _refuse_the_first(payload):
+            if payload["id"] == 1:
+                raise RuntimeError("bad id")
+            return f"evt-{payload['id']}"
+
+        returned = publisher.publish_many_committing(
+            "activity.deleted",
+            [{"id": 1}, {"id": 2}],
+            source="test",
+            event_id_for=_refuse_the_first,
+            db=db,
+            commit=lambda: None,
+        )
+
+        assert returned == [None, "evt-2"]
+
+    def test_publish_many_committing_on_the_durable_route(self, platform, db):
+        _register_durable("activity.deleted")
+
+        returned = publisher.publish_many_committing(
+            "activity.deleted",
+            [{"id": 1}, {"id": 2}],
+            source="test",
+            event_id_for=lambda payload: f"evt-{payload['id']}",
+            db=db,
+            commit=db.commit,
+        )
+
+        assert returned == ["evt-1", "evt-2"]
+
+    def test_an_empty_batch_returns_an_empty_list_and_still_commits(self, platform, db):
+        committed = []
+
+        returned = publisher.publish_many_committing(
+            "activity.deleted", [], source="test", db=db, commit=lambda: committed.append(True)
+        )
+
+        assert returned == []
+        assert committed == [True]
+
+    def test_publish_many_on_commit_on_the_bus(self, platform, db):
+        returned = publisher.publish_many_on_commit(
+            "a.one",
+            [{"n": 1}, {"n": 2}],
+            source="test",
+            event_id_for=lambda payload: f"evt-{payload['n']}",
+            db=db,
+        )
+
+        assert returned == ["evt-1", "evt-2"]
+
+    def test_publish_many_on_commit_has_none_for_a_mint_failure(self, platform, db):
+        def _refuse_the_first(payload):
+            if payload["n"] == 1:
+                raise RuntimeError("bad id")
+            return f"evt-{payload['n']}"
+
+        returned = publisher.publish_many_on_commit(
+            "a.one", [{"n": 1}, {"n": 2}], source="test", event_id_for=_refuse_the_first, db=db
+        )
+        db.commit()
+
+        assert returned == [None, "evt-2"]
+        assert [event.event_id for event in platform.events.published] == ["evt-2"]
+
+    def test_publish_many_on_commit_on_the_durable_route(self, platform, db):
+        _register_durable("a.one")
+
+        returned = publisher.publish_many_on_commit(
+            "a.one", [{"n": 1}, {"n": 2}], source="test", event_id_for=lambda payload: f"evt-{payload['n']}", db=db
+        )
+
+        assert returned == ["evt-1", "evt-2"]
+
+    def test_an_empty_on_commit_batch_returns_an_empty_list(self, platform, db):
+        assert publisher.publish_many_on_commit("a.one", [], source="test", db=db) == []
+
+
+class TestARepeatedEventIdIsIdempotent:
+    @pytest.fixture(autouse=True)
+    def _durable(self, platform):
+        _register_durable()
+
+    def test_publishing_twice_leaves_one_outbox_row_and_returns_the_id_both_times(self, platform, db):
+        first = publisher.publish("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+        second = publisher.publish("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+        assert (first, second) == ("evt-1", "evt-1")
+        assert db.query(EventOutbox).count() == 1
+
+    def test_the_queued_record_is_written_once(self, db, monkeypatch):
+        recorder = SessionAwareRecorder()
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=recorder))
+
+        for _ in range(2):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1")
+
+        assert len(recorder.staged) == 1
+
+    def test_a_legacy_recorder_is_called_once(self, db, monkeypatch):
+        recorder = RecordingRecorder()
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=recorder))
+
+        for _ in range(2):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1")
+
+        assert len(recorder.queued) == 1
+
+    def test_the_real_event_log_has_one_queued_row(self, db, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=EventLogRecorder(ClockForRecorder())))
+
+        for _ in range(2):
+            publisher.publish_committing(
+                "activity.created", {}, source="test", db=db, commit=db.commit, event_id="evt-1"
+            )
+
+        assert db.query(EventOutbox).count() == 1
+        assert _queued_rows(db) == 1
+
+    def test_a_repeat_inside_one_batch_and_transaction(self, db, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=EventLogRecorder(ClockForRecorder())))
+
+        returned = publisher.publish_many_on_commit(
+            "activity.created", [{"n": 1}, {"n": 1}], source="test", event_id_for=lambda _p: "evt-1", db=db
+        )
+        db.commit()
+
+        assert returned == ["evt-1", "evt-1"]
+        assert db.query(EventOutbox).count() == 1
+        assert _queued_rows(db) == 1
+
+    def test_the_outbox_row_and_the_queued_row_commit_together(self, db, db_engine, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=EventLogRecorder(ClockForRecorder())))
+
+        publisher.publish("activity.created", {}, source="test", db=db, event_id="evt-1")
+
+        with Session(db_engine) as other:
+            assert other.query(EventOutbox).count() == 1
+            assert _queued_rows(other) == 1
+
+    def test_without_committing_both_stay_in_the_callers_transaction(self, db, db_engine, monkeypatch):
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(recorder=EventLogRecorder(ClockForRecorder())))
+
+        publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="evt-1")
+        db.rollback()
+
+        with Session(db_engine) as other:
+            assert other.query(EventOutbox).count() == 0
+            assert _queued_rows(other) == 0
+
+    def test_a_different_payload_is_refused_on_publish_on_commit(self, db):
+        publisher.publish_on_commit("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+        with pytest.raises(ValueError, match=r"evt-1.*payload"):
+            publisher.publish_on_commit("activity.created", {"n": 2}, source="test", db=db, event_id="evt-1")
+
+    def test_a_different_event_type_is_refused_on_publish_on_commit(self, db):
+        jobs_registry.registry.register("other.type", "other", lambda _e: None)
+        publisher.publish_on_commit("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+        with pytest.raises(ValueError, match=r"evt-1.*event_type"):
+            publisher.publish_on_commit("other.type", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+    def test_a_different_payload_is_refused_on_publish_committing_before_committing(self, db):
+        publisher.publish_committing(
+            "activity.created", {"n": 1}, source="test", db=db, commit=db.commit, event_id="evt-1"
+        )
+        committed = []
+
+        with pytest.raises(ValueError, match="payload"):
+            publisher.publish_committing(
+                "activity.created",
+                {"n": 2},
+                source="test",
+                db=db,
+                commit=lambda: committed.append(True),
+                event_id="evt-1",
+            )
+
+        assert committed == []
+
+    def test_a_different_payload_is_swallowed_and_logged_by_publish_without_the_payload(self, db, caplog):
+        publisher.publish("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+        with caplog.at_level("ERROR"):
+            returned = publisher.publish(
+                "activity.created", {"secret": SECRET_PARAMETER}, source="test", db=db, event_id="evt-1"
+            )
+
+        assert returned is None
+        assert "Failed to publish event activity.created" in caplog.text
+        assert SECRET_PARAMETER not in caplog.text
+
+    def test_the_refusal_does_not_carry_the_payload(self, db):
+        publisher.publish_on_commit("activity.created", {"n": 1}, source="test", db=db, event_id="evt-1")
+
+        with pytest.raises(ValueError) as exc_info:
+            publisher.publish_on_commit(
+                "activity.created", {"secret": SECRET_PARAMETER}, source="test", db=db, event_id="evt-1"
+            )
+
+        assert SECRET_PARAMETER not in str(exc_info.value)
+
+    def test_a_tuple_equals_the_list_the_column_stores(self, db):
+        publisher.publish_on_commit("activity.created", {"tags": ("a", "b")}, source="test", db=db, event_id="evt-1")
+
+        returned = publisher.publish_on_commit(
+            "activity.created", {"tags": ["a", "b"]}, source="test", db=db, event_id="evt-1"
+        )
+
+        assert returned == "evt-1"
+        assert db.query(EventOutbox).count() == 1
+
+    def test_metadata_does_not_count_as_a_difference(self, db):
+        publisher.publish_on_commit(
+            "activity.created", {}, source="test", db=db, event_id="evt-1", metadata={"request_id": "a"}
+        )
+
+        returned = publisher.publish_on_commit(
+            "activity.created", {}, source="test", db=db, event_id="evt-1", metadata={"request_id": "b"}
+        )
+
+        assert returned == "evt-1"
+
+
+class TestAnEmptyEventIdIsRejected:
+    def test_publish_committing_raises_before_committing(self, platform, db):
+        committed = []
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_committing(
+                "activity.created", {}, source="test", db=db, commit=lambda: committed.append(True), event_id=""
+            )
+
+        assert committed == []
+
+    def test_publish_on_commit_raises_before_staging(self, platform, db):
+        _register_durable()
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id="")
+
+        assert db.query(EventOutbox).count() == 0
+
+    def test_publish_swallows_it_like_any_failure(self, platform, caplog):
+        with caplog.at_level("ERROR"):
+            returned = publisher.publish("activity.created", {}, source="test", event_id="")
+
+        assert returned is None
+        assert platform.events.published == []
+        assert "Failed to publish event activity.created" in caplog.text
+
+    def test_a_builder_returning_it_is_refused_on_the_durable_route(self, platform, db):
+        _register_durable("a.one")
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_many_on_commit("a.one", [{}], source="test", event_id_for=lambda _p: "", db=db)
+
+    def test_a_builder_returning_it_is_skipped_on_the_bus_route(self, platform, db):
+        returned = publisher.publish_many_on_commit("a.one", [{}], source="test", event_id_for=lambda _p: "", db=db)
+
+        assert returned == [None]
+
+
+class TestEventIdBuilderFailuresMirrorMetadataBuilderFailures:
+    @staticmethod
+    def _boom(_payload):
+        raise RuntimeError("bad id")
+
+    def test_publish_many_committing_skips_only_that_event_on_the_bus_route(self, platform, db, caplog):
+        def _id(payload):
+            return self._boom(payload) if payload["id"] == 1 else None
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_committing(
+                "activity.deleted", [{"id": 1}, {"id": 2}], source="test", event_id_for=_id, db=db, commit=db.commit
+            )
+
+        assert [event.payload["id"] for event in platform.events.published] == [2]
+        assert "Failed to publish event activity.deleted" in caplog.text
+
+    def test_publish_many_committing_raises_on_the_durable_route_without_committing(self, platform, db):
+        _register_durable("activity.deleted")
+        committed = []
+
+        with pytest.raises(RuntimeError, match="bad id"):
+            publisher.publish_many_committing(
+                "activity.deleted",
+                [{"id": 1}],
+                source="test",
+                event_id_for=self._boom,
+                db=db,
+                commit=lambda: committed.append(True),
+            )
+
+        assert committed == []
+
+    def test_publish_many_on_commit_skips_only_that_event_on_the_bus_route(self, platform, db, caplog):
+        def _id(payload):
+            return self._boom(payload) if payload["n"] == 1 else None
+
+        with caplog.at_level("ERROR"):
+            publisher.publish_many_on_commit("a.one", [{"n": 1}, {"n": 2}], source="test", event_id_for=_id, db=db)
+        db.commit()
+
+        assert [e.payload["n"] for e in platform.events.published] == [2]
+        assert "Failed to publish event a.one" in caplog.text
+
+    def test_publish_many_on_commit_raises_on_the_durable_route(self, platform, db):
+        _register_durable("a.one")
+
+        with pytest.raises(RuntimeError, match="bad id"):
+            publisher.publish_many_on_commit("a.one", [{}], source="test", event_id_for=self._boom, db=db)
+
+
+_BAD_EVENT_IDS = [
+    pytest.param("Evt-1", id="uppercase"),
+    pytest.param("evt 1", id="space"),
+    pytest.param("evt-1\n", id="trailing-newline"),
+    pytest.param("evt-1\nevt-2", id="newline"),
+    pytest.param("-evt", id="leading-dash"),
+    pytest.param("é", id="accent"),
+    pytest.param("a" * 37, id="too-long"),
+    pytest.param(5, id="not-a-string"),
+]
+
+
+class TestAnEventIdIsPortableAndBounded:
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    def test_publish_committing_raises_before_committing_on_the_bus_route(self, platform, db, event_id):
+        committed = []
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_committing(
+                "activity.created",
+                {},
+                source="test",
+                db=db,
+                commit=lambda: committed.append(True),
+                event_id=event_id,
+            )
+
+        assert committed == []
+        assert platform.events.published == []
+
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    def test_publish_committing_raises_before_committing_on_the_durable_route(self, platform, db, event_id):
+        _register_durable()
+        committed = []
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_committing(
+                "activity.created",
+                {},
+                source="test",
+                db=db,
+                commit=lambda: committed.append(True),
+                event_id=event_id,
+            )
+
+        assert committed == []
+        assert db.query(EventOutbox).count() == 0
+
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    @pytest.mark.parametrize("durable", [False, True])
+    def test_publish_on_commit_raises_before_staging_on_either_route(self, platform, db, event_id, durable):
+        if durable:
+            _register_durable()
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_on_commit("activity.created", {}, source="test", db=db, event_id=event_id)
+        db.commit()
+
+        assert db.query(EventOutbox).count() == 0
+        assert platform.events.published == []
+
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    @pytest.mark.parametrize("durable", [False, True])
+    def test_publish_swallows_it_like_any_failure(self, platform, db, caplog, event_id, durable):
+        if durable:
+            _register_durable()
+
+        with caplog.at_level("ERROR"):
+            returned = publisher.publish("activity.created", {}, source="test", db=db, event_id=event_id)
+
+        assert returned is None
+        assert platform.events.published == []
+        assert db.query(EventOutbox).count() == 0
+        assert "Failed to publish event activity.created" in caplog.text
+
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    def test_a_builder_returning_one_is_refused_on_the_durable_route(self, platform, db, event_id):
+        _register_durable("a.one")
+
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_many_on_commit("a.one", [{}], source="test", event_id_for=lambda _p: event_id, db=db)
+        with pytest.raises(ValueError, match="event_id"):
+            publisher.publish_many_committing(
+                "a.one", [{}], source="test", event_id_for=lambda _p: event_id, db=db, commit=db.commit
+            )
+
+        assert db.query(EventOutbox).count() == 0
+
+    @pytest.mark.parametrize("event_id", _BAD_EVENT_IDS)
+    def test_a_builder_returning_one_is_skipped_on_the_bus_route(self, platform, db, event_id):
+        returned = publisher.publish_many_on_commit(
+            "a.one", [{}], source="test", event_id_for=lambda _p: event_id, db=db
+        )
+        committed = publisher.publish_many_committing(
+            "a.one", [{}], source="test", event_id_for=lambda _p: event_id, db=db, commit=db.commit
+        )
+
+        assert (returned, committed) == ([None], [None])
+        assert platform.events.published == []
+
+    @pytest.mark.parametrize(
+        "event_id",
+        [
+            "2f1c3a8e-3d6b-4f0e-9b4e-0a1b2c3d4e5f",
+            "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+            "a",
+            "0.a_b-c",
+            "a" * 36,
+        ],
+    )
+    def test_a_uuid_or_a_portable_slug_is_accepted(self, platform, event_id):
+        assert publisher.publish("activity.created", {}, source="test", event_id=event_id) == event_id
+
+    def test_a_generated_uuid4_and_uuid5_are_accepted(self, platform):
+        import uuid
+
+        for generated in (uuid.uuid4(), uuid.uuid5(uuid.NAMESPACE_DNS, "example.org")):
+            assert publisher.publish("activity.created", {}, source="test", event_id=str(generated)) == str(generated)
+
+
+class TestAReusedIdThroughTheRelay:
+    @staticmethod
+    def _relay(session_factory, registry):
+        import jasil.jobs.relay as jobs_relay
+
+        return jobs_relay.relay_outbox_once(
+            registry=registry, clock=FixedClock(), session_factory=session_factory, max_attempts=3, batch_size=10
+        )
+
+    def test_one_job_per_subscriber_however_often_the_id_is_published(self, platform, db, session_factory):
+        from jasil.jobs.models import ProcessingJob
+        from jasil.jobs.registry import registry
+
+        _register_durable()
+        registry.register("activity.created", "t", lambda _e: None)
+        for _ in range(2):
+            publisher.publish_committing(
+                "activity.created", {"n": 1}, source="test", db=db, commit=db.commit, event_id="evt-1"
+            )
+
+        assert self._relay(session_factory, registry) == 1
+        assert sorted(job.subscriber_id for job in db.query(ProcessingJob).all()) == ["s", "t"]
+
+        publisher.publish_committing(
+            "activity.created", {"n": 1}, source="test", db=db, commit=db.commit, event_id="evt-1"
+        )
+
+        assert self._relay(session_factory, registry) == 0
+        assert db.query(ProcessingJob).count() == 2
+        assert db.query(EventOutbox).count() == 1

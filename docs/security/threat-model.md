@@ -237,6 +237,27 @@ that ignores the signal mid-side-effect, and a handler abandoned past
 double-charge, double-send, or double-count, that is a correctness bug in the
 handler, not in the queue.
 
+## Caller-supplied event ids
+
+A producer may pass its own `event_id`, and the outbox keeps one row per id. An
+id an attacker chooses or can guess lets one producer's event suppress another's
+of the same type: if the attacker publishes first, the legitimate event reuses
+the id and is refused, a denial of that event. A deterministic id is
+guessable, so an id handed back as a `202` polling handle must not be what
+authorizes reading the operation.
+
+**Mitigations.** A reused id is accepted only when the stored row has the same
+`event_type` and payload; otherwise it raises `ValueError` and the unit of work
+rolls back. An id is at most 36 characters of lowercase `a-z`, `0-9`, `.`, `_`
+and `-`, so it compares the same under every database collation and cannot carry
+a line break or control character into a log line. The error names the field and
+never echoes the payload. On the bus route, where nothing dedups, a reused id
+never rewrites the event-log row of a durable event or of another event type.
+
+**Yours.** Never pass untrusted input, such as an `Idempotency-Key` header, as
+`event_id`. Derive it server-side, namespaced per tenant or user (for example
+`uuid5` over tenant, event type and key), and authorize status lookups by owner.
+
 ## Tampering with the audit trail
 
 **Guarded.** `jasil_audit_log` is append-only for every role but its owner: `UPDATE`, `DELETE` and `TRUNCATE` are
@@ -263,12 +284,22 @@ and the signing key outside the database operators' reach, and reconcile the sin
 somewhere they do not control. See
 [Audit trail → What this does not do](../audit.md#what-this-does-not-do).
 
+**Yours on MySQL and MariaDB.** The same guards hold there (`rev0008`), with these differences. `TRUNCATE` skips
+triggers, so only the missing `DROP` privilege keeps the application from emptying the log, and a table grant cannot
+take away a database-wide one: an account with `ALL` (or `DROP`, `ALTER`, `TRIGGER`) on the whole database can
+truncate the log, drop its partitions or its triggers. Give the runtime, reader and maintenance accounts only what
+`grants_sql(..., dialect="mysql")` lists, and nothing on `database.*`. The first partition has no lower bound, so a
+row back-dated before it is accepted rather than rejected; a row added to a window already sealed fails
+`verify_checkpoints`. An account that may create temporary tables could shadow `jasil_audit_log` for its own session
+inside the procedures, which then fail rather than drop anything; `grants_sql` grants no `CREATE TEMPORARY TABLES`.
+
 **Yours, too: stalling maintenance.** PostgreSQL advisory locks are open to every role that can connect,
 the observability product's reader role included. Holding the key of JASIL's maintenance lock makes every
 replica skip audit maintenance; holding the partition functions' lock makes them fail after their 10-second
 `lock_timeout`. On PostgreSQL 13 and 14, where `PUBLIC` may still create tables in the `public` schema,
 anyone can also create a table under a future partition's name, which `jasil_audit_ensure_partitions` then
-refuses. Either way no new partitions are made, and once `partition_days_ahead` days pass, audited writes
+refuses. MySQL and MariaDB named locks (`GET_LOCK`) are open to every account in the same way. Either way no new
+partitions are made, and once `partition_days_ahead` days pass, audited writes
 fail. Revoke `CREATE` on the audit schema from `PUBLIC` (the default from PostgreSQL 15), keep database
 logins to the roles that need them, and alert on `get_audit_health()`: a `furthest_partition_date` closer
 than `partition_days_ahead`, or a `last_checkpoint_at` falling behind, is the symptom.

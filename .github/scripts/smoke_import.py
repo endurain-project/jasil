@@ -56,6 +56,8 @@ EXPECTED_REVISIONS = {
     "rev0005_job_deferrals.py",
     "rev0006_audit_trail_and_job_columns.py",
     "rev0007_job_continuations.py",
+    "rev0008_mysql_audit_partitions.py",
+    "rev0009_event_outbox_unique_event_id.py",
 }
 
 

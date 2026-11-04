@@ -300,7 +300,7 @@ class TestEventLogSummary:
     def test_the_failure_limit_is_configurable(self, platform, db):
         event = new_event("order.created", {}, source="api:create_order")
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
-        event_log_crud.mark_failed(event.event_id, "h", "boom", 5, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event, "h", "boom", 5, db, now=datetime.now(UTC))
 
         assert jasil_admin.get_event_log_summary(failure_limit=0).recent_failures == []
 

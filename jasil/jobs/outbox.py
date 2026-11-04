@@ -1,6 +1,8 @@
 """CRUD for ``event_outbox`` — the durable-delivery staging table.
 
-``add_to_outbox`` persists an event on the caller's session. With
+``add_to_outbox`` persists an event on the caller's session, once per ``event_id``: the unique index on that
+column makes staging an id that is already there a no-op, so a producer may publish the same id repeatedly (a
+scheduler tick on every replica, a retry after an ambiguous failure). With
 ``commit=False`` the row joins the caller's open transaction, so the domain change
 and the outbox row commit together; this is how the publisher stages durable
 events. With ``commit=True`` it is committed on its own, and a crash between that
@@ -11,6 +13,7 @@ net (backfill/sweeper) then recovers. ``list_unrelayed`` and
 that makes concurrent relayers safe and re-relaying a row harmless.
 """
 
+import json
 import uuid
 from datetime import datetime
 
@@ -18,15 +21,15 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 import jasil._core.pruning as pruning
-from jasil._core.dialects import supports_skip_locked
+from jasil._core.dialects import insert_ignoring_conflict, needs_locking_read, supports_skip_locked
 from jasil._core.sessions import commit_or_flush
 from jasil.events import Event
 from jasil.jobs.models import EventOutbox
 
 
-def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = True) -> str:
+def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = True) -> str | None:
     """
-    Persist an event to the outbox on the caller's session.
+    Persist an event to the outbox on the caller's session, unless its id is already there.
 
     With ``commit=True`` (default) the write is committed immediately. Callers on
     the ingestion path pass ``commit=False`` so the outbox row is only flushed and
@@ -36,6 +39,15 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
     so a crash between them can drop the event and the subscriber's reconciliation
     net is the safety net.
 
+    Whether this call inserted the row is read back from the row stored for ``event.event_id`` (it is ours when
+    it carries the id minted here), because the affected-row count of an insert that hit a duplicate differs
+    between databases and, on MySQL, with the connection's ``CLIENT_FOUND_ROWS`` flag. On MySQL and MariaDB the
+    read locks the row (see :func:`jasil._core.dialects.needs_locking_read`), so a ``REPEATABLE READ`` snapshot
+    cannot hide one a concurrent transaction committed first; elsewhere it is a plain read.
+
+    A payload published under an id that is already stored must be JSON-native (dict, list, str, int, float,
+    bool or ``None``), because it is compared with the stored one after a standard-library JSON round trip.
+
     Args:
         event: The event envelope to persist.
         now: Current instant (the outbox write time).
@@ -44,24 +56,57 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
             row in the caller's open transaction.
 
     Returns:
-        The new outbox row id.
+        The new outbox row id, or ``None`` when a row for ``event.event_id`` already existed and nothing was
+        written. That row must carry the same ``event_type`` and payload (the payload as it reads back from the
+        JSON column); ``source``, timestamp, schema version and metadata are not compared, since metadata
+        carries the per-replica request id.
+
+    Raises:
+        ValueError: When a row for ``event.event_id`` exists with a different ``event_type`` or payload. The
+            message names the field, never its contents, which may be personal data.
+        TypeError: When a row for ``event.event_id`` exists and the event's payload is not JSON-native.
     """
     outbox_id = str(uuid.uuid4())
-    db.add(
-        EventOutbox(
-            id=outbox_id,
-            event_id=event.event_id,
-            event_type=event.event_type,
-            source=event.source,
-            timestamp=event.timestamp,
-            payload=event.payload,
-            schema_version=event.schema_version,
-            event_metadata=event.metadata or None,
-            created_at=now,
-        )
+    values = {
+        "id": outbox_id,
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "source": event.source,
+        "timestamp": event.timestamp,
+        "payload": event.payload,
+        "schema_version": event.schema_version,
+        "event_metadata": event.metadata or None,
+        "created_at": now,
+    }
+    db.execute(insert_ignoring_conflict(EventOutbox, values, conflict_columns=["event_id"], db=db))
+    read_back = select(EventOutbox.id, EventOutbox.event_type, EventOutbox.payload).where(
+        EventOutbox.event_id == event.event_id
     )
+    if needs_locking_read(db.bind):
+        read_back = read_back.with_for_update()
+    stored = db.execute(read_back).one()
+    if stored.id != outbox_id:
+        _check_same_event(event, stored.event_type, stored.payload)
     commit_or_flush(db, commit)
-    return outbox_id
+    return outbox_id if stored.id == outbox_id else None
+
+
+def _check_same_event(event: Event, stored_type: str, stored_payload: object) -> None:
+    """Refuse an event whose id is already in the outbox for a different event.
+
+    The payload must be JSON-native (dict, list, str, int, float, bool or ``None``): it is serialised again with
+    the standard library to compare it with what the column reads back.
+
+    Raises:
+        ValueError: When the stored ``event_type`` or payload differs from the event's.
+        TypeError: When the event's payload is not JSON-native.
+    """
+    # The column stores JSON, so the event's payload is compared as it would read back (a tuple is a list).
+    differs = "event_type" if stored_type != event.event_type else None
+    if differs is None and stored_payload != json.loads(json.dumps(event.payload)):
+        differs = "payload"
+    if differs is not None:
+        raise ValueError(f"Event id {event.event_id!r} is already in the outbox with a different {differs}")
 
 
 def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:

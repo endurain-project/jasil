@@ -14,7 +14,8 @@ profile, more than one web worker, or standalone job workers — is decided in o
 place, :func:`~jasil.profile.resolve_topology`, so a new kind of process needs no
 change here.
 
-Five consistency rules are enforced:
+Five consistency rules are enforced (a capability the host disabled with ``none://`` has nothing to diverge and is
+exempt):
 
 - **Cross-process backends** — ephemeral *state* (rate limiting, escalating gates,
   single-use tokens), the *event* bus and the *realtime* hint channel — must not
@@ -68,6 +69,9 @@ from jasil.settings import JasilSettings, RuntimeSources
 
 # Shown in the report when a capability URI was left to the profile.
 _PROFILE_DEFAULT = "profile default"
+
+# The URI scheme with which a host disables an optional capability (storage, events, realtime).
+_DISABLED_SCHEME = "none"
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,16 @@ def _scheme_of(uri: str) -> str:
     """Return a URI's scheme, or ``invalid`` when it carries none: the value may hold a password."""
     scheme, separator, _ = uri.partition("://")
     return scheme if separator else "invalid"
+
+
+def _is_disabled(uri: str) -> bool:
+    """Whether ``uri`` disables an optional capability (storage, events, realtime) with ``none://``."""
+    return _scheme_of(uri) == _DISABLED_SCHEME
+
+
+def _optional_backend_of(uri: str) -> str:
+    """Name the backend of an optional capability: ``disabled`` for ``none://``, else its scheme."""
+    return "disabled" if _is_disabled(uri) else _scheme_of(uri)
 
 
 def _mail_backend_of(uri: str | None, *, secure: bool) -> str:
@@ -202,14 +216,16 @@ def build_capability_report(settings: JasilSettings, sources: RuntimeSources | N
     rows = (
         CapabilityRow("state", _scheme_of(settings.resolved_state_uri), _source_of(settings.state_uri, "state_uri")),
         CapabilityRow(
-            "storage", _scheme_of(settings.resolved_storage_uri), _source_of(settings.storage_uri, "storage_uri")
+            "storage",
+            _optional_backend_of(settings.resolved_storage_uri),
+            _source_of(settings.storage_uri, "storage_uri"),
         ),
         CapabilityRow(
-            "events", _scheme_of(settings.resolved_events_uri), _source_of(settings.events_uri, "events_uri")
+            "events", _optional_backend_of(settings.resolved_events_uri), _source_of(settings.events_uri, "events_uri")
         ),
         CapabilityRow(
             "realtime",
-            _scheme_of(settings.resolved_realtime_uri),
+            _optional_backend_of(settings.resolved_realtime_uri),
             "realtime_uri"
             if settings.realtime_uri
             else f"follows events_uri ({_source_of(settings.events_uri, 'events_uri')})",
@@ -263,11 +279,18 @@ def check_deployment_consistency(settings: JasilSettings) -> list[str]:
             topology=topology,
             state_sources=(
                 StateSource(label="state_uri", uri=settings.resolved_state_uri),
-                StateSource(label="events_uri", uri=settings.resolved_events_uri),
+                # Disabled (``none://``), there is no bus to diverge across processes.
+                StateSource(
+                    label="events_uri",
+                    uri=settings.resolved_events_uri,
+                    applies=not _is_disabled(settings.resolved_events_uri),
+                ),
                 # Unset, it *is* the events URI, already checked above: flagging
                 # it again would name a setting the operator never wrote.
                 StateSource(
-                    label="realtime_uri", uri=settings.resolved_realtime_uri, applies=bool(settings.realtime_uri)
+                    label="realtime_uri",
+                    uri=settings.resolved_realtime_uri,
+                    applies=bool(settings.realtime_uri) and not _is_disabled(settings.resolved_realtime_uri),
                 ),
             ),
         ),

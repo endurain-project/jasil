@@ -117,6 +117,9 @@ def _config(connection: Any = None) -> Any:
     return config
 
 
+#: The revision that partitions and protects the audit log on MySQL and MariaDB.
+_MYSQL_AUDIT_REVISION = "rev0008"
+
 #: Name of the database lock a migration run holds; see :func:`_one_run_at_a_time`.
 _RUN_LOCK = "jasil_migrations"
 
@@ -414,6 +417,59 @@ def _postgres_audit_differences(connection: Any) -> list[str]:
     return differences
 
 
+def _mysql_audit_differences(connection: Any, protected: bool) -> list[str]:
+    """Name how a MySQL or MariaDB audit log differs from what a revision built.
+
+    ``rev0008`` partitions the log and adds the append-only triggers and the retention procedures; the revisions
+    before it, like ``create_all``, build a plain table. A log that has only part of them matches no revision.
+    """
+    if connection.dialect.name not in ("mysql", "mariadb"):
+        return []
+    from sqlalchemy import text
+
+    from jasil.audit import _mysql as audit_mysql
+
+    table = audit_mysql.LOG
+    found: dict[str, bool] = {
+        "partitioning": bool(
+            connection.execute(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.PARTITIONS WHERE TABLE_SCHEMA = DATABASE() "
+                    "AND TABLE_NAME = :name AND PARTITION_METHOD = 'RANGE COLUMNS'"
+                ),
+                {"name": table},
+            ).scalar()
+        )
+    }
+    triggers = set(
+        connection.execute(
+            text(
+                "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+                "WHERE EVENT_OBJECT_SCHEMA = DATABASE() AND EVENT_OBJECT_TABLE = :name"
+            ),
+            {"name": table},
+        ).scalars()
+    )
+    procedures = set(
+        connection.execute(
+            text(
+                "SELECT ROUTINE_NAME FROM information_schema.ROUTINES "
+                "WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'PROCEDURE'"
+            )
+        ).scalars()
+    )
+    found.update({f"trigger {name!r}": name in triggers for name in audit_mysql.TRIGGERS})
+    found.update(
+        {
+            f"procedure {name!r}": name in procedures
+            for name in (audit_mysql.ENSURE_PROCEDURE, audit_mysql.DROP_PROCEDURE)
+        }
+    )
+    if protected:
+        return [f"{table}: missing {item}" for item, present in found.items() if not present]
+    return [f"{table}: unexpected {item}" for item, present in found.items() if present]
+
+
 def _postgres_gin_differences(connection: Any, inspector: Any, table_name: str) -> list[str]:
     if connection.dialect.name != "postgresql":
         return []
@@ -559,8 +615,16 @@ def _revision_schemas() -> list[tuple[str, Any]]:
     return schemas
 
 
-def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple[list[str], int]:
-    """Describe how the unversioned JASIL tables differ from ``metadata``.
+def _protects_mysql_audit(revision: str) -> bool:
+    """Whether ``revision`` is or follows the one that partitions and protects the audit log on MySQL."""
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(_config())
+    return any(step.revision == _MYSQL_AUDIT_REVISION for step in script.iterate_revisions(revision, "base"))
+
+
+def _schema_differences(connection: Any, inspector: Any, metadata: Any, revision: str) -> tuple[list[str], int]:
+    """Describe how the unversioned JASIL tables differ from ``metadata``, the schema ``revision`` builds.
 
     Returns the readable differences and a count of individual discrepancies,
     used to rank which revision came closest.
@@ -606,6 +670,7 @@ def _schema_differences(connection: Any, inspector: Any, metadata: Any) -> tuple
         detailed.extend(_postgres_gin_differences(connection, inspector, table_name))
     if "jasil_audit_log" in common:
         detailed.extend(_postgres_audit_differences(connection))
+        detailed.extend(_mysql_audit_differences(connection, _protects_mysql_audit(revision)))
     return differences + detailed, count + len(detailed)
 
 
@@ -658,7 +723,7 @@ def adopt_existing_schema(engine: "Engine") -> bool:
         for revision, metadata in _revision_schemas():
             if not set(metadata.tables) <= candidate_names:
                 continue
-            differences, weight = _schema_differences(connection, inspector, metadata)
+            differences, weight = _schema_differences(connection, inspector, metadata, revision)
             if not differences:
                 command.stamp(_config(connection), revision)
                 connection.commit()

@@ -272,6 +272,28 @@ class TestCapabilityReport:
 
         assert (row.backend, row.source) == ("redis", "realtime_uri")
 
+    @pytest.mark.parametrize(
+        ("name", "kwargs", "source"),
+        [
+            ("storage", {"storage_uri": "none://"}, "storage_uri"),
+            ("events", {"events_uri": "none://"}, "events_uri"),
+            ("realtime", {"events_uri": "none://"}, "follows events_uri (events_uri)"),
+            ("realtime", {"realtime_uri": "none://"}, "realtime_uri"),
+        ],
+    )
+    def test_a_capability_set_to_none_reports_disabled(self, name, kwargs, source):
+        row = next(row for row in build_capability_report(JasilSettings(**kwargs)).rows if row.name == name)
+
+        assert (row.backend, row.source) == ("disabled", source)
+
+    def test_state_set_to_none_still_reports_its_scheme(self):
+        """State is not optional, so ``none`` is reported as the (invalid) scheme it is."""
+        row = next(
+            row for row in build_capability_report(JasilSettings(state_uri="none://")).rows if row.name == "state"
+        )
+
+        assert row.backend == "none"
+
     def test_an_explicit_uri_is_attributed_to_its_setting(self):
         report = build_capability_report(JasilSettings(state_uri="memory://"))
 
@@ -444,6 +466,58 @@ class TestDeploymentConsistency:
         )
 
         assert issues == []
+
+    def test_a_disabled_event_bus_across_workers_is_consistent(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                web_workers=4,
+                state_uri="redis://c:6379/0",
+                events_uri="none://",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert issues == []
+
+    def test_disabled_realtime_across_workers_is_consistent(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                web_workers=4,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                lock_uri="postgres-advisory://",
+                realtime_uri="none://",
+            )
+        )
+
+        assert issues == []
+
+    def test_disabled_storage_on_a_distributed_profile_is_consistent(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                profile=DeploymentProfile.DISTRIBUTED,
+                state_uri="redis://c:6379/0",
+                events_uri="redis://c:6379/1",
+                storage_uri="none://",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert issues == []
+
+    def test_in_process_realtime_beside_a_disabled_bus_is_still_refused(self):
+        issues = check_deployment_consistency(
+            JasilSettings(
+                web_workers=4,
+                state_uri="redis://c:6379/0",
+                events_uri="none://",
+                lock_uri="postgres-advisory://",
+                realtime_uri="memory://",
+            )
+        )
+
+        assert len(issues) == 1
+        assert "realtime_uri resolves to process-local memory" in issues[0]
 
     def test_the_custom_profile_is_held_to_the_same_rules(self):
         """``custom`` promises no defaults, but eight workers on process-local backends still contradict."""

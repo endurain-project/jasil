@@ -39,6 +39,11 @@ through.
       uses its own `jasil_alembic_version` table and never touches yours.
 - [ ] On MySQL, note that `DATETIME` stores whole seconds and rounds. Do not
       compare a timestamp JASIL persisted for equality with the value you passed.
+- [ ] On MySQL and MariaDB, run migration `rev0008` as the account that should
+      own the audit procedures, with `log_bin_trust_function_creators=1` (or
+      `SUPER`) when binary logging is on, and give the application only the
+      table grants `grants_sql(..., dialect="mysql")` lists: a database-wide
+      privilege overrides them.
 - [ ] Upgrade through JASIL's packaged revisions before rolling out queue-aware
       code. The queue column is non-null and has a database-side `default`
       default so previous-release writers remain valid during the rollout.
@@ -126,6 +131,11 @@ through.
       performed external side effects, so idempotency still matters.
 - [ ] In handlers that loop or perform several side effects, check
       `jasil.jobs.lease_lost()` between units of work and return early.
+- [ ] Never pass request input (an `Idempotency-Key` header, a client-chosen id)
+      as `event_id`. Derive it server-side, namespaced per tenant or user, for
+      example with `uuid5` over tenant, event type and key.
+- [ ] Authorize a status lookup by the operation's owner, not by knowing its
+      `event_id`: a deterministic id is guessable.
 
 ## The admin surface
 

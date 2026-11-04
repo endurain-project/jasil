@@ -154,6 +154,12 @@ jobs:
       - name: Sync dependencies (with database drivers)
         run: uv sync --frozen --no-dev --group test --group test-db --no-install-project --python "$DATABASE_JOB_PYTHON"
 
+      # MySQL 8 logs binary by default, and then only SUPER may create the audit
+      # log's triggers (migration rev0008) unless this is set. MariaDB does not
+      # log binary by default, so its job needs no such step.
+      - name: Let the test account create triggers
+        run: docker exec ${{ job.services.mysql.id }} mysql -uroot -proot -e "SET PERSIST log_bin_trust_function_creators = 1"
+
       - name: Run tests
         run: uv run --no-sync --python "$DATABASE_JOB_PYTHON" pytest
 

@@ -18,7 +18,7 @@ event = new_event(
 
 | Field | Meaning |
 |---|---|
-| `event_id` | UUIDv4, stable across retries — also the deduplication key. |
+| `event_id` | UUIDv4 unless the producer supplies one (see [Publishing with a known id](#publishing-with-a-known-id)); at most 36 characters; stable across retries — also the deduplication key. |
 | `event_type` | Dot-notation channel, owned by the publishing domain. |
 | `source` | Where it originated. |
 | `timestamp` | ISO-8601 UTC, of the first publish. The publish functions stamp the platform clock's instant; `new_event` takes it as `now` and uses the system clock without one. |
@@ -88,6 +88,13 @@ publish("order.created", {"order_id": 42}, source="api:create_order", db=db)
     path — a backfill or sweeper that re-derives missed work. See
     [Reconciliation nets](durable-jobs.md#reconciliation-nets).
 
+`publish` returns the event's id, or `None` when it swallowed a failure. With
+`db=` and durable delivery it commits your session, so when it refuses the
+event (an invalid `event_id`, or an id already in the outbox with a different
+`event_type` or payload) it commits nothing and swallows the error: your pending
+changes stay uncommitted and the transaction stays open, so roll it back or
+commit it yourself.
+
 The ambient correlation id is stamped automatically; see
 [Configuration](configuration.md#correlation-ids).
 
@@ -119,6 +126,12 @@ Behaviour depends on the delivery route:
 
 `publish_many_committing` is the batch form, for producers that touch many rows
 in one unit of work. An empty batch still commits exactly once.
+
+`publish_committing` and `publish_on_commit` return the event's id; the batch
+forms return one entry per payload, in order. An entry is `None` for an event
+the best-effort route could not publish during the call (the failure is
+logged); on the durable route a failure raises, so every entry is an id.
+`publish_many_committing([])` and `publish_many_on_commit([])` return `[]`.
 
 ### Publishing without owning the commit
 
@@ -155,9 +168,83 @@ that already has one open, in any `join_transaction_mode`) dispatches when the
 session commits, before the external transaction does: if that one then rolls
 back, the event has already gone out. Publish on a session that owns its
 transaction when that matters; an event published from a subscriber during
-dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op.
+dispatch waits for the next commit. `publish_many_on_commit([])` is a no-op that
+returns `[]`.
 Only synchronous `Session` objects are supported; anything else (an `AsyncSession`,
 a `scoped_session` proxy) raises `TypeError`.
+
+On the best-effort route the returned id is minted before the commit that
+dispatches the event: it is not a promise the event goes out, because a rollback
+discards it.
+
+### Publishing with a known id
+
+Every publish function takes `event_id=` (the batch forms take `event_id_for=`,
+a callable from a payload to an id or `None`, like `metadata_for`), and returns
+the id. Pass one to answer a request with the id of the work it started:
+
+```python
+event_id = publish_committing(
+    "report.requested",
+    {"report_id": 42},
+    source="api:request_report",
+    db=db,
+    commit=db.commit,
+)
+return {"status": "accepted", "event_id": event_id}, 202
+```
+
+or to make a producer idempotent. A scheduler that ticks on every replica
+derives the same id from what makes the tick the same event, here the user and
+the minute:
+
+```python
+from uuid import NAMESPACE_URL, uuid5
+
+bucket = now.strftime("%Y-%m-%dT%H:%M")
+publish_committing(
+    "digest.due",
+    {"user_id": user_id},
+    source="scheduler",
+    event_id=str(uuid5(NAMESPACE_URL, f"digest.due:{user_id}:{bucket}")),
+    db=db,
+    commit=db.commit,
+)
+```
+
+On the durable route `jasil_event_outbox` has a unique index on `event_id`.
+Staging an id that is already there writes nothing (no outbox row and no
+`queued` row in the event log) and returns the id, provided the stored row has
+the same `event_type` and payload. The payload is compared as it reads back from
+the JSON column, so a tuple equals a list; metadata, source, timestamp and
+schema version are not compared. A different `event_type` or payload under the
+same id raises `ValueError` before the commit, so your unit of work rolls back
+(`publish` logs and swallows it). The message names the field, never the
+payload. The comparison is a standard-library JSON round trip, so a payload
+published under an id that is already stored must be JSON-native (`dict`,
+`list`, `str`, `int`, `float`, `bool`, `None`); anything else raises
+`TypeError` there.
+
+An id is at most 36 characters, starts with a lowercase letter or digit, and
+contains only `a-z`, `0-9`, `.`, `_` and `-`: the rule durable queue names
+follow, so that two ids are equal on every database (MySQL's default collation
+ignores case and accents) and an id is safe in a log line or a URL. A UUID
+string passes. Any other id raises `ValueError` before anything is committed or
+staged, on both routes; `publish` logs and swallows it.
+
+Know the limits:
+
+- **Dedup lasts as long as the outbox row.** Relayed rows are pruned after
+  `jobs.retention_days`; after that the same id is a new event. The fan-out's
+  `(event_id, subscriber_id)` uniqueness holds only while the completed jobs are
+  retained, which the same setting prunes.
+- **The bus route does not dedup.** A reused id is dispatched again and the
+  subscriber runs again. The event log keeps one row per id (its primary key):
+  the first event's type, source and payload, with the status of the latest
+  processing of an event of that type. A durable event's `queued` row, or a row
+  of another `event_type`, is never updated by a bus event that reuses its id.
+- **The payload must be deterministic for the id.** A per-replica timestamp in
+  the payload makes the repeats differ, and they are refused.
 
 ## Delivery routing
 
@@ -179,6 +266,9 @@ publish(...)
     └─ otherwise
            └─▶ event bus ──▶ subscriber (in-process, or via Redis Streams)
 ```
+
+With `events_uri="none://"` the event bus is disabled: an event that takes the event-bus route is dropped, and
+best-effort subscribers never run (`subscribe` raises `CapabilityDisabledError`). The outbox route is unaffected.
 
 ## Subscribing
 

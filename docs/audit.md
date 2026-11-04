@@ -211,7 +211,7 @@ set the context in every entry point.
 
 ### On PostgreSQL
 
-The migration (`rev0006`, PostgreSQL 13 or newer) builds the log differently from every other dialect:
+The migration (`rev0006`, PostgreSQL 13 or newer) builds the log differently from SQLite:
 
 - It is **range-partitioned by `occurred_at`, one partition per UTC day**.
 - A `BEFORE UPDATE OR DELETE` row trigger and a `BEFORE TRUNCATE` statement trigger raise an exception. Statement
@@ -231,36 +231,73 @@ The migration (`rev0006`, PostgreSQL 13 or newer) builds the log differently fro
 [maintenance](#maintenance) running; `audit.partition_days_ahead` (7 by default) is the margin by which it may
 stop, and `get_audit_health()["furthest_partition_date"]` is what to alert on.
 
-### On other dialects
+### On MySQL and MariaDB
 
-SQLite and MySQL get a plain, unpartitioned table with the same columns (and `create_all` builds the same, on any
-dialect). Nothing prevents `UPDATE` or `DELETE`, and retention is a bounded `DELETE`. This is for test
-environments; do not run a production audit trail on it.
+Migration `rev0008` (MySQL 8.0.1+, MariaDB 10.6+) gives the log the same guarantees:
+
+- It is **`RANGE COLUMNS` partitioned by `occurred_at`, one partition per UTC day**, named `p<YYYYMMDD>`. There is
+  no catch-all partition, so **a row whose day has no partition is rejected**, as on PostgreSQL.
+- `BEFORE UPDATE` and `BEFORE DELETE` triggers raise an error. These servers have no `TRUNCATE` trigger: `TRUNCATE`
+  needs the `DROP` privilege, which [`grants_sql`](#roles-and-grants) gives no role.
+- `jasil_audit_ensure_partitions(days_ahead)` and `jasil_audit_drop_partitions(cutoff, prune_at)` are `SQL SECURITY
+  DEFINER` procedures doing what the PostgreSQL functions do: `CALL` returns their result as a one-row result set,
+  and `prune_at` may be `NULL` for the server's UTC clock. The floor is measured on `UTC_TIMESTAMP()`, whatever the
+  session's `time_zone`. Partitions can only be added after the last one, which already holds every earlier day.
+- Both take a named lock (`GET_LOCK`, waiting at most 10 seconds) and wait at most 10 seconds for the table's
+  metadata lock (`lock_wait_timeout`, which they restore before returning); maintenance logs a failure and retries on
+  its next run.
+
+The differences that remain:
+
+- **DDL commits.** Neither procedure runs inside the caller's transaction: call it on a connection with no
+  uncommitted work, which it would commit. The drop procedure commits its `audit.retention.prune` row before
+  dropping the first partition, so a failure in between leaves a record of a prune the next run finishes, never a
+  prune with no record.
+- **Grants only grant.** MySQL and MariaDB cannot revoke a privilege that was never granted without failing, so
+  `grants_sql(..., dialect="mysql")` does not reset the roles first; see [Roles and grants](#roles-and-grants).
+- **Whole seconds.** `DATETIME` keeps whole seconds and rounds (see [Configuration](configuration.md)), so a row
+  staged in the last half second of a day is stored, and partitioned, as the next day's first second.
+
+### On SQLite
+
+SQLite gets a plain, unpartitioned table with the same columns (and `create_all` builds the same, on any dialect).
+Nothing prevents `UPDATE` or `DELETE`, and retention is a bounded `DELETE`. This is for development and tests; do not
+run a production audit trail on it.
 
 ### The retention floor
 
-The floor is a constant inside `jasil_audit_drop_partitions`, baked in when the migration runs from
+The floor is a constant inside `jasil_audit_drop_partitions`, baked in when its migration (`rev0006` on PostgreSQL,
+`rev0008` on MySQL and MariaDB) runs from
 `audit.retention_floor_days` (30 by default). That the guard lives in the database is the point: an application
 that is compromised, or misconfigured to a retention of one day, cannot shorten the trail below it.
 
-Changing the setting afterwards does **not** change the function. To change it, run the statement
-`jasil_audit.retention_floor_sql(floor_days, schema=...)` returns as the role that owns the function. `schema` is required
-and must be the schema the migration ran in (its `current_schema()`): the function names its schema in its body,
-so there is no default that is safe. It replaces the body only; the owner and grants stay.
+Changing the setting afterwards does **not** change the routine. To change it, run the statements
+`jasil_audit.retention_floor_sql(floor_days, *, schema, dialect="postgresql")` returns, in order, as the account that
+owns the routine. `schema` is required and must be the schema (on MySQL, the database) the migration ran in: its
+`current_schema()` or `DATABASE()`. The routine is qualified with it, so there is no default that is safe.
 
 ```python
 import sqlalchemy as sa
 
+import jasil.audit as jasil_audit
+
 with engine.begin() as connection:  # connected as the migrating (owner) role
-    connection.execute(sa.text(jasil_audit.retention_floor_sql(90, schema="public")))
+    for statement in jasil_audit.retention_floor_sql(90, schema="public"):
+        connection.execute(sa.text(statement))
 ```
 
-(Use `sa.text` or `psql`: the statement contains `%`, which a raw driver call would read as a placeholder.)
+(Use `sa.text` or `psql`: the statements contain `%`, which a raw driver call would read as a placeholder.)
+
+On PostgreSQL it is one `CREATE OR REPLACE FUNCTION`, which replaces the body only; the owner and grants stay.
+MySQL has no `CREATE OR REPLACE PROCEDURE`, so with `dialect="mysql"` it is `DROP PROCEDURE` then `CREATE
+PROCEDURE`: the running account becomes the definer, and dropping the procedure removes the `EXECUTE` grants on it,
+so run [`grants_sql`](#roles-and-grants) for the maintenance role again afterwards.
 
 ## Roles and grants
 
-JASIL names no role. `jasil_audit.grants_sql(runtime_role, reader_role, *, maintenance_role=None, schema=None)`
-returns the statements; review them and run them as the table owner:
+JASIL names no role. `jasil_audit.grants_sql(runtime_role, reader_role, *, maintenance_role=None, schema=None,
+dialect="postgresql")` returns the statements; review them and run them as the table owner. Pass `dialect="mysql"`
+for MySQL and MariaDB, where a role name is a role or account at host `%`:
 
 ```python
 for statement in jasil_audit.grants_sql("app_runtime", "app_observability", maintenance_role="app_maintenance"):
@@ -273,7 +310,10 @@ for statement in jasil_audit.grants_sql("app_runtime", "app_observability", main
 | **Reader** (the observability product) | `SELECT` on all four tables | Write anything; execute either function |
 | **Maintenance** (optional) | `SELECT`, `INSERT` on the log; `SELECT`, `INSERT` on the checkpoints; `SELECT`, `INSERT`, `UPDATE` on the catalog and the instance row; `EXECUTE` on both functions | Update or delete a log row |
 
-Every statement first revokes whatever the role held on these tables, so running the list converges. The reader
+On PostgreSQL every statement first revokes whatever the role held on these tables, so running the list converges.
+On MySQL and MariaDB the list only grants, because revoking a privilege that was never granted fails there: start
+from roles that hold nothing on these tables, and nothing on the whole database, which a table grant cannot take
+away (an account with `ALL` on the database can update, delete and truncate the log). The reader
 must differ from the runtime and the maintenance roles (`ValueError` otherwise): it would otherwise be able to write
 rows or checkpoints, or the application to read the trail it writes.
 
@@ -291,13 +331,13 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
 1. **Record a retention change**: if `audit.retention_days` or `audit.legal_hold` (or what the
    [retention source](#retention-the-host-edits-at-run-time) returns) differs from what the last run
    stored in `jasil_instance`, stage `audit.retention.change` (the first run only records the baseline).
-2. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL).
+2. **Ensure the partitions** for the next `partition_days_ahead` days (PostgreSQL, MySQL, MariaDB).
 3. **Seal the checkpoints** that are due.
 4. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
    checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
    `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
-   is pruned. On PostgreSQL call `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
-   `audit.retention.prune` row itself, so the row belongs to the window that clock is sealing. On other dialects, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
+   is pruned. On PostgreSQL, MySQL and MariaDB call `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
+   `audit.retention.prune` row itself, so the row belongs to the window that clock is sealing. On SQLite, or a plain table, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
    it, as a partition drop is) and write that row from Python.
 
 Each step runs on its own sessions, and a failure in one is logged and does not skip the others: a partition problem
@@ -323,7 +363,8 @@ interval bounds how far behind they run.
 entirely. The hold binds JASIL's maintenance, not the database: `jasil_audit_drop_partitions` refuses only a cutoff
 inside the retention floor, so any role with `EXECUTE` on it can still drop older partitions while the hold is set.
 For a hold the database enforces, revoke that right for its duration
-(`REVOKE EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz, timestamptz) FROM <maintenance role>`) and grant it back
+(`REVOKE EXECUTE ON FUNCTION jasil_audit_drop_partitions(timestamptz, timestamptz) FROM <maintenance role>`; on MySQL
+`REVOKE EXECUTE ON PROCEDURE jasil_audit_drop_partitions FROM <maintenance role>`) and grant it back
 afterwards; maintenance does not call it while `legal_hold` is set. `retention_floor_days` (30) is the database-side minimum described [above](#the-retention-floor); a
 positive `retention_days` below it is a configuration error. The host maps its own deployment profiles onto
 `retention_days`; JASIL supplies only the neutral default.
@@ -352,8 +393,8 @@ write path never calls it. Keep it cheap; it may raise.
 
 The value is validated as `AuditSettings` is: a positive `retention_days` below `retention_floor_days`, or above
 36500, is refused. When the source raises or returns a refused value, the error is logged, no checkpoint is sealed and
-nothing is pruned, and only the partitions step runs; the next run with a valid value catches up. On PostgreSQL the
-floor baked into `jasil_audit_drop_partitions` by the migration still applies whatever the source returns.
+nothing is pruned, and only the partitions step runs; the next run with a valid value catches up. On PostgreSQL, MySQL
+and MariaDB the floor baked into `jasil_audit_drop_partitions` by the migration still applies whatever the source returns.
 
 ## Tamper evidence
 
@@ -557,6 +598,22 @@ Migration `rev0006` creates the four tables and, on PostgreSQL, the partitions, 
 - Nothing else reads or writes the new tables, so processes of the previous release are unaffected during a rolling
   deploy.
 - Downgrading drops the tables, **and the audit trail with them**.
+
+On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the triggers and procedures:
+
+- It gives every day that already has rows its own partition, so retention drops them day by day as on a new
+  install. Partitioning rebuilds the table, which **blocks writes to the audit log** while its rows are copied.
+- Run it as the account that should own the procedures. With binary logging on (the MySQL 8 default), creating a
+  trigger needs `SUPER` or the server variable `log_bin_trust_function_creators=1`; without either the revision fails
+  before it rebuilds the table and records nothing. DDL is not transactional there, so a revision that failed
+  part-way can be run again: it replaces what the failed run created.
+- It cannot be rendered as SQL (`--sql`) for MySQL or MariaDB: the partitions depend on the rows in the table.
+- `adopt_existing_schema` adopts a plain MySQL audit log from a database at `rev0006` or `rev0007` (built by those
+  migrations, or by `create_all` with JASIL 0.15 or earlier) at `rev0007`, so the next `upgrade` partitions and
+  protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
+  `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
+- Processes of the previous release only insert into the log, so they are unaffected. Downgrading to `rev0007`
+  removes the partitioning, the triggers and the procedures and keeps the rows.
 
 ## For the host's architecture tests
 

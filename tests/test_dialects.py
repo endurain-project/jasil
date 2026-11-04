@@ -9,7 +9,7 @@ so every branch is pinned here rather than being discovered on a real server.
 import pytest
 from sqlalchemy import create_engine
 
-from jasil._core.dialects import supports_skip_locked
+from jasil._core.dialects import needs_locking_read, supports_skip_locked
 
 
 class FakeDialect:
@@ -85,3 +85,16 @@ class TestAgainstARealEngine:
         with engine.connect() as connection:
             assert supports_skip_locked(connection) is False
         engine.dispose()
+
+
+class TestNeedsLockingRead:
+    """A MySQL snapshot can hide a row another transaction committed first; the other databases cannot."""
+
+    def test_no_bind_does_not_need_it(self):
+        assert needs_locking_read(None) is False
+
+    @pytest.mark.parametrize(
+        ("name", "expected"), [("mysql", True), ("mariadb", True), ("postgresql", False), ("sqlite", False)]
+    )
+    def test_per_dialect(self, name, expected):
+        assert needs_locking_read(_bind(name)) is expected
