@@ -131,6 +131,11 @@ through.
       performed external side effects, so idempotency still matters.
 - [ ] In handlers that loop or perform several side effects, check
       `jasil.jobs.lease_lost()` between units of work and return early.
+- [ ] Never pass request input (an `Idempotency-Key` header, a client-chosen id)
+      as `event_id`. Derive it server-side, namespaced per tenant or user, for
+      example with `uuid5` over tenant, event type and key.
+- [ ] Authorize a status lookup by the operation's owner, not by knowing its
+      `event_id`: a deterministic id is guessable.
 
 ## The admin surface
 

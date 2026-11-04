@@ -72,7 +72,7 @@ class TestLifecycleWrites:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_processing(event.event_id, "worker-7", db, now=datetime.now(UTC))
+        event_log_crud.mark_processing(event, "worker-7", db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "processing"
@@ -83,7 +83,7 @@ class TestLifecycleWrites:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_completed(event.event_id, "render_invoice", 42, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(event, "render_invoice", 42, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "completed"
@@ -95,7 +95,7 @@ class TestLifecycleWrites:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_failed(event.event_id, "render_invoice", "upstream refused", 7, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event, "render_invoice", "upstream refused", 7, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "failed"
@@ -106,15 +106,13 @@ class TestLifecycleWrites:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_failed(
-            event.event_id, None, "x" * (MAX_STORED_ERROR_LENGTH * 2), 1, db, now=datetime.now(UTC)
-        )
+        event_log_crud.mark_failed(event, None, "x" * (MAX_STORED_ERROR_LENGTH * 2), 1, db, now=datetime.now(UTC))
 
         assert len(_row(db, event.event_id).error_message) == MAX_STORED_ERROR_LENGTH
 
     def test_a_transition_for_an_unknown_event_is_a_no_op(self, db):
         """The trail is best-effort; a missing row must not raise into the bus."""
-        event_log_crud.mark_completed("never-published", "handler", 1, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(_event(), "handler", 1, db, now=datetime.now(UTC))
 
         assert db.query(EventLog).count() == 0
 
@@ -149,7 +147,7 @@ class TestHandlerNameClamping:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_completed(event.event_id, "subscriber," * 200, 1, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(event, "subscriber," * 200, 1, db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "completed"
@@ -163,7 +161,7 @@ class TestWorkerIdClamping:
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
 
-        event_log_crud.mark_processing(event.event_id, "w" * (MAX_WORKER_ID_LENGTH * 2), db, now=datetime.now(UTC))
+        event_log_crud.mark_processing(event, "w" * (MAX_WORKER_ID_LENGTH * 2), db, now=datetime.now(UTC))
 
         row = _row(db, event.event_id)
         assert row.status == "processing"
@@ -190,7 +188,7 @@ class TestSummary:
             event_log_crud.record_published(_event("order.created"), db, now=datetime.now(UTC))
         completed = _event("order.created")
         event_log_crud.record_published(completed, db, now=datetime.now(UTC))
-        event_log_crud.mark_completed(completed.event_id, "h", 10, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(completed, "h", 10, db, now=datetime.now(UTC))
         event_log_crud.record_published(_event("invoice.rendered"), db, now=datetime.now(UTC))
 
         summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC))
@@ -215,7 +213,7 @@ class TestSummary:
         for duration in (10, 30):
             event = _event()
             event_log_crud.record_published(event, db, now=datetime.now(UTC))
-            event_log_crud.mark_completed(event.event_id, "h", duration, db, now=datetime.now(UTC))
+            event_log_crud.mark_completed(event, "h", duration, db, now=datetime.now(UTC))
 
         stats = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).by_type[0]
 
@@ -266,7 +264,7 @@ class TestPendingGroups:
     def test_finished_events_are_not_pending(self, db):
         event = _event()
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
-        event_log_crud.mark_completed(event.event_id, "h", 1, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(event, "h", 1, db, now=datetime.now(UTC))
 
         assert event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).pending == []
 
@@ -310,10 +308,10 @@ class TestRecentFailures:
     def test_only_failures_are_returned(self, db):
         completed = _event()
         event_log_crud.record_published(completed, db, now=datetime.now(UTC))
-        event_log_crud.mark_completed(completed.event_id, "h", 1, db, now=datetime.now(UTC))
+        event_log_crud.mark_completed(completed, "h", 1, db, now=datetime.now(UTC))
         failed = _event()
         event_log_crud.record_published(failed, db, now=datetime.now(UTC))
-        event_log_crud.mark_failed(failed.event_id, "h", "boom", 1, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(failed, "h", "boom", 1, db, now=datetime.now(UTC))
 
         failures = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures
 
@@ -322,7 +320,7 @@ class TestRecentFailures:
     def test_the_failure_carries_enough_to_investigate(self, db):
         event = _event(metadata={"request_id": "r-9"})
         event_log_crud.record_published(event, db, now=datetime.now(UTC))
-        event_log_crud.mark_failed(event.event_id, "render_invoice", "boom", 5, db, now=datetime.now(UTC))
+        event_log_crud.mark_failed(event, "render_invoice", "boom", 5, db, now=datetime.now(UTC))
 
         failure = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC)).recent_failures[0]
 
@@ -334,7 +332,7 @@ class TestRecentFailures:
         for _ in range(5):
             event = _event()
             event_log_crud.record_published(event, db, now=datetime.now(UTC))
-            event_log_crud.mark_failed(event.event_id, "h", "boom", 1, db, now=datetime.now(UTC))
+            event_log_crud.mark_failed(event, "h", "boom", 1, db, now=datetime.now(UTC))
 
         summary = event_log_crud.get_event_log_summary(db, now=datetime.now(UTC), failure_limit=2)
 
@@ -481,6 +479,63 @@ class TestRecorder:
             pass
 
         assert _row(db, event.event_id).processing_time_ms >= 0
+
+
+class TestAReusedEventIdOnTheBus:
+    """The event id is the row's primary key, so an id another event already owns must leave that row alone."""
+
+    @pytest.fixture
+    def bus(self, session_factory):
+        from jasil.backends.events_inprocess import InProcessEventBus
+
+        bus = InProcessEventBus(EventLogRecorder(FixedClock()))
+        self.handled = []
+        bus.subscribe("order.created", self.handled.append)
+        return bus
+
+    def test_publishing_the_same_id_twice_runs_the_handler_twice_and_leaves_one_clean_row(self, bus, db, caplog):
+        event = _event(event_id="evt-1")
+
+        with caplog.at_level("WARNING"):
+            bus.publish(event)
+            bus.publish(event)
+
+        assert len(self.handled) == 2
+        assert db.query(EventLog).count() == 1
+        assert _row(db, "evt-1").status == "completed"
+        assert "record_published failed" not in caplog.text
+
+    def test_it_leaves_a_durable_queued_row_queued(self, bus, db):
+        queued = _event(event_id="evt-1")
+        event_log_crud.record_queued(queued, db, now=datetime.now(UTC))
+
+        bus.publish(_event(event_id="evt-1"))
+
+        assert _row(db, "evt-1").status == "queued"
+
+    def test_it_leaves_a_row_of_another_event_type_untouched(self, bus, db):
+        other = _event("invoice.rendered", event_id="evt-1")
+        event_log_crud.record_published(other, db, now=datetime.now(UTC))
+
+        bus.publish(_event(event_id="evt-1"))
+
+        row = _row(db, "evt-1")
+        assert (row.event_type, row.status, row.completed_at) == ("invoice.rendered", "published", None)
+
+    def test_a_failing_handler_still_marks_its_own_row_failed(self, session_factory, db):
+        from jasil.backends.events_inprocess import InProcessEventBus
+
+        def _boom(_event):
+            raise RuntimeError("boom")
+
+        bus = InProcessEventBus(EventLogRecorder(FixedClock()))
+        bus.subscribe("order.created", _boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            bus.publish(_event(event_id="evt-1"))
+
+        row = _row(db, "evt-1")
+        assert (row.status, row.error_message) == ("failed", "boom")
 
 
 class TestRecorderNeverBreaksProcessing:

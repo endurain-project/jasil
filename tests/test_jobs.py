@@ -15,6 +15,7 @@ import pytest
 import jasil.jobs.crud as jobs_crud
 import jasil.jobs.outbox as jobs_outbox
 import jasil.jobs.relay as jobs_relay
+from jasil._core.dialects import insert_ignoring_conflict
 from jasil._core.timestamps import as_utc
 from jasil.events import MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH, new_event
 from jasil.jobs.backoff import backoff_seconds
@@ -196,8 +197,8 @@ class TestSubscriberRegistration:
         assert errors == []
 
 
-class TestInsertIgnoringDuplicate:
-    """The enqueue's conflict clause, per dialect name (MySQL and MariaDB report different ones)."""
+class TestInsertIgnoringConflict:
+    """The conflict clause, per dialect name (MySQL and MariaDB report different ones)."""
 
     @staticmethod
     def _session(dialect: str):
@@ -207,13 +208,18 @@ class TestInsertIgnoringDuplicate:
     def test_mysql_and_mariadb_ignore_a_duplicate_with_a_no_op_update(self, dialect):
         from sqlalchemy.dialects import mysql
 
-        statement = jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session(dialect))
+        statement = insert_ignoring_conflict(
+            ProcessingJob, {"id": "j"}, conflict_columns=["event_id", "subscriber_id"], db=self._session(dialect)
+        )
+        compiled = str(statement.compile(dialect=mysql.dialect()))
 
-        assert "ON DUPLICATE KEY UPDATE" in str(statement.compile(dialect=mysql.dialect()))
+        assert "ON DUPLICATE KEY UPDATE event_id = jasil_processing_jobs.event_id" in compiled
 
     def test_an_unsupported_dialect_is_refused(self):
         with pytest.raises(RuntimeError, match="insert-or-ignore"):
-            jobs_crud._insert_ignoring_duplicate({"id": "j"}, self._session("oracle"))
+            insert_ignoring_conflict(
+                ProcessingJob, {"id": "j"}, conflict_columns=["event_id"], db=self._session("oracle")
+            )
 
 
 class TestClaim:
@@ -863,6 +869,84 @@ class TestOutboxRelay:
         )
 
         assert relayed == 2
+
+    def test_a_first_write_returns_the_new_row_id(self, db, event):
+        outbox_id = jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        assert db.query(EventOutbox).one().id == outbox_id
+
+    def test_writing_the_same_event_again_inserts_nothing_and_returns_none(self, db, event):
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        assert jobs_outbox.add_to_outbox(event, now=T0, db=db) is None
+        assert db.query(EventOutbox).count() == 1
+
+    def test_the_same_event_id_with_another_payload_is_refused(self, db, event):
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+        other = new_event("activity.created", {"activity_id": 8}, source="test", event_id=event.event_id)
+
+        with pytest.raises(ValueError, match="payload") as exc_info:
+            jobs_outbox.add_to_outbox(other, now=T0, db=db)
+
+        assert "8" not in str(exc_info.value).replace(event.event_id, "")
+
+    def test_the_same_event_id_with_another_type_is_refused(self, db, event):
+        jobs_outbox.add_to_outbox(event, now=T0, db=db)
+        other = new_event("activity.deleted", event.payload, source="test", event_id=event.event_id)
+
+        with pytest.raises(ValueError, match="event_type"):
+            jobs_outbox.add_to_outbox(other, now=T0, db=db)
+
+    def test_the_read_back_locks_the_row_only_where_a_snapshot_could_hide_it(self, db, event, monkeypatch):
+        from sqlalchemy import event as sa_event
+        from sqlalchemy.dialects import mysql, postgresql
+
+        selects = []
+        sa_event.listen(
+            db,
+            "do_orm_execute",
+            lambda state: selects.append(state.statement) if state.is_select else None,
+        )
+        for locking in (True, False):
+            monkeypatch.setattr(jobs_outbox, "needs_locking_read", lambda _bind, locking=locking: locking)
+            jobs_outbox.add_to_outbox(event, now=T0, db=db)
+
+        locked, unlocked = selects
+        assert "FOR UPDATE" in str(locked.compile(dialect=mysql.dialect()))
+        assert "FOR UPDATE" not in str(unlocked.compile(dialect=mysql.dialect()))
+        assert "FOR UPDATE" not in str(unlocked.compile(dialect=postgresql.dialect()))
+
+    def test_the_insert_ignores_a_duplicate_event_id_on_postgresql(self):
+        from sqlalchemy.dialects import postgresql
+
+        statement = insert_ignoring_conflict(
+            EventOutbox,
+            {"id": "o", "event_id": "evt-1"},
+            conflict_columns=["event_id"],
+            db=SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))),
+        )
+
+        assert "ON CONFLICT (event_id) DO NOTHING" in str(statement.compile(dialect=postgresql.dialect()))
+
+    def test_a_payload_that_is_not_json_native_is_refused_when_its_id_is_reused(self):
+        """The comparison reads the stored JSON against the payload serialised again, with the standard library."""
+        import json
+        from decimal import Decimal
+
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        engine = create_engine("sqlite://", json_serializer=lambda value: json.dumps(value, default=str))
+        EventOutbox.__table__.create(engine)
+        event = new_event("activity.created", {"price": Decimal("1.5")}, source="test", event_id="evt-1")
+        try:
+            with Session(engine) as session:
+                jobs_outbox.add_to_outbox(event, now=T0, db=session)
+
+                with pytest.raises(TypeError, match="Decimal"):
+                    jobs_outbox.add_to_outbox(event, now=T0, db=session)
+        finally:
+            engine.dispose()
 
     def test_an_uncommitted_outbox_write_joins_the_callers_transaction(self, db, event):
         """``commit=False`` is what makes the outbox write atomic with the

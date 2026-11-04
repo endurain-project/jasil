@@ -31,7 +31,10 @@ class EventLogRecorder:
 
     def record_published(self, event: Event) -> None:
         """
-        Record the initial ``published`` row for an event.
+        Record the initial ``published`` row for an event, unless its id already has a row.
+
+        A reused id keeps the first row, and the transitions in :meth:`track` update only a row of the same
+        ``event_type`` that is not ``queued``, so one event never rewrites another's.
 
         Args:
             event: The event envelope being published.
@@ -113,7 +116,7 @@ class EventLogRecorder:
         if record_processing:
             self._safely(
                 "mark_processing",
-                lambda db: event_log_crud.mark_processing(event.event_id, worker_id, db, now=self._clock.now()),
+                lambda db: event_log_crud.mark_processing(event, worker_id, db, now=self._clock.now()),
             )
         start = self._clock.monotonic()
         try:
@@ -124,16 +127,14 @@ class EventLogRecorder:
             self._safely(
                 "mark_failed",
                 lambda db: event_log_crud.mark_failed(
-                    event.event_id, handler_name, error_message, elapsed_ms, db, now=self._clock.now()
+                    event, handler_name, error_message, elapsed_ms, db, now=self._clock.now()
                 ),
             )
             raise
         elapsed_ms = int((self._clock.monotonic() - start) * 1000)
         self._safely(
             "mark_completed",
-            lambda db: event_log_crud.mark_completed(
-                event.event_id, handler_name, elapsed_ms, db, now=self._clock.now()
-            ),
+            lambda db: event_log_crud.mark_completed(event, handler_name, elapsed_ms, db, now=self._clock.now()),
         )
 
     def _safely(self, operation: str, write: Callable[[Session], None]) -> None:
