@@ -16,6 +16,7 @@ import jasil.container as container
 import jasil.settings as settings
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
+from jasil.backends.events_none import NullEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.lock_noop import NoopLock
@@ -23,10 +24,12 @@ from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.realtime_inprocess import InProcessRealtime
+from jasil.backends.realtime_none import NullRealtime
 from jasil.backends.realtime_redis import RedisRealtime
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
+from jasil.backends.storage_none import NullStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.profile import DeploymentProfile, JobWorkerMode
 
@@ -72,6 +75,10 @@ class TestStateResolution:
         with pytest.raises(ValueError, match="Unsupported state_uri scheme"):
             container._build_state(_settings(state_uri="mysql://db"))
 
+    def test_none_is_not_accepted_because_state_is_not_optional(self):
+        with pytest.raises(ValueError, match="Unsupported state_uri scheme"):
+            container._build_state(_settings(state_uri="none://"))
+
 
 class TestStorageResolution:
     def test_local_uri_selects_the_filesystem_backend(self):
@@ -90,6 +97,9 @@ class TestStorageResolution:
     def test_an_unknown_scheme_is_refused(self):
         with pytest.raises(ValueError, match="Unsupported storage_uri scheme"):
             container._build_storage(_settings(storage_uri="ftp://files"))
+
+    def test_none_uri_disables_storage(self):
+        assert isinstance(container._build_storage(_settings(storage_uri="none://")), NullStorage)
 
     def test_s3_ignores_local_plain_area_settings(self):
         storage = container._build_storage(
@@ -141,6 +151,11 @@ class TestEventsResolution:
         with pytest.raises(ValueError, match="Unsupported events_uri scheme"):
             container._build_events(_settings(events_uri="kafka://broker"), None)
 
+    def test_none_uri_disables_the_bus_without_needing_a_stream_or_group(self):
+        bus = container._build_events(_settings(events_uri="none://", events_stream="", events_group=""), None)
+
+        assert isinstance(bus, NullEventBus)
+
     def test_the_default_stream_and_group_reach_the_stream_bus(self):
         bus = container._build_events(_settings(events_uri="redis://c:6379/1"), None)
 
@@ -172,6 +187,10 @@ class TestLockResolution:
     def test_an_unknown_scheme_is_refused(self):
         with pytest.raises(ValueError, match="Unsupported lock_uri scheme"):
             container._build_lock(_settings(lock_uri="zookeeper://"))
+
+    def test_none_is_not_accepted_because_the_lock_is_not_optional(self):
+        with pytest.raises(ValueError, match="Unsupported lock_uri scheme"):
+            container._build_lock(_settings(lock_uri="none://"))
 
 
 class TestGeocodingResolution:
@@ -315,6 +334,17 @@ class TestRealtimeResolution:
     def test_an_unknown_scheme_is_refused(self):
         with pytest.raises(ValueError, match="Unsupported realtime_uri scheme"):
             container._build_realtime(_settings(realtime_uri="nats://bus"))
+
+    def test_none_uri_disables_realtime(self):
+        assert isinstance(container._build_realtime(_settings(realtime_uri="none://")), NullRealtime)
+
+    def test_an_unset_uri_follows_a_disabled_event_bus(self):
+        assert isinstance(container._build_realtime(_settings(events_uri="none://")), NullRealtime)
+
+    def test_an_explicit_uri_wins_over_a_disabled_event_bus(self):
+        realtime = container._build_realtime(_settings(events_uri="none://", realtime_uri="memory://"))
+
+        assert isinstance(realtime, InProcessRealtime)
 
     def test_a_local_platform_carries_the_in_process_backend(self, tmp_path):
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
@@ -512,6 +542,18 @@ class TestBuildPlatform:
         assert isinstance(platform.lock, PgAdvisoryLock)
         assert platform.profile is DeploymentProfile.DISTRIBUTED
 
+    def test_closing_a_platform_with_disabled_capabilities_logs_no_warning(self, tmp_path, caplog):
+        platform = container.build_platform(
+            _settings(data_dir=str(tmp_path), storage_uri="none://", events_uri="none://", realtime_uri="none://")
+        )
+
+        with caplog.at_level("WARNING"):
+            platform.close()
+
+        assert isinstance(platform.events, NullEventBus)
+        assert isinstance(platform.realtime, NullRealtime)
+        assert caplog.records == []
+
 
 class TestDeploymentConsistencyGate:
     """``build_platform`` refuses wiring that would diverge across processes.
@@ -571,6 +613,36 @@ class TestDeploymentConsistencyGate:
         )
 
         assert isinstance(platform.realtime, RedisRealtime)
+
+    def test_a_distributed_profile_builds_with_storage_events_and_realtime_disabled(self, session_factory):
+        platform = container.build_platform(
+            _settings(
+                profile=DeploymentProfile.DISTRIBUTED,
+                state_uri="redis://c:6379/0",
+                storage_uri="none://",
+                events_uri="none://",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert isinstance(platform.storage, NullStorage)
+        assert isinstance(platform.events, NullEventBus)
+        assert isinstance(platform.realtime, NullRealtime)
+
+    def test_a_disabled_event_bus_across_workers_builds(self, tmp_path):
+        """With no bus there is no process-local bus to diverge, and realtime follows it."""
+        platform = container.build_platform(
+            _settings(
+                data_dir=str(tmp_path),
+                web_workers=4,
+                state_uri="redis://cache:6379/0",
+                events_uri="none://",
+                lock_uri="postgres-advisory://",
+            )
+        )
+
+        assert isinstance(platform.events, NullEventBus)
+        assert isinstance(platform.realtime, NullRealtime)
 
     def test_standalone_job_workers_stop_the_build_on_in_memory_wiring(self, tmp_path):
         """One API process, one worker process, the default ``local`` profile: two processes."""

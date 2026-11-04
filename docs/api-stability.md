@@ -101,7 +101,7 @@ Removing a column is a major change. Adding a nullable one is not.
 
 `StateBackendUnavailableError`, `StorageBackendUnavailableError`,
 `StorageKeyConflictError`, `StorageSizeLimitError`, `StorageUploadSessionError`,
-`UnsupportedEventVersionError`, `UnknownAuditActionError`, `AuditDetailsError`, and `AuditSinkConflictError` — what raises them and what they inherit from.
+`UnsupportedEventVersionError`, `UnknownAuditActionError`, `AuditDetailsError`, `AuditSinkConflictError`, and `CapabilityDisabledError` — what raises them and what they inherit from.
 
 ## Not covered
 

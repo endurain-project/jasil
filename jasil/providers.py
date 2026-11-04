@@ -47,6 +47,10 @@ class StorageUploadSessionError(RuntimeError):
     """Raised when a resumable upload session or part reference is not active."""
 
 
+class CapabilityDisabledError(RuntimeError):
+    """Raised when a host uses a capability its deployment disabled with a ``none://`` URI."""
+
+
 @dataclass(frozen=True)
 class UploadSession:
     """Durable handle and portable limits for one resumable upload."""

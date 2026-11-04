@@ -83,6 +83,7 @@ small test doubles can depend on only the slice they use:
 |---|---|---|
 | `LocalStorage` | `local://`, `local://<path>` | Logical objects in a private versioned filesystem layout. |
 | `S3Storage` | `s3://<bucket>` | Key prefix per area. Requires the `s3` extra. |
+| `NullStorage` | `none://` | Storage disabled: every method raises `StorageBackendUnavailableError`. |
 
 `s3://<bucket>[/prefix]` takes two optional query parameters: `region`, and
 `endpoint_url` for an S3-compatible store (MinIO, R2, Ceph). `endpoint_url` must be
@@ -346,6 +347,10 @@ temporary file inside it; it deliberately does not recreate a missing root, so a
 missing volume path is not reported ready. Failures raise
 `StorageBackendUnavailableError`.
 
+With `storage_uri="none://"` storage is disabled and every method raises
+`StorageBackendUnavailableError`, `check_writable` included, so a readiness probe built on it fails. `storage_uri`
+does not affect `audit.external_sink_uri`: the S3 audit sink builds its own client.
+
 This probe lives on `StorageProvider`, not on `Platform.health()`. The operation
 being promised is specifically "this object store can persist and remove a
 blob". A platform-wide readiness result would need host policy about which
@@ -394,6 +399,11 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 |---|---|---|
 | `InProcessEventBus` | `memory://` | Synchronous. `publish` runs subscribers inline. |
 | `RedisStreamEventBus` | `redis://`, `rediss://`, `unix://` | Redis Streams with a consumer group. |
+| `NullEventBus` | `none://` | Event bus disabled: `publish` drops the event, `subscribe` raises `CapabilityDisabledError`. |
+
+With `events_uri="none://"` the bus is disabled. Best-effort publishes are dropped (logged at debug) and
+`subscribe` raises `CapabilityDisabledError`, since a best-effort subscriber would never run. Durable delivery through
+the outbox is unaffected, and an injected event recorder records nothing for the dropped events.
 
 In-process dispatch is a direct function call. Every handler of the event runs
 even when one raises; the failure then propagates to the publisher (several
@@ -574,9 +584,11 @@ platform.realtime.notify(str(account.id), {"kind": "order.updated", "id": order.
 |---|---|---|
 | `InProcessRealtime` | `memory://` | `notify` calls the handlers inline on the caller's thread. `start` / `stop` are no-ops. |
 | `RedisRealtime` | `redis://`, `rediss://`, `unix://` | Redis Pub/Sub on one channel (`realtime_channel`, default `jasil:realtime`; server-wide, so unique per deployment). Every started process receives every hint. |
+| `NullRealtime` | `none://` | Realtime disabled: `notify` validates the hint, then drops it; `subscribe` raises `CapabilityDisabledError`. |
 
 `realtime_uri` follows `events_uri` when unset, so an existing deployment needs
-no new setting.
+no new setting. For the same reason `events_uri="none://"` alone also disables realtime; set `realtime_uri`
+explicitly to keep realtime without a bus.
 
 !!! warning "A hint is a latency optimisation, never the record"
     - Delivery is **best-effort, at-most-once and unordered**. A replica that is

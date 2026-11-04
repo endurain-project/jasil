@@ -42,10 +42,10 @@ fields.
 | `enforce_deployment_consistency` | `True` | Refuse to build a platform whose wiring contradicts its topology. `False` logs the issues as warnings instead. |
 | `data_dir` | `"data"` | Root directory for the local storage backend. |
 | `state_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
-| `storage_uri` | `None` | `local://` or `s3://`. |
-| `events_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
+| `storage_uri` | `None` | `local://` or `s3://`; `none://` disables storage. |
+| `events_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`; `none://` disables the event bus (and realtime, unless `realtime_uri` is set). |
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
-| `realtime_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
+| `realtime_uri` | `None` | `memory://`, `redis://` / `rediss://` / `unix://`, or `none://` to disable realtime: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
 | `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Must not be empty for Redis, checked when the platform is built; ignored for `memory://`. |
 | `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
@@ -162,8 +162,8 @@ Each capability resolves its backend by URI scheme, independently of the profile
 | Capability | Schemes |
 |---|---|
 | `state_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
-| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>[/<prefix>][?region=...&endpoint_url=...]` |
-| `events_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
+| `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>[/<prefix>][?region=...&endpoint_url=...]`, `none://` (disabled) |
+| `events_uri` | `memory://`, `redis://`, `rediss://`, `unix://`, `none://` (disabled) |
 | `lock_uri` | `noop://`, `postgres-advisory://` |
 
 An unrecognised scheme raises `ValueError` at startup. Failing to start beats
