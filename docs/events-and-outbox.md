@@ -267,6 +267,9 @@ publish(...)
            └─▶ event bus ──▶ subscriber (in-process, or via Redis Streams)
 ```
 
+With `events_uri="none://"` the event bus is disabled: an event that takes the event-bus route is dropped, and
+best-effort subscribers never run (`subscribe` raises `CapabilityDisabledError`). The outbox route is unaffected.
+
 ## Subscribing
 
 A durable handler must **raise** on failure, so the runner can retry and

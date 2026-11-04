@@ -7,10 +7,10 @@ published process-wide via ``jasil.runtime`` so both request and non-request
 code resolve the same instance.
 
 Every capability resolves its backend by URI scheme, independently of the
-profile: ``memory``/``redis`` for the state URI; ``local``/``s3`` for the storage
-URI; ``memory``/``redis`` for the events and realtime URIs;
-``noop``/``postgres-advisory`` for the lock URI. The deployment profile only shapes the *defaults* those URIs
-resolve to (see the ``resolved_*`` properties on
+profile: ``memory``/``redis`` for the state URI; ``local``/``s3``/``none`` for the storage
+URI; ``memory``/``redis``/``none`` for the events and realtime URIs;
+``noop``/``postgres-advisory`` for the lock URI. ``none`` disables the capability.
+The deployment profile only shapes the *defaults* those URIs resolve to (see the ``resolved_*`` properties on
 :class:`~jasil.settings.JasilSettings`), so ``local``, ``distributed``, and
 ``custom`` all build the same way — the profile just picks memory-vs-Redis and
 local-fs-vs-S3 defaults.
@@ -33,6 +33,7 @@ from jasil._core.mail_problems import SMTP_PORTS, MailProblemCode, mail_problems
 from jasil._reloading import ReloadingGeocoding, ReloadingMail, TransientBuildError
 from jasil.backends.clock_system import SystemClock
 from jasil.backends.events_inprocess import InProcessEventBus
+from jasil.backends.events_none import NullEventBus
 from jasil.backends.events_redis import RedisStreamEventBus
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, resolve_reverse_endpoint
 from jasil.backends.lock_noop import NoopLock
@@ -41,9 +42,11 @@ from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SEND_DEADLINE_SECONDS as SMTP_SEND_DEADLINE_SECONDS
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.realtime_inprocess import InProcessRealtime
+from jasil.backends.realtime_none import NullRealtime
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.backends.storage_local import LocalStorage
+from jasil.backends.storage_none import NullStorage
 from jasil.profile import DeploymentProfile
 from jasil.providers import (
     AuditSink,
@@ -78,8 +81,10 @@ class Platform:
     Attributes:
         profile: The active deployment profile.
         state: Ephemeral keyed-state provider.
-        storage: Blob-storage provider.
-        events: Publish/subscribe provider.
+        storage: Blob-storage provider. A :class:`~jasil.backends.storage_none.NullStorage` whose
+            operations all raise when ``storage_uri`` is ``none://``.
+        events: Publish/subscribe provider. A :class:`~jasil.backends.events_none.NullEventBus` that
+            drops best-effort events when ``events_uri`` is ``none://``.
         lock: Coordination-lock provider.
         clock: Time-source provider.
         geocoding: Reverse-geocoding provider. Always present — when geocoding is
@@ -99,6 +104,8 @@ class Platform:
             hand-built ``Platform`` need not supply it. The host registers its
             handler with ``subscribe`` and calls ``start`` itself (only the
             processes holding client connections need to); :meth:`close` stops it.
+            A :class:`~jasil.backends.realtime_none.NullRealtime` that drops hints when
+            ``realtime_uri`` (or ``events_uri``, when it is unset) is ``none://``.
     """
 
     profile: DeploymentProfile
@@ -282,6 +289,8 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
         from jasil.backends.storage_s3 import S3Storage
 
         return S3Storage.from_uri(storage_uri)
+    if scheme == "none":
+        return NullStorage()
     raise _unsupported_scheme("storage_uri", storage_uri)
 
 
@@ -290,6 +299,8 @@ def _build_events(settings: JasilSettings, recorder: EventRecorder | None) -> Ev
     scheme, _, _ = events_uri.partition("://")
     if scheme == "memory":
         return InProcessEventBus(recorder=recorder)
+    if scheme == "none":
+        return NullEventBus()
     if scheme in ("redis", "rediss", "unix"):
         if not settings.events_stream or not settings.events_group:
             raise ValueError("events_stream and events_group must not be empty")
@@ -304,6 +315,8 @@ def _build_realtime(settings: JasilSettings) -> RealtimeProvider:
     scheme, _, _ = realtime_uri.partition("://")
     if scheme == "memory":
         return InProcessRealtime()
+    if scheme == "none":
+        return NullRealtime()
     if scheme in ("redis", "rediss", "unix"):
         # Imported lazily, unlike the stream bus: nothing else needs it, and a
         # ``local`` deployment then never loads the module at all.

@@ -8,6 +8,7 @@ Public (pure) surface — safe to import anywhere; pulls in no backends:
         - ``StateProvider`` / ``EventBusProvider`` / ``LockProvider`` /
             ``ClockProvider`` - the other capability providers.
         - ``MailProvider`` / ``MailMessage`` and its ``MailError`` family.
+        - ``CapabilityDisabledError`` - using a capability disabled with ``none://``.
         - ``RealtimeProvider`` - cross-process, best-effort keyed hints.
 
 The composition root (``Platform`` / ``build_platform``) lives in
@@ -22,6 +23,7 @@ from importlib.metadata import version as _version
 from jasil.events import Event, new_event
 from jasil.profile import DeploymentProfile, JobWorkerMode
 from jasil.providers import (
+    CapabilityDisabledError,
     ClockProvider,
     EventBusProvider,
     LockProvider,
@@ -60,6 +62,7 @@ except _PackageNotFoundError:  # pragma: no cover - running from an unbuilt sour
 __all__ = [
     # Package metadata
     "__version__",
+    "CapabilityDisabledError",
     "ClockProvider",
     "DeploymentProfile",
     "Event",

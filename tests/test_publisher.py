@@ -21,6 +21,7 @@ import jasil.jobs.registry as jobs_registry
 import jasil.publisher as publisher
 import jasil.runtime as runtime
 import jasil.settings as settings
+import jasil.testing as jasil_testing
 from jasil.event_log.models import EventLog
 from jasil.event_log.recorder import EventLogRecorder
 from jasil.events import META_REQUEST_ID
@@ -195,6 +196,30 @@ class TestCorrelation:
         publisher.publish("activity.created", {}, source="test")
 
         assert META_REQUEST_ID not in platform.events.published[0].metadata
+
+
+class TestDisabledEventBus:
+    """``events_uri=none://`` drops best-effort events silently; the durable route never touches the bus."""
+
+    def test_a_best_effort_publish_logs_no_error(self, tmp_path, caplog):
+        jasil_testing.install_test_platform(tmp_path, settings=settings.JasilSettings(events_uri="none://"))
+
+        caplog.clear()
+        with caplog.at_level("ERROR"):
+            publisher.publish("activity.created", {"id": 1}, source="test")
+
+        assert caplog.records == []
+
+    def test_a_durable_event_is_still_staged_in_the_outbox(self, tmp_path, db):
+        jasil_testing.install_test_platform(
+            tmp_path,
+            settings=settings.JasilSettings(events_uri="none://", jobs=settings.JobSettings(enabled=True)),
+        )
+        jobs_registry.registry.register("activity.created", "s", lambda _e: None)
+
+        publisher.publish("activity.created", {"id": 1}, source="test", db=db)
+
+        assert db.query(EventOutbox).count() == 1
 
 
 class TestFailuresAreSwallowed:
