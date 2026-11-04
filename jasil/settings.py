@@ -448,10 +448,10 @@ class JasilSettings:
             running the distributed profile without Redis.
         data_dir: Root directory for the local storage backend.
         state_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``.
-        storage_uri: ``local://`` or ``s3://``.
-        events_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``.
+        storage_uri: ``local://``, ``s3://`` or ``none://`` (disabled).
+        events_uri: ``memory://``, ``redis://`` / ``rediss://`` / ``unix://`` or ``none://`` (disabled).
         lock_uri: ``noop://`` or ``postgres-advisory://``.
-        realtime_uri: ``memory://`` or ``redis://`` / ``rediss://`` / ``unix://``
+        realtime_uri: ``memory://``, ``redis://`` / ``rediss://`` / ``unix://`` or ``none://`` (disabled)
             — the channel that carries keyed realtime hints to every process
             (see :class:`~jasil.providers.RealtimeProvider`). Unset, it follows
             the resolved ``events_uri`` in every profile — ``memory://`` under

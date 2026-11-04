@@ -104,12 +104,13 @@ channel must not resolve to process-local memory when the deployment is
 multi-process. The stores would diverge silently across processes, and a hint
 published by one process (another replica, a standalone job worker) would never
 reach the process holding the connection it is for. An unset `realtime_uri` follows
-`events_uri`, so it is judged (and named in the refusal) as the event bus.
+`events_uri`, so it is judged (and named in the refusal) as the event bus. An event bus or realtime channel set to
+`none://` is disabled, so it is not judged.
 
 **Cross-node storage.** Blob storage must not resolve to the local filesystem
 when the deployment is multi-node, where replicas run on separate nodes with no
 shared disk. Several processes of a `local` deployment share one host disk, so
-local storage stays valid there.
+local storage stays valid there. Storage set to `none://` is disabled, so it is not judged.
 
 **Audit sink.** `audit.external_sink_uri` must not be a `file://` directory when
 the deployment is multi-node. Audit maintenance runs on whichever node takes the
@@ -227,6 +228,8 @@ Deployment profile: local (web_workers=1, job_worker_mode=in_process, multi_proc
   geocoding -> disabled  (source: not configured)
   clock     -> system  (source: always the system clock)
 ```
+
+Storage, events or realtime set to `none://` shows `disabled`, as mail and geocoding do when not configured.
 
 The `source` column separates what you chose from what you inherited. A
 capability that quietly resolved to the wrong backend is otherwise invisible
