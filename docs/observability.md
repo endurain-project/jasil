@@ -296,7 +296,9 @@ first exact match (the newest, if two describe the same schema). It returns
 requires the metadata GIN index and its PostgreSQL-specific definition, and an
 audit log partitioned with its append-only triggers and both `jasil_audit_*`
 functions, as `rev0006` builds it: one made by `create_all` is refused, because
-`upgrade()` would never add them afterwards.
+`upgrade()` would never add them afterwards. On MySQL and MariaDB a plain audit log
+is adopted at `rev0007`, but only with the outbox as it was then: a schema
+`create_all` builds with this release is refused too.
 
 Adopting an older revision leaves the database behind head, so always call
 `upgrade()` next: it applies the revisions after the recorded one. That is how a
