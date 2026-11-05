@@ -71,6 +71,7 @@ from jasil.audit.schema import (
 from jasil.audit.service import (
     AuditDetailsError,
     AuditRecord,
+    ensure_instance_id,
     get_audit_health,
     record_detached,
     stage,
@@ -113,6 +114,7 @@ __all__ = [
     "audit_context",
     "configure_provider",
     "configure_retention_source",
+    "ensure_instance_id",
     "get_audit_health",
     "get_catalog",
     "get_context",

@@ -546,9 +546,6 @@ class TestRoles:
         jasil_orm.configure_sessionmaker(sessionmaker(bind=roles, expire_on_commit=False))
         jasil_testing.install_test_platform(".", clock=SystemClock())
         with roles.connect() as connection:
-            connection.exec_driver_sql("INSERT INTO jasil_instance (id, instance_id) VALUES (1, 'x')")
-            connection.commit()
-        with roles.connect() as connection:
             connection.exec_driver_sql(f"SET ROLE {ROLES[0]}")
             session = sessionmaker(bind=connection, join_transaction_mode="create_savepoint")()
             jasil_audit.stage(session, action, target_id="7")

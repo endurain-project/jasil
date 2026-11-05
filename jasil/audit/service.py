@@ -118,8 +118,8 @@ def stage(
     the audited change and its row commit or roll back together. This never commits and never flushes
     on its own. The first call in a process reads the deployment's instance id on ``db`` (without
     flushing it); only a deployment's very first write, before ``jasil_instance`` holds its row, creates
-    it on a short session of its own on the same engine (call :func:`jasil.audit.sync_catalog` at startup
-    to do that outside any request).
+    it on a short session of its own on the same engine (call :func:`jasil.audit.sync_catalog` or
+    :func:`jasil.audit.ensure_instance_id` at startup to do that outside any request).
 
     Args:
         db: The caller's session.
@@ -333,7 +333,10 @@ def ensure_instance_id(engine: "Engine") -> str:
     Return the deployment's instance id, generating and storing it on first use.
 
     Runs on a short session of its own, so the id is durable whatever the caller's transaction does. The
-    id is cached afterwards: later calls do no I/O.
+    id is cached afterwards: later calls do no I/O. A database migrated with ``rev0010`` or later already
+    holds the row; call this once at startup for one built with ``create_all``, and on SQLite before the
+    first :func:`stage` that follows a write in the same transaction, because that session holds SQLite's
+    write lock and the row's own session would then wait for it and fail with ``database is locked``.
 
     Args:
         engine: The engine of the database holding ``jasil_instance``.

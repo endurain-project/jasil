@@ -127,11 +127,13 @@ def _watched_adapter() -> Any:
         def _new_conn(self) -> socket.socket:
             return _watch_current(super()._new_conn())
 
+    # ty rejects any ``ConnectionCls`` override, urllib3's own ``HTTPConnection`` included, against urllib3's
+    # ``BaseHTTPConnection`` protocol (``default_socket_options`` is declared read-only there); mypy accepts it.
     class _WatchedHTTPPool(HTTPConnectionPool):
-        ConnectionCls = _WatchedHTTPConnection
+        ConnectionCls = _WatchedHTTPConnection  # ty: ignore[invalid-assignment]
 
     class _WatchedHTTPSPool(HTTPSConnectionPool):
-        ConnectionCls = _WatchedHTTPSConnection
+        ConnectionCls = _WatchedHTTPSConnection  # ty: ignore[invalid-assignment]
 
     pool_classes = {"http": _WatchedHTTPPool, "https": _WatchedHTTPSPool}
 

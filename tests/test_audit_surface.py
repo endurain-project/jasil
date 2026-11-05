@@ -7,7 +7,7 @@ The package is public API and must be importable anywhere in a host's import gra
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, event, select
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
@@ -41,6 +41,7 @@ class TestPublicSurface:
             "run_audit_maintenance",
             "schedule_audit_maintenance",
             "sync_catalog",
+            "ensure_instance_id",
             "grants_sql",
             "retention_floor_sql",
             "AuditAction",
@@ -109,6 +110,23 @@ class TestInstanceId:
         assert first == second
         assert [row.instance_id for row in rows] == [first]
         assert len(first) == 36
+
+    def test_sync_catalog_creates_the_row_before_its_own_session_writes(self, audit_env, db_engine, session_factory):
+        """On SQLite the catalogue session holds the write lock, so a second session inserting the row then waits."""
+        with session_factory() as db:
+            db.execute(delete(Instance))
+            db.commit()
+        audit_service._instance_id = None
+        inserts: list[str] = []
+
+        @event.listens_for(db_engine, "before_cursor_execute")
+        def record(connection, cursor, statement, parameters, context, executemany):
+            if statement.lstrip().upper().startswith("INSERT"):
+                inserts.append(statement.split()[2])
+
+        jasil_audit.sync_catalog()
+
+        assert inserts.index("jasil_instance") < inserts.index("jasil_audit_actions")
 
     def test_a_cached_id_does_no_io(self, audit_env, session_factory, monkeypatch):
         with session_factory() as db:
