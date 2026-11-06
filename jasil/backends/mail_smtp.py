@@ -128,8 +128,9 @@ class SmtpMail:
         implicit_tls: Connect over TLS (``smtps``) instead of STARTTLS.
         tls: ``False`` sends in cleartext (no STARTTLS). Cannot be combined with
             credentials or ``implicit_tls``.
-        from_address: Sender identity (``From`` header; the envelope sender is
-            its bare address). Independent of ``username``.
+        from_address: Default sender identity (``From`` header; the envelope
+            sender is its bare address), used when a message sets none.
+            Independent of ``username``.
         clock: Time source for the ``Date`` header.
         username: Login, or ``None`` for an unauthenticated relay.
         password: Password for ``username``.
@@ -191,7 +192,8 @@ class SmtpMail:
         """
         if lease_lost():
             raise MailError("Job lease lost; send abandoned")
-        mime = build_mime(message, sender=self._from_address, now=self._clock.now())
+        sender = self._from_address if message.from_address is None else message.from_address
+        mime = build_mime(message, sender=sender, now=self._clock.now())
         message_id = str(mime["Message-ID"])
         try:
             refused = self._deliver(mime)

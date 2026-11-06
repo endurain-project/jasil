@@ -532,10 +532,14 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
-The sender is `from_address`, independent of the SMTP `username`: relays such as
-Brevo log you in as a generated identity and reject a `From` that is not a
-verified sender. The `From` header keeps any display name; the envelope sender is
-the bare address. If a server refuses *some* recipients the send succeeds and a
+The sender is the message's `from_address` when set, otherwise the configured
+`mail.from_address`; either way it is independent of the SMTP `username`: relays
+such as Brevo log you in as a generated identity and reject a `From` that is not
+a verified sender. A per-message sender lets one platform send as several
+identities (per team, brand or campaign) through the same relay; JASIL keeps no
+allowlist, so take it from your own configuration, never from user input. The
+`From` header keeps any display name; the envelope sender is the bare address,
+and the `Message-ID` uses the sender's domain. If a server refuses *some* recipients the send succeeds and a
 warning logs the refused count, because failing would make a retry re-send to
 recipients that already received it. Every recipient of a message is visible in
 `To`, and a refused one is only counted in that warning — send one message per

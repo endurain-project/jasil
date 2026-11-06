@@ -8,6 +8,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`MailMessage.from_address`** sets the sender of one message (`From`, envelope sender and `Message-ID` domain) in place of `mail.from_address`, which becomes the default. It is validated like the configured sender, and JASIL keeps no allowlist: take it from your own configuration, never from user input. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#54](https://github.com/endurain-project/jasil/issues/54))
+
 ## [0.17.0] - 2026-11-04
 
 This release fixes the first audit write on a fresh SQLite database failing with `database is locked`. Migration `rev0010` creates the `jasil_instance` row, and `ensure_instance_id` is now public.

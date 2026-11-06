@@ -45,7 +45,7 @@ class MemoryMail:
 
     Args:
         clock: Time source for the ``Date`` header.
-        from_address: Sender identity; a placeholder when empty.
+        from_address: Default sender identity, used when a message sets none; a placeholder when empty.
     """
 
     def __init__(self, clock: ClockProvider, from_address: str = "") -> None:
@@ -68,7 +68,8 @@ class MemoryMail:
         """
         if lease_lost():
             raise MailError("Job lease lost; send abandoned")
-        mime = build_mime(message, sender=self._from_address, now=self._clock.now())
+        sender = self._from_address if message.from_address is None else message.from_address
+        mime = build_mime(message, sender=sender, now=self._clock.now())
         # Recipients copied as sent: the caller's list may be reused or mutated
         # after ``send`` returns, which would rewrite what the test asserts on. A
         # shallow copy keeps the type, so ``outbox == [message]`` still holds.
