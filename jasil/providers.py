@@ -957,6 +957,12 @@ class MailMessage:
         html: HTML body. With ``text`` as well, the message is
             ``multipart/alternative``.
         reply_to: Optional single ``Reply-To`` address.
+        list_unsubscribe: Optional RFC 8058 one-click unsubscribe URL: an
+            absolute ``https`` URL of printable ASCII, at most 978 characters,
+            without spaces, ``<``, ``>`` or ``,``. The message then carries
+            ``List-Unsubscribe`` and ``List-Unsubscribe-Post``. The URL must
+            accept a POST with no login, and the relay must DKIM-sign the
+            ``List-Unsubscribe`` header.
     """
 
     to: Sequence[str]
@@ -964,11 +970,12 @@ class MailMessage:
     text: str | None = None
     html: str | None = None
     reply_to: str | None = None
+    list_unsubscribe: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
-        return hash((recipients, self.subject, self.text, self.html, self.reply_to))
+        return hash((recipients, self.subject, self.text, self.html, self.reply_to, self.list_unsubscribe))
 
 
 class MailError(RuntimeError):

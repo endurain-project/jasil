@@ -8,6 +8,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`MailMessage.list_unsubscribe`** adds RFC 8058 one-click unsubscribe: an `https` URL emitted as `List-Unsubscribe` together with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which Gmail and Yahoo require of bulk senders. The URL is written on one line, never folded or RFC 2047-encoded, and is limited to 978 printable ASCII characters. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
+
 ## [0.17.0] - 2026-11-04
 
 This release fixes the first audit write on a fresh SQLite database failing with `database is locked`. Migration `rev0010` creates the `jasil_instance` row, and `ensure_instance_id` is now public.

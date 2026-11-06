@@ -532,6 +532,35 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
+### One-click unsubscribe
+
+Gmail, Yahoo and other mailbox providers require bulk senders to offer RFC 8058
+one-click unsubscribe. Set `MailMessage.list_unsubscribe` to the recipient's
+unsubscribe URL:
+
+```python
+platform.mail.send(
+    MailMessage(
+        to=["a@example.com"],
+        subject="News",
+        text="...",
+        list_unsubscribe="https://example.com/unsubscribe?token=...",
+    )
+)
+```
+
+The message then carries `List-Unsubscribe: <url>` and
+`List-Unsubscribe-Post: List-Unsubscribe=One-Click`. The URL must be an absolute
+`https` URL of printable ASCII, at most 978 characters, without spaces, `<`, `>`
+or `,`; anything else is a `ValueError` that does not echo it. The header is
+written on one line, never folded or encoded, so a mailbox provider reads the URL
+as written.
+
+Two things stay with the host and the relay: the URL must unsubscribe on a `POST`
+with no login or cookie (that is what `One-Click` promises), and the relay must
+DKIM-sign the message covering `List-Unsubscribe`, which RFC 8058 requires.
+`mailto:` unsubscribe is not supported.
+
 The sender is `from_address`, independent of the SMTP `username`: relays such as
 Brevo log you in as a generated identity and reject a `From` that is not a
 verified sender. The `From` header keeps any display name; the envelope sender is
