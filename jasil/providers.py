@@ -957,6 +957,17 @@ class MailMessage:
         html: HTML body. With ``text`` as well, the message is
             ``multipart/alternative``.
         reply_to: Optional single ``Reply-To`` address.
+        message_id: Optional ``Message-ID``, so the host can store the key it
+            will find in the relay's logs before sending. ``"<left@right>"``,
+            each side dot-separated printable ASCII without whitespace, quotes,
+            brackets or parentheses, at most 250 characters; ``right`` is
+            normally a domain the host controls. ``send`` returns it unchanged.
+            When ``None`` one is generated on the sender's domain. The host keeps
+            it unique: reuse it only to retry the same message, never for
+            different content. It is visible to the recipient, every relay and
+            anyone the message is forwarded to, so make it an opaque value (a
+            random token), never one derived from personal data. A relay may
+            replace it with its own.
     """
 
     to: Sequence[str]
@@ -964,11 +975,12 @@ class MailMessage:
     text: str | None = None
     html: str | None = None
     reply_to: str | None = None
+    message_id: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
-        return hash((recipients, self.subject, self.text, self.html, self.reply_to))
+        return hash((recipients, self.subject, self.text, self.html, self.reply_to, self.message_id))
 
 
 class MailError(RuntimeError):

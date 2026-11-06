@@ -8,6 +8,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`MailMessage.message_id`** lets the host supply the `Message-ID`, so it can store the key before sending and find the message in the relay's logs even if the process dies before recording the result. It must be an RFC 5322 `<left@right>` dot-atom `msg-id` of at most 250 characters, is sent and returned unchanged, and must be an opaque value, never derived from personal data. Without it, an ID is generated as before. See [Choosing the Message-ID](docs/providers-and-backends.md#choosing-the-message-id). ([#55](https://github.com/endurain-project/jasil/issues/55))
+
 ## [0.17.0] - 2026-11-04
 
 This release fixes the first audit write on a fresh SQLite database failing with `database is locked`. Migration `rev0010` creates the `jasil_instance` row, and `ensure_instance_id` is now public.

@@ -8,6 +8,8 @@ same invalid message production (``SmtpMail``) would.
 """
 
 import contextlib
+import email
+import email.policy
 import logging
 import os
 import smtplib
@@ -20,6 +22,7 @@ from typing import ClassVar
 
 import pytest
 
+import jasil._core.mail_message as mail_message
 import jasil._core.network as network
 import jasil.backends.mail_smtp as mail_smtp
 from jasil._core.mail_message import build_mime
@@ -350,6 +353,72 @@ class TestConformance:
         with pytest.raises(ValueError):
             backend.send(_message(**bad))
         assert not FakeSMTP.instances
+
+
+class TestHostSuppliedMessageId:
+    """``MailMessage.message_id`` lets the host store the key before sending; it is sent and returned unchanged."""
+
+    MESSAGE_ID = "<7f3a9c1e.d41d8cd9@mail.example.com>"
+
+    def test_the_supplied_id_is_the_header_and_the_return_value(self, backend):
+        returned = backend.send(_message(message_id=self.MESSAGE_ID))
+
+        built = backend.built[-1] if isinstance(backend, MemoryMail) else FakeSMTP.instances[-1].sent
+        assert returned == self.MESSAGE_ID
+        assert built["Message-ID"] == self.MESSAGE_ID
+
+    def test_an_id_is_generated_when_none_is_supplied(self):
+        mime = build_mime(_message(), sender=SENDER, now=NOW)
+
+        assert mime["Message-ID"].endswith("@example.com>")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "<a.b!#$%&'*+-/=?^_`{|}~@x.example>",
+            "<" + "a" * (mail_message.MAX_MESSAGE_ID_LENGTH - 20) + "@mail.example.com>",
+        ],
+    )
+    def test_every_dot_atom_form_survives_the_wire_unchanged(self, value):
+        mime = build_mime(_message(message_id=value), sender=SENDER, now=NOW)
+
+        raw = mime.as_bytes()
+        unfolded = raw.split(b"\r\n\r\n")[0].replace(b"\r\n ", b" ").split(b"\r\n")
+        assert f"Message-ID: {value}".encode() in unfolded
+        assert email.message_from_bytes(raw, policy=email.policy.default)["Message-ID"] == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "a@example.com",
+            "<a@example.com",
+            "<a.example.com>",
+            "<a@b@example.com>",
+            "<@example.com>",
+            "<a@>",
+            "<a..b@example.com>",
+            "<.a@example.com>",
+            "<a.@example.com>",
+            "<a@[192.0.2.1]>",
+            "<a b@example.com>",
+            '<"q"@example.com>',
+            "<a(c)@example.com>",
+            "<olá@example.com>",
+            " <a@example.com>",
+            "<a@example.com>\r\nBcc: victim@example.com",
+            "<" + "a" * mail_message.MAX_MESSAGE_ID_LENGTH + "@example.com>",
+            42,
+        ],
+    )
+    def test_anything_but_a_dot_atom_msg_id_is_refused_without_echoing_it(self, value):
+        with pytest.raises(ValueError, match="message_id") as caught:
+            build_mime(_message(message_id=value), sender=SENDER, now=NOW)
+
+        assert not isinstance(value, str) or not value or value not in str(caught.value)
+
+    def test_the_id_is_part_of_the_message_identity(self):
+        assert hash(_message(message_id=self.MESSAGE_ID)) != hash(_message())
 
 
 class TestMemoryMail:

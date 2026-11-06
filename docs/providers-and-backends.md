@@ -532,6 +532,34 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
+### Choosing the Message-ID
+
+`send` generates a `Message-ID` on the sender's domain unless the message brings
+its own. Set `MailMessage.message_id` to store the key before sending, so a crash
+between `send` and recording its result still leaves you a key to look the message
+up in the relay's or provider's logs:
+
+```python
+platform.mail.send(
+    MailMessage(to=["a@example.com"], subject="Hi", text="Hello", message_id="<9f2c41d07a8e@mail.example.com>")
+)
+```
+
+- The format is `<left@right>`, each side dot-separated printable ASCII without
+  whitespace, quotes, brackets or parentheses, at most 250 characters (the RFC 5322
+  `msg-id` without its obsolete and domain-literal forms). Anything else is a
+  `ValueError` that does not echo it. `send` returns the value unchanged.
+- Make it an opaque value, such as a random token stored with the delivery, and
+  put a domain you control on the right. The `Message-ID` is visible to the
+  recipient, every relay and anyone the message is forwarded to: never derive it
+  from an address or other personal data, and do not use an unsalted hash of one.
+- Keeping it unique is the host's job. Reuse it only to retry the same message,
+  never for different content.
+- Some mailbox providers show two copies with the same `Message-ID` as one, but
+  nothing guarantees it: a retry with the same ID can still be delivered twice.
+- Some relays replace the `Message-ID` with their own (Amazon SES does). Check
+  what yours does before relying on the ID appearing in its logs or in bounces.
+
 The sender is `from_address`, independent of the SMTP `username`: relays such as
 Brevo log you in as a generated identity and reject a `From` that is not a
 verified sender. The `From` header keeps any display name; the envelope sender is
