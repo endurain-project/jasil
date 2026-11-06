@@ -559,7 +559,10 @@ failure.
   `MailError`, so a job on a deployment with no `mail.uri` uses its whole retry
   budget before dead-lettering. Catch it in the handler if that is not wanted.
 - **Delivery is at-least-once.** A retry after a lost acknowledgement sends the
-  message twice.
+  message twice. A `MailError` with `delivery_unknown` set lost its connection
+  after the body went out, so the message may already have been delivered; a
+  handler that must not send twice catches it, records `message_id`, and does
+  not retry.
 - **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
   SMTP send can take up to 90 seconds, and the DNS lookups before it are not
   counted against that deadline. A handler that sends N messages can take N times
