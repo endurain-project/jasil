@@ -570,7 +570,7 @@ a verified sender. A per-message sender lets one platform send as several
 identities (per team, brand or campaign) through the same relay; JASIL keeps no
 allowlist, so take it from your own configuration, never from user input. The
 `From` header keeps any display name; the envelope sender is the bare address,
-and the `Message-ID` uses the sender's domain. If a server refuses *some* recipients the send succeeds and a
+and a generated `Message-ID` uses the sender's domain. If a server refuses *some* recipients the send succeeds and a
 warning logs the refused count, because failing would make a retry re-send to
 recipients that already received it. Every recipient of a message is visible in
 `To`, and a refused one is only counted in that warning — send one message per
@@ -604,6 +604,34 @@ Two things stay with the host and the relay: the URL must unsubscribe on a `POST
 with no login or cookie (that is what `One-Click` promises), and the relay must
 DKIM-sign the message covering `List-Unsubscribe`, which RFC 8058 requires.
 `mailto:` unsubscribe is not supported.
+
+### Choosing the Message-ID
+
+`send` generates a `Message-ID` on the sender's domain unless the message brings
+its own. Set `MailMessage.message_id` to store the key before sending, so a crash
+between `send` and recording its result still leaves you a key to look the message
+up in the relay's or provider's logs:
+
+```python
+platform.mail.send(
+    MailMessage(to=["a@example.com"], subject="Hi", text="Hello", message_id="<9f2c41d07a8e@mail.example.com>")
+)
+```
+
+- The format is `<left@right>`, each side dot-separated printable ASCII without
+  whitespace, quotes, brackets or parentheses, at most 250 characters (the RFC 5322
+  `msg-id` without its obsolete and domain-literal forms). Anything else is a
+  `ValueError` that does not echo it. `send` returns the value unchanged.
+- Make it an opaque value, such as a random token stored with the delivery, and
+  put a domain you control on the right. The `Message-ID` is visible to the
+  recipient, every relay and anyone the message is forwarded to: never derive it
+  from an address or other personal data, and do not use an unsalted hash of one.
+- Keeping it unique is the host's job. Reuse it only to retry the same message,
+  never for different content.
+- Some mailbox providers show two copies with the same `Message-ID` as one, but
+  nothing guarantees it: a retry with the same ID can still be delivered twice.
+- Some relays replace the `Message-ID` with their own (Amazon SES does). Check
+  what yours does before relying on the ID appearing in its logs or in bounces.
 
 ### Runtime-configured mail
 

@@ -507,6 +507,71 @@ class TestListUnsubscribe:
         assert hash(_message(list_unsubscribe=self.URL)) != hash(_message())
 
 
+class TestHostSuppliedMessageId:
+    """``MailMessage.message_id`` lets the host store the key before sending; it is sent and returned unchanged."""
+
+    MESSAGE_ID = "<7f3a9c1e.d41d8cd9@mail.example.com>"
+
+    def test_the_supplied_id_is_the_header_and_the_return_value(self, backend):
+        returned = backend.send(_message(message_id=self.MESSAGE_ID))
+
+        assert returned == self.MESSAGE_ID
+        assert _last_built(backend)["Message-ID"] == self.MESSAGE_ID
+
+    def test_an_id_is_generated_when_none_is_supplied(self):
+        mime = build_mime(_message(), sender=SENDER, now=NOW)
+
+        assert mime["Message-ID"].endswith("@example.com>")
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "<a.b!#$%&'*+-/=?^_`{|}~@x.example>",
+            "<" + "a" * (mail_message.MAX_MESSAGE_ID_LENGTH - 20) + "@mail.example.com>",
+        ],
+    )
+    def test_every_dot_atom_form_survives_the_wire_unchanged(self, value):
+        mime = build_mime(_message(message_id=value), sender=SENDER, now=NOW)
+
+        raw = mime.as_bytes()
+        unfolded = raw.split(b"\r\n\r\n")[0].replace(b"\r\n ", b" ").split(b"\r\n")
+        assert f"Message-ID: {value}".encode() in unfolded
+        assert email.message_from_bytes(raw, policy=email.policy.default)["Message-ID"] == value
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "a@example.com",
+            "<a@example.com",
+            "<a.example.com>",
+            "<a@b@example.com>",
+            "<@example.com>",
+            "<a@>",
+            "<a..b@example.com>",
+            "<.a@example.com>",
+            "<a.@example.com>",
+            "<a@[192.0.2.1]>",
+            "<a b@example.com>",
+            '<"q"@example.com>',
+            "<a(c)@example.com>",
+            "<olá@example.com>",
+            " <a@example.com>",
+            "<a@example.com>\r\nBcc: victim@example.com",
+            "<" + "a" * mail_message.MAX_MESSAGE_ID_LENGTH + "@example.com>",
+            42,
+        ],
+    )
+    def test_anything_but_a_dot_atom_msg_id_is_refused_without_echoing_it(self, value):
+        with pytest.raises(ValueError, match="message_id") as caught:
+            build_mime(_message(message_id=value), sender=SENDER, now=NOW)
+
+        assert not isinstance(value, str) or not value or value not in str(caught.value)
+
+    def test_the_id_is_part_of_the_message_identity(self):
+        assert hash(_message(message_id=self.MESSAGE_ID)) != hash(_message())
+
+
 class TestMemoryMail:
     def test_messages_are_recorded_in_order(self):
         mail = _memory()

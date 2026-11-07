@@ -18,6 +18,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 - **`MailMessage.list_unsubscribe`** adds RFC 8058 one-click unsubscribe: an `https` URL emitted as `List-Unsubscribe` together with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which Gmail and Yahoo require of bulk senders. The URL is written on one line, never folded or RFC 2047-encoded, and is limited to 978 printable ASCII characters. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
 
+- **`MailMessage.message_id`** lets the host supply the `Message-ID`, so it can store the key before sending and find the message in the relay's logs even if the process dies before recording the result. It must be an RFC 5322 `<left@right>` dot-atom `msg-id` of at most 250 characters, is sent and returned unchanged, and must be an opaque value, never derived from personal data. Without it, an ID is generated as before. See [Choosing the Message-ID](docs/providers-and-backends.md#choosing-the-message-id). ([#55](https://github.com/endurain-project/jasil/issues/55))
+
 ### Changed
 
 - `SmtpMail` sends `MAIL FROM`, `RCPT TO` and `DATA` itself instead of through `smtplib`'s `send_message`, so it knows which step failed. The conversation on the wire is unchanged, including the `SIZE` declaration and success with a warning when only some recipients are refused. A refused `MAIL FROM` is now reported as a sender refusal, no longer as a rejected message.

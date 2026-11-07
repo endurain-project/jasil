@@ -11,6 +11,7 @@ Error messages here deliberately omit the offending value: a ``ValueError`` from
 a durable-job handler is persisted and logged, and an address is personal data.
 """
 
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from email import policy
@@ -49,6 +50,13 @@ _HEADERS.map_to_type("list-unsubscribe", _VerbatimHeader)
 # not declare ``BODY=8BITMIME``, so a raw 8bit body is not valid for a strict relay.
 _MIME_POLICY = policy.SMTP.clone(cte_type="7bit", header_factory=_HEADERS)
 
+#: Longest host-supplied ``Message-ID``, angle brackets included.
+MAX_MESSAGE_ID_LENGTH = 250
+
+# RFC 5322 ``msg-id`` without its obsolete and domain-literal forms: ``<`` dot-atom-text ``@`` dot-atom-text ``>``.
+_DOT_ATOM_TEXT = r"[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+(?:\.[A-Za-z0-9!#$%&'*+\-/=?^_`{|}~]+)*"
+_MESSAGE_ID = re.compile(rf"<{_DOT_ATOM_TEXT}@{_DOT_ATOM_TEXT}>", re.ASCII)
+
 
 class MailMessageLike(Protocol):
     """The shape :func:`build_mime` reads; ``jasil.providers.MailMessage`` fits.
@@ -76,6 +84,10 @@ class MailMessageLike(Protocol):
     @property
     def reply_to(self) -> str | None:
         """Single ``Reply-To`` address, if any."""
+
+    @property
+    def message_id(self) -> str | None:
+        """Host-supplied ``Message-ID``, if any."""
 
     @property
     def list_unsubscribe(self) -> str | None:
@@ -164,6 +176,20 @@ def parse_address(value: str, *, role: str) -> Address:
         raise invalid from None
 
 
+def _message_id(value: object) -> str:
+    """Return ``value`` when it is a ``<left@right>`` msg-id that the header carries unchanged.
+
+    Raises:
+        ValueError: Otherwise; the message does not echo the value.
+    """
+    if not isinstance(value, str) or len(value) > MAX_MESSAGE_ID_LENGTH or not _MESSAGE_ID.fullmatch(value):
+        raise ValueError(
+            "The mail message_id must be '<left@right>', each side dot-separated printable ASCII without "
+            f"whitespace, quotes, brackets or parentheses, at most {MAX_MESSAGE_ID_LENGTH} characters"
+        )
+    return value
+
+
 def _unsubscribe_url(value: object) -> str:
     """Return ``value`` when it is an ``https`` URL that can be written verbatim on one header line.
 
@@ -198,7 +224,9 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
         now: The ``Date`` header value, from the platform clock.
 
     Returns:
-        A complete message with ``From``, ``To``, ``Date`` and ``Message-ID`` set.
+        A complete message with ``From``, ``To``, ``Date`` and ``Message-ID`` set; the
+        ``Message-ID`` is the message's own when it has one, otherwise generated
+        on the sender's domain.
 
     Raises:
         ValueError: When the message or sender is invalid.
@@ -217,6 +245,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
         raise ValueError("The mail subject must be a single line")
     from_address = parse_address(sender, role="sender")
     reply_to = parse_address(message.reply_to, role="reply-to") if message.reply_to else None
+    message_id = None if message.message_id is None else _message_id(message.message_id)
     unsubscribe = None if message.list_unsubscribe is None else _unsubscribe_url(message.list_unsubscribe)
 
     mime = EmailMessage(policy=_MIME_POLICY)
@@ -226,7 +255,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
         mime["Reply-To"] = reply_to
     mime["Subject"] = message.subject
     mime["Date"] = format_datetime(now)
-    mime["Message-ID"] = make_msgid(domain=from_address.domain)
+    mime["Message-ID"] = make_msgid(domain=from_address.domain) if message_id is None else message_id
     if unsubscribe is not None:
         # RFC 8058 one-click: the mailbox provider POSTs ``List-Unsubscribe=One-Click`` to the URL.
         mime["List-Unsubscribe"] = f"<{unsubscribe}>"

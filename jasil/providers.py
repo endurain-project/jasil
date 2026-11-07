@@ -965,8 +965,8 @@ class MailMessage:
         reply_to: Optional single ``Reply-To`` address.
         from_address: The sender of this message, ``addr`` or ``"Name <addr>"``,
             in place of the configured ``mail.from_address``: the ``From``
-            header, the envelope sender (its bare address) and the
-            ``Message-ID`` domain. The relay decides which senders it accepts;
+            header, the envelope sender (its bare address) and the domain of
+            a generated ``Message-ID``. The relay decides which senders it accepts;
             never derive this from untrusted input.
         list_unsubscribe: Optional RFC 8058 one-click unsubscribe URL: an
             absolute ``https`` URL of printable ASCII, at most 978 characters,
@@ -974,6 +974,17 @@ class MailMessage:
             ``List-Unsubscribe`` and ``List-Unsubscribe-Post``. The URL must
             accept a POST with no login, and the relay must DKIM-sign the
             ``List-Unsubscribe`` header.
+        message_id: Optional ``Message-ID``, so the host can store the key it
+            will find in the relay's logs before sending. ``"<left@right>"``,
+            each side dot-separated printable ASCII without whitespace, quotes,
+            brackets or parentheses, at most 250 characters; ``right`` is
+            normally a domain the host controls. ``send`` returns it unchanged.
+            When ``None`` one is generated on the sender's domain. The host keeps
+            it unique: reuse it only to retry the same message, never for
+            different content. It is visible to the recipient, every relay and
+            anyone the message is forwarded to, so make it an opaque value (a
+            random token), never one derived from personal data. A relay may
+            replace it with its own.
     """
 
     to: Sequence[str]
@@ -983,12 +994,22 @@ class MailMessage:
     reply_to: str | None = None
     from_address: str | None = None
     list_unsubscribe: str | None = None
+    message_id: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
         return hash(
-            (recipients, self.subject, self.text, self.html, self.reply_to, self.from_address, self.list_unsubscribe)
+            (
+                recipients,
+                self.subject,
+                self.text,
+                self.html,
+                self.reply_to,
+                self.from_address,
+                self.list_unsubscribe,
+                self.message_id,
+            )
         )
 
 

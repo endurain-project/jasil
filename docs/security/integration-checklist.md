@@ -80,6 +80,7 @@ through.
 - [ ] Put credentials in `MailSettings.username` / `password`, never in the URI.
 - [ ] Set `from_address` to an identity your relay has verified.
 - [ ] Take any per-message `MailMessage.from_address` from your own configuration, never from user input.
+- [ ] If you supply `MailMessage.message_id`, make it a random token, never a value derived from an address or other personal data.
 - [ ] Remember the SMTP host is **not** SSRF-checked — it is expected to be an
       internal relay. Keep that setting out of attacker-influenced configuration.
 - [ ] Do not put a rendered body or secrets in an event payload that drives a

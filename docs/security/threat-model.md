@@ -106,7 +106,10 @@ own timeouts only.
 **Personal data and secrets in logs and job rows.** The job runner persists
 `str(error)` and logs `exc_info`, so `MailError` carries only a category and an
 SMTP status code and is raised `from None`. Log lines record the recipient count,
-`Message-ID` and outcome, never addresses, subjects or bodies. The password is
+`Message-ID` and outcome, never addresses, subjects or bodies. A host-supplied
+`MailMessage.message_id` is logged and travels with the message to every relay and
+recipient, so it must be opaque and never derived from personal data; JASIL checks
+its format only. The password is
 excluded from `repr(settings)`, and credentials are refused in the URI so they
 cannot end up in a logged string.
 
