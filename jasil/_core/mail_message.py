@@ -15,16 +15,40 @@ import re
 from collections.abc import Sequence
 from datetime import datetime
 from email import policy
-from email.headerregistry import Address
+from email.headerregistry import Address, BaseHeader, HeaderRegistry, UnstructuredHeader
 from email.message import EmailMessage
+from email.policy import Policy
 from email.utils import format_datetime, getaddresses, make_msgid
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from jasil._core.network import is_valid_hostname
 
+#: Longest ``list_unsubscribe`` URL: ``List-Unsubscribe: <url>`` must fit in one
+#: RFC 5322 line (998 characters), because it is never folded.
+MAX_UNSUBSCRIBE_URL_LENGTH = 998 - len("List-Unsubscribe: <>")
+
+
+class _VerbatimHeader(UnstructuredHeader, BaseHeader):
+    """A header written on one line exactly as given.
+
+    The default folding splits a long value with no whitespace into RFC 2047
+    encoded-words, and a URL encoded that way is not one a mailbox provider reads.
+    Only for values already checked to be printable ASCII that fit on one line.
+    """
+
+    def fold(self, *, policy: Policy) -> str:
+        """Return the header unfolded, ending with the policy's line separator."""
+        return f"{self.name}: {self}{policy.linesep}"
+
+
+# A registry of our own: the default one is shared by every ``EmailPolicy`` in the process.
+_HEADERS = HeaderRegistry()
+_HEADERS.map_to_type("list-unsubscribe", _VerbatimHeader)
+
 # Bodies are 7-bit safe (quoted-printable/base64 when non-ASCII): ``smtplib`` does
 # not declare ``BODY=8BITMIME``, so a raw 8bit body is not valid for a strict relay.
-_MIME_POLICY = policy.SMTP.clone(cte_type="7bit")
+_MIME_POLICY = policy.SMTP.clone(cte_type="7bit", header_factory=_HEADERS)
 
 #: Longest host-supplied ``Message-ID``, angle brackets included.
 MAX_MESSAGE_ID_LENGTH = 250
@@ -64,6 +88,10 @@ class MailMessageLike(Protocol):
     @property
     def message_id(self) -> str | None:
         """Host-supplied ``Message-ID``, if any."""
+
+    @property
+    def list_unsubscribe(self) -> str | None:
+        """One-click unsubscribe URL, if any."""
 
 
 def _has_control_character(value: str) -> bool:
@@ -162,6 +190,31 @@ def _message_id(value: object) -> str:
     return value
 
 
+def _unsubscribe_url(value: object) -> str:
+    """Return ``value`` when it is an ``https`` URL that can be written verbatim on one header line.
+
+    Raises:
+        ValueError: Otherwise; the message does not echo the value.
+    """
+    invalid = ValueError(
+        "The list-unsubscribe URL must be an absolute https URL of at most "
+        f"{MAX_UNSUBSCRIBE_URL_LENGTH} printable ASCII characters, without spaces, '<', '>' or ','"
+    )
+    if not isinstance(value, str) or not 0 < len(value) <= MAX_UNSUBSCRIBE_URL_LENGTH:
+        raise invalid
+    # ``<`` and ``>`` delimit the URL in the header, and ``,`` separates alternatives.
+    if any(not 33 <= ord(c) <= 126 or c in "<>," for c in value):
+        raise invalid
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+    except ValueError:
+        raise invalid from None
+    if parts.scheme.lower() != "https" or not host:
+        raise invalid
+    return value
+
+
 def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> EmailMessage:
     """Validate ``message`` and build the MIME message to send.
 
@@ -193,6 +246,7 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     from_address = parse_address(sender, role="sender")
     reply_to = parse_address(message.reply_to, role="reply-to") if message.reply_to else None
     message_id = None if message.message_id is None else _message_id(message.message_id)
+    unsubscribe = None if message.list_unsubscribe is None else _unsubscribe_url(message.list_unsubscribe)
 
     mime = EmailMessage(policy=_MIME_POLICY)
     mime["From"] = from_address
@@ -202,6 +256,10 @@ def build_mime(message: MailMessageLike, *, sender: str, now: datetime) -> Email
     mime["Subject"] = message.subject
     mime["Date"] = format_datetime(now)
     mime["Message-ID"] = make_msgid(domain=from_address.domain) if message_id is None else message_id
+    if unsubscribe is not None:
+        # RFC 8058 one-click: the mailbox provider POSTs ``List-Unsubscribe=One-Click`` to the URL.
+        mime["List-Unsubscribe"] = f"<{unsubscribe}>"
+        mime["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 
     if message.text and message.html:
         mime.set_content(message.text)

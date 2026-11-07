@@ -532,6 +532,79 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
+A `MailError` also tells a host what to do next without parsing its message:
+
+| Attribute | Meaning |
+|---|---|
+| `status` / `permanent` | The SMTP status code, and whether it is a 5xx. |
+| `kind` | A `MailFailure` naming the step that failed (table below). |
+| `delivery_unknown` | `True` when the connection was lost, or the send deadline fired, after the body started going out. The server may have accepted the message, so a retry may deliver it twice; reconcile with the relay's logs instead. `False` means the message was not accepted. |
+| `message_id` | The `Message-ID` of the message that failed, set on every failure after the message was built. Look it up in the relay's or provider's logs. It is never part of `str(error)`. |
+
+| `MailFailure` | Raised when | Typical reaction |
+|---|---|---|
+| `auth_failed` | The server refused the credentials. | Fix the configuration; alert an operator. |
+| `unsupported` | The server lacks STARTTLS, AUTH, or an AUTH mechanism `smtplib` implements. | Fix the configuration. |
+| `sender_refused` | `MAIL FROM` was refused. | When `permanent`, stop using that sender; a 4xx is usually rate limiting. |
+| `recipient_refused` | Every recipient was refused, or the server closed the session (421) during `RCPT`. | When `permanent`, record it against the recipient. |
+| `message_rejected` | The server refused the message at `DATA` or at its end (content, size, policy). | When `permanent`, do not retry the same content. |
+| `unreachable` | DNS, a refused or failed connect, a greeting other than 220, or a cleartext relay that no longer resolves to a private address. | Retry later. |
+| `tls_failed` | The TLS handshake failed. | Check the relay's certificate and name. |
+| `connection_lost` | The connection broke after the session was established. | Retry, unless `delivery_unknown`. |
+| `deadline` | The send ran past `MAIL_SEND_DEADLINE_SECONDS`. | Retry, unless `delivery_unknown`. |
+| `lease_lost` | The durable job lost its lease; nothing was sent. | None: another worker owns the job. |
+| `settings_unavailable` | Runtime mail settings could not be loaded or verified. | Retry later. |
+| `not_configured` | No backend is configured (`MailNotConfiguredError`). | Configure `mail.uri`. |
+| `other` | Anything else, and a `MailError` raised without a kind. | Treat by `status`. |
+
+Members may be added in a minor release; a member is never renamed or reused.
+
+One `SmtpMail` send is bounded by `MAIL_SEND_DEADLINE_SECONDS` (90 seconds; DNS
+lookups are not counted). Import it to size a lease or timeout around a send
+rather than copying the value, which may change in a minor release.
+
+The sender is the message's `from_address` when set, otherwise the configured
+`mail.from_address`; either way it is independent of the SMTP `username`: relays
+such as Brevo log you in as a generated identity and reject a `From` that is not
+a verified sender. A per-message sender lets one platform send as several
+identities (per team, brand or campaign) through the same relay; JASIL keeps no
+allowlist, so take it from your own configuration, never from user input. The
+`From` header keeps any display name; the envelope sender is the bare address,
+and a generated `Message-ID` uses the sender's domain. If a server refuses *some* recipients the send succeeds and a
+warning logs the refused count, because failing would make a retry re-send to
+recipients that already received it. Every recipient of a message is visible in
+`To`, and a refused one is only counted in that warning — send one message per
+recipient when either matters.
+
+### One-click unsubscribe
+
+Gmail, Yahoo and other mailbox providers require bulk senders to offer RFC 8058
+one-click unsubscribe. Set `MailMessage.list_unsubscribe` to the recipient's
+unsubscribe URL:
+
+```python
+platform.mail.send(
+    MailMessage(
+        to=["a@example.com"],
+        subject="News",
+        text="...",
+        list_unsubscribe="https://example.com/unsubscribe?token=...",
+    )
+)
+```
+
+The message then carries `List-Unsubscribe: <url>` and
+`List-Unsubscribe-Post: List-Unsubscribe=One-Click`. The URL must be an absolute
+`https` URL of printable ASCII, at most 978 characters, without spaces, `<`, `>`
+or `,`; anything else is a `ValueError` that does not echo it. The header is
+written on one line, never folded or encoded, so a mailbox provider reads the URL
+as written.
+
+Two things stay with the host and the relay: the URL must unsubscribe on a `POST`
+with no login or cookie (that is what `One-Click` promises), and the relay must
+DKIM-sign the message covering `List-Unsubscribe`, which RFC 8058 requires.
+`mailto:` unsubscribe is not supported.
+
 ### Choosing the Message-ID
 
 `send` generates a `Message-ID` on the sender's domain unless the message brings
@@ -559,15 +632,6 @@ platform.mail.send(
   nothing guarantees it: a retry with the same ID can still be delivered twice.
 - Some relays replace the `Message-ID` with their own (Amazon SES does). Check
   what yours does before relying on the ID appearing in its logs or in bounces.
-
-The sender is `from_address`, independent of the SMTP `username`: relays such as
-Brevo log you in as a generated identity and reject a `From` that is not a
-verified sender. The `From` header keeps any display name; the envelope sender is
-the bare address. If a server refuses *some* recipients the send succeeds and a
-warning logs the refused count, because failing would make a retry re-send to
-recipients that already received it. Every recipient of a message is visible in
-`To`, and a refused one is only counted in that warning — send one message per
-recipient when either matters.
 
 ### Runtime-configured mail
 
