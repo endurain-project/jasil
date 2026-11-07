@@ -963,6 +963,11 @@ class MailMessage:
         html: HTML body. With ``text`` as well, the message is
             ``multipart/alternative``.
         reply_to: Optional single ``Reply-To`` address.
+        from_address: The sender of this message, ``addr`` or ``"Name <addr>"``,
+            in place of the configured ``mail.from_address``: the ``From``
+            header, the envelope sender (its bare address) and the
+            ``Message-ID`` domain. The relay decides which senders it accepts;
+            never derive this from untrusted input.
     """
 
     to: Sequence[str]
@@ -970,11 +975,12 @@ class MailMessage:
     text: str | None = None
     html: str | None = None
     reply_to: str | None = None
+    from_address: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
-        return hash((recipients, self.subject, self.text, self.html, self.reply_to))
+        return hash((recipients, self.subject, self.text, self.html, self.reply_to, self.from_address))
 
 
 class MailFailure(StrEnum):

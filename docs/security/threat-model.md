@@ -79,6 +79,12 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
 `SMTP` email policy rejects CR/LF in a header value; and `MailMessage` has no
 field through which a caller could set an arbitrary header.
 
+**Sender spoofing.** `MailMessage.from_address` lets the host choose the sender
+of each message. JASIL validates it as one address and keeps no allowlist: the
+relay decides which senders or domains an account may use. A host that took the
+sender from user input would let a user send as any identity the relay accepts,
+so it must come from the host's own configuration.
+
 **Transport.** TLS is verified by default; `smtp://` refuses a server that does
 not offer STARTTLS rather than downgrading, and AUTH is sent only after TLS is
 up. The one opt-out, `mail.secure = False`, is cleartext and is accepted only for

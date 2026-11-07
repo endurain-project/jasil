@@ -79,6 +79,7 @@ through.
 - [ ] Use `smtp://` (STARTTLS) or `smtps://`. Cleartext (`mail.secure = False`) is for a relay on the same host or a private network only; it is refused with credentials.
 - [ ] Put credentials in `MailSettings.username` / `password`, never in the URI.
 - [ ] Set `from_address` to an identity your relay has verified.
+- [ ] Take any per-message `MailMessage.from_address` from your own configuration, never from user input.
 - [ ] Remember the SMTP host is **not** SSRF-checked — it is expected to be an
       internal relay. Keep that setting out of attacker-influenced configuration.
 - [ ] Do not put a rendered body or secrets in an event payload that drives a

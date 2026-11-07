@@ -406,6 +406,43 @@ class TestConformance:
         assert not FakeSMTP.instances
 
 
+class TestPerMessageSender:
+    """``MailMessage.from_address`` replaces the configured sender for one message, in every backend."""
+
+    def test_the_message_sender_is_used_in_place_of_the_configured_one(self, backend):
+        backend.send(_message(from_address="Billing <billing@brand.example>"))
+
+        mime = _last_built(backend)
+        assert mime["From"] == "Billing <billing@brand.example>"
+        assert mime["Message-ID"].endswith("@brand.example>")
+
+    def test_the_configured_sender_is_the_default(self, backend):
+        backend.send(_message())
+
+        assert _last_built(backend)["From"] == SENDER
+
+    def test_the_envelope_sender_is_the_bare_message_sender(self):
+        _smtp().send(_message(from_address="Billing <billing@brand.example>"))
+
+        assert FakeSMTP.instances[0].envelope_sender == "billing@brand.example"
+
+    @pytest.mark.parametrize("value", ["", "not an address", "a@b.com, c@d.com", "x\r\nBcc: victim@example.com"])
+    def test_an_invalid_message_sender_is_refused_without_echoing_it(self, backend, value):
+        with pytest.raises(ValueError, match="sender") as caught:
+            backend.send(_message(from_address=value))
+
+        assert value not in str(caught.value) or not value
+
+    def test_the_sender_is_part_of_the_message_identity(self):
+        assert hash(_message(from_address="a@example.com")) != hash(_message(from_address="b@example.com"))
+        assert _message(from_address="a@example.com") != _message()
+
+
+def _last_built(backend: MailProvider):
+    """The MIME message a backend built last, from ``MemoryMail.built`` or the fake SMTP server."""
+    return backend.built[-1] if isinstance(backend, MemoryMail) else FakeSMTP.instances[-1].sent
+
+
 class TestMemoryMail:
     def test_messages_are_recorded_in_order(self):
         mail = _memory()
