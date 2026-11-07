@@ -551,13 +551,17 @@ A `MailError` also tells a host what to do next without parsing its message:
 | `unreachable` | DNS, a refused or failed connect, a greeting other than 220, or a cleartext relay that no longer resolves to a private address. | Retry later. |
 | `tls_failed` | The TLS handshake failed. | Check the relay's certificate and name. |
 | `connection_lost` | The connection broke after the session was established. | Retry, unless `delivery_unknown`. |
-| `deadline` | The send ran past its overall deadline. | Retry, unless `delivery_unknown`. |
+| `deadline` | The send ran past `MAIL_SEND_DEADLINE_SECONDS`. | Retry, unless `delivery_unknown`. |
 | `lease_lost` | The durable job lost its lease; nothing was sent. | None: another worker owns the job. |
 | `settings_unavailable` | Runtime mail settings could not be loaded or verified. | Retry later. |
 | `not_configured` | No backend is configured (`MailNotConfiguredError`). | Configure `mail.uri`. |
 | `other` | Anything else, and a `MailError` raised without a kind. | Treat by `status`. |
 
 Members may be added in a minor release; a member is never renamed or reused.
+
+One `SmtpMail` send is bounded by `MAIL_SEND_DEADLINE_SECONDS` (90 seconds; DNS
+lookups are not counted). Import it to size a lease or timeout around a send
+rather than copying the value, which may change in a minor release.
 
 The sender is `from_address`, independent of the SMTP `username`: relays such as
 Brevo log you in as a generated identity and reject a `From` that is not a

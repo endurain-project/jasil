@@ -564,8 +564,8 @@ failure.
   handler that must not send twice catches it, records `message_id`, and does
   not retry.
 - **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
-  SMTP send can take up to 90 seconds, and the DNS lookups before it are not
-  counted against that deadline. A handler that sends N messages can take N times
+  SMTP send can take up to `jasil.providers.MAIL_SEND_DEADLINE_SECONDS` (90
+  seconds), and the DNS lookups before it are not counted against that deadline. A handler that sends N messages can take N times
   that. The worker's heartbeat keeps the job's lease alive while it runs, so the
   lease itself no longer needs to be that long; the cap is
   `max_runtime_seconds` (default 30 minutes). Past it the job is abandoned and a

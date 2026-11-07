@@ -29,7 +29,14 @@ import jasil.backends.mail_smtp as mail_smtp
 from jasil._core.mail_message import build_mime
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
-from jasil.providers import MailError, MailFailure, MailMessage, MailNotConfiguredError, MailProvider
+from jasil.providers import (
+    MAIL_SEND_DEADLINE_SECONDS,
+    MailError,
+    MailFailure,
+    MailMessage,
+    MailNotConfiguredError,
+    MailProvider,
+)
 
 # Windows: shutdown() does not wake a thread blocked in recv(), so the watchdog cannot interrupt a read there; only the per-read timeout bounds one.
 CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
@@ -569,7 +576,7 @@ class TestSmtpTransport:
 
         def connect(self, host, port):
             tried.append(host)
-            clock[0] += mail_smtp.SEND_DEADLINE_SECONDS + 1  # a failure that took longer than the whole send may
+            clock[0] += MAIL_SEND_DEADLINE_SECONDS + 1  # a failure that took longer than the whole send may
             raise OSError("slow failure")
 
         monkeypatch.setattr(FakeSMTP, "connect", connect)
@@ -852,7 +859,7 @@ class TestTheWatchdog:
     def test_it_releases_a_read_through_the_duplicate_it_watches(self, monkeypatch, blocked_read):
         """``watched`` is a duplicate of the raw socket; shutting it down reaches a TLS-wrapped read too."""
         sock, released = blocked_read
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0)
+        monkeypatch.setattr(mail_smtp, "MAIL_SEND_DEADLINE_SECONDS", 0)
         connection = SimpleNamespace(watched=sock.dup(), sock=None)
         expired, finished, watchdog = self._start(connection)
         try:
@@ -867,7 +874,7 @@ class TestTheWatchdog:
     def test_a_socket_that_appears_after_the_deadline_is_shut_down_too(self, monkeypatch, blocked_read):
         """A slow connect hands the socket over only after the deadline; one shutdown attempt would miss it."""
         sock, released = blocked_read
-        monkeypatch.setattr(mail_smtp, "SEND_DEADLINE_SECONDS", 0)
+        monkeypatch.setattr(mail_smtp, "MAIL_SEND_DEADLINE_SECONDS", 0)
         connection = SimpleNamespace(watched=None, sock=None)
         expired, finished, watchdog = self._start(connection)
         try:

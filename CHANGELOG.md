@@ -10,6 +10,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
+- **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted). Import it to size a lease or timeout around a send; the value may change in a minor release. `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered, is removed. ([#57](https://github.com/endurain-project/jasil/issues/57))
+
 - **`MailError` says why a send failed and whether it may have been delivered.** `kind` is a new `jasil.providers.MailFailure` naming the failed step (`auth_failed`, `sender_refused`, `recipient_refused`, `message_rejected`, `unreachable`, `connection_lost`, `deadline`, ...). `delivery_unknown` is `True` only when the connection was lost, or the deadline fired, after the message body started going out. `message_id` is set on every failure after the message was built. All three are keyword-only with defaults, so existing code is unaffected. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#52](https://github.com/endurain-project/jasil/issues/52), [#53](https://github.com/endurain-project/jasil/issues/53))
 
 ### Changed

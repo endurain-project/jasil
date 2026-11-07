@@ -22,6 +22,11 @@ from jasil.events import Event
 #: (code points, not bytes).
 MAX_REALTIME_KEY_LENGTH = MAX_KEY_LENGTH
 
+#: Upper bound on one :meth:`MailProvider.send` through the built-in SMTP backend, in seconds. DNS lookups are not
+#: counted against it, so a host sizing a lease or timeout around a send adds a margin. Import it rather than copy
+#: the value, which may change in a minor release.
+MAIL_SEND_DEADLINE_SECONDS = 90
+
 
 class StateBackendUnavailableError(RuntimeError):
     """Raised by a :class:`StateProvider` when its backing store is unreachable.
@@ -998,7 +1003,7 @@ class MailFailure(StrEnum):
     TLS_FAILED = "tls_failed"
     #: The connection broke after the session was established.
     CONNECTION_LOST = "connection_lost"
-    #: The send ran past its overall deadline.
+    #: The send ran past `MAIL_SEND_DEADLINE_SECONDS`.
     DEADLINE = "deadline"
     #: The durable job sending the message lost its lease; nothing was sent.
     LEASE_LOST = "lease_lost"

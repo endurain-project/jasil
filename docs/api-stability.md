@@ -19,7 +19,7 @@ modules:
 
 | Module | Surface |
 |---|---|
-| `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), `AuditSink` and `AuditSinkConflictError`, and `MAX_REALTIME_KEY_LENGTH`. |
+| `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), `AuditSink` and `AuditSinkConflictError`, `MAX_REALTIME_KEY_LENGTH`, and `MAIL_SEND_DEADLINE_SECONDS` (its value may change in a minor release). |
 | `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri` with its `StateBackendKind`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
@@ -145,8 +145,8 @@ wiring and tests:
 - The limit constants and helpers a public module imports from `jasil._core`:
   `MAX_AUDIT_*`, `MAX_JOB_BATCH_SIZE`, `MAX_PARTITION_DAYS_AHEAD` and
   `MAX_RETENTION_DAYS` in `jasil.settings`, `MAX_DASHBOARD_*` and `check_limit` in
-  `jasil.admin`, `MAX_KEY_LENGTH` in `jasil.providers`, and `SMTP_PORTS`,
-  `SMTP_SEND_DEADLINE_SECONDS` and `resolve_reverse_endpoint` in `jasil.container`.
+  `jasil.admin`, `MAX_KEY_LENGTH` in `jasil.providers`, and `SMTP_PORTS` and
+  `resolve_reverse_endpoint` in `jasil.container`.
   Their values are described in the configuration page; the names are not covered.
 - `jasil.testing.DEFAULT_NOW`, `jasil.jobs.registry.normalize_queue_selector` and
   `JobHandler`, and the `profile`, `web_workers` and `job_worker_mode` fields of
