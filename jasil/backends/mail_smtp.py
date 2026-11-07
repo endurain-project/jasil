@@ -17,17 +17,19 @@ One connection per ``send``: stateless, thread-safe, nothing to close.
 import contextlib
 import functools
 import logging
+import re
 import smtplib
 import socket
 import ssl
 import threading
 import time
 from email.message import EmailMessage
+from typing import Literal
 
 import jasil._core.network as network
 from jasil._core.job_context import lease_lost
 from jasil._core.mail_message import build_mime, parse_address
-from jasil.providers import MAIL_SEND_DEADLINE_SECONDS, ClockProvider, MailError, MailMessage
+from jasil.providers import MAIL_SEND_DEADLINE_SECONDS, ClockProvider, MailError, MailFailure, MailMessage
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,70 @@ _TIMEOUT_SECONDS = 30
 # one step it cannot interrupt.
 _WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
+
+# How far a send got: ``connecting`` until the session is up (greeting, and TLS
+# when it is used), ``session`` from then on, ``data`` once the server answered
+# ``DATA`` with 354 and the body may be on its way. A connection lost in ``data``
+# may have delivered the message.
+_Stage = Literal["connecting", "session", "data"]
+
+
+def _failure(error: OSError, stage: _Stage) -> MailError:
+    """Map an ``smtplib`` or socket failure to a :class:`MailError` that carries no server text.
+
+    Only a lost connection is ambiguous: a reply, even to ``DATA``, says the
+    server did not accept the message.
+    """
+    if isinstance(error, smtplib.SMTPAuthenticationError):
+        return MailError(
+            f"SMTP authentication failed (status {error.smtp_code})",
+            status=error.smtp_code,
+            kind=MailFailure.AUTH_FAILED,
+        )
+    if isinstance(error, smtplib.SMTPRecipientsRefused):
+        # Codes only: 4xx (greylisting, retry) and 5xx (unknown user) differ.
+        codes = sorted({code for code, _ in error.recipients.values()})
+        # ``min``: one 4xx among 5xx is worth a retry, so it is not permanent.
+        return MailError(
+            "SMTP server refused the recipients (status " + ", ".join(map(str, codes)) + ")",
+            status=codes[0] if codes else None,
+            kind=MailFailure.RECIPIENT_REFUSED,
+        )
+    if isinstance(error, smtplib.SMTPSenderRefused):
+        return MailError(
+            f"SMTP server refused the sender (status {error.smtp_code})",
+            status=error.smtp_code,
+            kind=MailFailure.SENDER_REFUSED,
+        )
+    if isinstance(error, smtplib.SMTPConnectError):
+        return MailError(
+            f"SMTP server refused the connection (status {error.smtp_code})",
+            status=error.smtp_code,
+            kind=MailFailure.UNREACHABLE,
+        )
+    if isinstance(error, smtplib.SMTPDataError):
+        return MailError(
+            f"SMTP server rejected the message (status {error.smtp_code})",
+            status=error.smtp_code,
+            kind=MailFailure.MESSAGE_REJECTED,
+        )
+    if isinstance(error, smtplib.SMTPResponseException):
+        return MailError(f"SMTP server refused a command (status {error.smtp_code})", status=error.smtp_code)
+    if isinstance(error, smtplib.SMTPNotSupportedError):
+        return MailError("SMTP server lacks a required feature", kind=MailFailure.UNSUPPORTED)
+    if stage == "connecting":
+        if isinstance(error, ssl.SSLError):
+            return MailError("TLS negotiation with the SMTP server failed", kind=MailFailure.TLS_FAILED)
+        return MailError("SMTP server unreachable", kind=MailFailure.UNREACHABLE)
+    return MailError("SMTP connection lost", kind=MailFailure.CONNECTION_LOST, delivery_unknown=stage == "data")
+
+
+def _data_payload(body: bytes) -> bytes:
+    """``body`` as ``smtplib.SMTP.data`` sends it: leading dots doubled, ended by ``CRLF.CRLF``."""
+    payload = re.sub(rb"(?m)^\.", b"..", body)
+    if not payload.endswith(b"\r\n"):
+        payload += b"\r\n"
+    return payload + b".\r\n"
 
 
 def _default_local_hostname() -> str:
@@ -182,43 +248,24 @@ class SmtpMail:
             ValueError: When the message is invalid.
             MailError: When the server could not be reached or refused the
                 message, or when the durable job sending it has lost its lease
-                (nothing is sent: another worker owns the job now). If only
-                *some* recipients are refused the send succeeds and a warning
-                records the count, since failing would make a retry re-send to
-                recipients that already got it.
+                (nothing is sent: another worker owns the job now). Its ``kind``
+                names the step that failed, ``delivery_unknown`` is set when the
+                connection broke after the body started going out, and
+                ``message_id`` is set on every failure after the message was
+                built. If only *some* recipients are refused the send succeeds
+                and a warning records the count, since failing would make a
+                retry re-send to recipients that already got it.
         """
         if lease_lost():
-            raise MailError("Job lease lost; send abandoned")
+            raise MailError("Job lease lost; send abandoned", kind=MailFailure.LEASE_LOST)
         mime = build_mime(message, sender=self._from_address, now=self._clock.now())
         message_id = str(mime["Message-ID"])
         try:
             refused = self._deliver(mime)
-        except MailError:
+        except MailError as error:
+            # Every failure of a built message passes here, whichever step raised it.
+            error.message_id = message_id
             raise
-        except smtplib.SMTPAuthenticationError as error:
-            raise MailError(f"SMTP authentication failed (status {error.smtp_code})", status=error.smtp_code) from None
-        except smtplib.SMTPRecipientsRefused as error:
-            # Codes only: 4xx (greylisting, retry) and 5xx (unknown user) differ.
-            codes = sorted({code for code, _ in error.recipients.values()})
-            # ``min``: one 4xx among 5xx is worth a retry, so it is not permanent.
-            raise MailError(
-                "SMTP server refused every recipient (status " + ", ".join(map(str, codes)) + ")",
-                status=codes[0] if codes else None,
-            ) from None
-        except smtplib.SMTPConnectError as error:
-            raise MailError(
-                f"SMTP server refused the connection (status {error.smtp_code})", status=error.smtp_code
-            ) from None
-        except smtplib.SMTPResponseException as error:
-            raise MailError(
-                f"SMTP server rejected the message (status {error.smtp_code})", status=error.smtp_code
-            ) from None
-        except smtplib.SMTPNotSupportedError:
-            raise MailError("SMTP server lacks a required feature (AUTH or SMTPUTF8)") from None
-        except ssl.SSLError:
-            raise MailError("TLS negotiation with the SMTP server failed") from None
-        except (smtplib.SMTPException, OSError):
-            raise MailError("SMTP server unreachable or connection lost") from None
         if refused:
             logger.warning(
                 "Mail %s accepted with %d of %d recipients refused",
@@ -234,7 +281,7 @@ class SmtpMail:
         """Cap the next step to the time left, or abort when none is."""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise MailError(_DEADLINE_EXCEEDED)
+            raise MailError(_DEADLINE_EXCEEDED, kind=MailFailure.DEADLINE)
         sock = getattr(connection, "sock", None)
         if sock is not None:
             sock.settimeout(min(_TIMEOUT_SECONDS, remaining))
@@ -269,7 +316,9 @@ class SmtpMail:
             return [self._host]
         addresses, reason = network.resolve_private_addresses(self._host)
         if reason is not None or not addresses:
-            raise MailError("SMTP relay no longer resolves to a private address; cleartext refused")
+            raise MailError(
+                "SMTP relay no longer resolves to a private address; cleartext refused", kind=MailFailure.UNREACHABLE
+            )
         return addresses
 
     def _connect(self, connection: smtplib.SMTP, deadline: float) -> tuple[int, bytes]:
@@ -279,7 +328,7 @@ class SmtpMail:
             # A connect is not interruptible by the watchdog, so do not start one
             # after the deadline.
             if time.monotonic() >= deadline:
-                raise MailError(_DEADLINE_EXCEEDED)
+                raise MailError(_DEADLINE_EXCEEDED, kind=MailFailure.DEADLINE)
             # ``connection.timeout`` bounds each address tried; cap it to the time
             # left, and the dial itself stops at the deadline between addresses,
             # so a connect begun near the deadline cannot run past it.
@@ -303,7 +352,11 @@ class SmtpMail:
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _deliver(self, mime: EmailMessage) -> dict[str, tuple[int, bytes]]:
-        """Connect, secure, authenticate and send; returns refused recipients."""
+        """Connect, secure, authenticate and send; returns refused recipients.
+
+        Raises:
+            MailError: On any failure, classified by the stage it interrupted.
+        """
         context = self._context
         deadline = time.monotonic() + MAIL_SEND_DEADLINE_SECONDS
         # Built without a host so nothing is dialed before the watchdog is armed:
@@ -320,6 +373,7 @@ class SmtpMail:
         finished = threading.Event()
         watchdog = threading.Thread(target=self._watch, args=(connection, expired, finished), daemon=True)
         watchdog.start()
+        stage: _Stage = "connecting"
         try:
             try:
                 code, reply = self._connect(connection, deadline)
@@ -329,22 +383,37 @@ class SmtpMail:
                     self._arm(connection, deadline)
                     connection.ehlo()
                     if not connection.has_extn("starttls"):
-                        raise MailError("SMTP server does not offer STARTTLS")
+                        raise MailError("SMTP server does not offer STARTTLS", kind=MailFailure.UNSUPPORTED)
                     self._arm(connection, deadline)
                     connection.starttls(context=context)
                     connection.ehlo()
+                stage = "session"
                 if self._username and self._password:
                     self._arm(connection, deadline)
                     self._login(connection, self._username, self._password)
                 self._arm(connection, deadline)
-                # Explicit envelope sender: the bare address, never the display name.
-                return connection.send_message(mime, from_addr=mime["From"].addresses[0].addr_spec)
-            except (smtplib.SMTPException, OSError):
+                body = mime.as_bytes()
+                refused = self._envelope(connection, mime, len(body))
+                self._arm(connection, deadline)
+                # Not ``connection.data``: it waits for the 354 too, and a connection
+                # lost there cannot have delivered anything.
+                code, reply = connection.docmd("DATA")
+                if code != 354:
+                    raise smtplib.SMTPDataError(code, reply)
+                stage = "data"
+                connection.send(_data_payload(body))
+                code, reply = connection.getreply()
+                if code != 250:
+                    raise smtplib.SMTPDataError(code, reply)
+                return refused
+            except (smtplib.SMTPException, OSError) as error:
                 # The watchdog's shutdown surfaces as a dropped connection, and the
                 # last step's socket timeout is the time left, so it can fire first.
                 if expired.is_set() or time.monotonic() >= deadline:
-                    raise MailError(_DEADLINE_EXCEEDED) from None
-                raise
+                    raise MailError(
+                        _DEADLINE_EXCEEDED, kind=MailFailure.DEADLINE, delivery_unknown=stage == "data"
+                    ) from None
+                raise _failure(error, stage) from None
         finally:
             # Not ``with``: its exit raises on a non-221 reply to QUIT, which would
             # report a message the server already accepted as a failure (a retry
@@ -361,6 +430,41 @@ class SmtpMail:
                 watched.close()
 
     @staticmethod
+    def _envelope(connection: smtplib.SMTP, mime: EmailMessage, size: int) -> dict[str, tuple[int, bytes]]:
+        """Send ``MAIL FROM`` and one ``RCPT TO`` per recipient, as ``smtplib.SMTP.sendmail`` does.
+
+        Run step by step rather than through ``sendmail`` so the caller knows when
+        ``DATA`` begins. ``build_mime`` emits 7-bit content and ASCII addresses, so
+        neither ``SMTPUTF8`` nor ``8BITMIME`` is needed.
+
+        Returns:
+            The refused recipients, when some but not all were refused.
+
+        Raises:
+            smtplib.SMTPSenderRefused: When ``MAIL FROM`` is refused.
+            smtplib.SMTPRecipientsRefused: When every recipient is refused, or the
+                server closes the session (421) while recipients are offered.
+        """
+        connection.ehlo_or_helo_if_needed()
+        options = [f"size={size}"] if connection.does_esmtp and connection.has_extn("size") else []
+        # The envelope sender is the bare address, never the display name.
+        sender = mime["From"].addresses[0].addr_spec
+        code, reply = connection.mail(sender, options)
+        if code != 250:
+            raise smtplib.SMTPSenderRefused(code, reply, sender)
+        refused: dict[str, tuple[int, bytes]] = {}
+        recipients = [address.addr_spec for address in mime["To"].addresses]
+        for recipient in recipients:
+            code, reply = connection.rcpt(recipient)
+            if code not in (250, 251):
+                refused[recipient] = (code, reply)
+            if code == 421:
+                raise smtplib.SMTPRecipientsRefused(refused)
+        if len(refused) == len(recipients):
+            raise smtplib.SMTPRecipientsRefused(refused)
+        return refused
+
+    @staticmethod
     def _login(connection: smtplib.SMTP, username: str, password: str) -> None:
         """Authenticate, naming the one failure ``smtplib`` raises untyped."""
         try:
@@ -369,5 +473,7 @@ class SmtpMail:
             # A bare ``SMTPException`` from ``login`` means the server advertises
             # AUTH but no mechanism ``smtplib`` implements.
             if type(error) is smtplib.SMTPException:
-                raise MailError("SMTP server offers no supported authentication mechanism") from None
+                raise MailError(
+                    "SMTP server offers no supported authentication mechanism", kind=MailFailure.UNSUPPORTED
+                ) from None
             raise

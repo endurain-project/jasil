@@ -45,8 +45,11 @@ modules:
 
 ### Provider protocols
 
-`MailProvider.send` returns the `Message-ID` as a `str`, and `MailError` /
-`MailNotConfiguredError` are covered. Adding a field to `MailMessage` with a
+`MailProvider.send` returns the `Message-ID` as a `str`, and `MailError` (with
+`status`, `permanent`, `kind`, `delivery_unknown` and `message_id`) /
+`MailNotConfiguredError` are covered. `MailFailure` is covered like
+`MailProblemCode`: members may be added in a minor release, and a member is never
+renamed or reused. Which `kind` a given failure maps to is documented, not frozen. Adding a field to `MailMessage` with a
 default is additive.
 
 `RealtimeProvider`'s four methods and its contract are covered: best-effort,

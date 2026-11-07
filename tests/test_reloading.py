@@ -21,6 +21,7 @@ from jasil.providers import (
     GeocodedPlace,
     GeocodingProvider,
     MailError,
+    MailFailure,
     MailMessage,
     MailNotConfiguredError,
     MailProvider,
@@ -346,6 +347,7 @@ class TestSourceFailure:
             _mail(source).send(MESSAGE)
 
         assert not isinstance(caught.value, MailNotConfiguredError)
+        assert caught.value.kind is MailFailure.SETTINGS_UNAVAILABLE
         assert caught.value.permanent is False
         # The source's exception is the host's and may carry a secret, so it is not chained.
         assert caught.value.__cause__ is None
@@ -356,8 +358,9 @@ class TestSourceFailure:
         provider = _mail(source)
         provider.send(MESSAGE)
         source.value = BAD_MAIL
-        with pytest.raises(MailNotConfiguredError):
+        with pytest.raises(MailNotConfiguredError) as rejected:
             provider.send(MESSAGE)
+        assert rejected.value.kind is MailFailure.NOT_CONFIGURED
 
         source.error = RuntimeError("db down")
         with pytest.raises(MailError, match="could not be loaded"):
@@ -581,6 +584,7 @@ class TestTransientAndUnexpectedFailures:
         with pytest.raises(MailError) as first:
             provider.send(MESSAGE)
         assert not isinstance(first.value, MailNotConfiguredError)
+        assert first.value.kind is MailFailure.SETTINGS_UNAVAILABLE
         with pytest.raises(MailError):
             provider.send(MESSAGE)
         assert calls["n"] == 1  # remembered until the delay passes

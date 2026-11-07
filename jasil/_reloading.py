@@ -21,6 +21,7 @@ from jasil.providers import (
     GeocodedPlace,
     GeocodingProvider,
     MailError,
+    MailFailure,
     MailMessage,
     MailNotConfiguredError,
     MailProvider,
@@ -181,9 +182,9 @@ class ReloadingMail:
             outcome = self._backend.resolve()
         except SourceUnavailableError:
             # Not chained: the source's exception is the host's, and its text may carry a secret.
-            raise MailError("Mail settings could not be loaded") from None
+            raise MailError("Mail settings could not be loaded", kind=MailFailure.SETTINGS_UNAVAILABLE) from None
         if outcome.transient:
-            raise MailError("Mail settings could not be verified; retry")
+            raise MailError("Mail settings could not be verified; retry", kind=MailFailure.SETTINGS_UNAVAILABLE)
         if outcome.backend is None:
             # The reason carries no setting's value (see ``ReloadingBackend``).
             raise MailNotConfiguredError(f"Mail settings are invalid: {outcome.rejection}")
