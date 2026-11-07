@@ -532,6 +532,37 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
+A `MailError` also tells a host what to do next without parsing its message:
+
+| Attribute | Meaning |
+|---|---|
+| `status` / `permanent` | The SMTP status code, and whether it is a 5xx. |
+| `kind` | A `MailFailure` naming the step that failed (table below). |
+| `delivery_unknown` | `True` when the connection was lost, or the send deadline fired, after the body started going out. The server may have accepted the message, so a retry may deliver it twice; reconcile with the relay's logs instead. `False` means the message was not accepted. |
+| `message_id` | The `Message-ID` of the message that failed, set on every failure after the message was built. Look it up in the relay's or provider's logs. It is never part of `str(error)`. |
+
+| `MailFailure` | Raised when | Typical reaction |
+|---|---|---|
+| `auth_failed` | The server refused the credentials. | Fix the configuration; alert an operator. |
+| `unsupported` | The server lacks STARTTLS, AUTH, or an AUTH mechanism `smtplib` implements. | Fix the configuration. |
+| `sender_refused` | `MAIL FROM` was refused. | When `permanent`, stop using that sender; a 4xx is usually rate limiting. |
+| `recipient_refused` | Every recipient was refused, or the server closed the session (421) during `RCPT`. | When `permanent`, record it against the recipient. |
+| `message_rejected` | The server refused the message at `DATA` or at its end (content, size, policy). | When `permanent`, do not retry the same content. |
+| `unreachable` | DNS, a refused or failed connect, a greeting other than 220, or a cleartext relay that no longer resolves to a private address. | Retry later. |
+| `tls_failed` | The TLS handshake failed. | Check the relay's certificate and name. |
+| `connection_lost` | The connection broke after the session was established. | Retry, unless `delivery_unknown`. |
+| `deadline` | The send ran past `MAIL_SEND_DEADLINE_SECONDS`. | Retry, unless `delivery_unknown`. |
+| `lease_lost` | The durable job lost its lease; nothing was sent. | None: another worker owns the job. |
+| `settings_unavailable` | Runtime mail settings could not be loaded or verified. | Retry later. |
+| `not_configured` | No backend is configured (`MailNotConfiguredError`). | Configure `mail.uri`. |
+| `other` | Anything else, and a `MailError` raised without a kind. | Treat by `status`. |
+
+Members may be added in a minor release; a member is never renamed or reused.
+
+One `SmtpMail` send is bounded by `MAIL_SEND_DEADLINE_SECONDS` (90 seconds; DNS
+lookups are not counted). Import it to size a lease or timeout around a send
+rather than copying the value, which may change in a minor release.
+
 The sender is the message's `from_address` when set, otherwise the configured
 `mail.from_address`; either way it is independent of the SMTP `username`: relays
 such as Brevo log you in as a generated identity and reject a `From` that is not

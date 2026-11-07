@@ -39,7 +39,6 @@ from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding, resolve_
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.lock_pg import PgAdvisoryLock
 from jasil.backends.mail_memory import MemoryMail, NullMail
-from jasil.backends.mail_smtp import SEND_DEADLINE_SECONDS as SMTP_SEND_DEADLINE_SECONDS
 from jasil.backends.mail_smtp import SmtpMail
 from jasil.backends.realtime_inprocess import InProcessRealtime
 from jasil.backends.realtime_none import NullRealtime
@@ -49,6 +48,7 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_none import NullStorage
 from jasil.profile import DeploymentProfile
 from jasil.providers import (
+    MAIL_SEND_DEADLINE_SECONDS,
     AuditSink,
     ClockProvider,
     EventBusProvider,
@@ -527,7 +527,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
         return MemoryMail(clock, mail.from_address)
     if not mail.secure:
         logger.warning("Mail over smtp:// is CLEARTEXT (mail.secure=False); use only on a trusted private network")
-    if settings.jobs.enabled and settings.jobs.max_runtime_seconds <= SMTP_SEND_DEADLINE_SECONDS:
+    if settings.jobs.enabled and settings.jobs.max_runtime_seconds <= MAIL_SEND_DEADLINE_SECONDS:
         # A running job keeps its lease, but only up to ``max_runtime_seconds``: past
         # it the job is abandoned and a send in flight is delivered by a worker that
         # no longer owns the job. Only the floor is checkable here: a handler
@@ -536,7 +536,7 @@ def _build_mail(settings: JasilSettings, clock: ClockProvider) -> MailProvider:
             "jobs.max_runtime_seconds (%d) is not above the SMTP send deadline (%d s, per "
             "message); a slow send can be abandoned mid-delivery and sent again by a retry",
             settings.jobs.max_runtime_seconds,
-            SMTP_SEND_DEADLINE_SECONDS,
+            MAIL_SEND_DEADLINE_SECONDS,
         )
     resolved_port = parts.port or SMTP_PORTS[scheme]
     logger.info("Mail enabled via %s%s", scheme, " (authenticated)" if mail.username else "")
