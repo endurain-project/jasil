@@ -532,6 +532,10 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
 
+One `SmtpMail` send is bounded by `MAIL_SEND_DEADLINE_SECONDS` (90 seconds; DNS
+lookups are not counted). Import it to size a lease or timeout around a send
+rather than copying the value, which may change in a minor release.
+
 The sender is `from_address`, independent of the SMTP `username`: relays such as
 Brevo log you in as a generated identity and reject a `From` that is not a
 verified sender. The `From` header keeps any display name; the envelope sender is

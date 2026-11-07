@@ -8,6 +8,10 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted). Import it to size a lease or timeout around a send; the value may change in a minor release. `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered, is removed. ([#57](https://github.com/endurain-project/jasil/issues/57))
+
 ## [0.17.0] - 2026-11-04
 
 This release fixes the first audit write on a fresh SQLite database failing with `database is locked`. Migration `rev0010` creates the `jasil_instance` row, and `ensure_instance_id` is now public.
