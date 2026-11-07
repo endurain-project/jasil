@@ -77,7 +77,9 @@ resolves to — including a cloud metadata endpoint — and taking one logs at
 
 **Header injection (CWE-93).** Addresses are parsed, never concatenated; the
 `SMTP` email policy rejects CR/LF in a header value; and `MailMessage` has no
-field through which a caller could set an arbitrary header.
+field through which a caller could set an arbitrary header. The one header
+written unfolded, `List-Unsubscribe`, takes only an `https` URL of printable ASCII
+without spaces, `<`, `>` or `,`, so it cannot carry a line break or a second URL.
 
 **Sender spoofing.** `MailMessage.from_address` lets the host choose the sender
 of each message. JASIL validates it as one address and keeps no allowlist: the

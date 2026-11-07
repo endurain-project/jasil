@@ -25,6 +25,7 @@ from typing import ClassVar, Literal
 
 import pytest
 
+import jasil._core.mail_message as mail_message
 import jasil._core.network as network
 import jasil.backends.mail_smtp as mail_smtp
 from jasil._core.mail_message import build_mime
@@ -441,6 +442,69 @@ class TestPerMessageSender:
 def _last_built(backend: MailProvider):
     """The MIME message a backend built last, from ``MemoryMail.built`` or the fake SMTP server."""
     return backend.built[-1] if isinstance(backend, MemoryMail) else FakeSMTP.instances[-1].sent
+
+
+class TestListUnsubscribe:
+    """RFC 8058 one-click unsubscribe: two headers, the URL written verbatim on one line."""
+
+    URL = "https://example.com/unsubscribe?token=abc123"
+
+    def test_both_headers_are_emitted(self):
+        mime = build_mime(_message(list_unsubscribe=self.URL), sender=SENDER, now=NOW)
+
+        assert mime["List-Unsubscribe"] == f"<{self.URL}>"
+        assert mime["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click"
+
+    def test_no_header_without_a_url(self):
+        mime = build_mime(_message(), sender=SENDER, now=NOW)
+
+        assert "List-Unsubscribe" not in mime and "List-Unsubscribe-Post" not in mime
+
+    def test_the_longest_url_is_sent_unfolded_and_unencoded(self):
+        """Folded or RFC 2047-encoded, the URL is not one a mailbox provider can read."""
+        url = "https://example.com/u?t=" + "a" * (mail_message.MAX_UNSUBSCRIBE_URL_LENGTH - 24)
+        mime = build_mime(_message(list_unsubscribe=url, subject="é" * 100), sender=SENDER, now=NOW)
+
+        lines = mime.as_bytes().split(b"\r\n")
+        assert f"List-Unsubscribe: <{url}>".encode() in lines
+        assert max(len(line) for line in lines) <= 998
+
+    def test_other_headers_are_still_folded(self):
+        mime = build_mime(_message(list_unsubscribe=self.URL, subject="word " * 40), sender=SENDER, now=NOW)
+
+        assert max(len(line) for line in mime.as_bytes().split(b"\r\n")) <= 78
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "",
+            "http://example.com/u",
+            "mailto:unsubscribe@example.com",
+            "/unsubscribe",
+            "https:///no-host",
+            "https://example.com/a b",
+            "https://example.com/<x>",
+            "https://example.com/a,b",
+            "https://example.com/olá",
+            "https://example.com/\r\nBcc: victim@example.com",
+            "https://[::1/",
+            "https://example.com/" + "a" * 1000,
+            42,
+        ],
+    )
+    def test_anything_but_a_one_line_https_url_is_refused_without_echoing_it(self, value):
+        with pytest.raises(ValueError, match="list-unsubscribe") as caught:
+            build_mime(_message(list_unsubscribe=value), sender=SENDER, now=NOW)
+
+        assert not isinstance(value, str) or not value or value not in str(caught.value)
+
+    def test_every_backend_sends_it(self, backend):
+        backend.send(_message(list_unsubscribe=self.URL))
+
+        assert _last_built(backend)["List-Unsubscribe"] == f"<{self.URL}>"
+
+    def test_the_url_is_part_of_the_message_identity(self):
+        assert hash(_message(list_unsubscribe=self.URL)) != hash(_message())
 
 
 class TestMemoryMail:

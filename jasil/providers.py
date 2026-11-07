@@ -968,6 +968,12 @@ class MailMessage:
             header, the envelope sender (its bare address) and the
             ``Message-ID`` domain. The relay decides which senders it accepts;
             never derive this from untrusted input.
+        list_unsubscribe: Optional RFC 8058 one-click unsubscribe URL: an
+            absolute ``https`` URL of printable ASCII, at most 978 characters,
+            without spaces, ``<``, ``>`` or ``,``. The message then carries
+            ``List-Unsubscribe`` and ``List-Unsubscribe-Post``. The URL must
+            accept a POST with no login, and the relay must DKIM-sign the
+            ``List-Unsubscribe`` header.
     """
 
     to: Sequence[str]
@@ -976,11 +982,14 @@ class MailMessage:
     html: str | None = None
     reply_to: str | None = None
     from_address: str | None = None
+    list_unsubscribe: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
-        return hash((recipients, self.subject, self.text, self.html, self.reply_to, self.from_address))
+        return hash(
+            (recipients, self.subject, self.text, self.html, self.reply_to, self.from_address, self.list_unsubscribe)
+        )
 
 
 class MailFailure(StrEnum):
