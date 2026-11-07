@@ -32,6 +32,7 @@ from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_none import NullStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.profile import DeploymentProfile, JobWorkerMode
+from jasil.providers import MAIL_SEND_DEADLINE_SECONDS
 
 #: Taken before the autouse fixture replaces it, for the tests of client ownership.
 REAL_GET_SHARED_CLIENT = redis_clients.get_shared_client
@@ -737,7 +738,7 @@ class TestMailResolution:
 
     def test_a_runtime_cap_not_above_the_smtp_deadline_warns(self, caplog):
         """A running job keeps its lease only up to ``max_runtime_seconds``."""
-        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=60)
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=MAIL_SEND_DEADLINE_SECONDS)
         cfg = _settings(
             mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
         )
@@ -747,7 +748,7 @@ class TestMailResolution:
         assert "max_runtime_seconds" in caplog.text
 
     def test_a_longer_runtime_cap_does_not_warn(self, caplog):
-        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=1800)
+        jobs = settings.JobSettings(enabled=True, lease_seconds=60, max_runtime_seconds=MAIL_SEND_DEADLINE_SECONDS + 1)
         cfg = _settings(
             mail=settings.MailSettings(uri="smtps://mail.example.com", from_address="a@example.com"), jobs=jobs
         )

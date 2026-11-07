@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
@@ -20,6 +21,11 @@ from jasil.events import Event
 #: Cap on the length of a :class:`RealtimeProvider` hint key, in characters
 #: (code points, not bytes).
 MAX_REALTIME_KEY_LENGTH = MAX_KEY_LENGTH
+
+#: Upper bound on one :meth:`MailProvider.send` through the built-in SMTP backend, in seconds. DNS lookups are not
+#: counted against it, so a host sizing a lease or timeout around a send adds a margin. Import it rather than copy
+#: the value, which may change in a minor release.
+MAIL_SEND_DEADLINE_SECONDS = 90
 
 
 class StateBackendUnavailableError(RuntimeError):
@@ -957,6 +963,11 @@ class MailMessage:
         html: HTML body. With ``text`` as well, the message is
             ``multipart/alternative``.
         reply_to: Optional single ``Reply-To`` address.
+        from_address: The sender of this message, ``addr`` or ``"Name <addr>"``,
+            in place of the configured ``mail.from_address``: the ``From``
+            header, the envelope sender (its bare address) and the
+            ``Message-ID`` domain. The relay decides which senders it accepts;
+            never derive this from untrusted input.
         list_unsubscribe: Optional RFC 8058 one-click unsubscribe URL: an
             absolute ``https`` URL of printable ASCII, at most 978 characters,
             without spaces, ``<``, ``>`` or ``,``. The message then carries
@@ -970,12 +981,51 @@ class MailMessage:
     text: str | None = None
     html: str | None = None
     reply_to: str | None = None
+    from_address: str | None = None
     list_unsubscribe: str | None = None
 
     def __hash__(self) -> int:
         # ``to`` is usually a list, which the generated hash cannot digest.
         recipients = (self.to,) if isinstance(self.to, str) else tuple(self.to)
-        return hash((recipients, self.subject, self.text, self.html, self.reply_to, self.list_unsubscribe))
+        return hash(
+            (recipients, self.subject, self.text, self.html, self.reply_to, self.from_address, self.list_unsubscribe)
+        )
+
+
+class MailFailure(StrEnum):
+    """Which step of a send failed, so a host can react without parsing the message.
+
+    Members may be added in a minor release; a member is never renamed or reused.
+    """
+
+    #: Not classified: the default for a :class:`MailError` raised without a kind.
+    OTHER = "other"
+    #: The server refused the credentials.
+    AUTH_FAILED = "auth_failed"
+    #: The server lacks something the send requires: STARTTLS, AUTH, or an AUTH mechanism ``smtplib`` implements.
+    UNSUPPORTED = "unsupported"
+    #: ``MAIL FROM`` was refused. Only a permanent (5xx) refusal means the sender itself is unusable; a 4xx is
+    #: usually rate limiting.
+    SENDER_REFUSED = "sender_refused"
+    #: Every recipient was refused, or the server closed the session (421) while recipients were offered.
+    RECIPIENT_REFUSED = "recipient_refused"
+    #: The server refused the message at ``DATA`` or at its end (content, size or policy).
+    MESSAGE_REJECTED = "message_rejected"
+    #: No session could be opened: DNS, a refused or failed connect, a greeting other than 220, or a cleartext relay
+    #: that no longer resolves to a private address.
+    UNREACHABLE = "unreachable"
+    #: The TLS handshake failed (certificate, hostname or protocol).
+    TLS_FAILED = "tls_failed"
+    #: The connection broke after the session was established.
+    CONNECTION_LOST = "connection_lost"
+    #: The send ran past `MAIL_SEND_DEADLINE_SECONDS`.
+    DEADLINE = "deadline"
+    #: The durable job sending the message lost its lease; nothing was sent.
+    LEASE_LOST = "lease_lost"
+    #: Runtime mail settings could not be loaded or verified; retry later.
+    SETTINGS_UNAVAILABLE = "settings_unavailable"
+    #: No mail backend is configured (:class:`MailNotConfiguredError`).
+    NOT_CONFIGURED = "not_configured"
 
 
 class MailError(RuntimeError):
@@ -988,11 +1038,30 @@ class MailError(RuntimeError):
     Attributes:
         status: The SMTP status code, or ``None`` when the failure had none
             (unreachable server, TLS failure, deadline).
+        kind: The step that failed.
+        delivery_unknown: ``True`` when the connection was lost, or the deadline
+            fired, after the message body started going out: the server may have
+            accepted it, so a retry may deliver it twice. ``False`` means the
+            message was not accepted.
+        message_id: The ``Message-ID`` of the message that failed, angle brackets
+            included, when the message was built before the failure; the key to
+            look it up in the relay's logs. Never part of ``str(error)``.
     """
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        kind: MailFailure = MailFailure.OTHER,
+        delivery_unknown: bool = False,
+        message_id: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.kind = kind
+        self.delivery_unknown = delivery_unknown
+        self.message_id = message_id
 
     @property
     def permanent(self) -> bool:
@@ -1001,7 +1070,10 @@ class MailError(RuntimeError):
 
 
 class MailNotConfiguredError(MailError):
-    """Mail was sent while no backend is configured."""
+    """Mail was sent while no backend is configured; its ``kind`` is :attr:`MailFailure.NOT_CONFIGURED`."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message, status=status, kind=MailFailure.NOT_CONFIGURED)
 
 
 @runtime_checkable

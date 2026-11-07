@@ -10,7 +10,17 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ### Added
 
+- **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted). Import it to size a lease or timeout around a send; the value may change in a minor release. `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered, is removed. ([#57](https://github.com/endurain-project/jasil/issues/57))
+
+- **`MailError` says why a send failed and whether it may have been delivered.** `kind` is a new `jasil.providers.MailFailure` naming the failed step (`auth_failed`, `sender_refused`, `recipient_refused`, `message_rejected`, `unreachable`, `connection_lost`, `deadline`, ...). `delivery_unknown` is `True` only when the connection was lost, or the deadline fired, after the message body started going out. `message_id` is set on every failure after the message was built. All three are keyword-only with defaults, so existing code is unaffected. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#52](https://github.com/endurain-project/jasil/issues/52), [#53](https://github.com/endurain-project/jasil/issues/53))
+
+- **`MailMessage.from_address`** sets the sender of one message (`From`, envelope sender and `Message-ID` domain) in place of `mail.from_address`, which becomes the default. It is validated like the configured sender, and JASIL keeps no allowlist: take it from your own configuration, never from user input. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#54](https://github.com/endurain-project/jasil/issues/54))
+
 - **`MailMessage.list_unsubscribe`** adds RFC 8058 one-click unsubscribe: an `https` URL emitted as `List-Unsubscribe` together with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which Gmail and Yahoo require of bulk senders. The URL is written on one line, never folded or RFC 2047-encoded, and is limited to 978 printable ASCII characters. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
+
+### Changed
+
+- `SmtpMail` sends `MAIL FROM`, `RCPT TO` and `DATA` itself instead of through `smtplib`'s `send_message`, so it knows which step failed. The conversation on the wire is unchanged, including the `SIZE` declaration and success with a warning when only some recipients are refused. A refused `MAIL FROM` is now reported as a sender refusal, no longer as a rejected message.
 
 ## [0.17.0] - 2026-11-04
 

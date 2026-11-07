@@ -351,8 +351,9 @@ class MailSettings:
             ``memory://`` is refused in a multi-process deployment (see
             ``enforce_deployment_consistency``), where no message would ever be
             delivered.
-        from_address: Sender identity, ``"addr"`` or ``"Name <addr>"``. Required
-            for the SMTP schemes. Independent of ``username``.
+        from_address: Default sender identity, ``"addr"`` or ``"Name <addr>"``,
+            used when a ``MailMessage`` sets no ``from_address``. Required for
+            the SMTP schemes. Independent of ``username``.
         secure: ``True`` (the default) requires verified TLS. ``False`` sends
             over a cleartext connection and is accepted only for ``smtp://``,
             only when the host resolves exclusively to private, loopback or
