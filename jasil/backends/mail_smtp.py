@@ -17,6 +17,7 @@ One connection per ``send``: stateless, thread-safe, nothing to close.
 import contextlib
 import functools
 import logging
+import re
 import smtplib
 import socket
 import ssl
@@ -48,8 +49,9 @@ _WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
 
 # How far a send got: ``connecting`` until the session is up (greeting, and TLS
-# when it is used), ``session`` from then on, ``data`` once ``DATA`` was sent. A
-# connection lost in ``data`` may have delivered the message.
+# when it is used), ``session`` from then on, ``data`` once the server answered
+# ``DATA`` with 354 and the body may be on its way. A connection lost in ``data``
+# may have delivered the message.
 _Stage = Literal["connecting", "session", "data"]
 
 
@@ -101,6 +103,14 @@ def _failure(error: OSError, stage: _Stage) -> MailError:
             return MailError("TLS negotiation with the SMTP server failed", kind=MailFailure.TLS_FAILED)
         return MailError("SMTP server unreachable", kind=MailFailure.UNREACHABLE)
     return MailError("SMTP connection lost", kind=MailFailure.CONNECTION_LOST, delivery_unknown=stage == "data")
+
+
+def _data_payload(body: bytes) -> bytes:
+    """``body`` as ``smtplib.SMTP.data`` sends it: leading dots doubled, ended by ``CRLF.CRLF``."""
+    payload = re.sub(rb"(?m)^\.", b"..", body)
+    if not payload.endswith(b"\r\n"):
+        payload += b"\r\n"
+    return payload + b".\r\n"
 
 
 def _default_local_hostname() -> str:
@@ -385,8 +395,14 @@ class SmtpMail:
                 body = mime.as_bytes()
                 refused = self._envelope(connection, mime, len(body))
                 self._arm(connection, deadline)
+                # Not ``connection.data``: it waits for the 354 too, and a connection
+                # lost there cannot have delivered anything.
+                code, reply = connection.docmd("DATA")
+                if code != 354:
+                    raise smtplib.SMTPDataError(code, reply)
                 stage = "data"
-                code, reply = connection.data(body)
+                connection.send(_data_payload(body))
+                code, reply = connection.getreply()
                 if code != 250:
                     raise smtplib.SMTPDataError(code, reply)
                 return refused

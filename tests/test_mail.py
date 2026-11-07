@@ -13,6 +13,7 @@ import email.policy
 import functools
 import logging
 import os
+import re
 import smtplib
 import socket
 import ssl
@@ -20,7 +21,7 @@ import sys
 import threading
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import pytest
 
@@ -151,16 +152,27 @@ class FakeSMTP:
             return 421, b"srvtext-xyz closing"
         return FakeSMTP.refused.get(recipient, (250, b"ok"))
 
-    def data(self, body):
+    def docmd(self, cmd):
+        assert cmd == "DATA"
         self.calls.append("data")
-        self.body = body
-        self.sent = email.message_from_bytes(body, policy=email.policy.default)
+        if FakeSMTP.fail_on == "drop-before-354":
+            raise smtplib.SMTPServerDisconnected("srvtext-xyz " + ADDRESS)
+        if FakeSMTP.fail_on == "data-refused":
+            return 554, ("srvtext-xyz " + ADDRESS).encode()
+        return 354, b"go"
+
+    def send(self, payload):
+        assert payload.endswith(b"\r\n.\r\n")
+        self.body = re.sub(rb"(?m)^\.\.", b".", payload.removesuffix(b".\r\n"))
+        self.sent = email.message_from_bytes(self.body, policy=email.policy.default)
+        if FakeSMTP.fail_on == "tls-in-data":
+            raise ssl.SSLEOFError("srvtext-xyz")
+
+    def getreply(self):
         if FakeSMTP.fail_on == "data":
             return 554, ("srvtext-xyz " + ADDRESS).encode()
         if FakeSMTP.fail_on == "drop-in-data":
             raise smtplib.SMTPServerDisconnected("srvtext-xyz " + ADDRESS)
-        if FakeSMTP.fail_on == "tls-in-data":
-            raise ssl.SSLEOFError("srvtext-xyz")
         return 250, b"queued"
 
 
@@ -914,6 +926,8 @@ class TestFailuresAreRedacted:
             ("all-refused", "refused the recipients (status 550)", MailFailure.RECIPIENT_REFUSED, False),
             ("rcpt-closing", "refused the recipients (status 421)", MailFailure.RECIPIENT_REFUSED, False),
             ("drop-at-rcpt", "connection lost", MailFailure.CONNECTION_LOST, False),
+            ("data-refused", "rejected the message (status 554)", MailFailure.MESSAGE_REJECTED, False),
+            ("drop-before-354", "connection lost", MailFailure.CONNECTION_LOST, False),
             ("data", "rejected the message (status 554)", MailFailure.MESSAGE_REJECTED, False),
             ("drop-in-data", "connection lost", MailFailure.CONNECTION_LOST, True),
             ("tls-in-data", "connection lost", MailFailure.CONNECTION_LOST, True),
@@ -972,6 +986,12 @@ class TestFailuresAreRedacted:
         assert caught.value.message_id is None
         assert not caught.value.delivery_unknown
 
+    def test_success_logs_no_personal_data(self, caplog):
+        with caplog.at_level(logging.DEBUG):
+            _smtp().send(_message(subject="Top secret subject"))
+
+        assert ADDRESS not in caplog.text and "Top secret subject" not in caplog.text
+
 
 class TestTheEnvelope:
     """``SmtpMail`` runs MAIL, RCPT and DATA itself, so it knows which step a failure interrupted."""
@@ -1018,55 +1038,53 @@ class TestTheEnvelope:
 
         assert FakeSMTP.instances[0].calls.count("rcpt") == 2
 
-    def test_the_watchdog_firing_during_data_may_have_delivered(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("mode", "delivery_unknown"),
+        [("drop-at-rcpt", False), ("drop-before-354", False), ("drop-in-data", True)],
+    )
+    def test_the_watchdog_firing_may_have_delivered_only_after_the_354(self, monkeypatch, mode, delivery_unknown):
         monkeypatch.setattr(SmtpMail, "_watch", staticmethod(lambda connection, expired, finished: expired.set()))
-        FakeSMTP.fail_on = "drop-in-data"
+        FakeSMTP.fail_on = mode
 
         with pytest.raises(MailError) as caught:
             _smtp().send(_message())
 
         assert caught.value.kind is MailFailure.DEADLINE
-        assert caught.value.delivery_unknown
-
-    def test_the_watchdog_firing_before_data_did_not_deliver(self, monkeypatch):
-        monkeypatch.setattr(SmtpMail, "_watch", staticmethod(lambda connection, expired, finished: expired.set()))
-        FakeSMTP.fail_on = "drop-at-rcpt"
-
-        with pytest.raises(MailError) as caught:
-            _smtp().send(_message())
-
-        assert caught.value.kind is MailFailure.DEADLINE
-        assert not caught.value.delivery_unknown
+        assert caught.value.delivery_unknown is delivery_unknown
 
     def test_real_smtplib_declares_the_size_and_sends_the_built_message(self, monkeypatch):
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["10.0.0.5"], None))
         seen: list[bytes] = []
 
-        peer = _Peer(monkeypatch, functools.partial(_serve_smtp, seen, drop_after_body=False))
-        message_id = _smtp(tls=False).send(_message())
+        peer = _Peer(monkeypatch, functools.partial(_serve_smtp, seen, drop=None))
+        message_id = _smtp(tls=False).send(_message(text=".leading dot\n."))
         peer.join()
 
         verbs = [line.split()[0].upper() for line in seen if line[:1].isalpha()]
         assert verbs[:4] == [b"EHLO", b"MAIL", b"RCPT", b"DATA"]
         assert b"size=" in next(line for line in seen if line.upper().startswith(b"MAIL"))
         assert any(message_id.encode() in line for line in seen)
+        assert b"..leading dot\r\n" in seen and b"..\r\n" in seen
 
-    def test_real_smtplib_losing_the_connection_after_the_body_may_have_delivered(self, monkeypatch):
+    @pytest.mark.parametrize(("drop", "delivery_unknown"), [("before-354", False), ("after-body", True)])
+    def test_real_smtplib_losing_the_connection_may_have_delivered_only_after_the_354(
+        self, monkeypatch, drop, delivery_unknown
+    ):
         monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
         monkeypatch.setattr(mail_smtp.network, "resolve_private_addresses", lambda host: (["10.0.0.5"], None))
 
-        peer = _Peer(monkeypatch, functools.partial(_serve_smtp, [], drop_after_body=True))
+        peer = _Peer(monkeypatch, functools.partial(_serve_smtp, [], drop=drop))
         with pytest.raises(MailError) as caught:
             _smtp(tls=False).send(_message())
         peer.join()
 
         assert caught.value.kind is MailFailure.CONNECTION_LOST
-        assert caught.value.delivery_unknown
+        assert caught.value.delivery_unknown is delivery_unknown
 
 
-def _serve_smtp(seen: list[bytes], f, *, drop_after_body: bool) -> None:
-    """A minimal SMTP peer offering SIZE; with ``drop_after_body`` it hangs up instead of answering the body."""
+def _serve_smtp(seen: list[bytes], f, *, drop: Literal["before-354", "after-body"] | None) -> None:
+    """A minimal SMTP peer offering SIZE; ``drop`` makes it hang up instead of answering ``DATA`` or the body."""
     f.write(b"220 hi\r\n")
     f.flush()
     while line := f.readline():
@@ -1075,11 +1093,13 @@ def _serve_smtp(seen: list[bytes], f, *, drop_after_body: bool) -> None:
         if verb == b"EHLO":
             f.write(b"250-localhost\r\n250 SIZE 100000\r\n")
         elif verb == b"DATA":
+            if drop == "before-354":
+                return
             f.write(b"354 go\r\n")
             f.flush()
             while (body := f.readline()) != b".\r\n":
                 seen.append(body)
-            if drop_after_body:
+            if drop == "after-body":
                 return
             f.write(b"250 queued\r\n")
         elif verb == b"QUIT":
@@ -1089,12 +1109,6 @@ def _serve_smtp(seen: list[bytes], f, *, drop_after_body: bool) -> None:
         else:
             f.write(b"250 ok\r\n")
         f.flush()
-
-    def test_success_logs_no_personal_data(self, caplog):
-        with caplog.at_level(logging.DEBUG):
-            _smtp().send(_message(subject="Top secret subject"))
-
-        assert ADDRESS not in caplog.text and "Top secret subject" not in caplog.text
 
 
 class TestResolvePrivateAddresses:
