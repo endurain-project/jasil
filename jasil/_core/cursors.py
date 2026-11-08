@@ -42,7 +42,7 @@ def decode_cursor(cursor: str, *, name: str) -> tuple[datetime, str]:
         name: What the cursor pages through, for the error message.
 
     Returns:
-        ``(timestamp, id)``, the timestamp timezone-aware.
+        ``(timestamp, id)``, the timestamp timezone-aware and in UTC.
 
     Raises:
         ValueError: When ``cursor`` is not one this module produced.
@@ -58,6 +58,6 @@ def decode_cursor(cursor: str, *, name: str) -> tuple[datetime, str]:
         moment = datetime.fromisoformat(values[0])
         if moment.tzinfo is None or not values[1]:
             raise ValueError
-        return moment, values[1]
-    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as error:
+        return as_utc(moment), values[1]
+    except (ValueError, TypeError, OverflowError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as error:
         raise ValueError(f"invalid {name} cursor") from error
