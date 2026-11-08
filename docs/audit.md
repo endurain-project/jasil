@@ -216,6 +216,12 @@ scope's rows, is the host's to decide. It is an id like `actor_id`: at most 64 c
 never a name or other personal data. Leave it `None` where the host has no partitions, or for work that belongs to
 none.
 
+A durable handler takes its scope from the event that queued it: publish with
+`metadata={jasil.events.META_SCOPE: str(workspace.id)}` and the handler's audit context carries it (see
+[Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)). The publisher does not copy the publishing request's
+scope into the event; name it where the event is published. `new_event`, and so every publish, refuses a value that
+is not a string or an audit row could not store.
+
 ## Storage
 
 | Table | Holds |

@@ -73,8 +73,9 @@ The runner opens two scopes around every handler, closed however the handler
 ends (returning, raising, deferring, continuing, or the worker losing its claim):
 
 - **Audit context:** `actor_type=system`, `source=worker`, `event_id` set to the
-  event that queued the job, and every other field empty. An audit row staged in
-  the handler is attributed to that event instead of to an anonymous API call.
+  event that queued the job, `scope` set to the event's `META_SCOPE` metadata
+  (see [Scope](audit.md#scope)), and every other field empty. An audit row staged
+  in the handler is attributed to that event instead of to an anonymous API call.
 - **Correlation id:** the `request_id` the event carried in its metadata, or
   `None` when it carried none. Audit rows and events written in the handler carry
   the id of the request that started the chain.
@@ -82,7 +83,7 @@ ends (returning, raising, deferring, continuing, or the worker losing its claim)
 Both scopes win over an installed provider and over `set_context` /
 `set_correlation_id`, which know nothing about the request a queued job came
 from. A handler that knows who it acts for opens its own block on top; it keeps
-`source` and `event_id`:
+`source`, `event_id` and `scope`:
 
 ```python
 import jasil.audit as jasil_audit

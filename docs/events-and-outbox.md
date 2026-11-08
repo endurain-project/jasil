@@ -34,10 +34,14 @@ The envelope is frozen. Handlers share one instance, so a mutation would be
 visible to every other handler.
 
 Event types and payload shapes are **owned by the publishing domain**, not
-defined here. JASIL only knows the envelope. The one metadata key it defines is
-`META_REQUEST_ID`; everything else in `metadata` is yours to name. Its value is
-a string or absent: `new_event` (and so every publish) raises `TypeError` for
-anything else, because a durable handler runs under it as its correlation id.
+defined here. JASIL only knows the envelope. The metadata keys it defines are
+`META_REQUEST_ID` and `META_SCOPE`; everything else in `metadata` is yours to
+name. Each value is a string or absent: `new_event` (and so every publish)
+raises `TypeError` for anything else, because a durable handler runs under the
+first as its correlation id and the second as its [audit scope](audit.md#scope).
+A `META_SCOPE` longer than 64 characters or holding a NUL character raises
+`ValueError`. The publisher stamps the ambient request id for you; it never sets
+`META_SCOPE`.
 
 ### What not to put in one
 

@@ -18,7 +18,7 @@ import jasil.audit as jasil_audit
 import jasil.correlation as correlation
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
-from jasil.events import META_REQUEST_ID, new_event
+from jasil.events import META_REQUEST_ID, META_SCOPE, new_event
 from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
@@ -201,6 +201,30 @@ class TestJobRunner:
         runner.run_once()
 
         assert seen[0][1] == "req-7"
+
+    def test_the_handler_context_carries_the_scope_its_event_named(self, runner, registry, db):
+        seen = self._record_context(registry)
+        event = new_event("activity.created", {"id": 1}, source="test", metadata={META_SCOPE: "ws-1"})
+        jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        assert seen[0][0] == jasil_audit.AuditContext(
+            actor_type="system", source="worker", event_id=event.event_id, scope="ws-1"
+        )
+
+    def test_a_scope_an_audit_row_could_not_store_fails_the_attempt(self, runner, registry, db):
+        """Only an envelope built without new_event can carry one; the handler must not run unscoped."""
+        seen = self._record_context(registry)
+        event = new_event("activity.created", {"id": 1}, source="test")
+        event.metadata[META_SCOPE] = "x" * 65
+        job_id = jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        db.expire_all()
+        assert seen == []
+        assert "scope is 65 characters" in db.get(ProcessingJob, job_id).last_error
 
     def test_a_job_without_a_request_id_runs_with_none(self, runner, registry, db):
         """A worker thread's leftover id or a request-scoped provider must not be stamped on the handler's rows."""

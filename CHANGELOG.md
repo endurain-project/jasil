@@ -12,6 +12,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 - **An opaque, host-defined `scope` on audit rows.** `AuditContext.scope` names the partition a row belongs to (an organisation, workspace, project or customer id). It is checked like the other ids (at most 64 characters, no NUL character), stored in the new `jasil_audit_log.scope` column with an index on `(scope, occurred_at)`, returned as `AuditEntry.scope` and matched by `AuditFilters.scope`. JASIL never parses it or uses it to authorize anything. See [Scope](docs/audit.md#scope). ([#39](https://github.com/endurain-project/jasil/issues/39))
 - **Checkpoints cover `scope`.** A checkpoint records the format it was sealed in, in the new `jasil_audit_checkpoints.format_version`. Format 2, which this release seals, hashes `scope` with the rest of the row. Format 1, which every earlier checkpoint is, hashes the row without it. `verify_checkpoints` hashes each window in its own format, so windows sealed before the upgrade keep verifying. The format is part of what a checkpoint signs, and the external sink's copy records it as `v`. See [Tamper evidence](docs/audit.md#tamper-evidence).
+- **`jasil.events.META_SCOPE`.** A durable handler's audit context takes its `scope` from this event-metadata key (`"scope"`), as it takes the correlation id from `META_REQUEST_ID`. `new_event`, and so every publish, raises `TypeError` for a value that is neither a string nor `None`, and `ValueError` for one longer than 64 characters or holding a NUL character. The publisher does not set it. See [Durable jobs](docs/durable-jobs.md#the-context-a-handler-runs-in).
 
 ### Changed
 
@@ -20,6 +21,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 ### Upgrading
 
 - Run migration `rev0011`. It adds `jasil_audit_log.scope` and its index, and `jasil_audit_checkpoints.format_version`, which is 1 for every checkpoint already sealed. On PostgreSQL the index is built partition by partition, `CONCURRENTLY`, after the columns commit, so audit writes continue; a script rendered with `--sql` builds it with one plain `CREATE INDEX`, which blocks writes to the log while it runs. Processes of the previous release keep working during a rolling deploy: their rows have no scope, and the checkpoints their maintenance seals are format 1, which verify but do not cover `scope`. Downgrading drops both columns and every `scope` with them, and windows sealed in format 2 then report `row_mismatch`. See [Audit trail](docs/audit.md#upgrading).
+- If your events already carry a `"scope"` metadata key, it now has to be a string of at most 64 characters with no NUL character, or `None`, and durable handlers stamp it on their audit rows. Rename your key if it means something else.
 
 ## [0.18.0] - 2026-11-08
 
