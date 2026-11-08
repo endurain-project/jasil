@@ -9,6 +9,7 @@ Two behaviours matter most and are easy to regress:
   subscriber's reconciliation net.
 """
 
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -196,6 +197,20 @@ class TestCorrelation:
         publisher.publish("activity.created", {}, source="test")
 
         assert META_REQUEST_ID not in platform.events.published[0].metadata
+
+    @pytest.mark.parametrize("returned", [uuid.UUID(int=1), 7], ids=["uuid", "int"])
+    def test_a_provider_returning_a_non_string_is_no_id_and_the_event_still_publishes(self, platform, caplog, returned):
+        correlation.configure_provider(lambda: returned)
+
+        with caplog.at_level("WARNING"):
+            assert correlation.get_correlation_id() is None
+            assert correlation.get_correlation_id() is None
+        event_id = publisher.publish("activity.created", {}, source="test")
+
+        assert event_id is not None
+        assert META_REQUEST_ID not in platform.events.published[0].metadata
+        assert caplog.text.count(type(returned).__name__) == 1
+        assert str(returned) not in caplog.text
 
 
 class TestDisabledEventBus:
