@@ -44,25 +44,41 @@ def shutdown() -> None:
     wrong, and a failure to release a connection must not mask it; each step
     logs and continues instead.
 
+    When the worker's thread does not stop in time because a handler is still
+    running, the platform that handler uses is left open and published, and a
+    warning is logged. Exiting the process releases it, as does calling this
+    again once the handler has returned.
+
     Returns:
         None.
     """
-    _stop_job_worker()
+    if not _stop_job_worker():
+        # A handler is still running on the worker thread, and it uses the platform: closing or unpublishing it
+        # now would fail that handler and cost its job an attempt. Exiting the process releases it, and so does
+        # a later call once the worker has stopped.
+        logger.warning("The durable-job worker did not stop in time; the platform stays open for its running handler")
+        return
     _close_platform()
     platform_runtime.reset()
 
 
-def _stop_job_worker() -> None:
-    """Stop the in-process durable-job worker, if this deployment has one."""
+def _stop_job_worker() -> bool:
+    """Stop the in-process durable-job worker, if this deployment has one.
+
+    Returns:
+        False when the worker's thread is still running a handler after its stop
+        timed out; True otherwise, including when stopping it raised.
+    """
     try:
         import jasil.jobs.service as jobs_service
     except ImportError:
         # The jobs layer cannot be imported at all (a partial install), so no worker can be running.
-        return
+        return True
     try:
-        jobs_service.stop_job_worker()
+        return jobs_service.stop_job_worker()
     except Exception as error:
         logger.warning("Failed to stop the durable-job worker during shutdown: %r", error)
+        return True
 
 
 def _close_platform() -> None:

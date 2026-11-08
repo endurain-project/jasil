@@ -239,6 +239,7 @@ class TestBackgroundWorker:
         assert worker._runner.ran.wait(timeout=WAIT_TIMEOUT)
 
     def test_a_timed_out_thread_is_retained_and_cannot_be_overlapped(self):
+        """Starting while it finishes its handler raises: it is about to exit, so returning would leave no worker."""
         runner = BlockingRunner()
         worker = BackgroundWorker(runner, poll_interval_seconds=0)
         worker.start()
@@ -247,7 +248,8 @@ class TestBackgroundWorker:
 
         assert worker.stop(timeout=0.01) is False
         assert worker._thread is original
-        worker.start()
+        with pytest.raises(RuntimeError, match="still stopping"):
+            worker.start()
         assert worker._thread is original
 
         runner.release.set()
