@@ -88,7 +88,10 @@ small test doubles can depend on only the slice they use:
 `s3://<bucket>[/prefix]` takes two optional query parameters: `region`, and
 `endpoint_url` for an S3-compatible store (MinIO, R2, Ceph). `endpoint_url` must be
 `https://`, or `http://` to a host that resolves only to private addresses:
-request signatures, objects and presigned URLs cross that connection. The client
+request signatures, objects and presigned URLs cross that connection. When the
+URI gives none, an endpoint boto3 takes from `AWS_ENDPOINT_URL`,
+`AWS_ENDPOINT_URL_S3` or the AWS config file is held to the same rule. The host
+is checked once, when the backend is built, and not again for each request. The client
 waits at most 10 seconds to connect and 60 seconds for each read.
 
 ```python

@@ -226,6 +226,21 @@ class TestFromUri:
         with pytest.raises(ValueError, match="private"):
             S3Storage.from_uri("s3://my-bucket?endpoint_url=http://s3.example.com")
 
+    @pytest.mark.parametrize("variable", ["AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3"])
+    def test_a_cleartext_endpoint_from_the_aws_configuration_is_held_to_the_same_rule(self, monkeypatch, variable):
+        """botocore also takes the endpoint from the environment or the AWS config file, not only from the URI."""
+        _resolve_to(monkeypatch, "93.184.216.34")
+        monkeypatch.setenv(variable, "http://s3.example.com")
+
+        with pytest.raises(ValueError, match="private"):
+            S3Storage.from_uri("s3://my-bucket")
+
+    def test_a_cleartext_endpoint_from_the_aws_configuration_on_a_private_network_is_accepted(self, monkeypatch):
+        _resolve_to(monkeypatch, "10.0.0.5")
+        monkeypatch.setenv("AWS_ENDPOINT_URL_S3", "http://minio:9000")
+
+        assert S3Storage.from_uri("s3://my-bucket")._client.meta.endpoint_url == "http://minio:9000"
+
     @pytest.mark.parametrize("endpoint", ["ftp://minio.test", "minio.test", "https://"])
     def test_an_endpoint_that_is_not_an_http_url_is_refused(self, endpoint):
         with pytest.raises(ValueError, match="endpoint_url"):
