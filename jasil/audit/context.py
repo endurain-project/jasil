@@ -68,6 +68,18 @@ class Source(StrEnum):
 
 @dataclass(frozen=True)
 class AuditContext:
+_TEXT_FIELDS = (
+    "actor_id",
+    "credential_type",
+    "credential_id",
+    "on_behalf_of_id",
+    "ip_address",
+    "user_agent",
+    "event_id",
+    "scope",
+)
+
+
     """Who is acting, and from where. Every field is optional; the defaults describe an anonymous API call.
 
     Attributes:
@@ -103,10 +115,15 @@ class AuditContext:
         Raises:
             ValueError: When ``actor_type`` or ``source`` is not a known value, or an id exceeds its column or contains a NUL character.
         """
+            TypeError: When a text field is neither a ``str`` nor ``None``.
         object.__setattr__(self, "actor_type", ActorType(self.actor_type))
         object.__setattr__(self, "source", Source(self.source))
         # A NUL cannot be stored in PostgreSQL text; a client controls these two, so they are repaired, not refused.
         for name, limit in (("user_agent", MAX_USER_AGENT_LENGTH), ("ip_address", MAX_IP_ADDRESS_LENGTH)):
+        for name in _TEXT_FIELDS:
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"audit context {name} must be a str, not {type(value).__name__}")
             value = getattr(self, name)
             object.__setattr__(self, name, fit_length(value.replace("\x00", "\ufffd") if value else value, limit))
         for name, limit in (

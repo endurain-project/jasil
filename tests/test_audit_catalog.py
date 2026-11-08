@@ -279,6 +279,28 @@ class TestContext:
         with pytest.raises(ValueError, match=message):
             AuditContext(scope=scope)
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "actor_id",
+            "credential_type",
+            "credential_id",
+            "on_behalf_of_id",
+            "event_id",
+            "scope",
+            "user_agent",
+            "ip_address",
+        ],
+    )
+    @pytest.mark.parametrize("value", [1, {"id": 1}, ["a"], b"x"])
+    def test_a_text_field_that_is_not_a_str_is_rejected_without_echoing_it(self, name, value):
+        with pytest.raises(
+            TypeError, match=f"audit context {name} must be a str, not {type(value).__name__}"
+        ) as raised:
+            AuditContext(**{name: value})
+
+        assert repr(value) not in str(raised.value)
+
     def test_a_failing_provider_is_logged_by_type(self, caplog):
         """Rows would otherwise be attributed to an anonymous actor with no trace of why."""
 

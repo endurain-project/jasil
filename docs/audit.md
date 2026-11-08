@@ -179,6 +179,8 @@ registers only JASIL's own actions.
 | `event_id` | The domain event being handled, when running in a handler |
 | `scope` | The host's partition key: see [Scope](#scope) |
 
+The text fields must be a `str` or `None`; anything else raises `TypeError`.
+
 `request_id` is not part of it: it is always read from [`jasil.correlation`](configuration.md#correlation-ids), so
 there is one source of truth.
 
