@@ -124,6 +124,7 @@ class TestTransactionalWrite:
                 ip_address="203.0.113.5",
                 user_agent="pytest",
                 event_id="evt-1",
+                scope="ws-1",
             )
         )
 
@@ -153,7 +154,7 @@ class TestTransactionalWrite:
             "9",
         )
         assert (row.target_type, row.target_id, row.target_owner_id) == ("user", "7", "7")
-        assert (row.request_id, row.event_id, row.source) == ("req-1", "evt-1", "api")
+        assert (row.request_id, row.event_id, row.source, row.scope) == ("req-1", "evt-1", "api", "ws-1")
         assert (row.ip_address, row.user_agent) == ("203.0.113.5", "pytest")
         assert (row.details, row.details_version) == ({"fields": ["email"]}, 3)
         assert (row.app_name, row.app_version) == ("shop", "1.2.3")

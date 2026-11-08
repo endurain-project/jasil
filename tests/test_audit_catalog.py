@@ -269,6 +269,16 @@ class TestContext:
         with pytest.raises(ValueError, match="credential_type is 51 characters"):
             AuditContext(credential_type="x" * 51)
 
+    def test_a_scope_is_kept_verbatim(self):
+        assert AuditContext(scope="Workspace 7/eu").scope == "Workspace 7/eu"
+
+    @pytest.mark.parametrize(
+        ("scope", "message"), [("x" * 65, "scope is 65 characters"), ("ws\x001", "scope must not contain a NUL")]
+    )
+    def test_a_scope_is_checked_like_the_other_ids(self, scope, message):
+        with pytest.raises(ValueError, match=message):
+            AuditContext(scope=scope)
+
     def test_a_failing_provider_is_logged_by_type(self, caplog):
         """Rows would otherwise be attributed to an anonymous actor with no trace of why."""
 

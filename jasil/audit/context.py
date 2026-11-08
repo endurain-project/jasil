@@ -82,6 +82,8 @@ class AuditContext:
         user_agent: The client's ``User-Agent``. Clipped to :data:`MAX_USER_AGENT_LENGTH`
             characters, with a trailing ``...`` marking the cut.
         event_id: The domain event that triggered the work, when it runs in a handler.
+        scope: The host's partition key for the work (an organisation, workspace or project id). Opaque:
+            stored, filtered on and covered by checkpoints, never parsed or used to authorize anything.
     """
 
     actor_type: ActorType = ActorType.ANONYMOUS
@@ -93,6 +95,7 @@ class AuditContext:
     ip_address: str | None = None
     user_agent: str | None = None
     event_id: str | None = None
+    scope: str | None = None
 
     def __post_init__(self) -> None:
         """Coerce the enums and clip the client-controlled strings.
@@ -112,6 +115,7 @@ class AuditContext:
             ("credential_id", MAX_AUDIT_ID_LENGTH),
             ("on_behalf_of_id", MAX_AUDIT_ID_LENGTH),
             ("event_id", MAX_EVENT_ID_LENGTH),
+            ("scope", MAX_AUDIT_ID_LENGTH),
         ):
             value = getattr(self, name)
             if value is not None and len(value) > limit:

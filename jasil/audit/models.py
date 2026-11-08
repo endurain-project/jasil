@@ -61,6 +61,8 @@ class AuditLog(Base):
         instance_id: The deployment's id from ``jasil_instance``.
         app_name: The host application's name.
         app_version: The host application's version.
+        scope: The host's partition key (an organisation, workspace or project id). Opaque: JASIL never parses
+            it or uses it to authorize anything.
     """
 
     __tablename__ = "jasil_audit_log"
@@ -71,6 +73,7 @@ class AuditLog(Base):
         Index("idx_jasil_audit_log_actor", "actor_id", "occurred_at"),
         Index("idx_jasil_audit_log_target", "target_type", "target_id"),
         Index("idx_jasil_audit_log_request", "request_id"),
+        Index("idx_jasil_audit_log_scope", "scope", "occurred_at"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -143,6 +146,9 @@ class AuditLog(Base):
     app_version: Mapped[str | None] = mapped_column(
         String(MAX_AUDIT_APP_VERSION_LENGTH), nullable=True, comment="Host application version"
     )
+    scope: Mapped[str | None] = mapped_column(
+        String(MAX_AUDIT_ID_LENGTH), nullable=True, comment="Host-defined partition key; opaque to JASIL"
+    )
 
 
 class AuditActionRecord(Base):
@@ -201,6 +207,8 @@ class AuditCheckpoint(Base):
             accepts as the age past which a window may have been pruned.
         legal_hold: ``audit.legal_hold`` when the window was sealed; a checkpoint sealed under a hold allows
             no prune.
+        format_version: Which columns of each row ``hash`` covers: 1 for windows sealed before ``scope`` existed,
+            2 with it. A release that does not know the column writes 1.
         created_at: When the checkpoint was written.
     """
 
@@ -219,6 +227,9 @@ class AuditCheckpoint(Base):
     key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="Signing-key fingerprint")
     retention_days: Mapped[int] = mapped_column(Integer, nullable=False, comment="Retention when sealed")
     legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, comment="Legal hold when sealed")
+    format_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="Row format the hash covers"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the checkpoint was written"
     )

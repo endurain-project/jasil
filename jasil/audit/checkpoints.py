@@ -14,6 +14,10 @@ grace period exists because ``occurred_at`` is taken when the
 row is staged but the row is only visible once its transaction commits: sealing at the window's end
 would let a slow transaction look like a later insertion.
 
+Each checkpoint records the format it was sealed in, which names the columns its hash covers: format 1
+(sealed before ``scope`` existed, or by an earlier release during a rolling upgrade) and format 2, which adds
+``scope``. Verification hashes every window in its own format, so an upgrade never invalidates the chain.
+
 There is deliberately no per-row hash chain: it would serialize every insert across replicas.
 
 Detection, not prevention: someone who can rewrite the rows *and* the checkpoints *and* holds the
@@ -57,11 +61,13 @@ MAX_WINDOWS_PER_RUN = 1000
 #: The longest range one :func:`verify_checkpoints` call reads; every row in it is hashed in one session.
 MAX_VERIFY_RANGE = timedelta(days=366)
 
-_MESSAGE_PREFIX = "jasil-audit-checkpoint-v1"
 _FETCH_SIZE = 1000
 _EARLIEST = datetime.min.replace(tzinfo=UTC)
 
-_COLUMNS = (
+#: The format new windows are sealed in.
+_FORMAT_VERSION = 2
+
+_FORMAT_1_COLUMNS = (
     "id",
     "occurred_at",
     "action_id",
@@ -88,6 +94,9 @@ _COLUMNS = (
     "app_version",
 )
 
+#: The columns of each row a checkpoint's hash covers, by its ``format_version``, in serialization order.
+_COLUMNS: dict[int, tuple[str, ...]] = {1: _FORMAT_1_COLUMNS, 2: (*_FORMAT_1_COLUMNS, "scope")}
+
 _unsigned_warned = False
 
 
@@ -101,13 +110,14 @@ def _iso(moment: datetime) -> str:
     return as_utc(moment).isoformat(timespec="microseconds")
 
 
-def canonical_row(row: Any) -> bytes:
-    """Serialize one audit row to the bytes that are hashed.
+def canonical_row(row: Any, format_version: int) -> bytes:
+    """Serialize one audit row to the bytes that are hashed in checkpoint format ``format_version``.
 
-    A JSON array of the columns in a fixed order with keys sorted inside ``details``, so the bytes depend
-    on the stored values and on nothing a database or driver may reorder.
+    A JSON array of the format's columns in a fixed order with keys sorted inside ``details``, so the bytes
+    depend on the stored values and on nothing a database or driver may reorder.
     """
-    values = [_iso(row.occurred_at) if name == "occurred_at" else getattr(row, name) for name in _COLUMNS]
+    columns = _COLUMNS[format_version]
+    values = [_iso(row.occurred_at) if name == "occurred_at" else getattr(row, name) for name in columns]
     return json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
@@ -131,21 +141,24 @@ def _window_rows(db: Session, start: datetime, end: datetime) -> Iterator[Any]:
         yield from sorted(group, key=lambda row: row.id)
 
 
-def _digest(db: Session, start: datetime, end: datetime, prev_hash: str | None) -> _Digest:
+def _digest(db: Session, start: datetime, end: datetime, prev_hash: str | None, format_version: int) -> _Digest:
     hasher = hashlib.sha256()
     count = 0
     for row in _window_rows(db, start, end):
-        hasher.update(canonical_row(row) + b"\n")
+        hasher.update(canonical_row(row, format_version) + b"\n")
         count += 1
     hasher.update((prev_hash or "").encode())
     return _Digest(count, hasher.hexdigest())
 
 
 def _message(checkpoint: Any, instance_id: str) -> bytes:
-    """Return the bytes a checkpoint's signature covers: its deployment, window, rows, chain link and retention."""
+    """Return the bytes a checkpoint's signature covers: its format, deployment, window, rows, chain link and retention.
+
+    The prefix names the format, so a signature over a window in one format is never one over it in another.
+    """
     return "|".join(
         (
-            _MESSAGE_PREFIX,
+            f"jasil-audit-checkpoint-v{checkpoint.format_version}",
             instance_id,
             _iso(checkpoint.window_start),
             _iso(checkpoint.window_end),
@@ -224,7 +237,7 @@ def _sink_name(start: datetime, instance_id: str) -> str:
 
 def _sink_payload(checkpoint: Any, instance_id: str) -> bytes:
     document = {
-        "v": 1,
+        "v": checkpoint.format_version,
         "instance_id": instance_id,
         "window_start": _iso(checkpoint.window_start),
         "window_end": _iso(checkpoint.window_end),
@@ -245,8 +258,11 @@ def _sealed(checkpoint: Any, settings: AuditSettings, instance_id: str) -> Any:
     return checkpoint
 
 
-def _recorded_retention(document: bytes | None) -> tuple[int, bool] | None:
-    """Return the ``(retention_days, legal_hold)`` a sink copy records, or ``None`` when it records none."""
+def _recorded_seal(document: bytes | None) -> tuple[int, int, bool] | None:
+    """Return the ``(format_version, retention_days, legal_hold)`` a sink copy records, or ``None`` when it does not.
+
+    A format this release cannot hash is not recorded either: such a copy is not one it can reproduce.
+    """
     if document is None:
         return None
     try:
@@ -255,20 +271,23 @@ def _recorded_retention(document: bytes | None) -> tuple[int, bool] | None:
         return None
     if not isinstance(fields, dict):
         return None
-    retention_days, legal_hold = fields.get("retention_days"), fields.get("legal_hold")
+    format_version, retention_days, legal_hold = fields.get("v"), fields.get("retention_days"), fields.get("legal_hold")
+    if type(format_version) is not int or format_version not in _COLUMNS:
+        return None
     if type(retention_days) is not int or type(legal_hold) is not bool:
         return None
-    return retention_days, legal_hold
+    return format_version, retention_days, legal_hold
 
 
 def _copy_to_sink(sink: AuditSink, checkpoint: Any, settings: AuditSettings, instance_id: str) -> Any:
     """Write ``checkpoint`` to the sink and return the checkpoint to store.
 
     Sealing the same rows gives the same bytes (Ed25519 signatures are deterministic) except for the
-    ``retention_days`` and ``legal_hold`` taken from the settings in force. So when the sink already holds
-    the window, as after a crash between the sink write and the database commit, and the settings have
-    changed since, the window is resealed under the values that copy records: that checkpoint is stored
-    when it reproduces the copy byte for byte, and anything else is a conflict.
+    ``retention_days`` and ``legal_hold`` taken from the settings in force and the format of the release
+    sealing. So when the sink already holds the window, as after a crash between the sink write and the
+    database commit, and the settings or the release have changed since, the window is resealed under the
+    values and in the format that copy records (rehashing its rows when the format differs): that checkpoint
+    is stored when it reproduces the copy byte for byte, and anything else is a conflict.
 
     Raises:
         AuditSinkConflictError: When the sink holds content for the window that this window does not
@@ -282,18 +301,26 @@ def _copy_to_sink(sink: AuditSink, checkpoint: Any, settings: AuditSettings, ins
         return checkpoint
     except AuditSinkConflictError:
         stored = sink.read(name)
-        recorded = _recorded_retention(stored)
+        recorded = _recorded_seal(stored)
         if recorded is None:
             raise
+        format_version, retention_days, legal_hold = recorded
+        digest = _Digest(checkpoint.row_count, checkpoint.hash)
+        if format_version != checkpoint.format_version:
+            with jasil_orm.get_sessionmaker()() as db:
+                digest = _digest(
+                    db, checkpoint.window_start, checkpoint.window_end, checkpoint.prev_hash, format_version
+                )
         resealed = _sealed(
             AuditCheckpoint(
                 window_start=checkpoint.window_start,
                 window_end=checkpoint.window_end,
-                row_count=checkpoint.row_count,
-                hash=checkpoint.hash,
+                row_count=digest.row_count,
+                hash=digest.hash,
                 prev_hash=checkpoint.prev_hash,
-                retention_days=recorded[0],
-                legal_hold=recorded[1],
+                retention_days=retention_days,
+                legal_hold=legal_hold,
+                format_version=format_version,
             ),
             settings,
             instance_id,
@@ -301,8 +328,8 @@ def _copy_to_sink(sink: AuditSink, checkpoint: Any, settings: AuditSettings, ins
         if _sink_payload(resealed, instance_id) != stored:
             raise
         logger.warning(
-            "Audit checkpoint %s was already in the external sink under retention_days=%d, legal_hold=%s; "
-            "storing that copy",
+            "Audit checkpoint %s was already in the external sink in format %d under retention_days=%d, "
+            "legal_hold=%s; storing that copy",
             name,
             *recorded,
         )
@@ -379,7 +406,7 @@ def seal_pending_windows(now: datetime | None = None, settings: AuditSettings | 
         if end + grace > now:
             break
         with sessionmaker() as db:
-            digest = _digest(db, start, end, prev_hash)
+            digest = _digest(db, start, end, prev_hash, _FORMAT_VERSION)
         checkpoint = _sealed(
             AuditCheckpoint(
                 window_start=start,
@@ -389,6 +416,7 @@ def seal_pending_windows(now: datetime | None = None, settings: AuditSettings | 
                 prev_hash=prev_hash,
                 retention_days=settings.retention_days,
                 legal_hold=settings.legal_hold,
+                format_version=_FORMAT_VERSION,
             ),
             settings,
             instance_id,
@@ -529,10 +557,18 @@ def verify_checkpoints(
             if previous is not None and as_utc(previous.window_end) != start:
                 results.append(_missing(as_utc(previous.window_end), start))
             expected_prev = previous.hash if previous is not None else None
-            digest = _digest(db, start, end, checkpoint.prev_hash)
-            rows_match = digest.row_count == checkpoint.row_count and digest.hash == checkpoint.hash
+            # A format this release cannot hash (a rewritten checkpoint) cannot be shown to match its rows.
+            digest = (
+                _digest(db, start, end, checkpoint.prev_hash, checkpoint.format_version)
+                if checkpoint.format_version in _COLUMNS
+                else None
+            )
+            rows_match = (
+                digest is not None and digest.row_count == checkpoint.row_count and digest.hash == checkpoint.hash
+            )
             pruned = (
-                not rows_match
+                digest is not None
+                and not rows_match
                 and digest.row_count == 0
                 and checkpoint.row_count > 0
                 and horizon is not None
@@ -552,7 +588,7 @@ def verify_checkpoints(
                     status=status,
                     pruned=pruned,
                     expected_rows=checkpoint.row_count,
-                    actual_rows=None if pruned else digest.row_count,
+                    actual_rows=None if pruned or digest is None else digest.row_count,
                 )
             )
             previous = checkpoint

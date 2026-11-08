@@ -8,6 +8,19 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **An opaque, host-defined `scope` on audit rows.** `AuditContext.scope` names the partition a row belongs to (an organisation, workspace, project or customer id). It is checked like the other ids (at most 64 characters, no NUL character), stored in the new `jasil_audit_log.scope` column with an index on `(scope, occurred_at)`, returned as `AuditEntry.scope` and matched by `AuditFilters.scope`. JASIL never parses it or uses it to authorize anything. See [Scope](docs/audit.md#scope). ([#39](https://github.com/endurain-project/jasil/issues/39))
+- **Checkpoints cover `scope`.** A checkpoint records the format it was sealed in, in the new `jasil_audit_checkpoints.format_version`. Format 2, which this release seals, hashes `scope` with the rest of the row. Format 1, which every earlier checkpoint is, hashes the row without it. `verify_checkpoints` hashes each window in its own format, so windows sealed before the upgrade keep verifying. The format is part of what a checkpoint signs, and the external sink's copy records it as `v`. See [Tamper evidence](docs/audit.md#tamper-evidence).
+
+### Changed
+
+- New checkpoints are sealed in format 2, so the hash of a window holding the same rows differs from what 0.18 sealed, and the external sink's copies carry `"v": 2`. A tool that recomputes hashes or checks signatures outside JASIL must hash `scope` as the last column and use the message prefix `jasil-audit-checkpoint-v2` for format 2 windows.
+
+### Upgrading
+
+- Run migration `rev0011`. It adds `jasil_audit_log.scope` and its index, and `jasil_audit_checkpoints.format_version`, which is 1 for every checkpoint already sealed. On PostgreSQL the index is built partition by partition, `CONCURRENTLY`, after the columns commit, so audit writes continue; a script rendered with `--sql` builds it with one plain `CREATE INDEX`, which blocks writes to the log while it runs. Processes of the previous release keep working during a rolling deploy: their rows have no scope, and the checkpoints their maintenance seals are format 1, which verify but do not cover `scope`. Downgrading drops both columns and every `scope` with them, and windows sealed in format 2 then report `row_mismatch`. See [Audit trail](docs/audit.md#upgrading).
+
 ## [0.18.0] - 2026-11-08
 
 This release gives the host control over each mail message and tells it what happened when a send fails: a message can set its own sender, `Message-ID` and one-click unsubscribe, and a `MailError` names the step that failed and whether the message may still have been delivered. JASIL also works with a host that routes several databases through `sessionmaker(binds=...)`, and a durable-job worker that does not stop in time no longer has its platform closed under it. Four security issues are fixed, in local storage, SMTP, S3 and geocoding. No migration is added, but three of the security fixes refuse a configuration or key that was accepted before, and restarting a worker that is still stopping now raises; see **Upgrading**.

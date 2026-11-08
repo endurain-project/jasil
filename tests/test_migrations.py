@@ -480,6 +480,110 @@ class TestInstanceRowSeed:
         assert "jasil_instance" not in config.output_buffer.getvalue()
 
 
+class TestAuditScope:
+    """rev0011 adds ``scope`` to the audit log and the format a checkpoint was sealed in."""
+
+    @staticmethod
+    def _columns(engine, table: str) -> set[str]:
+        return {column["name"] for column in inspect(engine).get_columns(table)}
+
+    def test_the_upgrade_adds_the_columns_and_the_index(self, engine):
+        migrations.upgrade(engine)
+
+        assert "scope" in self._columns(engine, "jasil_audit_log")
+        assert "format_version" in self._columns(engine, "jasil_audit_checkpoints")
+        index = next(
+            i for i in inspect(engine).get_indexes("jasil_audit_log") if i["name"] == "idx_jasil_audit_log_scope"
+        )
+        assert index["column_names"] == ["scope", "occurred_at"]
+
+    def test_checkpoints_sealed_before_it_are_format_1(self, engine):
+        migrations.upgrade(engine, "rev0010")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO jasil_audit_checkpoints "
+                    "(window_start, window_end, row_count, hash, retention_days, legal_hold) "
+                    "VALUES ('2026-01-01 12:00:00', '2026-01-01 12:15:00', 0, :hash, 90, :hold)"
+                ),
+                {"hash": "0" * 64, "hold": False},
+            )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT format_version FROM jasil_audit_checkpoints")).scalars().all() == [1]
+
+    @staticmethod
+    def _scope_index_state(engine) -> tuple[bool, set[str]]:
+        """Whether the parent's index is valid, and the partitions that still have no index attached to it."""
+        with engine.connect() as connection:
+            valid = connection.execute(
+                text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_jasil_audit_log_scope')")
+            ).scalar_one()
+            missing = connection.execute(
+                text(
+                    "SELECT member.relname FROM pg_inherits AS link JOIN pg_class AS member ON member.oid = link.inhrelid"
+                    " WHERE link.inhparent = to_regclass('jasil_audit_log') AND NOT EXISTS ("
+                    "  SELECT 1 FROM pg_inherits AS attached JOIN pg_index AS built"
+                    "  ON built.indexrelid = attached.inhrelid"
+                    "  WHERE attached.inhparent = to_regclass('idx_jasil_audit_log_scope')"
+                    "  AND built.indrelid = link.inhrelid)"
+                )
+            ).scalars()
+            return valid, set(missing)
+
+    def test_on_postgresql_every_partition_is_indexed_and_the_parent_index_is_valid(self, engine):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("partitioned indexes are PostgreSQL-only")
+
+        migrations.upgrade(engine)
+
+        assert self._scope_index_state(engine) == (True, set())
+        with engine.begin() as connection:
+            connection.execute(text("SELECT jasil_audit_ensure_partitions(30)"))
+        assert self._scope_index_state(engine) == (True, set())
+
+    def test_on_postgresql_a_build_that_failed_part_way_is_resumed(self, engine):
+        """The columns committed and one partition was indexed before the run failed; the next run finishes it."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("partitioned indexes are PostgreSQL-only")
+        migrations.upgrade(engine, "rev0010")
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE jasil_audit_log ADD COLUMN scope VARCHAR(64)"))
+            connection.execute(
+                text("ALTER TABLE jasil_audit_checkpoints ADD COLUMN format_version INTEGER DEFAULT 1 NOT NULL")
+            )
+            connection.execute(
+                text("CREATE INDEX idx_jasil_audit_log_scope ON ONLY jasil_audit_log (scope, occurred_at)")
+            )
+            first = connection.execute(
+                text(
+                    "SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'jasil_audit_log'::regclass LIMIT 1"
+                )
+            ).scalar_one()
+            connection.execute(text(f"CREATE INDEX {first}_scope_occurred_at_idx ON {first} (scope, occurred_at)"))
+            connection.execute(
+                text(f"ALTER INDEX idx_jasil_audit_log_scope ATTACH PARTITION {first}_scope_occurred_at_idx")
+            )
+        assert self._scope_index_state(engine)[0] is False
+
+        migrations.upgrade(engine)
+
+        assert self._scope_index_state(engine) == (True, set())
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_the_downgrade_removes_them(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0010")
+
+        assert "scope" not in self._columns(engine, "jasil_audit_log")
+        assert "format_version" not in self._columns(engine, "jasil_audit_checkpoints")
+        assert "idx_jasil_audit_log_scope" not in _indexes(engine)["jasil_audit_log"]
+        assert migrations.db_revision(engine) == "rev0010"
+
+
 class TestRevisionTransactions:
     """Each revision commits on its own, so no lock one takes is held through the next."""
 

@@ -449,6 +449,7 @@ def _prepare(record: AuditRecord, settings: AuditSettings) -> AuditEntry:
         details_version=action.details_model.SCHEMA_VERSION,
         app_name=settings.app_name,
         app_version=settings.app_version,
+        scope=context.scope,
     )
     return entry
 
