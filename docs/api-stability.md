@@ -167,8 +167,10 @@ covered there.
 
 ### Internal helpers
 
-Functions in `jasil.jobs.crud` and `jasil.event_log.crud`. They are importable,
-but they exist to serve the layers above and their signatures follow those needs.
+Functions in `jasil.jobs.crud` and `jasil.event_log.crud`. They are importable
+once `jasil.orm.map_models` has run (see
+[Configuration](configuration.md#host-integration)), but they exist to serve the layers
+above and their signatures follow those needs.
 Use `jasil.admin` for the dashboard aggregates and dead-letter replay.
 
 ### The capability report

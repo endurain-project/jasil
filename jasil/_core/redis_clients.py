@@ -7,7 +7,7 @@ classes exposed through the module-level :func:`__getattr__`). The platform
 borrow a shared client from :func:`get_shared_client`; because nothing here
 touches ``redis`` until a ``redis://`` URI is actually resolved, a ``local``
 deployment (or one where ``redis`` is not installed — it is the optional
-``distributed`` extra) loads zero Redis.
+``redis`` extra) loads zero Redis.
 
 ``get_shared_client`` memoizes clients so the process owns *one* connection per
 distinct ``(uri, decode_responses)`` pair: in the common case (a single Redis URL
@@ -137,7 +137,7 @@ def create_redis_client(
     Raises:
         RuntimeError: When Redis cannot be initialized.
     """
-    # Imported lazily: ``redis`` is the optional ``distributed`` extra, so this
+    # Imported lazily: ``redis`` is the optional ``redis`` extra, so this
     # is the single point where the package is actually loaded and only on the
     # Redis code path.
     try:

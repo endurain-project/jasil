@@ -93,8 +93,8 @@ because you installed it.
 
 The [audit trail](audit.md). Unlike the two above it defaults to **on**, because it writes nothing until the host
 calls `stage` or `record_detached`. Numeric values are checked when the object is built (a bad one raises
-`ValueError`); `external_sink_uri` is checked when `build_platform` constructs the audit sink, and `signing_key` when
-checkpoint maintenance seals a window, so an invalid key makes that maintenance step fail and be logged.
+`ValueError`), and so is `signing_key`; `external_sink_uri` is checked when `build_platform` constructs the audit
+sink.
 
 | Field | Default | Meaning |
 |---|---|---|

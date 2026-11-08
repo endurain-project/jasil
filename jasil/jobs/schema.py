@@ -184,9 +184,9 @@ class JobAttemptInfo(BaseModel):
         claimed_at: When the worker took the lease.
         started_at: When the handler began; ``None`` if it never ran.
         finished_at: When the attempt ended; ``None`` while it is open.
-        outcome: One of ``completed``, ``failed``, ``deferred``, ``dead_letter``,
-            ``lease_expired``, ``superseded``, ``released``, ``abandoned``;
-            ``None`` while open.
+        outcome: One of ``completed``, ``failed``, ``deferred``, ``continued``,
+            ``dead_letter``, ``lease_expired``, ``superseded``, ``released``,
+            ``abandoned``; ``None`` while open.
         duration_ms: Handler wall time.
         error: The failure reason, if it failed.
     """
