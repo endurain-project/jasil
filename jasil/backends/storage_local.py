@@ -235,20 +235,21 @@ class LocalStorage:
         self._write_identity(area_file, area)
         self._write_identity(path.parent / _OBJECT_KEY_FILE, key)
 
-    def _names_another_entry(self, path: Path) -> bool:
-        """Whether a flat-layout ``path`` reaches an existing entry whose name is spelled differently.
+    def _names_another_entry(self, area: str, key: str) -> bool:
+        """Whether the flat-layout path of ``area``/``key`` reaches an existing entry whose name is spelled differently.
 
         The plain and legacy layouts map a key straight to a path, and a filesystem that folds letter case or
         Unicode normalization (macOS, Windows), or keeps other names for an entry (Windows short names), opens
-        one file for two keys that S3 keeps apart. Every component of ``path`` that exists must therefore be
-        listed by its parent exactly as requested.
+        one file for two keys that S3 keeps apart. Every component of the path that exists must therefore be
+        listed by its parent exactly as the area and key spell it. The spelling is taken from them, not from a
+        resolved path, which Windows returns in the spelling on disk.
 
         Raises:
             StorageBackendUnavailableError: When a directory cannot be listed.
         """
         try:
             current = self._base.resolve()
-            for name in path.relative_to(current).parts:
+            for name in (area, *key.split("/")):
                 parent, current = current, current / name
                 if not os.path.lexists(current):
                     return False
@@ -269,7 +270,7 @@ class LocalStorage:
 
     def _check_plain_key_conflicts(self, area: str, key: str, path: Path) -> None:
         """Reject spelling and file/directory conflicts across plain and opaque objects."""
-        if self._names_another_entry(path):
+        if self._names_another_entry(area, key):
             raise self._spelling_conflict(area, key)
         area_path = self._resolve_area(area, legacy=True)
         current = area_path
@@ -433,7 +434,7 @@ class LocalStorage:
     def _existing_object_path(self, area: str, key: str) -> Path | None:
         if area in self._plain_areas:
             plain_path = self._resolve_plain(area, key)
-            if self._is_regular_file(plain_path) and not self._names_another_entry(plain_path):
+            if self._is_regular_file(plain_path) and not self._names_another_entry(area, key):
                 return plain_path
         path = self._current_object_path(area, key)
         if path is not None:
@@ -441,7 +442,7 @@ class LocalStorage:
         if area in self._plain_areas or not self._legacy_layout:
             return None
         legacy_path = self._resolve_legacy(area, key)
-        if self._is_regular_file(legacy_path) and not self._names_another_entry(legacy_path):
+        if self._is_regular_file(legacy_path) and not self._names_another_entry(area, key):
             return legacy_path
         return None
 
@@ -450,7 +451,7 @@ class LocalStorage:
             return
         path = self._resolve_legacy(area, key)
         try:
-            if stat.S_ISREG(path.stat().st_mode) and not self._names_another_entry(path):
+            if stat.S_ISREG(path.stat().st_mode) and not self._names_another_entry(area, key):
                 path.unlink()
                 self._prune_empty_directories(path.parent)
         except OSError as error:
@@ -974,7 +975,7 @@ class LocalStorage:
         if area in self._plain_areas:
             plain_path = self._resolve_plain(area, key)
             try:
-                if stat.S_ISREG(plain_path.stat().st_mode) and not self._names_another_entry(plain_path):
+                if stat.S_ISREG(plain_path.stat().st_mode) and not self._names_another_entry(area, key):
                     plain_path.unlink()
                     self._prune_empty_directories(plain_path.parent)
             except (FileNotFoundError, NotADirectoryError):
@@ -996,7 +997,7 @@ class LocalStorage:
             return
         legacy_path = self._resolve_legacy(area, key)
         try:
-            if stat.S_ISREG(legacy_path.stat().st_mode) and not self._names_another_entry(legacy_path):
+            if stat.S_ISREG(legacy_path.stat().st_mode) and not self._names_another_entry(area, key):
                 legacy_path.unlink()
                 self._prune_empty_directories(legacy_path.parent)
         except OSError as error:
@@ -1227,7 +1228,7 @@ class LocalStorage:
         if path is None and area in self._plain_areas:
             path = self._resolve_plain(area, key)
             # The host's web server would serve the existing, differently spelled file for this path.
-            if self._names_another_entry(path):
+            if self._names_another_entry(area, key):
                 raise self._spelling_conflict(area, key)
         elif path is None:
             path = self._resolve(area, key)
