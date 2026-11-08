@@ -17,11 +17,25 @@ What counts as a breaking change — and what does not — is defined in [API st
 ### Changed
 
 - New checkpoints are sealed in format 2, so the hash of a window holding the same rows differs from what 0.18 sealed, and the external sink's copies carry `"v": 2`. A tool that recomputes hashes or checks signatures outside JASIL must hash `scope` as the last column and use the message prefix `jasil-audit-checkpoint-v2` for format 2 windows.
+- **A durable-job worker claims only the subscribers it registered.** A worker that claimed a job it had no handler for failed it on every attempt until it was dead-lettered, as an older worker would during a rolling deploy that adds a subscriber. Such a job now stays pending until a worker that registered its subscriber claims it, and shows as backlog in the jobs summary meanwhile. See [Durable jobs](docs/durable-jobs.md).
+
+### Security
+
+- **A `list_unsubscribe` URL is sent exactly as it was checked.** The header decoded RFC 2047 encoded-words before writing, so a URL holding `=?utf-8?q?...?=` passed the check and went out with a second URL or, on Python before 3.12.5, a line break that starts a new header. On later Pythons the line break made the send raise `HeaderWriteError` after authenticating, with the header in the message.
+- **Concurrent first writes to a plain local storage area can no longer overwrite each other under another spelling.** The spelling check ran before the write, so two keys that differ only in letter case or Unicode normalization (`Alice/x`, `alice/x`) written at the same time on a filesystem that folds them could both pass it and land in one file. A new object is now published with a hard link, which fails when the name exists under any spelling, and the losing write raises `StorageKeyConflictError`. Plain areas therefore need a filesystem with hard links; see **Upgrading**.
+
+### Fixed
+
+- A checkpoint retried after a crash between the external sink write and the database commit, and resealed in the older format its sink copy records, no longer breaks the chain of the window sealed after it in the same run; that window chained onto the hash of the current format, which was never stored, and reported `broken_chain` (signed, it could not be repaired).
+- A local storage `delete`, or a failed write of a new key, racing a save of the same key no longer leaves the saved object unreadable and undeletable: removing an object's identity file now restores it when a concurrent save has installed the object meanwhile.
+- `RedisState.incr` with `ttl_seconds` no longer sets the expiry when Redis refuses the increment (a value that is not an integer, or past the 64-bit range), which deleted a key that never expired; the increment and the expiry run in one Lua script.
 
 ### Upgrading
 
 - Run migration `rev0011`. It adds `jasil_audit_log.scope` and its index, and `jasil_audit_checkpoints.format_version`, which is 1 for every checkpoint already sealed. On PostgreSQL the index is built partition by partition, `CONCURRENTLY`, after the columns commit, so audit writes continue; a script rendered with `--sql` builds it with one plain `CREATE INDEX`, which blocks writes to the log while it runs. Processes of the previous release keep working during a rolling deploy: their rows have no scope, and the checkpoints their maintenance seals are format 1, which verify but do not cover `scope`. Downgrading drops both columns and every `scope` with them, and windows sealed in format 2 then report `row_mismatch`. See [Audit trail](docs/audit.md#upgrading).
 - If your events already carry a `"scope"` metadata key, it now has to be a string of at most 64 characters with no NUL character, or `None`, and durable handlers stamp it on their audit rows. Rename your key if it means something else.
+- A plain local storage area must sit on a filesystem with hard links (APFS, NTFS, ext4, XFS and most others; not FAT or exFAT): a write there now fails with `StorageBackendUnavailableError` otherwise.
+- Register every durable subscriber in every worker process, as before: a job is now claimed only by a worker that registered its subscriber, and waits pending while none runs.
 
 ## [0.18.0] - 2026-11-08
 
