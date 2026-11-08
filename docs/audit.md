@@ -221,8 +221,8 @@ none.
 A durable handler takes its scope from the event that queued it: publish with
 `metadata={jasil.events.META_SCOPE: str(workspace.id)}` and the handler's audit context carries it (see
 [Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)). The publisher does not copy the publishing request's
-scope into the event; name it where the event is published. `new_event`, and so every publish, refuses a value that
-is not a string or an audit row could not store.
+scope into the event; name it where the event is published. `new_event` refuses a value that is not a
+string or an audit row could not store, and `publish()` logs the refusal and returns `None`.
 
 ## Storage
 
@@ -673,12 +673,18 @@ to `jasil_audit_checkpoints`:
   with `--sql` builds it with one plain `CREATE INDEX`, which blocks writes to the log while it runs. On MySQL and
   MariaDB both columns and the index are added with `ALTER TABLE`, which InnoDB runs without blocking inserts.
 - Processes of the previous release keep writing rows without a scope. Their maintenance seals format 1 checkpoints,
-  which verify but do not cover `scope`, so upgrade every process that runs maintenance soon after.
+  which verify but do not cover `scope`, so upgrade every process that runs maintenance soon after. Upgrade the
+  processes that verify checkpoints first, or together with those that seal: a 0.18 verifier hashes without
+  `scope` and checks the format 1 signature prefix, so it reports a format 2 window as `row_mismatch` or a bad
+  signature.
 - Downgrading drops both columns, and every `scope` with them; the previous release then verifies each checkpoint as
   format 1, so windows sealed in format 2 report `row_mismatch`.
 
 On MySQL and MariaDB, migration `rev0012` makes `occurred_at` and the other timestamp columns `DATETIME(6)`. Rebuilding
-the log blocks audit writes while it runs; see [Revision `rev0012`](observability.md#migrations).
+the log blocks audit writes while it runs; see [Revision `rev0012`](observability.md#migrations). Adopting an
+unversioned schema with `adopt_existing_schema` does not compare column precision, so a schema that already had
+`rev0011` and lost its version table is stamped at `rev0012` unconverted: check `DATETIME_PRECISION` and, if it
+is 0, call `migrations.downgrade(engine, "rev0011")` and then `migrations.upgrade(engine)`.
 
 ## For the host's architecture tests
 

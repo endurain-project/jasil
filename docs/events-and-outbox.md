@@ -36,8 +36,8 @@ visible to every other handler.
 Event types and payload shapes are **owned by the publishing domain**, not
 defined here. JASIL only knows the envelope. The metadata keys it defines are
 `META_REQUEST_ID` and `META_SCOPE`; everything else in `metadata` is yours to
-name. Each value is a string or absent: `new_event` (and so every publish)
-raises `TypeError` for anything else, because a durable handler runs under the
+name. Each value is a string or absent: `new_event` raises `TypeError` for anything
+else (`publish()` logs it and returns `None`), because a durable handler runs under the
 first as its correlation id and the second as its [audit scope](audit.md#scope).
 A `META_SCOPE` longer than 64 characters or holding a NUL character raises
 `ValueError`. The publisher stamps the ambient request id for you; it never sets
