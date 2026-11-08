@@ -202,7 +202,7 @@ class TestInsertIgnoringConflict:
 
     @staticmethod
     def _session(dialect: str):
-        return SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
+        return SimpleNamespace(get_bind=lambda _model: SimpleNamespace(dialect=SimpleNamespace(name=dialect)))
 
     @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
     def test_mysql_and_mariadb_ignore_a_duplicate_with_a_no_op_update(self, dialect):
@@ -923,7 +923,7 @@ class TestOutboxRelay:
             EventOutbox,
             {"id": "o", "event_id": "evt-1"},
             conflict_columns=["event_id"],
-            db=SimpleNamespace(bind=SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))),
+            db=SimpleNamespace(get_bind=lambda _model: SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))),
         )
 
         assert "ON CONFLICT (event_id) DO NOTHING" in str(statement.compile(dialect=postgresql.dialect()))

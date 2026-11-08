@@ -323,8 +323,10 @@ def add_observer(observer: Callable[[AuditEntry], None]) -> Callable[[], None]:
 
 
 def engine_of(db: Session) -> "Engine":
-    """Return the engine ``db`` is bound to, also when it is bound to a connection."""
-    bind = db.get_bind()
+    """Return the engine ``db`` routes JASIL's audit tables to, also when it is bound to a connection."""
+    from jasil.audit.models import Instance
+
+    bind = db.get_bind(Instance)
     return bind.engine if isinstance(bind, Connection) else bind
 
 

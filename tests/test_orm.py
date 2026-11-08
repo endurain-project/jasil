@@ -112,10 +112,17 @@ class TestEngineAccess:
         """The advisory-lock backend holds a raw connection and cannot go via a session."""
         assert orm.get_engine() is db_engine
 
+    def test_a_factory_bound_to_a_connection_gives_that_connections_engine(self, db_engine):
+        """The advisory-lock backend opens connections of its own, which a ``Connection`` cannot."""
+        with db_engine.connect() as connection:
+            orm.configure_sessionmaker(sessionmaker(bind=connection))
+
+            assert orm.get_engine() is db_engine
+
     def test_an_unbound_factory_is_rejected_with_guidance(self, pristine_orm):
         pristine_orm.configure_sessionmaker(sessionmaker())
 
-        with pytest.raises(RuntimeError, match="not bound to an engine"):
+        with pytest.raises(RuntimeError, match="gives its tables no engine"):
             pristine_orm.get_engine()
 
     def test_reading_the_engine_before_configuring_raises(self, pristine_orm):

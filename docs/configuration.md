@@ -314,6 +314,14 @@ every change, so all three are supported rather than merely expected to work.
 JASIL never creates the engine — whichever you hand it through
 `configure_sessionmaker` is the one it uses.
 
+A host with several databases can route engines with
+`sessionmaker(binds={Base: engine, OtherBase: other_engine})` instead of one
+`bind=`. JASIL's tables then go to the engine the rules give the base you passed
+to `map_models`, and so do its raw SQL, its dialect checks and the engine the
+`postgres-advisory` lock connects with. Keep them on the database of the domain
+tables that publish events: the outbox row commits atomically with your change
+only when both are in the same database.
+
 What differs between them is handled internally, but two consequences are worth
 knowing:
 

@@ -236,7 +236,7 @@ def claim_jobs(
                 ),
             )
         filters.append(queue_filter)
-    skip_locked = supports_skip_locked(db.bind)
+    skip_locked = supports_skip_locked(db.get_bind(ProcessingJob))
     job_ids = _select_due_ids(filters, queue_cursor=queue_cursor, limit=limit, skip_locked=skip_locked, db=db)
     if not job_ids:
         db.commit()  # end the transaction so FOR UPDATE locks are released
@@ -1031,7 +1031,9 @@ def reclaim_expired_leases(*, now: datetime, db: Session, limit: int = 100) -> i
         .where(ProcessingJob.status == STATUS_CLAIMED, ProcessingJob.lease_expires_at < now)
         .limit(limit)
     )
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+    if supports_skip_locked(
+        db.get_bind(ProcessingJob)
+    ):  # pragma: no cover - server-side locking, not exercised on SQLite
         id_stmt = id_stmt.with_for_update(skip_locked=True)
     job_ids: list[str] = list(db.execute(id_stmt).scalars().all())
     if not job_ids:
