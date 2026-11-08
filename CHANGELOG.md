@@ -10,7 +10,7 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [0.18.0] - 2026-11-08
 
-This release gives the host control over each mail message and tells it what happened when a send fails: a message can set its own sender, `Message-ID` and one-click unsubscribe, and a `MailError` names the step that failed and whether the message may still have been delivered. JASIL also works with a host that routes several databases through `sessionmaker(binds=...)`, and a durable-job worker that does not stop in time no longer has its platform closed under it. Four security issues are fixed, in local storage, SMTP, S3 and geocoding. Nothing is breaking and no migration is added.
+This release gives the host control over each mail message and tells it what happened when a send fails: a message can set its own sender, `Message-ID` and one-click unsubscribe, and a `MailError` names the step that failed and whether the message may still have been delivered. JASIL also works with a host that routes several databases through `sessionmaker(binds=...)`, and a durable-job worker that does not stop in time no longer has its platform closed under it. Four security issues are fixed, in local storage, SMTP, S3 and geocoding. No migration is added, but three of the security fixes refuse a configuration or key that was accepted before, and restarting a worker that is still stopping now raises; see **Upgrading**.
 
 ### Added
 
@@ -42,14 +42,18 @@ This release gives the host control over each mail message and tells it what hap
 
 ### Fixed
 
-- `MemoryState.incr` refuses a stored value, an amount or a result outside the signed 64-bit range with `ValueError`, as Redis does.
+- `MemoryState.incr` and `MemoryState.record_tiered_failure` refuse a stored value, an amount or a result outside the signed 64-bit range with `ValueError`, leaving the counter unchanged, as Redis does.
 - An event payload upgrader receives a copy of the payload, so one that edits its dict in place no longer changes the payload the event's other handlers read.
 - Downgrading past `rev0003` refuses, before renaming anything, when one of the host's tables has one of the old unprefixed names, instead of failing part-way.
 - The `rev0008` upgrade notes for MySQL and MariaDB said processes of the previous release are unaffected. They are not; see **Upgrading**.
 
 ### Upgrading
 
-- Nothing to do from 0.17.0.
+- Three security fixes refuse something 0.17.0 accepted, which [API stability](docs/api-stability.md) lets a security fix do in a minor release. Check each before upgrading:
+    - An S3 endpoint taken from `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` or the AWS config file must be `https://`, or `http://` to a host that resolves only to private addresses; otherwise building the platform raises `ValueError`. Change the endpoint first.
+    - A `+http` geocoder is no longer reached through `HTTP_PROXY`, so it must be reachable directly.
+    - In a plain local storage area on macOS or Windows, a key that differs from an existing one only in letter case or Unicode normalization now raises `StorageKeyConflictError` on write and finds nothing on read. If your keys can differ that way, choose one spelling, for example lowercase.
+- Restart code that calls `start_job_worker()` after a `stop_job_worker()` that returned `False` now gets `RuntimeError` while the old worker finishes its handler; call it again once `stop_job_worker()` returns `True`.
 - Upgrading MySQL or MariaDB from 0.15 or earlier: upgrade every process that runs audit maintenance together with migration `rev0008`. The older maintenance treats the audit log as a plain table, so the new trigger refuses its row `DELETE` on every pass, each time after it has committed an `audit.retention.prune` entry for a prune that did not happen, and it never creates partitions, so inserts fail once the ones `rev0008` created run out (`audit.partition_days_ahead` days, 7 by default) unless a process of 0.16 or later runs maintenance. See [Audit trail](docs/audit.md#upgrading).
 
 ## [0.17.0] - 2026-11-04
