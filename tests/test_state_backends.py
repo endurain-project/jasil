@@ -253,6 +253,14 @@ class TestTieredFailureConformance:
         assert outcome.count == 3
         assert outcome.newly_locked is False
 
+    def test_a_count_past_the_64_bit_range_is_refused_and_left_unchanged(self, state):
+        state.set("counter", str(2**63 - 1).encode())
+
+        with pytest.raises(ValueError):
+            self._record(state)
+
+        assert state.get("counter") == str(2**63 - 1).encode()
+
     def test_the_highest_crossed_tier_wins(self, state):
         """Tiers are ascending and the last match applies, so a caller that
         somehow reaches tier two gets the longer lockout, not the shorter."""

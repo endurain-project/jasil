@@ -172,6 +172,8 @@ class MemoryState:
 
             counter_bytes = self._live_value(counter_key)
             count = (_parse_integer(counter_bytes) if counter_bytes is not None else 0) + 1
+            if count > _INT64_MAX:
+                raise ValueError("increment or decrement would overflow")
             self._data[counter_key] = (str(count).encode(), time.monotonic() + counter_ttl_seconds)
 
             lock_seconds = 0

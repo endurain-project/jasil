@@ -59,8 +59,9 @@ Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
 zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
 Redis it would match every key in the database), and an operation the stored
 value does not support, such as `incr` of a non-integer or, on Redis, a key that
-holds another type. Counters are signed 64-bit integers on both: an `incr` whose
-stored value, amount or result falls outside that range raises `ValueError`.
+holds another type. Counters are signed 64-bit integers on both: an `incr` or
+`record_tiered_failure` whose stored value, amount or result falls outside that
+range raises `ValueError` and leaves the counter unchanged.
 
 ## StorageProvider
 
