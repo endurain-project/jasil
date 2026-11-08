@@ -51,6 +51,8 @@ JASIL never creates the engine; the host owns the connection.
 import importlib
 from typing import Any
 
+from sqlalchemy import Connection
+from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from jasil._core.registry import ConfigSlot
@@ -220,8 +222,10 @@ def configure_sessionmaker(factory: sessionmaker[Session]) -> None:
     """Install the host's session factory.
 
     Call once at startup with a ``sessionmaker`` bound to the application's
-    engine. The event-log recorder, the job runner, the relay, and the retention
-    sweeps all obtain their sessions from it.
+    engine, or one routing several with ``binds=``: JASIL's tables go to the
+    engine its rules give the base passed to :func:`map_models`. The event-log
+    recorder, the job runner, the relay, and the retention sweeps all obtain their
+    sessions from it.
 
     Args:
         factory: A configured ``sessionmaker``.
@@ -244,23 +248,43 @@ def is_sessionmaker_configured() -> bool:
 
 
 def get_engine() -> Any:
-    """Return the engine the session factory is bound to.
+    """Return the engine JASIL's tables are on.
 
-    Needed by the Postgres advisory-lock backend, which holds a dedicated
-    connection for the lifetime of a lock and so cannot work through a session.
+    That is the session factory's ``bind``, or, for a factory that routes engines
+    with ``binds=``, the engine its rules give JASIL's models once
+    :func:`map_models` has mapped them. Needed by the Postgres advisory-lock
+    backend, which holds a dedicated connection for the lifetime of a lock and so
+    cannot work through a session.
 
     Raises:
         RuntimeError: If :func:`configure_sessionmaker` has not been called, or
-            its factory is not bound to an engine.
+            its factory gives JASIL's tables no engine.
     """
-    bind = get_sessionmaker().kw.get("bind")
-    if bind is None:
-        raise RuntimeError(
-            "JASIL's session factory is not bound to an engine. Pass bind= to "
-            "sessionmaker(...) so capabilities needing a raw connection (the "
-            "postgres-advisory lock) can reach it."
-        )
-    return bind
+    factory = get_sessionmaker()
+    mapper = _jasil_mapper()
+    with factory() as session:
+        try:
+            bind = session.get_bind(mapper) if mapper is not None else session.get_bind()
+        except UnboundExecutionError:
+            if mapper is None and factory.kw.get("binds"):
+                # Its binds= rules route by model, and JASIL has no model mapped yet.
+                cause = "routes engines by model and JASIL's are not mapped: call jasil.orm.map_models() first"
+            else:
+                cause = "gives its tables no engine: pass bind= to sessionmaker(...), or a binds= rule for their base"
+            raise RuntimeError(
+                f"JASIL's session factory {cause}, so capabilities needing a raw connection (the postgres-advisory "
+                "lock) can reach it."
+            ) from None
+    return bind.engine if isinstance(bind, Connection) else bind
+
+
+def _jasil_mapper() -> Any:
+    """A mapper of one of JASIL's tables, through which a session's ``binds=`` rules route them; None before
+    :func:`map_models`."""
+    if _active_base is None:
+        return None
+    mappers = _active_base.registry.mappers
+    return next((mapper for mapper in mappers if getattr(mapper.local_table, "name", None) in _TABLE_NAMES), None)
 
 
 def reset() -> None:

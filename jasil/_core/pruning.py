@@ -43,7 +43,7 @@ def bounded_delete(
     total = 0
     for _ in range(PRUNE_MAX_BATCHES):
         id_stmt = select(model.id).where(*conditions).limit(batch_size)
-        if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+        if supports_skip_locked(db.get_bind(model)):  # pragma: no cover - server-side locking, not exercised on SQLite
             # Concurrent prunes step over each other's claimed page rather
             # than blocking on it.
             id_stmt = id_stmt.with_for_update(skip_locked=True)

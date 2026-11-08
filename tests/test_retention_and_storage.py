@@ -1761,6 +1761,136 @@ class TestLocalStorageListingGuards:
         assert storage.list_keys("plain") == ["ok.txt"]
 
 
+def _folds(tmp_path: Path, written: str, other: str) -> bool:
+    """Whether the filesystem under ``tmp_path`` opens ``written`` for the name ``other``."""
+    probe = tmp_path / ".fold-probe"
+    probe.mkdir()
+    (probe / written).write_bytes(b"")
+    try:
+        return (probe / other).exists()
+    finally:
+        (probe / written).unlink()
+        probe.rmdir()
+
+
+class TestLocalStorageNameAliases:
+    """A flat layout maps a key straight to a path, and a filesystem that folds letter case (macOS, Windows) or
+    Unicode normalization (macOS) opens one file for two keys that S3 keeps apart. A key spelled differently from
+    an existing name never reaches it."""
+
+    AREA = "activity_files"
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        if not _folds(tmp_path, "probe", "PROBE"):
+            pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
+        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+        storage.save(self.AREA, "alice/Report.pdf", b"alice")
+        return storage
+
+    def test_a_read_of_another_spelling_finds_nothing(self, storage):
+        assert storage.get(self.AREA, "ALICE/report.PDF") is None
+        assert not storage.exists(self.AREA, "alice/report.pdf")
+        assert storage.stat(self.AREA, "Alice/Report.pdf") is None
+        with pytest.raises(FileNotFoundError):
+            storage.open_stream(self.AREA, "alice/REPORT.pdf")
+        with pytest.raises(FileNotFoundError):
+            storage.serve(self.AREA, "ALICE/Report.pdf")
+
+    @pytest.mark.parametrize("key", ["alice/report.PDF", "ALICE/other.pdf"])
+    def test_a_write_of_another_spelling_is_a_conflict(self, storage, key):
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save(self.AREA, key, b"mallory")
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save_stream(self.AREA, key, io.BytesIO(b"mallory"))
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.begin_upload(self.AREA, key)
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.copy(self.AREA, "alice/Report.pdf", self.AREA, key)
+
+        assert storage.get(self.AREA, "alice/Report.pdf") == b"alice"
+        assert storage.list_keys(self.AREA) == ["alice/Report.pdf"]
+
+    def test_a_delete_of_another_spelling_leaves_the_object(self, storage):
+        storage.delete(self.AREA, "ALICE/report.pdf")
+        assert storage.delete_prefix(self.AREA, "ALICE") == 0
+
+        assert storage.get(self.AREA, "alice/Report.pdf") == b"alice"
+
+    def test_a_url_for_another_spelling_is_refused(self, storage):
+        """The host's web server would serve the existing file for it."""
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.url(self.AREA, "ALICE/Report.pdf")
+
+    def test_a_legacy_object_is_not_reached_through_another_spelling(self, tmp_path):
+        if not _folds(tmp_path, "probe", "PROBE"):
+            pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
+        storage = LocalStorage(str(tmp_path / "data"), legacy_layout=True)
+        legacy = tmp_path / "data" / "avatars" / "alice"
+        legacy.mkdir(parents=True)
+        (legacy / "me.png").write_bytes(b"alice")
+
+        assert storage.get("avatars", "ALICE/me.png") is None
+        storage.save("avatars", "ALICE/me.png", b"mallory")
+        storage.delete("avatars", "Alice/me.png")
+
+        assert storage.get("avatars", "alice/me.png") == b"alice"
+        assert storage.get("avatars", "ALICE/me.png") == b"mallory"
+
+    def test_a_key_in_another_unicode_normalization_is_another_key(self, tmp_path):
+        composed, decomposed = "café.txt", "café.txt"
+        if not _folds(tmp_path, composed, decomposed):
+            pytest.skip("the filesystem keeps Unicode normalization forms apart, so they cannot alias")
+        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+        storage.save(self.AREA, composed, b"composed")
+
+        assert storage.get(self.AREA, decomposed) is None
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save(self.AREA, decomposed, b"decomposed")
+        assert storage.get(self.AREA, composed) == b"composed"
+
+
+class TestLocalStorageSpellingCheckFailures:
+    """The spelling check lists directories; a listing that fails is handled like any other filesystem failure."""
+
+    @staticmethod
+    def _failing_listdir(monkeypatch, error: OSError) -> None:
+        def listdir(_path):
+            raise error
+
+        monkeypatch.setattr(storage_local.os, "listdir", listdir)
+
+    def test_a_directory_that_cannot_be_listed_makes_the_backend_unavailable(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        storage.save("plain", "a/b.txt", b"x")
+        self._failing_listdir(monkeypatch, PermissionError("denied"))
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.get("plain", "a/b.txt")
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("plain", "a/b.txt", b"y")
+
+    def test_a_directory_removed_while_it_is_checked_holds_nothing(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        storage.save("plain", "a/b.txt", b"x")
+        self._failing_listdir(monkeypatch, FileNotFoundError("gone"))
+
+        assert storage.exists("plain", "a/b.txt")
+
+    def test_a_legacy_copy_that_cannot_be_checked_does_not_fail_the_committed_write(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        storage = LocalStorage(str(tmp_path), legacy_layout=True)
+        (tmp_path / "avatars").mkdir()
+        (tmp_path / "avatars" / "me.png").write_bytes(b"old")
+        self._failing_listdir(monkeypatch, PermissionError("denied"))
+
+        storage.save("avatars", "me.png", b"new")
+
+        assert "Failed to remove a migrated legacy local storage object" in caplog.text
+        assert (tmp_path / "avatars" / "me.png").read_bytes() == b"old"
+
+
 class TestLocalStorageConcurrentDelete:
     """A delete that runs between a writer's preparation and its install must not leave an unreadable payload."""
 

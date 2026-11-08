@@ -93,8 +93,8 @@ because you installed it.
 
 The [audit trail](audit.md). Unlike the two above it defaults to **on**, because it writes nothing until the host
 calls `stage` or `record_detached`. Numeric values are checked when the object is built (a bad one raises
-`ValueError`); `external_sink_uri` is checked when `build_platform` constructs the audit sink, and `signing_key` when
-checkpoint maintenance seals a window, so an invalid key makes that maintenance step fail and be logged.
+`ValueError`), and so is `signing_key`; `external_sink_uri` is checked when `build_platform` constructs the audit
+sink.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -313,6 +313,14 @@ JASIL runs its whole suite against **SQLite**, **PostgreSQL** and **MySQL** on
 every change, so all three are supported rather than merely expected to work.
 JASIL never creates the engine — whichever you hand it through
 `configure_sessionmaker` is the one it uses.
+
+A host with several databases can route engines with
+`sessionmaker(binds={Base: engine, OtherBase: other_engine})` instead of one
+`bind=`. JASIL's tables then go to the engine the rules give the base you passed
+to `map_models`, and so do its raw SQL, its dialect checks and the engine the
+`postgres-advisory` lock connects with. Keep them on the database of the domain
+tables that publish events: the outbox row commits atomically with your change
+only when both are in the same database.
 
 What differs between them is handled internally, but two consequences are worth
 knowing:

@@ -14,7 +14,9 @@ needs ``SUPER`` or ``log_bin_trust_function_creators=1``. DDL commits on these s
 part-way is not rolled back; running it again replaces what the failed run created. The partitions are chosen
 from the rows in the table, so this revision cannot be rendered as SQL for MySQL; it renders as nothing for
 other databases.
-Processes of the previous release are unaffected: they only insert into the log.
+Upgrade every process that runs audit maintenance with it. The maintenance of JASIL 0.15 and earlier treats this
+log as a plain table: the trigger refuses its row ``DELETE`` (after it has committed a prune record each time), and it
+never creates partitions, so inserts fail once the days created here run out.
 
 Revision ID: rev0008
 Revises: rev0007

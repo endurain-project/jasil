@@ -8,21 +8,53 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-08
+
+This release gives the host control over each mail message and tells it what happened when a send fails: a message can set its own sender, `Message-ID` and one-click unsubscribe, and a `MailError` names the step that failed and whether the message may still have been delivered. JASIL also works with a host that routes several databases through `sessionmaker(binds=...)`, and a durable-job worker that does not stop in time no longer has its platform closed under it. Four security issues are fixed, in local storage, SMTP, S3 and geocoding. No migration is added, but three of the security fixes refuse a configuration or key that was accepted before, and restarting a worker that is still stopping now raises; see **Upgrading**.
+
 ### Added
 
-- **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted). Import it to size a lease or timeout around a send; the value may change in a minor release. `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered, is removed. ([#57](https://github.com/endurain-project/jasil/issues/57))
-
-- **`MailError` says why a send failed and whether it may have been delivered.** `kind` is a new `jasil.providers.MailFailure` naming the failed step (`auth_failed`, `sender_refused`, `recipient_refused`, `message_rejected`, `unreachable`, `connection_lost`, `deadline`, ...). `delivery_unknown` is `True` only when the connection was lost, or the deadline fired, after the message body started going out. `message_id` is set on every failure after the message was built. All three are keyword-only with defaults, so existing code is unaffected. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#52](https://github.com/endurain-project/jasil/issues/52), [#53](https://github.com/endurain-project/jasil/issues/53))
-
-- **`MailMessage.from_address`** sets the sender of one message (`From`, envelope sender and `Message-ID` domain) in place of `mail.from_address`, which becomes the default. It is validated like the configured sender, and JASIL keeps no allowlist: take it from your own configuration, never from user input. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#54](https://github.com/endurain-project/jasil/issues/54))
-
-- **`MailMessage.list_unsubscribe`** adds RFC 8058 one-click unsubscribe: an `https` URL emitted as `List-Unsubscribe` together with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which Gmail and Yahoo require of bulk senders. The URL is written on one line, never folded or RFC 2047-encoded, and is limited to 978 printable ASCII characters. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
-
-- **`MailMessage.message_id`** lets the host supply the `Message-ID`, so it can store the key before sending and find the message in the relay's logs even if the process dies before recording the result. It must be an RFC 5322 `<left@right>` dot-atom `msg-id` of at most 250 characters, is sent and returned unchanged, and must be an opaque value, never derived from personal data. Without it, an ID is generated as before. See [Choosing the Message-ID](docs/providers-and-backends.md#choosing-the-message-id). ([#55](https://github.com/endurain-project/jasil/issues/55))
+- **Per-message mail options on `MailMessage`.** See [MailProvider](docs/providers-and-backends.md#mailprovider).
+    - `from_address` sets the sender of one message (`From`, envelope sender and `Message-ID` domain); `mail.from_address` becomes the default. It is validated like the configured sender and JASIL keeps no allowlist, so take it from your own configuration, never from user input. ([#54](https://github.com/endurain-project/jasil/issues/54))
+    - `list_unsubscribe` adds RFC 8058 one-click unsubscribe, which Gmail and Yahoo require of bulk senders: an `https` URL of at most 978 printable ASCII characters, sent unfolded as `List-Unsubscribe` with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
+    - `message_id` supplies the `Message-ID`, so the host can store it before sending and find the message in the relay's logs even if the process dies before recording the result. It must be an RFC 5322 dot-atom `<left@right>` of at most 250 characters, and opaque, never derived from personal data; without it one is generated as before. See [Choosing the Message-ID](docs/providers-and-backends.md#choosing-the-message-id). ([#55](https://github.com/endurain-project/jasil/issues/55))
+- **A `MailError` says why a send failed and whether the message may have been delivered.** `kind` is a new `jasil.providers.MailFailure` naming the failed step (`auth_failed`, `sender_refused`, `recipient_refused`, `message_rejected`, `unreachable`, `connection_lost`, `deadline`, ...); `delivery_unknown` is `True` only when the connection was lost, or the deadline fired, after the body started going out; and `message_id` is set on every failure after the message was built. All three are keyword-only with defaults, so existing code is unaffected. ([#52](https://github.com/endurain-project/jasil/issues/52), [#53](https://github.com/endurain-project/jasil/issues/53))
+- **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted), to size a lease or timeout around a send. The value may change in a minor release. ([#57](https://github.com/endurain-project/jasil/issues/57))
+- **Hosts with several databases.** A session factory built with `sessionmaker(binds={Base: engine, ...})` instead of `bind=` works: JASIL's statements, its dialect checks (`SKIP LOCKED`, the idempotent insert) and the audit maintenance SQL go to the engine the rules give the base passed to `map_models`, and `jasil.orm.get_engine()` returns that engine. Keep JASIL's tables in the database of the domain tables that publish events, so the outbox commits with them. See [Configuration](docs/configuration.md#databases).
 
 ### Changed
 
-- `SmtpMail` sends `MAIL FROM`, `RCPT TO` and `DATA` itself instead of through `smtplib`'s `send_message`, so it knows which step failed. The conversation on the wire is unchanged, including the `SIZE` declaration and success with a warning when only some recipients are refused. A refused `MAIL FROM` is now reported as a sender refusal, no longer as a rejected message.
+- `SmtpMail` sends `MAIL FROM`, `RCPT TO` and `DATA` itself instead of through `smtplib`'s `send_message`, so it knows which step failed. The conversation on the wire is unchanged, including the `SIZE` declaration and success with a warning when only some recipients are refused; a refused `MAIL FROM` is reported as a sender refusal rather than a rejected message.
+- **A durable-job worker that does not stop in time keeps its platform.** When a handler outlives the stop's join timeout, `jasil.lifecycle.shutdown()` logs a warning and leaves the platform open and published for it, instead of closing it so the handler failed and used one of its job's attempts; exiting the process, or calling `shutdown()` again once the handler is done, releases it. `jasil.jobs.service.stop_job_worker()` returns `False` in that case and `True` once no worker is left running (it returned `None`), and `start_job_worker()` raises `RuntimeError` while that worker is still finishing, where it returned without starting one.
+- `jasil.orm.get_engine()` returns the engine of a session factory bound to a `Connection`, rather than the connection.
+
+### Removed
+
+- `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered; use `jasil.providers.MAIL_SEND_DEADLINE_SECONDS`.
+- Internal helpers outside the API-stability contract that nothing used: `jasil.jobs.crud.enqueue_job` (use `insert_job`) and the `job_ids` parameter of `jasil.jobs.dead_letter.deliver_dead_letters` and `jasil.jobs.crud.claim_dead_letter_callbacks`.
+
+### Security
+
+- **Plain local storage areas keep keys that differ only in letter case or Unicode normalization apart.** On a filesystem that folds them (macOS, Windows), `alice/Report.pdf` and `ALICE/report.PDF` opened one file, so one key could read, overwrite or delete another's object. A key is now matched against the names on disk exactly, in plain areas and in the legacy layout: a read of the other spelling finds nothing, `delete` leaves the existing object alone, and a write or `url()` raises `StorageKeyConflictError`. Every plain-area operation lists the directories along the key's path to do so. See [StorageProvider](docs/providers-and-backends.md#storageprovider).
+- **`SmtpMail` caps each server reply at 64 KiB.** `smtplib` limits the length of a reply line but not how many lines a reply has, so a relay, or anyone on the path before STARTTLS, could stream one reply into memory until the send deadline. A longer reply ends the send with a `MailError` of kind `unreachable` before the session is established and `connection_lost` after.
+- **An S3 endpoint from the AWS configuration is held to the cleartext rule.** With no `endpoint_url` in the URI, boto3 takes one from `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` or the AWS config file, and an `http://` one to a public host was accepted, so signatures, objects and presigned URLs crossed the internet unencrypted. It must now be `https://`, or `http://` to a private host, as in the URI. The check runs once, when the backend is built.
+- **Cleartext geocoding (`+http`) never goes through an environment proxy.** `requests` took one from `HTTP_PROXY`, so the coordinates went unencrypted to a host the address check never saw. `https` requests still use the environment's egress proxy.
+
+### Fixed
+
+- `MemoryState.incr` and `MemoryState.record_tiered_failure` refuse a stored value, an amount or a result outside the signed 64-bit range with `ValueError`, leaving the counter unchanged, as Redis does.
+- An event payload upgrader receives a copy of the payload, so one that edits its dict in place no longer changes the payload the event's other handlers read.
+- Downgrading past `rev0003` refuses, before renaming anything, when one of the host's tables has one of the old unprefixed names, instead of failing part-way.
+- The `rev0008` upgrade notes for MySQL and MariaDB said processes of the previous release are unaffected. They are not; see **Upgrading**.
+
+### Upgrading
+
+- Three security fixes refuse something 0.17.0 accepted, which [API stability](docs/api-stability.md) lets a security fix do in a minor release. Check each before upgrading:
+    - An S3 endpoint taken from `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_S3` or the AWS config file must be `https://`, or `http://` to a host that resolves only to private addresses; otherwise building the platform raises `ValueError`. Change the endpoint first.
+    - A `+http` geocoder is no longer reached through `HTTP_PROXY`, so it must be reachable directly.
+    - In a plain local storage area on macOS or Windows, a key that differs from an existing one only in letter case or Unicode normalization now raises `StorageKeyConflictError` on write and finds nothing on read. If your keys can differ that way, choose one spelling, for example lowercase.
+- Restart code that calls `start_job_worker()` after a `stop_job_worker()` that returned `False` now gets `RuntimeError` while the old worker finishes its handler; call it again once `stop_job_worker()` returns `True`.
+- Upgrading MySQL or MariaDB from 0.15 or earlier: upgrade every process that runs audit maintenance together with migration `rev0008`. The older maintenance treats the audit log as a plain table, so the new trigger refuses its row `DELETE` on every pass, each time after it has committed an `audit.retention.prune` entry for a prune that did not happen, and it never creates partitions, so inserts fail once the ones `rev0008` created run out (`audit.partition_days_ahead` days, 7 by default) unless a process of 0.16 or later runs maintenance. See [Audit trail](docs/audit.md#upgrading).
 
 ## [0.17.0] - 2026-11-04
 
@@ -63,7 +95,7 @@ This release brings the audit trail's guarantees to MySQL and MariaDB, lets a se
 
 ### Upgrading
 
-- On MySQL and MariaDB, run migration `rev0008` as the account that should own the audit procedures. With binary logging on (the MySQL 8 default) creating its triggers needs `SUPER` or `log_bin_trust_function_creators=1`, or the revision fails. Partitioning rebuilds the audit log, blocking writes to it while its rows are copied. It cannot be rendered with `--sql`. Processes of the previous release only insert into the log and are unaffected. Then grant the accounts with `grants_sql(..., dialect="mysql")`. Other databases are unchanged.
+- On MySQL and MariaDB, run migration `rev0008` as the account that should own the audit procedures. With binary logging on (the MySQL 8 default) creating its triggers needs `SUPER` or `log_bin_trust_function_creators=1`, or the revision fails. Partitioning rebuilds the audit log, blocking writes to it while its rows are copied. It cannot be rendered with `--sql`. Upgrade every process that runs audit maintenance together with it: the maintenance of the previous release cannot prune a partitioned log and never creates its partitions (corrected in 0.18.0; see [Audit trail](docs/audit.md#upgrading)). Then grant the accounts with `grants_sql(..., dialect="mysql")`. Other databases are unchanged.
 - Run migration `rev0009` before deploying the producers of this release: it adds the unique index on `jasil_event_outbox.event_id` that a reused event id relies on. Processes of the previous release always mint a fresh UUIDv4 id and keep working while it applies. The build fails if the outbox already holds two rows with the same `event_id`, which only a host that wrote rows with `jasil.jobs.outbox.add_to_outbox` directly can have: remove the duplicates and run it again. On PostgreSQL the index is built `CONCURRENTLY`, so producers keep writing; with your own Alembic history set `transaction_per_migration=True`.
 - If you call `retention_floor_sql`, run every statement of the list it now returns.
 

@@ -325,6 +325,21 @@ class TestPrefixRename:
 
         assert jasil_table_names() <= set(inspect(engine).get_table_names())
 
+    def test_the_downgrade_refuses_to_take_an_unprefixed_name_the_host_owns(self, engine):
+        """The prefix exists so a host's own ``event_log`` can coexist; renaming back onto it must not start."""
+        migrations.upgrade(engine)
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE event_log (id INTEGER PRIMARY KEY)"))
+            connection.execute(text("CREATE TABLE job_workers (id INTEGER PRIMARY KEY)"))
+
+        with pytest.raises(RuntimeError, match="event_log, job_workers"):
+            migrations.downgrade(engine, "rev0002")
+
+        tables = set(inspect(engine).get_table_names())
+        renamed_by_rev0003 = {f"jasil_{name}" for name in legacy_table_names()}
+        assert renamed_by_rev0003 <= tables
+        assert {"event_log", "job_workers"} <= tables
+
 
 class TestDeadLetterNotified:
     def test_existing_dead_letters_are_not_called_back_after_the_upgrade(self, engine):

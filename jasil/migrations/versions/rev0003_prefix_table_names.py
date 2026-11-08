@@ -152,4 +152,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    _rename([table for table, _ in _TABLES], to_prefixed=False)
+    tables = [table for table, _ in _TABLES]
+    if not op.get_context().as_sql:
+        # A host table may hold an unprefixed name: the prefix exists so it can. Refuse before renaming anything,
+        # so a database without transactional DDL is not left half downgraded.
+        inspector = sa.inspect(op.get_bind())
+        taken = [table for table in tables if inspector.has_table(table)]
+        if taken:
+            raise RuntimeError(
+                "Cannot downgrade past rev0003: the database already has tables named "
+                f"{', '.join(taken)}, which this downgrade would rename JASIL's tables to. Rename or drop those first."
+            )
+    _rename(tables, to_prefixed=False)

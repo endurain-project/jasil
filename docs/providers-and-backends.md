@@ -59,7 +59,9 @@ Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
 zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
 Redis it would match every key in the database), and an operation the stored
 value does not support, such as `incr` of a non-integer or, on Redis, a key that
-holds another type.
+holds another type. Counters are signed 64-bit integers on both: an `incr` or
+`record_tiered_failure` whose stored value, amount or result falls outside that
+range raises `ValueError` and leaves the counter unchanged.
 
 ## StorageProvider
 
@@ -88,7 +90,10 @@ small test doubles can depend on only the slice they use:
 `s3://<bucket>[/prefix]` takes two optional query parameters: `region`, and
 `endpoint_url` for an S3-compatible store (MinIO, R2, Ceph). `endpoint_url` must be
 `https://`, or `http://` to a host that resolves only to private addresses:
-request signatures, objects and presigned URLs cross that connection. The client
+request signatures, objects and presigned URLs cross that connection. When the
+URI gives none, an endpoint boto3 takes from `AWS_ENDPOINT_URL`,
+`AWS_ENDPOINT_URL_S3` or the AWS config file is held to the same rule. The host
+is checked once, when the backend is built, and not again for each request. The client
 waits at most 10 seconds to connect and 60 seconds for each read.
 
 ```python
@@ -145,10 +150,15 @@ layout with `StorageSettings(local_plain_areas=frozenset({"activity_files"}))`.
 Those objects live at `{data_dir}/{area}/{key}`; all other areas continue to use
 the private layout. The setting is ignored by S3. In a plain area, a key and one
 of its descendants (for example, `a` and `a/b`) cannot both be stored because a
-filesystem path cannot be both a file and a directory. The conflicting write
-raises `StorageKeyConflictError`. This is the one difference in key/descendant
-namespace semantics between a plain local area and S3; non-conflicting keys keep
-the same provider API and behavior.
+filesystem path cannot be both a file and a directory. Nor can two keys that the
+filesystem stores under one name: on one that folds letter case or Unicode
+normalization (macOS, Windows), `alice/Report.pdf` and `ALICE/report.PDF`. The
+conflicting write raises `StorageKeyConflictError`. A key is matched against the
+names on disk exactly, so a read of the other spelling finds nothing, `delete()`
+leaves the existing object alone, and `url()` raises `StorageKeyConflictError`
+rather than return a path the web server would answer with the existing file.
+These are the only differences in key namespace semantics between a plain local
+area and S3; non-conflicting keys keep the same provider API and behavior.
 
 Plain-area reads and listings also find objects still in the private hashed
 layout. A plain copy takes precedence when both exist; `serve()` and `url()` use
@@ -166,16 +176,17 @@ prefix. Write latency therefore grows with the number of unmigrated objects.
 Overwrite those objects into the plain layout before relying on write latency in
 a large area.
 
-Unlike the private layout, plain paths inherit the host filesystem's path-length,
-case-sensitivity, and Unicode-normalization behavior; choose keys that remain
-distinct and addressable on the target filesystem.
+Unlike the private layout, plain paths inherit the host filesystem's path-length
+limit. Matching a key exactly lists each directory along its path on every
+operation, so latency grows with the number of entries in those directories.
 
 Objects in the flat `{data_dir}/{area}/{key}` layout, written by JASIL 0.3 and
 earlier and by the application JASIL was extracted from, are **not** consulted by
 default outside explicitly selected plain areas, so no other file under
 `data_dir` can be served as an object. Set
 `storage.local_legacy_layout=True` ([Configuration](configuration.md#storagesettings))
-to read, list, serve, and delete them transparently in other areas. Rewriting a
+to read, list, serve, and delete them transparently in other areas, by the exact
+spelling of their path only, as in a plain area. Rewriting a
 legacy object there moves that logical key into the versioned layout; in a plain
 area, the same flat path is already the active layout. Untouched legacy files
 remain valid and can be removed through normal `delete` or `delete_prefix`
@@ -548,9 +559,9 @@ A `MailError` also tells a host what to do next without parsing its message:
 | `sender_refused` | `MAIL FROM` was refused. | When `permanent`, stop using that sender; a 4xx is usually rate limiting. |
 | `recipient_refused` | Every recipient was refused, or the server closed the session (421) during `RCPT`. | When `permanent`, record it against the recipient. |
 | `message_rejected` | The server refused the message at `DATA` or at its end (content, size, policy). | When `permanent`, do not retry the same content. |
-| `unreachable` | DNS, a refused or failed connect, a greeting other than 220, or a cleartext relay that no longer resolves to a private address. | Retry later. |
+| `unreachable` | DNS, a refused or failed connect, a greeting other than 220, a reply over 64 KiB before the session was established, or a cleartext relay that no longer resolves to a private address. | Retry later. |
 | `tls_failed` | The TLS handshake failed. | Check the relay's certificate and name. |
-| `connection_lost` | The connection broke after the session was established. | Retry, unless `delivery_unknown`. |
+| `connection_lost` | The connection broke, or a reply over 64 KiB ended it, after the session was established. | Retry, unless `delivery_unknown`. |
 | `deadline` | The send ran past `MAIL_SEND_DEADLINE_SECONDS`. | Retry, unless `delivery_unknown`. |
 | `lease_lost` | The durable job lost its lease; nothing was sent. | None: another worker owns the job. |
 | `settings_unavailable` | Runtime mail settings could not be loaded or verified. | Retry later. |

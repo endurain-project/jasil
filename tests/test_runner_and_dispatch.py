@@ -80,7 +80,10 @@ class TestJobRunner:
 
     def _enqueue(self, db, subscriber="s", queue="default", max_attempts=3, payload=None):
         event = new_event("activity.created", payload or {"id": 1}, source="test")
-        return jobs_crud.enqueue_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db)
+        return db.get(
+            ProcessingJob,
+            jobs_crud.insert_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db),
+        )
 
     def test_an_empty_queue_processes_nothing(self, runner):
         assert runner.run_once() == 0
@@ -193,7 +196,7 @@ class TestJobRunner:
         correlation.configure_provider(lambda: "from-the-worker-thread")
         seen = self._record_context(registry)
         event = new_event("activity.created", {"id": 1}, source="test", metadata={META_REQUEST_ID: "req-7"})
-        jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+        jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
 
         runner.run_once()
 
@@ -254,7 +257,7 @@ class TestJobRunner:
         seen = []
         registry.register("activity.created", "s", seen.append)
         event = replace(new_event("activity.created", {"id": 1}, source="test"), timestamp="2025-12-31T23:59:00+00:00")
-        jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+        jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
 
         runner.run_once()
 
@@ -328,8 +331,8 @@ class TestJobRunner:
         registry.register("activity.created", "good", seen.append)
         registry.register("activity.created", "bad", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
         event = new_event("activity.created", {"id": 1}, source="test")
-        jobs_crud.enqueue_job(event, "good", max_attempts=3, now=T0, db=db)
-        jobs_crud.enqueue_job(event, "bad", max_attempts=3, now=T0, db=db)
+        jobs_crud.insert_job(event, "good", max_attempts=3, now=T0, db=db)
+        jobs_crud.insert_job(event, "bad", max_attempts=3, now=T0, db=db)
 
         processed = runner.run_once()
 
@@ -381,7 +384,7 @@ class TestJobRunner:
     def test_the_batch_size_bounds_a_pass(self, registry, clock, session_factory, db):
         registry.register("activity.created", "s", lambda _e: None)
         for index in range(5):
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("activity.created", {"i": index}, source="test"), "s", max_attempts=3, now=T0, db=db
             )
         runner = JobRunner(

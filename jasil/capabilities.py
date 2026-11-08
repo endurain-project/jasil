@@ -14,7 +14,7 @@ profile, more than one web worker, or standalone job workers — is decided in o
 place, :func:`~jasil.profile.resolve_topology`, so a new kind of process needs no
 change here.
 
-Five consistency rules are enforced (a capability the host disabled with ``none://`` has nothing to diverge and is
+Six consistency rules are enforced (a capability the host disabled with ``none://`` has nothing to diverge and is
 exempt):
 
 - **Cross-process backends** — ephemeral *state* (rate limiting, escalating gates,

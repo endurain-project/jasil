@@ -113,12 +113,16 @@ def start_job_worker(
         metadata: Optional host-supplied neutral metadata.
 
     Raises:
-        RuntimeError: When ``job_worker_mode`` is not ``in_process``, or when the
-            configured database is SQLite and the topology is multi-process.
+        RuntimeError: When ``job_worker_mode`` is not ``in_process``, when the
+            configured database is SQLite and the topology is multi-process, or
+            when a previous :func:`stop_job_worker` timed out and its thread is
+            still finishing a handler.
     """
     global _worker
     if _worker is not None:
         if _worker.is_alive:
+            # A no-op for a running worker; raises for one whose stop timed out and is still finishing a handler.
+            _worker.start()
             return
         _worker = None
     _ensure_job_topology(JobWorkerMode.IN_PROCESS, entry_point="start_job_worker", other="run_job_worker")
@@ -204,14 +208,22 @@ def _build_heartbeat(
     )
 
 
-def stop_job_worker() -> None:
-    """Stop the in-process worker from synchronous shutdown code."""
+def stop_job_worker() -> bool:
+    """Stop the in-process worker from synchronous shutdown code.
+
+    Returns:
+        True when no worker is left running. False when its thread did not stop
+        within the join timeout, because a handler is still running: the handle is
+        kept, so a later call can stop it once the handler returns.
+    """
     global _worker
     if _worker is None:
-        return
+        return True
     worker = _worker
-    if worker.stop() and _worker is worker:
+    stopped = worker.stop()
+    if stopped and _worker is worker:
         _worker = None
+    return stopped
 
 
 def _ensure_job_topology(expected: JobWorkerMode, *, entry_point: str, other: str) -> None:

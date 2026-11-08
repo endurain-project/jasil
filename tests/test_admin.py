@@ -53,7 +53,7 @@ def _dead_letter_job(db, now) -> str:
     so can place ``available_at`` fractionally in the future.
     """
     event = new_event("order.created", {"order_id": 1}, source="api:create_order")
-    job = jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=now, db=db)
+    job = db.get(ProcessingJob, jobs_crud.insert_job(event, SUBSCRIBER, max_attempts=1, now=now, db=db))
     claimed_at = now + timedelta(seconds=1)
     claimed = jobs_crud.claim_jobs(worker_id="worker-1", limit=10, lease_seconds=60, now=claimed_at, db=db)[0]
     jobs_crud.mark_job_failed(
@@ -91,7 +91,7 @@ class TestJobsSummary:
         assert jasil_admin.get_jobs_summary().total_jobs == 0
 
     def test_it_reports_queue_counts(self, platform, db, now):
-        jobs_crud.enqueue_job(
+        jobs_crud.insert_job(
             new_event("order.created", {"order_id": 1}, source="api:create_order"),
             SUBSCRIBER,
             queue="campaign",
@@ -107,7 +107,7 @@ class TestJobsSummary:
         assert queue.total == 1
 
     def test_it_reports_backlog_older_than_the_count_window(self, platform, db, now):
-        jobs_crud.enqueue_job(
+        jobs_crud.insert_job(
             new_event("order.created", {"order_id": 1}, source="api:create_order"),
             SUBSCRIBER,
             queue="campaign",
@@ -246,7 +246,7 @@ class TestTheWindowEndsAtThePlatformClock:
 
     def test_for_jobs(self, ahead, db):
         event = new_event("order.created", {}, source="api:create_order")
-        jobs_crud.enqueue_job(event, SUBSCRIBER, max_attempts=1, now=datetime.now(UTC), db=db)
+        jobs_crud.insert_job(event, SUBSCRIBER, max_attempts=1, now=datetime.now(UTC), db=db)
 
         assert jasil_admin.get_jobs_summary(hours=24).total_jobs == 0
 

@@ -31,6 +31,11 @@ whenever configuration is.
   changes its answer after the check (see the limits below).
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
+- An `https` request goes through the egress proxy the environment names
+  (`HTTPS_PROXY`, `ALL_PROXY`), as `requests` does by default. The proxy resolves
+  and dials the geocoder's host itself, so the address check does not cover that
+  connection; the proxy is yours to trust. The cleartext `+http` forms never use a
+  proxy, which would read the coordinates.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
   cannot exhaust memory. The request, headers and body, runs under a 30-second
   deadline: a watchdog shuts its sockets down when it passes, which ends a blocked
@@ -101,7 +106,10 @@ that a watchdog enforces by shutting the socket down — a per-read timeout alon
 would let a relay that drips its replies hold a send open indefinitely. The
 deadline covers the TLS handshake and every read after the connection is made;
 the DNS lookup and the TCP connect (30 seconds per address) are bounded by their
-own timeouts only.
+own timeouts only. Each server reply is read under a 64 KiB cap, and a longer one
+ends the send: `smtplib` limits the length of a line but not how many lines a
+reply has, and the greeting and first EHLO reply arrive before TLS, so anyone on
+the path could otherwise stream one reply into memory until the deadline.
 
 **Personal data and secrets in logs and job rows.** The job runner persists
 `str(error)` and logs `exc_info`, so `MailError` carries only a category and an
@@ -143,6 +151,12 @@ pair.
   Resumable parts live under a separate reserved private staging directory;
   session manifests and part files are validated before they are read, and
   symbolic-link aliases are rejected.
+- The plain and legacy layouts map a key straight to a path, and a filesystem that
+  folds letter case or Unicode normalization (macOS, Windows) would open one file
+  for keys S3 keeps apart, so one user's `Alice/x` could read or overwrite another's
+  `alice/x`. Every existing component of such a path must be listed by its
+  directory exactly as the key spells it: a read of another spelling finds nothing,
+  and a write or `url()` of it raises `StorageKeyConflictError`.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
   alter the URL it lands in.
 

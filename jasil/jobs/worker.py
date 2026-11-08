@@ -261,9 +261,18 @@ class BackgroundWorker:
 
         Returns:
             None.
+
+        Raises:
+            RuntimeError: When a stop timed out and the thread is still finishing a
+                handler: it exits right after, so returning would leave no worker.
         """
         if self._thread is not None:
             if self._thread.is_alive():
+                if self._stop.is_set():
+                    raise RuntimeError(
+                        "The durable-job worker is still stopping: its thread is finishing a handler. "
+                        "Start it again once stop() returns True."
+                    )
                 return
             self._thread = None
         self._stop.clear()

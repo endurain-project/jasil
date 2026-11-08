@@ -71,12 +71,40 @@ class TestShutdown:
         order: list[str] = []
         platform = RecordingPlatform()
         monkeypatch.setattr(platform_runtime, "_active_platform", platform)
-        monkeypatch.setattr(jobs_service, "stop_job_worker", lambda: order.append("worker"))
+        monkeypatch.setattr(jobs_service, "stop_job_worker", lambda: order.append("worker") or True)
         monkeypatch.setattr(type(platform), "close", lambda _self: order.append("platform"))
 
         jasil_lifecycle.shutdown()
 
         assert order == ["worker", "platform"]
+
+
+class TestAWorkerStillRunningAHandler:
+    """A stop that timed out leaves a handler running on the worker thread, and that handler uses the platform."""
+
+    def test_the_platform_is_left_open_and_published_for_it(self, monkeypatch, caplog):
+        platform = RecordingPlatform()
+        monkeypatch.setattr(platform_runtime, "_active_platform", platform)
+        monkeypatch.setattr(jobs_service, "stop_job_worker", lambda: False)
+
+        with caplog.at_level("WARNING"):
+            jasil_lifecycle.shutdown()
+
+        assert platform.closed is False
+        assert platform_runtime.get_active_platform() is platform
+        assert "did not stop in time" in caplog.text
+
+    def test_a_later_shutdown_releases_it_once_the_worker_stopped(self, monkeypatch):
+        platform = RecordingPlatform()
+        monkeypatch.setattr(platform_runtime, "_active_platform", platform)
+        outcomes = iter([False, True])
+        monkeypatch.setattr(jobs_service, "stop_job_worker", lambda: next(outcomes))
+
+        jasil_lifecycle.shutdown()
+        jasil_lifecycle.shutdown()
+
+        assert platform.closed is True
+        assert platform_runtime.is_platform_active() is False
 
 
 class TestItToleratesAPartialStartup:

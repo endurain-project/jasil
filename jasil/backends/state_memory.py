@@ -14,13 +14,18 @@ SWEEP_INTERVAL_SECONDS = 60
 
 # What Redis accepts as an integer: an optional minus sign and no leading zeros, with nothing around it.
 _INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)")
+# Redis counters are signed 64-bit integers.
+_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 
 
 def _parse_integer(raw: bytes) -> int:
-    """Read a stored counter as Redis does, refusing what ``int()`` would let through (spaces, underscores)."""
-    if _INTEGER.fullmatch(raw) is None:
+    """Read a stored counter as Redis does, refusing what ``int()`` would let through (spaces, underscores).
+
+    A value outside the signed 64-bit range is refused too, as Redis refuses it.
+    """
+    if _INTEGER.fullmatch(raw) is None or not _INT64_MIN <= (value := int(raw)) <= _INT64_MAX:
         raise ValueError("value is not an integer or out of range")
-    return int(raw)
+    return value
 
 
 class MemoryState:
@@ -85,11 +90,15 @@ class MemoryState:
     def incr(self, key: str, amount: int = 1, ttl_seconds: int | None = None) -> int:
         """Add ``amount`` to the stored integer; keep the existing expiry unless ``ttl_seconds`` is given."""
         _check_ttl(ttl_seconds)
+        if not _INT64_MIN <= amount <= _INT64_MAX:
+            raise ValueError("value is not an integer or out of range")
         with self._lock:
             self._sweep_if_due()
             current_bytes = self._live_value(key)
             current = _parse_integer(current_bytes) if current_bytes is not None else 0
             new_value = current + amount
+            if not _INT64_MIN <= new_value <= _INT64_MAX:
+                raise ValueError("increment or decrement would overflow")
             if ttl_seconds is not None:
                 expiry: float | None = time.monotonic() + ttl_seconds
             elif current_bytes is not None:
@@ -163,6 +172,8 @@ class MemoryState:
 
             counter_bytes = self._live_value(counter_key)
             count = (_parse_integer(counter_bytes) if counter_bytes is not None else 0) + 1
+            if count > _INT64_MAX:
+                raise ValueError("increment or decrement would overflow")
             self._data[counter_key] = (str(count).encode(), time.monotonic() + counter_ttl_seconds)
 
             lock_seconds = 0

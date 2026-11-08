@@ -86,7 +86,8 @@ def insert_ignoring_conflict(model: Any, values: dict, *, conflict_columns: Sequ
         RuntimeError: On a dialect with no supported conflict clause, rather than emitting a plain INSERT that
             would raise on the second write.
     """
-    dialect = db.bind.dialect.name if db.bind is not None else ""
+    # The engine ``model`` is routed to: a session built with ``binds=`` has no single ``db.bind``.
+    dialect = db.get_bind(model).dialect.name
     if dialect == "postgresql":  # pragma: no cover - exercised on Postgres, not in SQLite tests
         return pg_insert(model).values(**values).on_conflict_do_nothing(index_elements=list(conflict_columns))
     if dialect == "sqlite":

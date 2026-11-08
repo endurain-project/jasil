@@ -73,13 +73,16 @@ def _runner(registry, session_factory, worker_id, *, queues, batch_size=10, cloc
 
 
 def _enqueue(db, *, subscriber, queue, item):
-    return jobs_crud.enqueue_job(
-        new_event("work.created", {"item": item}, source="test"),
-        subscriber,
-        queue=queue,
-        max_attempts=3,
-        now=T0,
-        db=db,
+    return db.get(
+        ProcessingJob,
+        jobs_crud.insert_job(
+            new_event("work.created", {"item": item}, source="test"),
+            subscriber,
+            queue=queue,
+            max_attempts=3,
+            now=T0,
+            db=db,
+        ),
     )
 
 
@@ -224,7 +227,7 @@ def test_public_standalone_worker_selects_queues_and_records_its_lifecycle(
     jobs_registry.registry.register("work.created", "campaign-handler", handle, queue="campaign")
     jobs_registry.registry.register("work.created", "maintenance-handler", lambda _event: None, queue="maintenance")
     now = platform.clock.now() - timedelta(seconds=1)
-    jobs_crud.enqueue_job(
+    jobs_crud.insert_job(
         new_event("work.created", {"item": 1}, source="test"),
         "campaign-handler",
         queue="campaign",
@@ -232,7 +235,7 @@ def test_public_standalone_worker_selects_queues_and_records_its_lifecycle(
         now=now,
         db=db,
     )
-    jobs_crud.enqueue_job(
+    jobs_crud.insert_job(
         new_event("work.created", {"item": 2}, source="test"),
         "maintenance-handler",
         queue="maintenance",
@@ -327,7 +330,7 @@ def test_queue_and_worker_admin_summaries_match_concurrent_claims(db, session_fa
         "00000000-0000-4000-8000-000000000022",
     )
     for item in range(10):
-        jobs_crud.enqueue_job(
+        jobs_crud.insert_job(
             new_event("work.created", {"item": item}, source="test"),
             "handler",
             queue="campaign",

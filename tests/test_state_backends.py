@@ -189,6 +189,30 @@ class TestArgumentConformance:
         with pytest.raises(ValueError):
             state.incr("k")
 
+    @pytest.mark.parametrize(("stored", "amount"), [(2**63 - 1, 1), (-(2**63), -1)])
+    def test_an_increment_past_the_64_bit_range_is_a_value_error(self, state, stored, amount):
+        """Redis counters are signed 64-bit integers; the memory backend must not count on past them."""
+        state.set("k", str(stored).encode())
+
+        with pytest.raises(ValueError):
+            state.incr("k", amount)
+
+        assert state.get("k") == str(stored).encode()
+
+    @pytest.mark.parametrize("stored", [2**63, -(2**63) - 1])
+    def test_a_stored_value_outside_the_64_bit_range_is_a_value_error(self, state, stored):
+        state.set("k", str(stored).encode())
+
+        with pytest.raises(ValueError):
+            state.incr("k")
+
+    @pytest.mark.parametrize("amount", [2**63, -(2**63) - 1])
+    def test_an_amount_outside_the_64_bit_range_is_a_value_error(self, state, amount):
+        with pytest.raises(ValueError):
+            state.incr("k", amount)
+
+        assert state.get("k") is None
+
 
 class TestTieredFailureConformance:
     """The atomic lockout both backends implement — memory under a lock, Redis in Lua."""
@@ -228,6 +252,14 @@ class TestTieredFailureConformance:
 
         assert outcome.count == 3
         assert outcome.newly_locked is False
+
+    def test_a_count_past_the_64_bit_range_is_refused_and_left_unchanged(self, state):
+        state.set("counter", str(2**63 - 1).encode())
+
+        with pytest.raises(ValueError):
+            self._record(state)
+
+        assert state.get("counter") == str(2**63 - 1).encode()
 
     def test_the_highest_crossed_tier_wins(self, state):
         """Tiers are ascending and the last match applies, so a caller that

@@ -353,6 +353,10 @@ class HttpGeocoding:
 
             # A session of its own, so its connections are the watched ones and none outlives the request.
             with requests.Session() as session:
+                # ``requests`` takes a proxy from the environment. Over TLS the proxy only relays the tunnel; a
+                # cleartext ``+http`` request would hand it the coordinates, and the address check covered the
+                # geocoder's host, not the proxy's, so cleartext goes direct.
+                session.trust_env = self._base_url.startswith("https://")
                 adapter = _watched_adapter()()
                 session.mount("http://", adapter)
                 session.mount("https://", adapter)

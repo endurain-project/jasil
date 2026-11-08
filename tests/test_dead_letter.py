@@ -94,7 +94,7 @@ def calls(registry):
 
 def enqueue(db, max_attempts=2):
     event = new_event("a.b", {"id": 1}, source="test")
-    return jobs_crud.enqueue_job(event, "s", max_attempts=max_attempts, now=T0, db=db)
+    return db.get(ProcessingJob, jobs_crud.insert_job(event, "s", max_attempts=max_attempts, now=T0, db=db))
 
 
 def fail_until_dead(runner, clock, db, attempts):
@@ -214,7 +214,7 @@ class TestTheWorkerNeverRunsTheCallback:
         registry.register("a.b", "s", _boom, on_dead_letter=lambda _e, _r: pytest.fail("ran in the worker"))
         registry.register("c.d", "t", lambda event: ran.append(event.event_type))
         enqueue(db, max_attempts=1)
-        jobs_crud.enqueue_job(new_event("c.d", {}, source="test"), "t", max_attempts=1, now=T0, db=db)
+        jobs_crud.insert_job(new_event("c.d", {}, source="test"), "t", max_attempts=1, now=T0, db=db)
 
         assert runner.run_once() == 2
 
@@ -309,7 +309,7 @@ class TestLeaseExpiry:
             # microsecond-precision ``now`` would leave ``available_at`` up to a
             # second in the future and the claim below would select nothing.
             now = platform_runtime.get_active_platform().clock.now().replace(microsecond=0)
-            jobs_crud.enqueue_job(new_event("a.b", {}, source="t"), "s", max_attempts=1, now=now, db=db)
+            jobs_crud.insert_job(new_event("a.b", {}, source="t"), "s", max_attempts=1, now=now, db=db)
             jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=-1, now=now, db=db)
 
             jobs_service.reap_expired_jobs_scheduled()
@@ -511,8 +511,8 @@ class TestCallbackRaising:
         registry.register("a.b", "bad", _boom, on_dead_letter=lambda _e, _r: 1 / 0)
         registry.register("a.b", "good", _boom, on_dead_letter=lambda e, r: done.append(e.event_id))
         event = new_event("a.b", {}, source="t")
-        jobs_crud.enqueue_job(event, "bad", max_attempts=1, now=T0, db=db)
-        jobs_crud.enqueue_job(event, "good", max_attempts=1, now=T0, db=db)
+        jobs_crud.insert_job(event, "bad", max_attempts=1, now=T0, db=db)
+        jobs_crud.insert_job(event, "good", max_attempts=1, now=T0, db=db)
         runner.run_once()
 
         sweep(runner)
@@ -585,19 +585,19 @@ class TestNoCallback:
             raise AssertionError("no session should be opened")
 
         assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock) == 0
-        assert deliver_dead_letters(registry=registry, session_factory=never, clock=clock, job_ids=[]) == 0
 
 
 class TestTheCallbackEnvelope:
     def test_it_carries_the_publish_timestamp(self, db):
         event = replace(new_event("a.b", {}, source="t"), timestamp="2025-12-31T23:59:00+00:00")
-        job = jobs_crud.enqueue_job(event, "s", queue="default", max_attempts=1, now=T0, db=db)
+        job = db.get(ProcessingJob, jobs_crud.insert_job(event, "s", queue="default", max_attempts=1, now=T0, db=db))
 
         assert jobs_crud.event_from_row(job).timestamp == "2025-12-31T23:59:00+00:00"
 
     def test_a_job_enqueued_before_the_column_existed_falls_back_to_its_enqueue_time(self, db):
-        job = jobs_crud.enqueue_job(
-            new_event("a.b", {}, source="t"), "s", queue="default", max_attempts=1, now=T0, db=db
+        job = db.get(
+            ProcessingJob,
+            jobs_crud.insert_job(new_event("a.b", {}, source="t"), "s", queue="default", max_attempts=1, now=T0, db=db),
         )
         job.event_timestamp = None
 
@@ -658,23 +658,20 @@ class TestDeliveryGuards:
         registry.register("a.b", "s", _boom, on_dead_letter=failing)
         for _ in range(MAX_DELIVERIES + 3):
             clock.advance(RETRY_MAX_SECONDS + 1)
-            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=None)
+            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock)
 
         job = stored_job(db)
         assert job.dead_letter_attempts == MAX_DELIVERIES
         assert job.dead_letter_notified_at is None
 
-    def test_the_sweep_ignores_old_history_but_a_targeted_pass_does_not(self, registry, clock, db, session_factory):
+    def test_the_sweep_ignores_old_history(self, registry, clock, db, session_factory):
         received = []
         registry.register("a.b", "s", _boom, on_dead_letter=lambda e, r: received.append(r))
         self._dead(db)
         clock.advance(SWEEP_WINDOW.total_seconds() + 1)
-        job_id = stored_job(db).id
 
         assert deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock) == 0
-        assert (
-            deliver_dead_letters(registry=registry, session_factory=session_factory, clock=clock, job_ids=[job_id]) == 1
-        )
+        assert received == []
 
     def test_a_job_is_not_leased_until_its_own_callback_starts(self, registry, clock, db, session_factory):
         for _ in range(2):

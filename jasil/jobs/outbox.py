@@ -82,7 +82,7 @@ def add_to_outbox(event: Event, *, now: datetime, db: Session, commit: bool = Tr
     read_back = select(EventOutbox.id, EventOutbox.event_type, EventOutbox.payload).where(
         EventOutbox.event_id == event.event_id
     )
-    if needs_locking_read(db.bind):
+    if needs_locking_read(db.get_bind(EventOutbox)):
         read_back = read_back.with_for_update()
     stored = db.execute(read_back).one()
     if stored.id != outbox_id:
@@ -129,7 +129,9 @@ def list_unrelayed(*, limit: int, db: Session) -> list[EventOutbox]:
         Unrelayed outbox rows, oldest-first.
     """
     stmt = select(EventOutbox).where(EventOutbox.relayed_at.is_(None)).order_by(EventOutbox.created_at).limit(limit)
-    if supports_skip_locked(db.bind):  # pragma: no cover - server-side locking, not exercised on SQLite
+    if supports_skip_locked(
+        db.get_bind(EventOutbox)
+    ):  # pragma: no cover - server-side locking, not exercised on SQLite
         stmt = stmt.with_for_update(skip_locked=True)
     return list(db.execute(stmt).scalars().all())
 

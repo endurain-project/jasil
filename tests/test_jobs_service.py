@@ -30,6 +30,19 @@ from jasil.profile import DeploymentProfile, JobWorkerMode
 WAIT_TIMEOUT = 5.0
 
 
+class _BlockingRunner:
+    """Holds its one iteration, like a long handler, until the test releases it."""
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def run_once(self, stop=None) -> int:
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return 1
+
+
 @pytest.fixture
 def platform(tmp_path, session_factory, monkeypatch):
     """A real local-profile platform, published process-wide for this test only."""
@@ -162,9 +175,31 @@ class TestWorkerLifecycle:
         worker = type("TimedOutWorker", (), {"stop": lambda self: False})()
         monkeypatch.setattr(jobs_service, "_worker", worker)
 
-        jobs_service.stop_job_worker()
+        assert jobs_service.stop_job_worker() is False
 
         assert jobs_service._worker is worker
+
+    def test_stopping_reports_that_no_worker_is_left_running(self):
+        assert jobs_service.stop_job_worker() is True
+
+        jobs_service.start_job_worker()
+
+        assert jobs_service.stop_job_worker() is True
+
+    def test_starting_while_a_timed_out_worker_is_still_stopping_raises(self, monkeypatch):
+        """Returning would leave no worker once the old thread finishes its handler and exits."""
+        stopping = jobs_worker.BackgroundWorker(_BlockingRunner(), poll_interval_seconds=0)
+        stopping.start()
+        assert stopping._runner.started.wait(timeout=5)
+        assert stopping.stop(timeout=0.01) is False
+        monkeypatch.setattr(jobs_service, "_worker", stopping)
+        try:
+            with pytest.raises(RuntimeError, match="still stopping"):
+                jobs_service.start_job_worker()
+            assert jobs_service._worker is stopping
+        finally:
+            stopping._runner.release.set()
+            stopping._thread.join(timeout=5)
 
     def test_the_poll_interval_comes_from_settings(self):
         settings.configure(settings.JasilSettings(jobs=settings.JobSettings(poll_interval_seconds=0.25)))
@@ -358,7 +393,7 @@ class TestScheduledReaper:
     def test_it_requeues_an_expired_lease(self, platform, session_factory, db):
         event = new_event("order.created", {"id": 1}, source="api")
         now = platform.clock.now()
-        jobs_crud.enqueue_job(event, "invoice.render", max_attempts=3, now=now, db=db)
+        jobs_crud.insert_job(event, "invoice.render", max_attempts=3, now=now, db=db)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=-1, now=now, db=db)
 
         jobs_service.reap_expired_jobs_scheduled()
@@ -370,7 +405,7 @@ class TestScheduledReaper:
         """After a crash every claimed job expires at once; one pass of 100 a minute would take minutes."""
         now = platform.clock.now()
         for n in range(jobs_service._REAP_BATCH_SIZE + 5):
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("order.created", {"id": n}, source="api"), "s", max_attempts=3, now=now, db=db
             )
         jobs_crud.claim_jobs(worker_id="w1", limit=1000, lease_seconds=-1, now=now, db=db)

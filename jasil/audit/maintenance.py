@@ -21,7 +21,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, text, update
 from sqlalchemy.engine import ScalarResult
@@ -248,6 +248,16 @@ def _record_retention_change(settings: AuditSettings) -> None:
         db.commit()
 
 
+def _on_audit_tables() -> dict[str, Any]:
+    """Route a raw SQL statement to the engine of the audit tables, as their ORM statements are routed.
+
+    A ``text()`` statement names no table, so a session built with ``binds=`` could not otherwise place it.
+    """
+    from jasil.audit.models import AuditLog
+
+    return {"mapper": AuditLog}
+
+
 #: The partition routines each dialect's migration installs: ``rev0006`` on PostgreSQL, ``rev0008`` on MySQL/MariaDB.
 _ROUTINES: dict[str, ModuleType] = {"postgresql": audit_pg, "mysql": audit_mysql, "mariadb": audit_mysql}
 
@@ -260,10 +270,10 @@ def _partition_routines(db: Session) -> ModuleType | None:
     also lacks the append-only triggers and the retention floor.
     """
     global _warned_plain
-    routines = _ROUTINES.get(db.get_bind().dialect.name)
+    routines = _ROUTINES.get(db.get_bind(**_on_audit_tables()).dialect.name)
     if routines is None:
         return None
-    if db.scalar(text(routines.INSTALLED_SQL)) is not None:
+    if db.scalar(text(routines.INSTALLED_SQL), bind_arguments=_on_audit_tables()) is not None:
         return routines
     if not _warned_plain:
         logger.warning(
@@ -281,7 +291,9 @@ def _ensure_partitions() -> None:
             return
         service.ensure_instance_id(service.engine_of(db))
         furthest: date = db.execute(
-            text(routines.ENSURE_CALL), {"days": get_settings().audit.partition_days_ahead}
+            text(routines.ENSURE_CALL),
+            {"days": get_settings().audit.partition_days_ahead},
+            bind_arguments=_on_audit_tables(),
         ).scalar_one()
         service.note_maintenance(db, furthest_partition_date=furthest)
         db.commit()
@@ -310,11 +322,13 @@ def _apply_retention(now: datetime, settings: AuditSettings) -> None:
         if routines is not None:
             # The routine's floor is measured on the database's clock; an application clock ahead of it would
             # make a cutoff at the floor look younger than the floor, and the prune be refused.
-            database_now = as_utc(db.scalar(text(routines.NOW_SQL)))
+            database_now = as_utc(db.scalar(text(routines.NOW_SQL), bind_arguments=_on_audit_tables()))
             cutoff = min(cutoff, database_now - timedelta(days=settings.retention_floor_days))
             # The prune row is stamped with the platform clock, like every row sealing counts, so it can never
             # land in a window an application clock ahead of the database has already sealed.
-            dropped = db.execute(text(routines.DROP_CALL), {"cutoff": cutoff, "prune_at": now}).scalar_one()
+            dropped = db.execute(
+                text(routines.DROP_CALL), {"cutoff": cutoff, "prune_at": now}, bind_arguments=_on_audit_tables()
+            ).scalar_one()
             db.commit()
             if dropped:
                 logger.info("Audit retention: dropped %d partition(s) older than %s", dropped, cutoff.isoformat())

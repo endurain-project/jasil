@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.17.0"
+!!! warning "Status: 0.18.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -125,6 +125,10 @@ consumer thread and the shared Redis clients it took, each closed once no other
 platform in the process still uses it — and unpublishes it. That order
 matters: the worker runs subscribers, and a subscriber that publishes needs the
 bus still up. It never raises, and it is safe to call when nothing was started.
+If the worker does not stop in time because a handler is still running, the
+platform is left open for that handler and a warning is logged; exiting the
+process releases it, as does calling `shutdown()` again once the handler is done.
+`start_job_worker()` raises while such a worker is still finishing.
 
 Your APScheduler instance and your database engine are yours to stop. JASIL never
 created either, so it does not close them.

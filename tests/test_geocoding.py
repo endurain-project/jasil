@@ -364,6 +364,34 @@ class TestRequestBehaviour:
         assert len(responses.calls) == 1
 
 
+class TestEnvironmentProxies:
+    """An egress proxy from the environment is honoured over TLS, which it cannot read; a cleartext ``+http``
+    request never goes through one, since the coordinates would cross to a host the address check never saw."""
+
+    @pytest.fixture(autouse=True)
+    def proxy_environment(self, monkeypatch):
+        for variable in ("NO_PROXY", "no_proxy", "ALL_PROXY", "all_proxy"):
+            monkeypatch.delenv(variable, raising=False)
+        for variable in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+            monkeypatch.setenv(variable, "http://proxy.test:3128")
+
+    @responses.activate
+    def test_a_cleartext_request_ignores_an_environment_proxy(self):
+        responses.add(responses.GET, "http://10.0.0.5/reverse", json={"address": {"country": "Portugal"}})
+
+        HttpGeocoding("nominatim", "http://10.0.0.5/reverse").reverse(38.7, -9.1)
+
+        assert not responses.calls[0].request.req_kwargs["proxies"]
+
+    @responses.activate
+    def test_an_https_request_goes_through_an_environment_proxy(self):
+        responses.add(responses.GET, "https://geo.test/reverse", json={"address": {"country": "Portugal"}})
+
+        HttpGeocoding("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1)
+
+        assert responses.calls[0].request.req_kwargs["proxies"]["https"] == "http://proxy.test:3128"
+
+
 class TestFailuresNeverPropagate:
     """Enrichment must not fail the import or backfill that triggered it."""
 

@@ -239,6 +239,7 @@ class TestBackgroundWorker:
         assert worker._runner.ran.wait(timeout=WAIT_TIMEOUT)
 
     def test_a_timed_out_thread_is_retained_and_cannot_be_overlapped(self):
+        """Starting while it finishes its handler raises: it is about to exit, so returning would leave no worker."""
         runner = BlockingRunner()
         worker = BackgroundWorker(runner, poll_interval_seconds=0)
         worker.start()
@@ -247,7 +248,8 @@ class TestBackgroundWorker:
 
         assert worker.stop(timeout=0.01) is False
         assert worker._thread is original
-        worker.start()
+        with pytest.raises(RuntimeError, match="still stopping"):
+            worker.start()
         assert worker._thread is original
 
         runner.release.set()
@@ -294,7 +296,7 @@ class TestWorkerTelemetry:
 
         registry.register("work.created", "handler", handle, queue="campaign")
         with threaded_session_factory() as db:
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
                 queue="campaign",
@@ -401,7 +403,7 @@ class TestWorkerTelemetry:
 
         registry.register("work.created", "handler", handle)
         with threaded_session_factory() as db:
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
                 max_attempts=3,

@@ -143,7 +143,8 @@ def _check_endpoint(endpoint_url: str) -> None:
     """Refuse an ``endpoint_url`` that is not HTTPS, unless it is cleartext to a private host.
 
     Request signatures, object contents and presigned URLs cross the connection, so cleartext is for an
-    S3-compatible store on the same private network only, as for mail and geocoding.
+    S3-compatible store on the same private network only. As for geocoding, the host is checked once, when the
+    backend is built; unlike mail, later requests resolve the name again and are not re-checked.
 
     Raises:
         ValueError: When the URL is not ``http(s)://host``, or is ``http://`` to a host that resolves to a public
@@ -187,8 +188,9 @@ class S3Storage:
             A configured ``S3Storage``.
 
         Raises:
-            ValueError: When the URI has no bucket, carries credentials, or has an ``endpoint_url`` that is not
-                an ``https://`` URL or an ``http://`` one whose host resolves only to private addresses.
+            ValueError: When the URI has no bucket, carries credentials, or the endpoint, from the URI or else
+                from the AWS configuration, is not an ``https://`` URL or an ``http://`` one whose host resolves
+                only to private addresses.
         """
         parsed = urlparse(uri)
         bucket = parsed.netloc
@@ -217,6 +219,10 @@ class S3Storage:
             )
         except BotoCoreError as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+        if endpoint_url is None:
+            # botocore takes an endpoint the URI does not give from the environment (``AWS_ENDPOINT_URL``,
+            # ``AWS_ENDPOINT_URL_S3``) or the AWS config file, and the same rule holds for it.
+            _check_endpoint(client.meta.endpoint_url)
         return cls(client, bucket, parsed.path)
 
     def _object_key(self, area: str, key: str) -> str:

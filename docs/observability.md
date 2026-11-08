@@ -279,8 +279,8 @@ row changes.
   revision; `upgrade()` then renames it. A lone unprefixed `event_log` is taken to
   be yours and is left alone.
 - Anything of yours that names the old tables (a reporting query, a dashboard)
-  must be updated. Downgrading `rev0003` restores the old names, and fails if a
-  table of yours has since taken one.
+  must be updated. Downgrading `rev0003` restores the old names, and refuses,
+  before renaming anything, if a table of yours has since taken one.
 
 ### Adopting existing tables
 
