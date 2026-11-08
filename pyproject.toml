@@ -62,8 +62,11 @@ fastapi = [
     "fastapi>=0.141.1",
 ]
 # HTTP reverse-geocoding backend (nominatim / photon / geocode.maps.co).
+# urllib3 >= 2.6.0 decompresses a streamed body chunk by chunk (CVE-2025-66471), which the 1 MiB
+# response cap relies on; requests alone accepts older releases.
 geocoding = [
     "requests>=2.34.2",
+    "urllib3>=2.6.0",
 ]
 # Alembic migrations for JASIL's companion tables (jasil.migrations).
 migrations = [
@@ -82,6 +85,7 @@ all = [
     "apscheduler>=3.11.3",
     "fastapi>=0.141.1",
     "requests>=2.34.2",
+    "urllib3>=2.6.0",
     "alembic>=1.20.0",
     "cryptography>=46.0.0",
 ]

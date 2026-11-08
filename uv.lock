@@ -1133,6 +1133,7 @@ all = [
     { name = "psycopg", extra = ["binary"] },
     { name = "redis" },
     { name = "requests" },
+    { name = "urllib3" },
 ]
 audit = [
     { name = "cryptography" },
@@ -1142,6 +1143,7 @@ fastapi = [
 ]
 geocoding = [
     { name = "requests" },
+    { name = "urllib3" },
 ]
 jobs = [
     { name = "apscheduler" },
@@ -1238,6 +1240,8 @@ requires-dist = [
     { name = "requests", marker = "extra == 'all'", specifier = ">=2.34.2" },
     { name = "requests", marker = "extra == 'geocoding'", specifier = ">=2.34.2" },
     { name = "sqlalchemy", specifier = ">=2.0.54" },
+    { name = "urllib3", marker = "extra == 'all'", specifier = ">=2.6.0" },
+    { name = "urllib3", marker = "extra == 'geocoding'", specifier = ">=2.6.0" },
 ]
 provides-extras = ["redis", "s3", "postgres", "jobs", "fastapi", "geocoding", "migrations", "audit", "all"]
 
