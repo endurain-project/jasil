@@ -393,7 +393,7 @@ class TestScheduledReaper:
     def test_it_requeues_an_expired_lease(self, platform, session_factory, db):
         event = new_event("order.created", {"id": 1}, source="api")
         now = platform.clock.now()
-        jobs_crud.enqueue_job(event, "invoice.render", max_attempts=3, now=now, db=db)
+        jobs_crud.insert_job(event, "invoice.render", max_attempts=3, now=now, db=db)
         jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=-1, now=now, db=db)
 
         jobs_service.reap_expired_jobs_scheduled()
@@ -405,7 +405,7 @@ class TestScheduledReaper:
         """After a crash every claimed job expires at once; one pass of 100 a minute would take minutes."""
         now = platform.clock.now()
         for n in range(jobs_service._REAP_BATCH_SIZE + 5):
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("order.created", {"id": n}, source="api"), "s", max_attempts=3, now=now, db=db
             )
         jobs_crud.claim_jobs(worker_id="w1", limit=1000, lease_seconds=-1, now=now, db=db)

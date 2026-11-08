@@ -50,8 +50,11 @@ def event():
 
 
 def _enqueue(event, db, *, subscriber=SUBSCRIBER, queue="default", max_attempts=3, now=T0, available_at=None):
-    return jobs_crud.enqueue_job(
-        event, subscriber, queue=queue, max_attempts=max_attempts, now=now, db=db, available_at=available_at
+    return db.get(
+        ProcessingJob,
+        jobs_crud.insert_job(
+            event, subscriber, queue=queue, max_attempts=max_attempts, now=now, db=db, available_at=available_at
+        ),
     )
 
 

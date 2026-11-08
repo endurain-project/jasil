@@ -68,7 +68,9 @@ def runner(registry, clock, session_factory):
 
 def _enqueue(db, subscriber="s", *, event=None, max_attempts=3, queue="default"):
     event = event or new_event("activity.created", {"id": 1}, source="test")
-    return jobs_crud.enqueue_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db)
+    return db.get(
+        ProcessingJob, jobs_crud.insert_job(event, subscriber, queue=queue, max_attempts=max_attempts, now=T0, db=db)
+    )
 
 
 def _attempts(db, job_id=None):

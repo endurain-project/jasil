@@ -296,7 +296,7 @@ class TestWorkerTelemetry:
 
         registry.register("work.created", "handler", handle, queue="campaign")
         with threaded_session_factory() as db:
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
                 queue="campaign",
@@ -403,7 +403,7 @@ class TestWorkerTelemetry:
 
         registry.register("work.created", "handler", handle)
         with threaded_session_factory() as db:
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("work.created", {}, source="test"),
                 "handler",
                 max_attempts=3,

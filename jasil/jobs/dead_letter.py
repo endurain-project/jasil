@@ -15,7 +15,7 @@ added to a subscriber later does not fire for its old history.
 """
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from datetime import timedelta
 from functools import partial
 
@@ -49,7 +49,6 @@ def deliver_dead_letters(
     registry: JobHandlerRegistry,
     session_factory: Callable[[], Session],
     clock: ClockProvider,
-    job_ids: Iterable[str] | None = None,
     limit: int = 100,
 ) -> int:
     """
@@ -62,8 +61,6 @@ def deliver_dead_letters(
         session_factory: Opens short-lived sessions; none is open while a
             callback runs.
         clock: Source of the current instant.
-        job_ids: The jobs this process just dead-lettered. Omit it to sweep every
-            owed callback that is due and recent enough.
         limit: Maximum number of jobs handled in one call.
 
     Returns:
@@ -71,8 +68,7 @@ def deliver_dead_letters(
         failure is stored on it, and a later sweep retries it after a backoff.
     """
     subscribers = set(registry.dead_letter_subscriber_ids())
-    ids = None if job_ids is None else list(job_ids)
-    if not subscribers or ids == []:
+    if not subscribers:
         return 0
     delivered = 0
     for _ in range(limit):
@@ -85,10 +81,9 @@ def deliver_dead_letters(
                 now=now,
                 lease_seconds=CLAIM_LEASE_SECONDS,
                 db=db,
-                job_ids=ids,
                 limit=1,
                 max_deliveries=MAX_DELIVERIES,
-                dead_after=None if ids is not None else now - SWEEP_WINDOW,
+                dead_after=now - SWEEP_WINDOW,
             )
         if not claimed:
             break

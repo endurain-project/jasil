@@ -76,7 +76,7 @@ def runner(registry, clock, session_factory):
 
 
 def _enqueue(db, subscriber: str) -> None:
-    jobs_crud.enqueue_job(
+    jobs_crud.insert_job(
         new_event("activity.created", {"id": 1}, source="test"), subscriber, max_attempts=3, now=T0, db=db
     )
 
@@ -745,7 +745,7 @@ class TestAFullBatch:
 
     def test_the_largest_batch_can_be_renewed_and_released(self, db):
         for number in range(MAX_JOB_BATCH_SIZE):
-            jobs_crud.enqueue_job(
+            jobs_crud.insert_job(
                 new_event("activity.created", {"id": number}, source="test"),
                 "s",
                 max_attempts=3,

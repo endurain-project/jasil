@@ -29,17 +29,6 @@ OUTCOME_LEASE_EXPIRED = "lease_expired"  # the lease ran out with no result: the
 OUTCOME_SUPERSEDED = "superseded"  # the handler finished after its job was taken: it ran twice
 OUTCOME_RELEASED = "released"  # claimed but never run; returned to pending with the attempt refunded
 OUTCOME_ABANDONED = "abandoned"  # exceeded the maximum runtime; signalled and left to the reaper
-OUTCOMES = (
-    OUTCOME_COMPLETED,
-    OUTCOME_FAILED,
-    OUTCOME_DEFERRED,
-    OUTCOME_CONTINUED,
-    OUTCOME_DEAD_LETTER,
-    OUTCOME_LEASE_EXPIRED,
-    OUTCOME_SUPERSEDED,
-    OUTCOME_RELEASED,
-    OUTCOME_ABANDONED,
-)
 
 DEFAULT_ATTEMPT_LIMIT = 50
 MAX_ATTEMPT_LIMIT = 500

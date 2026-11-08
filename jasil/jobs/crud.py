@@ -6,7 +6,7 @@ Hosts wanting the dashboard aggregates or dead-letter replay should use
 :mod:`jasil.admin`, which is importable from anywhere and opens its own session.
 
 **Every function here commits the session it is given** — except where a
-``commit`` flag says otherwise (``enqueue_job``, for the relay's single-
+``commit`` flag says otherwise (``insert_job``, for the relay's single-
 transaction fan-out). The claim, the terminal state writes and the reaper all
 have to be durable before the caller moves on, so they are not optional. Pass a
 session JASIL owns, not one carrying a caller's uncommitted work.
@@ -82,11 +82,27 @@ def insert_job(
     available_at: datetime | None = None,
     commit: bool = True,
 ) -> str:
-    """Insert one job like :func:`enqueue_job`, returning the id it was given.
+    """Enqueue one durable job for ``(event, subscriber_id)``, idempotently, returning the id it was given.
 
-    For a caller that does not need to know whether the row is new, such as the relay fanning a batch out:
-    unlike :func:`enqueue_job` it issues no ``SELECT`` per job. When a job for ``(event, subscriber_id)``
-    already existed nothing is inserted and the id names no row.
+    The ``(event_id, subscriber_id)`` uniqueness makes a repeat a no-op, so the same subscriber never runs twice
+    for the same event (idempotent consumer). Each call mints a fresh id, so when a job for
+    ``(event, subscriber_id)`` already existed nothing is inserted and the id names no row; no ``SELECT`` is
+    issued to tell the two apart.
+
+    Args:
+        event: The originating event envelope.
+        subscriber_id: The durable subscriber this job runs.
+        queue: Named queue eligible workers must select; defaults to ``default``.
+        max_attempts: Attempt ceiling before the job is dead-lettered.
+        now: Current instant (used for created/updated/available timestamps).
+        db: Active database session.
+        available_at: Earliest claim instant; defaults to ``now``.
+        commit: When True, commit immediately; when False, flush only and leave
+            the row in the caller's open transaction (the relay fans a whole
+            batch out under one commit).
+
+    Returns:
+        The id given to the job, which names no row when one already existed.
     """
     validate_queue_name(queue)
     job_id = str(uuid.uuid4())
@@ -111,56 +127,6 @@ def insert_job(
     db.execute(insert_ignoring_conflict(ProcessingJob, values, conflict_columns=_CONFLICT_KEYS, db=db))
     commit_or_flush(db, commit)
     return job_id
-
-
-def enqueue_job(
-    event: Event,
-    subscriber_id: str,
-    *,
-    queue: str = DEFAULT_QUEUE,
-    max_attempts: int,
-    now: datetime,
-    db: Session,
-    available_at: datetime | None = None,
-    commit: bool = True,
-) -> ProcessingJob | None:
-    """
-    Enqueue one durable job for ``(event, subscriber_id)``, idempotently.
-
-    The ``(event_id, subscriber_id)`` uniqueness makes a repeat enqueue a no-op,
-    so the same subscriber never runs twice for the same event (idempotent
-    consumer). Because each call mints a fresh job id, the freshly inserted row
-    is returned only when this call actually inserted it.
-
-    Args:
-        event: The originating event envelope.
-        subscriber_id: The durable subscriber this job runs.
-        queue: Named queue eligible workers must select; defaults to ``default``.
-        max_attempts: Attempt ceiling before the job is dead-lettered.
-        now: Current instant (used for created/updated/available timestamps).
-        db: Active database session.
-        available_at: Earliest claim instant; defaults to ``now``.
-        commit: When True, commit immediately; when False, flush only and leave
-            the row in the caller's open transaction (the relay fans a whole
-            batch out under one commit).
-
-    Returns:
-        The inserted job, or ``None`` when a job for this ``(event, subscriber)``
-        already existed.
-    """
-    # Returns the row only when this call inserted it: a skipped conflict leaves
-    # our unique job_id absent, so ``get`` yields None for a duplicate enqueue.
-    job_id = insert_job(
-        event,
-        subscriber_id,
-        queue=queue,
-        max_attempts=max_attempts,
-        now=now,
-        db=db,
-        available_at=available_at,
-        commit=commit,
-    )
-    return db.get(ProcessingJob, job_id)
 
 
 def claim_jobs(
@@ -451,7 +417,7 @@ def close_attempts(
     Args:
         job_attempts: ``{job_id: attempt number of the claim}``.
         worker_id: The worker that holds the claims.
-        outcome: One of :data:`OUTCOMES`.
+        outcome: One of the ``OUTCOME_*`` constants of :mod:`jasil.jobs._attempts`.
         now: The instant the attempts ended.
         db: Active database session.
 
@@ -1368,7 +1334,6 @@ def claim_dead_letter_callbacks(
     now: datetime,
     lease_seconds: float,
     db: Session,
-    job_ids: Iterable[str] | None = None,
     limit: int = 100,
     max_deliveries: int | None = None,
     dead_after: datetime | None = None,
@@ -1388,7 +1353,6 @@ def claim_dead_letter_callbacks(
         now: Current instant.
         lease_seconds: How long the claim holds off other deliveries.
         db: Active database session.
-        job_ids: Restrict to these jobs (the ones this process just dead-lettered).
         limit: Maximum number of jobs claimed.
         max_deliveries: Give up on a job once this many deliveries were claimed.
         dead_after: Ignore jobs dead-lettered before this instant, so a callback
@@ -1411,8 +1375,6 @@ def claim_dead_letter_callbacks(
         statement = statement.where(ProcessingJob.dead_letter_attempts < max_deliveries)
     if dead_after is not None:
         statement = statement.where(ProcessingJob.updated_at >= dead_after)
-    if job_ids is not None:
-        statement = statement.where(ProcessingJob.id.in_(list(job_ids)))
     rows: Sequence[ProcessingJob] = (
         db.execute(statement.order_by(ProcessingJob.updated_at, ProcessingJob.id).limit(limit)).scalars().all()
     )
