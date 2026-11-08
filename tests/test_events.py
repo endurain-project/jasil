@@ -221,6 +221,29 @@ class TestParsePayload:
         assert record.event_version == 4
         assert record.supported_version == 3
 
+    def test_an_upgrader_that_edits_in_place_leaves_the_event_as_written(self):
+        """Every handler of an event type parses the same ``Event``; one upgrade must not rewrite it for the next."""
+
+        def rename_in_place(payload: dict) -> dict:
+            payload["name"] = payload.pop("title")
+            payload["tags"]["upgraded"] = True
+            return payload
+
+        class Renamed(VersionedPayload):
+            SCHEMA_VERSION: ClassVar[int] = 2
+            UPGRADERS: ClassVar[dict] = {1: rename_in_place}
+
+            name: str
+            tags: dict
+
+        event = _event_at(1, {"title": "t", "tags": {}})
+
+        first = parse_payload(Renamed, event)
+        second = parse_payload(Renamed, event)
+
+        assert first.name == second.name == "t"
+        assert event.payload == {"title": "t", "tags": {}}
+
     def test_a_missing_upgrader_is_refused(self):
         """An evolution that shipped without its migration must fail loudly."""
         event = _event_at(1, {"name": "n"})

@@ -29,6 +29,7 @@ No new machinery is needed for either: durable handlers already raise on failure
 and the runner already retries and then dead-letters.
 """
 
+import copy
 import logging
 from collections.abc import Callable
 from typing import ClassVar
@@ -116,7 +117,9 @@ def parse_payload[T: VersionedPayload](model: type[T], event: Event) -> T:
                 "supported_version": target,
             },
         )
-        payload = _upgrade(model, payload, version, target, event)
+        # A copy: every handler of the event type parses this same ``Event``, and an upgrader that edits its
+        # dict in place would otherwise rewrite the payload the next handler reads.
+        payload = _upgrade(model, copy.deepcopy(payload), version, target, event)
 
     return model.model_validate(payload)
 
@@ -132,7 +135,7 @@ def _upgrade[T: VersionedPayload](
 
     Args:
         model: The payload model whose upgraders to apply.
-        payload: The payload as written.
+        payload: A copy of the payload as written, which the upgraders may change.
         version: The version it was written at.
         target: The version to reach.
         event: The originating event, for error context.
