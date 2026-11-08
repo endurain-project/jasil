@@ -428,7 +428,9 @@ def seal_pending_windows(now: datetime | None = None, settings: AuditSettings | 
             service.note_maintenance(db, last_checkpoint_at=end)
             db.commit()
         written += 1
-        start, prev_hash = end, digest.hash
+        # The stored checkpoint's hash, not this run's digest: a window resealed in its sink copy's format hashes
+        # differently, and the next window chains onto what verification reads.
+        start, prev_hash = end, checkpoint.hash
     return written
 
 

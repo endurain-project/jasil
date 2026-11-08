@@ -359,6 +359,39 @@ class TestSealingThroughTheSink:
         assert (newest.hash, newest.signature) == (copy["hash"], copy["signature"])
         assert jasil_audit.verify_checkpoints(None, T0, T0 + timedelta(hours=1)).ok
 
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_the_window_after_one_resealed_in_its_copy_format_chains_onto_the_stored_hash(
+        self, trail, monkeypatch, signed
+    ):
+        """A window with rows hashes differently in each format, so the next window must chain onto the stored one."""
+        if signed:
+            trail.configure(signing_key=base64.b64encode(bytes(range(32))).decode())
+        action = jasil_audit.get_catalog().get("shop.order.place")
+        trail.clock.moment = T0 + timedelta(minutes=35)
+        jasil_audit.record_detached(action, outcome=Outcome.SUCCESS, target_id="b")
+        trail.clock.moment = T0 + timedelta(minutes=60)
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoints, "_FORMAT_VERSION", 1)
+            checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+        trail.clock.moment = T0 + timedelta(minutes=120)
+
+        assert checkpoints.seal_pending_windows() == 5
+
+        assert [checkpoint.format_version for checkpoint in self._stored()] == [1, 1, 1, 2, 2, 2, 2]
+        public_key = None
+        if signed:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            raw = (
+                Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+                .public_key()
+                .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            )
+            public_key = base64.b64encode(raw).decode()
+        assert jasil_audit.verify_checkpoints(public_key, T0, T0 + timedelta(hours=2)).ok
+
     @pytest.mark.parametrize("version", [3, "2", None])
     def test_a_copy_in_a_format_this_release_does_not_know_is_a_conflict(self, trail, version):
         checkpoints.seal_pending_windows()
