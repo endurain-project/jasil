@@ -91,11 +91,17 @@ def _revision_metadata(revision: str) -> MetaData:
 
 
 def _schema(engine) -> dict[str, dict]:
-    """Snapshot JASIL's tables as {table: {column: type_string}}."""
+    """Snapshot JASIL's tables as {table: {column: type_string}}, the types as the database dialect spells them.
+
+    ``str(type)`` compiles for the default dialect, which leaves out a MySQL ``DATETIME(6)``'s precision.
+    """
     inspector = inspect(engine)
     present = set(inspector.get_table_names()) & jasil_table_names()
     return {
-        table: {column["name"]: str(column["type"]) for column in inspector.get_columns(table)} for table in present
+        table: {
+            column["name"]: column["type"].compile(dialect=engine.dialect) for column in inspector.get_columns(table)
+        }
+        for table in present
     }
 
 
@@ -201,6 +207,26 @@ class TestNoDrift:
 
         assert migrated == created
 
+    @staticmethod
+    def _same_boolean_default(
+        context, inspected_column, metadata_column, inspected_default, metadata_default, rendered
+    ):
+        """Compare a boolean column's default as a boolean; ``None`` leaves every other default to alembic.
+
+        The models say ``false()`` and MySQL reflects the stored ``0`` as the text ``'0'``, which alembic reads as a
+        different default. A default that is not the same boolean is still a difference.
+        """
+        from sqlalchemy import Boolean
+        from sqlalchemy.sql.elements import False_, True_
+
+        if not isinstance(metadata_column.type, Boolean) or inspected_default is None:
+            return None
+        wanted = {False_: False, True_: True}.get(type(getattr(metadata_default, "arg", None)))
+        found = {"0": False, "false": False, "1": True, "true": True}.get(str(inspected_default).strip("'\"()").lower())
+        if wanted is None or found is None:
+            return None
+        return wanted != found
+
     def _diff(self, engine, mapped_base) -> list:
         """What alembic's autogenerate would change to make the database match the models, for JASIL's tables."""
         with engine.connect() as connection:
@@ -208,7 +234,7 @@ class TestNoDrift:
                 connection,
                 opts={
                     "compare_type": True,
-                    "compare_server_default": True,
+                    "compare_server_default": self._same_boolean_default,
                     "include_object": migrations.jasil_include_object,
                     "version_table": migrations.VERSION_TABLE,
                 },

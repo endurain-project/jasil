@@ -1933,7 +1933,7 @@ class TestLocalStorageConcurrentDelete:
 
 
 def _files_under(root: Path) -> set[str]:
-    return {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
+    return {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
 
 
 class TestLocalStoragePlainFirstWriteRace:

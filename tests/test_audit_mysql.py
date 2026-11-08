@@ -296,12 +296,14 @@ class TestMicrosecondTimestamps:
         assert {key: precision for key, (precision, _) in columns.items()} == dict.fromkeys(columns, 6)
 
     def test_every_server_default_is_the_microsecond_clock(self, migrated, mapped_base):
-        """MySQL reports ``CURRENT_TIMESTAMP(6)``, MariaDB ``current_timestamp(6)``."""
+        """MySQL reports ``CURRENT_TIMESTAMP(6)``, MariaDB ``current_timestamp(6)`` and, for a nullable column with
+        no default, the string ``NULL`` where MySQL reports none."""
         columns = self._datetime_columns(migrated)
 
         for key, defaulted in self._expected(mapped_base).items():
             default = columns[key][1]
-            assert (default.lower() if default else None) == ("current_timestamp(6)" if defaulted else None), key
+            default = None if default is None or default.lower() == "null" else default.lower()
+            assert default == ("current_timestamp(6)" if defaulted else None), key
 
     def test_a_server_default_stamps_a_fraction_of_a_second(self, migrated):
         """The session's clock is pinned (``SET timestamp``), so the default's value is known to the microsecond."""

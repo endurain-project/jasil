@@ -308,7 +308,10 @@ class TestRedisTtlIsArmed:
             RedisState(client).incr("counter", amount, ttl_seconds=60)
 
         assert client.get("counter") == stored
-        assert client.ttl("counter") == (-1 if expiry is None else 600)
+        if expiry is None:
+            assert client.ttl("counter") == -1
+        else:
+            assert 60 < client.ttl("counter") <= 600  # some of the 600 seconds may have elapsed; 60 would be re-armed
 
     def test_set_if_absent_arms_the_expiry_when_asked(self, client):
         RedisState(client).set_if_absent("lock", b"owner", ttl_seconds=60)
