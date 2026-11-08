@@ -298,9 +298,10 @@ def publish(
             which a UUID string satisfies; anything else is refused.
 
     Returns:
-        The event's id, or ``None`` when publishing failed. Delivery failures (including an invalid
-        ``event_id``, or a reused one with a different ``event_type`` or payload) are logged and swallowed so a
-        publish never breaks the producer. The domain row remains the source of truth and each subscriber's
+        The event's id, or ``None`` when publishing failed. A failure is logged and swallowed so a publish never
+        breaks the producer: an invalid ``event_id``, a reused one with a different ``event_type`` or payload,
+        or a bus that could not take the event. A handler that raises is logged by the bus and does not make
+        this ``None``, because the event was dispatched. The domain row remains the source of truth and each subscriber's
         reconciliation net recovers anything missed.
     """
     try:

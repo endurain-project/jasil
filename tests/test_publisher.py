@@ -837,6 +837,19 @@ class TestPublishReturnsTheEventId:
 
         assert publisher.publish("activity.created", {}, source="test") is None
 
+    def test_publish_returns_the_id_after_a_partial_delivery(self, monkeypatch):
+        """A producer retrying on None would run the handlers that succeeded a second time."""
+        from jasil.backends.events_inprocess import InProcessEventBus
+
+        bus = InProcessEventBus()
+        calls = []
+        bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+        bus.subscribe("activity.created", lambda _e: calls.append("second"))
+        monkeypatch.setattr(runtime, "_active_platform", FakePlatform(events=bus))
+
+        assert publisher.publish("activity.created", {}, source="test", event_id="evt-1") == "evt-1"
+        assert calls == ["second"]
+
     def test_publish_returns_none_when_the_platform_is_missing(self, monkeypatch):
         monkeypatch.setattr(runtime, "_active_platform", None)
 

@@ -4,7 +4,7 @@ These are the three places a handler exception is caught, and each has a
 different contract:
 
 * the **runner** turns a failure into a retry or a dead-letter;
-* the **in-process bus** re-raises to the publisher (dispatch is a direct call);
+* the **in-process bus** logs the failure and returns, as the Redis consumer does;
 * the **subscriber wrapper** swallows, so one bad subscriber cannot fail a request.
 """
 
@@ -796,36 +796,44 @@ class TestInProcessBus:
 
         assert len(first) == len(second) == 1
 
-    def test_a_handler_exception_propagates_to_the_publisher(self):
-        """Dispatch is a direct call in the local profile, so the caller sees it;
-        the scheduler backfill is the safety net."""
+    def test_a_handler_exception_is_logged_not_raised(self, caplog):
+        """Every handler has run by the time publish returns, so a raise would make a retrying producer run them twice."""
         bus = InProcessEventBus()
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+        event = new_event("activity.created", {"secret": "payload-value"}, source="test")
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(new_event("activity.created", {}, source="test"))
+        with caplog.at_level("ERROR"):
+            bus.publish(event)
 
-    def test_every_handler_runs_before_the_failure_propagates(self):
+        records = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert event.event_type in records[0].getMessage()
+        assert event.event_id in records[0].getMessage()
+        assert "payload-value" not in caplog.text
+
+    def test_every_handler_runs_when_one_raises(self):
         bus = InProcessEventBus()
         calls = []
         bus.subscribe("activity.created", lambda _e: calls.append("first"))
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
         bus.subscribe("activity.created", lambda _e: calls.append("third"))
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(new_event("activity.created", {}, source="test"))
+        bus.publish(new_event("activity.created", {}, source="test"))
 
         assert calls == ["first", "third"]
 
-    def test_several_failures_propagate_together(self):
+    def test_several_failures_are_logged_together(self, caplog):
         bus = InProcessEventBus()
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("one")))
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(ValueError("two")))
 
-        with pytest.raises(ExceptionGroup) as excinfo:
+        with caplog.at_level("ERROR"):
             bus.publish(new_event("activity.created", {}, source="test"))
 
-        assert [type(error) for error in excinfo.value.exceptions] == [RuntimeError, ValueError]
+        records = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(records) == 1
+        assert [type(error) for error in records[0].exc_info[1].exceptions] == [RuntimeError, ValueError]
 
     def test_start_and_stop_are_no_ops(self):
         bus = InProcessEventBus()
@@ -913,12 +921,11 @@ class TestInProcessBusRecording:
 
         assert len(seen) == 1
 
-    def test_a_failure_is_recorded_and_still_propagates(self, bus, recorder):
+    def test_a_failure_is_recorded_and_publish_returns(self, bus, recorder):
         event = new_event("activity.created", {}, source="test")
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(event)
+        bus.publish(event)
 
         assert recorder.failed == [event.event_id]
 

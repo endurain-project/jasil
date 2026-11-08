@@ -420,8 +420,8 @@ With `events_uri="none://"` the bus is disabled. Best-effort publishes are dropp
 the outbox is unaffected, and an injected event recorder records nothing for the dropped events.
 
 In-process dispatch is a direct function call. Every handler of the event runs
-even when one raises; the failure then propagates to the publisher (several
-together as an `ExceptionGroup`), which logs it. Under Redis Streams, replicas
+even when one raises; the bus logs the failure (several together as an
+`ExceptionGroup`) and `publish` still returns the event's id. Under Redis Streams, replicas
 form one consumer group, giving competing-consumer semantics: each derived
 computation runs once per event across the cluster, while in-process fan-out to
 every handler of an event type happens on whichever replica claims the entry.
