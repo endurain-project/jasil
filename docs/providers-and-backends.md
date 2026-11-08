@@ -426,7 +426,9 @@ form one consumer group, giving competing-consumer semantics: each derived
 computation runs once per event across the cluster, while in-process fan-out to
 every handler of an event type happens on whichever replica claims the entry.
 
-Redis delivery is best-effort, at most once per event. Every handler runs even
+Redis delivery is best-effort, at most once per event. Every handler runs, as the
+system under the event's correlation id and audit context (the same scopes a
+[durable handler](durable-jobs.md#the-context-a-handler-runs-in) gets), even
 when one raises, the failure is logged and recorded in the event log, and the
 entry is acked either way: the consumer reads with `XREADGROUP ... >`, which
 only returns entries no one has claimed, so an entry left pending would never be

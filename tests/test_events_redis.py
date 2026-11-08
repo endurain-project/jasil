@@ -20,12 +20,14 @@ import fakeredis
 import pytest
 import redis
 
+from jasil.audit.context import ActorType, Source, get_context
 from jasil.backends.events_redis import (
     RedisStreamEventBus,
     deserialize_event,
     serialize_event,
 )
-from jasil.events import Event, new_event
+from jasil.correlation import get_correlation_id
+from jasil.events import META_REQUEST_ID, META_SCOPE, Event, new_event
 
 STREAM = "test:events"
 GROUP = "test"
@@ -218,6 +220,47 @@ class TestDispatch:
         bus._poll_once()
 
         assert seen == [0, 1, 2]
+
+
+class TestHandlerContext:
+    def test_a_handler_runs_as_the_system_for_the_event(self, bus):
+        seen = []
+
+        def handler(_event):
+            context = get_context()
+            seen.append((get_correlation_id(), context.actor_type, context.source, context.event_id, context.scope))
+
+        bus.subscribe("order.created", handler)
+        event = new_event("order.created", {}, source="api", metadata={META_REQUEST_ID: "req-1", META_SCOPE: "ws-7"})
+        bus.publish(event)
+
+        bus._poll_once()
+
+        assert seen == [("req-1", ActorType.SYSTEM, Source.WORKER, event.event_id, "ws-7")]
+
+    def test_nothing_leaks_after_the_handler(self, bus):
+        bus.subscribe("order.created", lambda _event: None)
+        bus.publish(new_event("order.created", {}, source="api", metadata={META_REQUEST_ID: "req-1"}))
+
+        bus._poll_once()
+
+        assert get_correlation_id() is None
+        assert get_context().actor_type is ActorType.ANONYMOUS
+
+    def test_a_bad_stored_scope_is_logged_and_acked_and_the_consumer_continues(self, bus, client, caplog):
+        seen = []
+        bus.subscribe("order.created", seen.append)
+        bad = new_event("order.created", {}, source="api")
+        client.xadd(STREAM, {**serialize_event(bad), "metadata": json.dumps({META_SCOPE: 5})})
+        good = new_event("order.created", {}, source="api")
+        bus.publish(good)
+
+        with caplog.at_level("ERROR"):
+            bus._poll_once()
+
+        assert [event.event_id for event in seen] == [good.event_id]
+        assert _pending_count(client) == 0
+        assert "Event handling failed" in caplog.text
 
 
 class TestAckFailure:

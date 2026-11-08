@@ -82,7 +82,7 @@ ends (returning, raising, deferring, continuing, or the worker losing its claim)
 
 Both scopes win over an installed provider and over `set_context` /
 `set_correlation_id`, which know nothing about the request a queued job came
-from. A handler that knows who it acts for opens its own block on top; it keeps
+from. Best-effort handlers on the Redis event bus run in the same two scopes. A handler that knows who it acts for opens its own block on top; it keeps
 `source`, `event_id` and `scope`:
 
 ```python

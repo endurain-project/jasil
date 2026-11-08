@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any
 import jasil._core.identity as identity
 import jasil._core.redis_clients as redis_clients
 from jasil._core.threads import backoff_delay, signal_and_join
+from jasil.audit.context import event_handler_scope
 from jasil.events import INITIAL_SCHEMA_VERSION, Event
 
 logger = logging.getLogger(__name__)
@@ -222,13 +223,18 @@ class RedisStreamEventBus:
 
 
 def _call_each(handlers: list[Callable[[Event], None]], event: Event) -> None:
-    """Call every handler, then raise what failed: the error itself, or an ``ExceptionGroup`` of several."""
+    """Call every handler as the system working for ``event``, then raise what failed.
+
+    Raises the error itself, or an ``ExceptionGroup`` of several. An invalid stored scope raises before any
+    handler runs.
+    """
     errors = []
-    for handler in handlers:
-        try:
-            handler(event)
-        except Exception as error:  # one subscriber must not keep the event from the others
-            errors.append(error)
+    with event_handler_scope(event):
+        for handler in handlers:
+            try:
+                handler(event)
+            except Exception as error:  # one subscriber must not keep the event from the others
+                errors.append(error)
     if len(errors) == 1:
         raise errors[0]
     if errors:

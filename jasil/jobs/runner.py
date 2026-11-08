@@ -17,7 +17,7 @@ events it writes trace back to the request.
 import logging
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import timedelta
 
 from sqlalchemy.orm import Session
@@ -26,9 +26,8 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
-from jasil.audit.context import ActorType, AuditContext, Source, audit_context
-from jasil.correlation import correlation_scope
-from jasil.events import META_REQUEST_ID, META_SCOPE, Event
+from jasil.audit.context import event_handler_scope
+from jasil.events import Event
 from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
@@ -338,18 +337,7 @@ class JobRunner:
         try:
             if handler is None:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
-            # Every field is passed, so nothing is inherited from the worker thread or a request-scoped provider.
-            context = AuditContext(
-                actor_type=ActorType.SYSTEM,
-                source=Source.WORKER,
-                event_id=job.event_id,
-                scope=event.metadata.get(META_SCOPE),
-            )
-            with (
-                job_lease(lost),
-                correlation_scope(event.metadata.get(META_REQUEST_ID)),
-                audit_context(**asdict(context)),
-            ):
+            with job_lease(lost), event_handler_scope(event):
                 handler(event)
         except DeferJob as deferral:
             self._leases.finalize(job.id)
