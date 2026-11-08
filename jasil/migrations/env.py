@@ -11,7 +11,7 @@ concurrently (see :mod:`jasil.migrations._online`).
 
 from alembic import context
 
-from jasil.migrations import VERSION_TABLE, _one_run_at_a_time, jasil_include_object
+from jasil.migrations import VERSION_TABLE, _migration_prefix, _names, _one_run_at_a_time, jasil_include_object
 from jasil.orm import get_active_base
 
 target_metadata = get_active_base().metadata
@@ -62,7 +62,14 @@ def _run_online(connection) -> None:
     """Run the migrations on ``connection``, one process at a time."""
     _configure(connection=connection)
     with context.begin_transaction(), _one_run_at_a_time(connection):
-        context.run_migrations()
+        command_name = context.config.attributes.get("command")
+        if command_name is None:  # a stamp runs no revision, so no table is named
+            context.run_migrations()
+            return
+        # Decided under the lock: another run may be part-way through creating the tables it inspects.
+        prefix = _migration_prefix(connection, command_name, context.get_revision_argument())
+        with _names.use_prefix(prefix):
+            context.run_migrations()
 
 
 if context.is_offline_mode():

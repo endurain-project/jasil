@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -312,6 +313,86 @@ class TestPrefixRename:
         tables = set(inspector.get_table_names())
         assert legacy_table_names() <= tables
         assert not tables & jasil_table_names()
+class TestDowngradeOfAnInterruptedInstall:
+    """A fresh install creates prefixed tables from ``rev0001`` on, so one stopped early has to downgrade as such."""
+
+    @pytest.fixture
+    def interrupted(self, engine, monkeypatch):
+        def install_to(revision: str) -> None:
+            with monkeypatch.context() as patch:
+                patch.setattr(migrations, "_fresh_install_prefix", lambda _connection, _revision: "jasil_")
+                migrations.upgrade(engine, revision)
+
+        return install_to
+
+    @pytest.mark.parametrize("revision", ["rev0001", "rev0002"])
+    def test_it_downgrades_to_base_and_leaves_no_jasil_table(self, engine, interrupted, revision):
+        interrupted(revision)
+        assert migrations.db_revision(engine) == revision
+        assert set(inspect(engine).get_table_names()) & jasil_table_names()
+
+        migrations.downgrade(engine, "base")
+
+        assert migrations.db_revision(engine) is None
+        assert not set(inspect(engine).get_table_names()) & (jasil_table_names() | legacy_table_names())
+
+    def test_it_downgrades_one_revision_and_upgrades_again(self, engine, interrupted):
+        interrupted("rev0002")
+
+        migrations.downgrade(engine, "rev0001")
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert jasil_table_names() <= set(inspect(engine).get_table_names())
+
+    def test_a_legacy_install_at_rev0002_downgrades_to_base(self, engine):
+        migrations.upgrade(engine, "rev0002")
+        assert legacy_table_names() <= set(inspect(engine).get_table_names())
+
+        migrations.downgrade(engine, "base")
+
+        assert not set(inspect(engine).get_table_names()) & (jasil_table_names() | legacy_table_names())
+
+
+class TestPrefixDecisionUnderTheLock:
+    """Another process may be part-way through ``rev0001`` while the lock is held, so the decision waits for the lock."""
+
+    @pytest.fixture
+    def events(self, monkeypatch):
+        events: list[str] = []
+        lock = migrations._one_run_at_a_time
+        decide = migrations._migration_prefix
+
+        @contextmanager
+        def recording_lock(connection):
+            with lock(connection):
+                events.append("locked")
+                yield
+            events.append("unlocked")
+
+        def recording_decision(connection, command_name, revision):
+            events.append("decided")
+            return decide(connection, command_name, revision)
+
+        monkeypatch.setattr(migrations, "_one_run_at_a_time", recording_lock)
+        monkeypatch.setattr(migrations, "_migration_prefix", recording_decision)
+        return events
+
+    def test_an_upgrade_decides_while_the_lock_is_held(self, engine, events):
+        migrations.upgrade(engine)
+
+        assert events == ["locked", "decided", "unlocked"]
+
+    def test_a_downgrade_decides_while_the_lock_is_held(self, engine, events):
+        migrations.upgrade(engine)
+        events.clear()
+
+        migrations.downgrade(engine, "base")
+
+        assert events == ["locked", "decided", "unlocked"]
+        assert not set(inspect(engine).get_table_names()) & jasil_table_names()
+
+
         assert any(
             set(c["column_names"]) == {"event_id", "subscriber_id"}
             and c["name"] == "uq_processing_jobs_event_subscriber"
