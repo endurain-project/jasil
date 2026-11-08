@@ -125,6 +125,13 @@ class TestEngineAccess:
         with pytest.raises(RuntimeError, match="gives its tables no engine"):
             pristine_orm.get_engine()
 
+    def test_a_binds_factory_before_map_models_is_told_to_map_first(self, pristine_orm, db_engine, mapped_base):
+        """Its rules route JASIL's models, which there are none of until ``map_models`` has run."""
+        pristine_orm.configure_sessionmaker(sessionmaker(binds={mapped_base: db_engine}))
+
+        with pytest.raises(RuntimeError, match=r"call jasil\.orm\.map_models\(\) first"):
+            pristine_orm.get_engine()
+
     def test_reading_the_engine_before_configuring_raises(self, pristine_orm):
         with pytest.raises(RuntimeError, match="configure_sessionmaker"):
             pristine_orm.get_engine()
