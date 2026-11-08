@@ -180,6 +180,9 @@ class JobRunner:
                 queue_cursor=self._queue_cursor,
                 default_queue_subscribers=default_subscribers,
                 excluded_default_queue_subscribers=excluded_subscribers,
+                # Read on every claim, so a subscriber registered later is picked up. A job whose subscriber this
+                # process lacks stays pending for a worker that has it, rather than failing here.
+                subscribers=self._registry.subscriber_ids(),
                 record_attempts=self._record_attempts,
             )
             snapshots = [self._snapshot(job) for job in claimed]

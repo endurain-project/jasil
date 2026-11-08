@@ -338,16 +338,48 @@ class TestJobRunner:
 
         assert stored_job(db).last_error == recorded
 
-    def test_a_job_with_no_registered_handler_fails_rather_than_vanishing(self, runner, db):
-        """A subscriber removed from the code while jobs are still queued must
-        surface, not silently succeed."""
-        self._enqueue(db, subscriber="gone", max_attempts=1)
+    def test_a_handler_gone_between_the_claim_and_the_run_fails_rather_than_vanishing(
+        self, runner, registry, db, monkeypatch
+    ):
+        """Only a registry reset mid-batch gets here: the job must surface, not silently succeed."""
+        registry.register("activity.created", "s", lambda _event: None)
+        self._enqueue(db, max_attempts=1)
+        monkeypatch.setattr(registry, "get", lambda _subscriber_id: None)
 
         runner.run_once()
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
         assert "no durable handler" in job.last_error
+
+    def test_a_job_of_an_unregistered_subscriber_stays_pending_for_a_worker_that_has_it(self, runner, registry, db):
+        """A rolling deploy adds a subscriber: an old worker must leave its jobs alone, not dead-letter them."""
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.event_id))
+        unknown = self._enqueue(db, subscriber="x", max_attempts=1)
+        known = self._enqueue(db, subscriber="s")
+
+        assert runner.run_once() == 1
+
+        db.rollback()
+        db.refresh(unknown)
+        db.refresh(known)
+        assert (unknown.status, unknown.attempts, unknown.last_error) == (jobs_crud.STATUS_PENDING, 0, None)
+        assert known.status == jobs_crud.STATUS_COMPLETED
+        assert seen == [known.event_id]
+
+    def test_a_subscriber_registered_after_the_runner_was_built_is_claimed_on_the_next_batch(
+        self, runner, registry, db
+    ):
+        self._enqueue(db, subscriber="late")
+        assert runner.run_once() == 0
+
+        seen = []
+        registry.register("activity.created", "late", lambda event: seen.append(event.event_id))
+
+        assert runner.run_once() == 1
+        assert stored_job(db).status == jobs_crud.STATUS_COMPLETED
+        assert len(seen) == 1
 
     def test_one_failing_job_does_not_abort_the_batch(self, runner, registry, db):
         """Each job is finalised independently; the rest of the batch must run."""
@@ -363,7 +395,8 @@ class TestJobRunner:
         assert processed == 2
         assert len(seen) == 1
 
-    def test_a_finalization_error_does_not_abort_the_batch(self, runner, db, monkeypatch, caplog):
+    def test_a_finalization_error_does_not_abort_the_batch(self, runner, registry, db, monkeypatch, caplog):
+        registry.register("activity.created", "s", lambda _event: None)
         self._enqueue(db, payload={"id": 1})
         self._enqueue(db, payload={"id": 2})
         finalized = []
@@ -564,7 +597,7 @@ class TestJobRunner:
             queues=queues,
         )
 
-    def test_a_selective_default_runner_still_dead_letters_an_unknown_subscriber(
+    def test_a_selective_default_runner_leaves_an_unknown_subscriber_pending(
         self,
         registry,
         clock,
@@ -587,10 +620,9 @@ class TestJobRunner:
             queues=("default",),
         )
 
-        assert runner.run_once() == 1
+        assert runner.run_once() == 0
         job = stored_job(db)
-        assert job.status == jobs_crud.STATUS_DEAD_LETTER
-        assert "no durable handler" in job.last_error
+        assert (job.status, job.attempts) == (jobs_crud.STATUS_PENDING, 0)
 
     def test_an_empty_queue_allowlist_is_refused(self, registry, clock, session_factory):
         with pytest.raises(ValueError, match="queues"):

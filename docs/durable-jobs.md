@@ -491,14 +491,20 @@ queue isolation remains intact while old writers drain. Conversely, a selective
 `default` worker excludes legacy rows for subscribers now assigned to a named
 queue; the two workers cannot race for the same compatibility row.
 
-Both rules are decided from the registrations of the worker process that makes
-the claim, so **every worker process must register every durable subscriber**,
-even those it will not consume, before it starts. A worker that has not
-registered a subscriber cannot tell that a legacy `default` row belongs to
-another queue, and will claim it, find no handler, and dead-letter it. Routing
-reads the registrations on every claim, but the one-time retag of legacy rows
-runs on the worker's first batch, so register subscribers before starting the
-worker. Alternatively, let the `default` queue drain before rolling out.
+A worker claims only the jobs of subscribers registered in its own process. A job
+whose subscriber no running worker has registered (a subscriber added by a rolling
+deploy, for example) stays `pending` with its attempts untouched, and shows as
+backlog in the jobs summary until a worker that registered it runs; it is not
+dead-lettered. Registrations are read on every claim, so a subscriber registered
+after the worker started is picked up on its next batch.
+
+The legacy `default` routing rules above are decided from the same registrations,
+so register every durable subscriber, even those the worker will not consume,
+before it starts: a selective worker that has not registered a subscriber cannot
+tell that a legacy `default` row belongs to another queue, and leaves it pending
+for the worker that can. The one-time retag of legacy rows runs on the worker's
+first batch, so register subscribers before starting the worker. Alternatively,
+let the `default` queue drain before rolling out.
 
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
