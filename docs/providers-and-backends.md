@@ -157,6 +157,9 @@ conflicting write raises `StorageKeyConflictError`. A key is matched against the
 names on disk exactly, so a read of the other spelling finds nothing, `delete()`
 leaves the existing object alone, and `url()` raises `StorageKeyConflictError`
 rather than return a path the web server would answer with the existing file.
+A plain area publishes each new object with a hard link, so that of two simultaneous first
+writes of such keys exactly one wins; the filesystem must support hard links, or writes to the
+area fail with `StorageBackendUnavailableError`.
 These are the only differences in key namespace semantics between a plain local
 area and S3; non-conflicting keys keep the same provider API and behavior.
 

@@ -157,6 +157,9 @@ pair.
   `alice/x`. Every existing component of such a path must be listed by its
   directory exactly as the key spells it: a read of another spelling finds nothing,
   and a write or `url()` of it raises `StorageKeyConflictError`.
+  A plain area publishes a new object with a hard link, which fails if the name exists under any
+  spelling, so two simultaneous first writes cannot overwrite each other; the filesystem must support
+  hard links.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
   alter the URL it lands in.
 
