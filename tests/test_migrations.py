@@ -18,6 +18,8 @@ from typing import ClassVar
 
 import pytest
 from sqlalchemy import (
+from alembic.autogenerate import compare_metadata
+from alembic.runtime.migration import MigrationContext
     CheckConstraint,
     Column,
     Index,
@@ -199,6 +201,51 @@ class TestNoDrift:
         assert migrated == created
 
     def test_the_indexes_match_the_models(self, engine, mapped_base):
+    def _diff(self, engine, mapped_base) -> list:
+        """What alembic's autogenerate would change to make the database match the models, for JASIL's tables."""
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={
+                    "compare_type": True,
+                    "compare_server_default": True,
+                    "include_object": migrations.jasil_include_object,
+                    "version_table": migrations.VERSION_TABLE,
+                },
+            )
+            diff = compare_metadata(context, mapped_base.metadata)
+        # The PostgreSQL-only GIN index (see DIALECT_ONLY_INDEXES) is the one intended difference.
+        return [
+            change
+            for change in diff
+            if not (change[0] == "remove_index" and change[1].name in self.DIALECT_ONLY_INDEXES)
+        ]
+
+    def test_a_fresh_install_has_nothing_to_autogenerate(self, engine, mapped_base):
+        """Types, nullability, server defaults, indexes, unique constraints and foreign keys all compare equal."""
+        migrations.upgrade(engine)
+
+        assert self._diff(engine, mapped_base) == []
+
+    def test_a_legacy_install_migrated_through_the_rename_has_nothing_to_autogenerate(self, engine, mapped_base):
+        migrations.upgrade(engine, "rev0002")
+        migrations.upgrade(engine)
+
+        assert self._diff(engine, mapped_base) == []
+
+    def test_primary_keys_and_check_constraints_match_the_models(self, engine, mapped_base):
+        """Autogenerate does not compare either, so they are read back and compared here."""
+        migrations.upgrade(engine)
+        inspector = inspect(engine)
+
+        for table_name in sorted(jasil_table_names()):
+            table = mapped_base.metadata.tables[table_name]
+            assert inspector.get_pk_constraint(table_name)["constrained_columns"] == [
+                column.name for column in table.primary_key.columns
+            ], table_name
+            expected = {c.name for c in table.constraints if isinstance(c, CheckConstraint) and c.name}
+            assert {c["name"] for c in inspector.get_check_constraints(table_name)} >= expected, table_name
+
         migrations.upgrade(engine)
         migrated = _indexes(engine)
         _drop_everything(engine, mapped_base)
