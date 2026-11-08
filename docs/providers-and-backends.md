@@ -381,9 +381,9 @@ exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
     Area, key, source, destination, and deletion-prefix values are validated
     before backend I/O. Addresses must be canonical slash-delimited paths: an
     absolute path, a `.` or `..` component, a repeated or trailing separator,
-    or any backslash raises `ValueError`, and so does a control character or a
-    value over 1024 bytes in UTF-8, S3's key limit (on S3 the bucket prefix and
-    area count toward it too). Dots inside a component, such as
+    or any backslash raises `ValueError`, and so does a control character, U+FFFE or
+    U+FFFF (which XML 1.0 cannot carry), or a value over 1024 bytes in UTF-8,
+    S3's key limit (on S3 the bucket prefix and area count toward it too). Dots inside a component, such as
     `.metadata.json`, remain valid. Keys are expected to be server-generated,
     but a stray value must never escape or alias another address. Local storage
     also rejects object addresses that traverse symbolic links and omits symlink
