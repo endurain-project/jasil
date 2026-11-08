@@ -109,7 +109,8 @@ def _alter_statements(precision: str) -> list[str]:
         for name, nullable, defaulted, comment in columns:
             default = f" DEFAULT CURRENT_TIMESTAMP{precision}" if defaulted else ""
             nullability = "NULL" if nullable else "NOT NULL"
-            clauses.append(f"MODIFY COLUMN {name} DATETIME{precision} {nullability}{default} COMMENT '{comment}'")
+            quoted = comment.replace("'", "''")
+            clauses.append(f"MODIFY COLUMN {name} DATETIME{precision} {nullability}{default} COMMENT '{quoted}'")
         statements.append(f"ALTER TABLE {table} " + ", ".join(clauses))
     return statements
 
