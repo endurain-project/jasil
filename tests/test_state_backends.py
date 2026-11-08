@@ -298,6 +298,18 @@ class TestRedisTtlIsArmed:
 
         assert client.ttl("counter") == -1
 
+    @pytest.mark.parametrize(("stored", "amount"), [(b"abc", 1), (str(2**63 - 1).encode(), 1)])
+    @pytest.mark.parametrize("expiry", [None, 600])
+    def test_a_refused_incr_leaves_the_expiry_as_it_was(self, client, stored, amount, expiry):
+        """A refused increment leaves the counter unchanged, as on the memory backend: its expiry too."""
+        client.set("counter", stored, ex=expiry)
+
+        with pytest.raises(ValueError):
+            RedisState(client).incr("counter", amount, ttl_seconds=60)
+
+        assert client.get("counter") == stored
+        assert client.ttl("counter") == (-1 if expiry is None else 600)
+
     def test_set_if_absent_arms_the_expiry_when_asked(self, client):
         RedisState(client).set_if_absent("lock", b"owner", ttl_seconds=60)
 
