@@ -42,7 +42,11 @@ class StorageBackendUnavailableError(RuntimeError):
 
 
 class StorageKeyConflictError(ValueError):
-    """Raised when plain local storage cannot represent a key and its descendants."""
+    """Raised when plain local storage cannot represent a key beside existing ones.
+
+    That is a key and its descendants, or two keys the filesystem stores under one
+    name because it folds letter case or Unicode normalization.
+    """
 
 
 class StorageSizeLimitError(ValueError):
@@ -530,6 +534,8 @@ class StorageDelivery(Protocol):
 
         Raises:
             ValueError: When an address or delivery control is invalid for the backend.
+            StorageKeyConflictError: When local plain storage holds an existing object under
+                another spelling of ``key``, which the URL would serve.
             StorageBackendUnavailableError: When the backend cannot build the URL.
         """
 

@@ -24,7 +24,7 @@ import ssl
 import threading
 import time
 from email.message import EmailMessage
-from typing import Literal
+from typing import IO, Literal
 
 import jasil._core.network as network
 from jasil._core.job_context import lease_lost
@@ -47,6 +47,11 @@ _TIMEOUT_SECONDS = 30
 # one step it cannot interrupt.
 _WATCH_INTERVAL_SECONDS = 0.1
 _DEADLINE_EXCEEDED = "SMTP send exceeded its overall deadline"
+# The most one server reply may hold (bytes). ``smtplib`` caps each line at 8 KiB
+# but not how many continuation lines a reply has, so a server, or anyone on the
+# path before STARTTLS, could stream one reply until the deadline and have it all
+# held in memory. A real reply, the longest being the EHLO list, is far smaller.
+_MAX_REPLY_BYTES = 64 * 1024
 
 # How far a send got: ``connecting`` until the session is up (greeting, and TLS
 # when it is used), ``session`` from then on, ``data`` once the server answered
@@ -123,6 +128,28 @@ def _default_local_hostname() -> str:
     return name if name and network.is_valid_hostname(name) else "localhost"
 
 
+class _CappedReplyReader:
+    """The stream ``smtplib`` reads replies from, refusing a reply longer than ``_MAX_REPLY_BYTES``.
+
+    ``remaining`` is reset before each reply. Running out raises ``OSError``, which
+    ``smtplib.SMTP.getreply`` turns into a closed connection.
+    """
+
+    def __init__(self, file: IO[bytes]) -> None:
+        self._file = file
+        self.remaining = _MAX_REPLY_BYTES
+
+    def readline(self, limit: int = -1) -> bytes:
+        line = self._file.readline(limit)
+        self.remaining -= len(line)
+        if self.remaining < 0:
+            raise OSError("SMTP reply exceeds its size limit")
+        return line
+
+    def close(self) -> None:
+        self._file.close()
+
+
 @functools.cache
 def _tracked(base: type[smtplib.SMTP]) -> type[smtplib.SMTP]:
     """Subclass ``base`` so the raw socket it dials stays reachable to the watchdog.
@@ -130,15 +157,32 @@ def _tracked(base: type[smtplib.SMTP]) -> type[smtplib.SMTP]:
     ``watched`` is a duplicate of the connected socket made *before* any TLS wrap,
     so shutting it down unblocks a handshake that is still reading.
 
-    This leans on private ``smtplib`` details: ``SMTP._get_socket``, and the
-    ``_host``, ``context`` and ``source_address`` attributes of ``SMTP_SSL``.
+    It also caps every server reply at ``_MAX_REPLY_BYTES`` (see ``getreply``).
+
+    This leans on private ``smtplib`` details: ``SMTP._get_socket``, the
+    ``_host``, ``context`` and ``source_address`` attributes of ``SMTP_SSL``, and
+    ``getreply`` reading through ``file`` and opening it from ``sock`` when unset.
     ``tests/test_mail.py`` pins their shape so an interpreter change fails loudly
-    instead of silently disarming the watchdog.
+    instead of silently disarming the watchdog or the reply cap.
     """
 
     class Tracked(base):  # type: ignore[valid-type, misc]
         watched: socket.socket | None = None
         deadline: float | None = None
+        file: _CappedReplyReader | None = None
+
+        def getreply(self) -> tuple[int, bytes]:
+            """Read one reply as ``smtplib`` does, through a reader that refuses an oversized one.
+
+            ``smtplib`` opens ``file`` from ``sock`` when it is unset (on the first
+            reply, and again after STARTTLS replaced the socket); it is opened here
+            first, so every reply is read through the cap.
+            """
+            if self.file is None and self.sock is not None:
+                self.file = _CappedReplyReader(self.sock.makefile("rb"))
+            if self.file is not None:
+                self.file.remaining = _MAX_REPLY_BYTES
+            return super().getreply()
 
         def _dial(self, host: str, port: int, timeout: float) -> socket.socket:
             """Connect like ``socket.create_connection``, stopping at the deadline.

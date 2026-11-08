@@ -1004,6 +1004,62 @@ class _Peer:
         assert not self._thread.is_alive()
 
 
+class TestTheReplyCap:
+    """``smtplib`` caps each line of a reply but not how many lines it has, so a server could stream one reply
+    until the deadline, all of it held in memory. Every reply is capped instead."""
+
+    @pytest.fixture(autouse=True)
+    def real_smtplib(self, monkeypatch):
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP", REAL_SMTP)
+        monkeypatch.setattr(mail_smtp.smtplib, "SMTP_SSL", REAL_SMTP_SSL)
+        monkeypatch.setattr(mail_smtp, "_MAX_REPLY_BYTES", 1000)
+
+    @staticmethod
+    def _serve(greeting_lines: int, ehlo_lines: int):
+        """A server whose greeting and EHLO reply have this many 100-byte continuation lines, and no STARTTLS."""
+
+        def serve(f):
+            with contextlib.suppress(OSError):
+                f.writelines(b"220-" + b"x" * 94 + b"\r\n" for _ in range(greeting_lines))
+                f.write(b"220 hi\r\n")
+                f.flush()
+                while line := f.readline():
+                    verb = line.split()[0].upper()
+                    if verb == b"EHLO":
+                        f.writelines(b"250-" + b"x" * 94 + b"\r\n" for _ in range(ehlo_lines))
+                        f.write(b"250 localhost\r\n")
+                    elif verb == b"QUIT":
+                        f.write(b"221 bye\r\n")
+                        f.flush()
+                        return
+                    else:
+                        f.write(b"250 ok\r\n")
+                    f.flush()
+
+        return serve
+
+    def test_a_reply_past_the_cap_ends_the_send(self, monkeypatch):
+        peer = _Peer(monkeypatch, self._serve(greeting_lines=20, ehlo_lines=0))
+        mail = SmtpMail("relay.test", 587, implicit_tls=False, from_address=SENDER, clock=_Clock())
+
+        with pytest.raises(MailError) as caught:
+            mail.send(_message())
+
+        assert caught.value.kind is MailFailure.UNREACHABLE
+        peer.join()
+
+    def test_the_cap_is_per_reply_not_per_session(self, monkeypatch):
+        peer = _Peer(monkeypatch, self._serve(greeting_lines=8, ehlo_lines=8))
+        mail = SmtpMail("relay.test", 587, implicit_tls=False, from_address=SENDER, clock=_Clock())
+
+        with pytest.raises(MailError) as caught:
+            mail.send(_message())
+
+        # The whole of both replies was read: the send got as far as finding no STARTTLS in the EHLO reply.
+        assert caught.value.kind is MailFailure.UNSUPPORTED
+        peer.join()
+
+
 class TestTheWatchdog:
     """A socket timeout restarts on every read, so a server dripping its reply never trips one: once the deadline
     passes, the watchdog shuts the connection's socket down, and keeps doing so until the send ends."""
@@ -1312,6 +1368,13 @@ class TestSmtplibShapeTheWatchdogRelaysOn:
         assert "self._host" in init_source
         assert "self.context" in init_source
         assert "self.source_address" in inspect.getsource(REAL_SMTP._get_socket)
+
+    def test_replies_are_read_through_file_which_starttls_resets(self):
+        """The reply cap wraps ``file`` before ``getreply`` would open it, so it must stay the only reader."""
+        import inspect
+
+        assert "self.file.readline(" in inspect.getsource(REAL_SMTP.getreply)
+        assert "self.file = None" in inspect.getsource(REAL_SMTP.starttls)
 
 
 def test_idn_domain_with_uppercase_ascii_label_is_accepted():

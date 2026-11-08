@@ -614,8 +614,16 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   migrations, or by `create_all` with JASIL 0.15 or earlier) at `rev0007`, so the next `upgrade` partitions and
   protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
   `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
-- Processes of the previous release only insert into the log, so they are unaffected. Downgrading to `rev0007`
-  removes the partitioning, the triggers and the procedures and keeps the rows.
+- Upgrade every process that runs audit maintenance (`run_audit_maintenance`, or the job
+  `schedule_audit_maintenance` adds) together with this revision. Processes of JASIL 0.15 and earlier keep inserting,
+  but their maintenance treats a MySQL audit log as a plain table:
+    - Their retention step deletes rows, which the trigger refuses, so whenever there are rows to prune it fails and
+      is logged on every pass, each time after committing an `audit.retention.prune` entry for a prune that did not
+      happen.
+    - They never create partitions, so once the days `rev0008` created run out (today plus
+      `audit.partition_days_ahead`, 7 by default) every insert fails unless a process of JASIL 0.16 or later runs
+      maintenance.
+- Downgrading to `rev0007` removes the partitioning, the triggers and the procedures and keeps the rows.
 
 Migration `rev0010` creates the `jasil_instance` row if it is missing, so the first audited write has nothing to
 create. A row that exists keeps its id, and downgrading leaves the row. A script rendered with `--sql` seeds nothing: its id would be one literal shared by every database it runs on, so those databases create the row on their first audited write. Processes of the previous release read the

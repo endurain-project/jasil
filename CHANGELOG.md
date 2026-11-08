@@ -8,21 +8,27 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-08
+
+This release lets a host choose the sender, `Message-ID` and one-click unsubscribe of each message, and tells it why a send failed and whether the message may have been delivered. It also fixes two security issues: plain local storage areas on macOS and Windows let a key reach another key's file through a different letter case or Unicode normalization, and an SMTP relay could stream one reply into memory without limit. The `rev0008` upgrade notes are corrected for MySQL and MariaDB.
+
 ### Added
 
 - **`jasil.providers.MAIL_SEND_DEADLINE_SECONDS`** is public: the upper bound on one SMTP `send` (90 seconds, DNS lookups excepted). Import it to size a lease or timeout around a send; the value may change in a minor release. `jasil.container.SMTP_SEND_DEADLINE_SECONDS`, which was not covered, is removed. ([#57](https://github.com/endurain-project/jasil/issues/57))
-
 - **`MailError` says why a send failed and whether it may have been delivered.** `kind` is a new `jasil.providers.MailFailure` naming the failed step (`auth_failed`, `sender_refused`, `recipient_refused`, `message_rejected`, `unreachable`, `connection_lost`, `deadline`, ...). `delivery_unknown` is `True` only when the connection was lost, or the deadline fired, after the message body started going out. `message_id` is set on every failure after the message was built. All three are keyword-only with defaults, so existing code is unaffected. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#52](https://github.com/endurain-project/jasil/issues/52), [#53](https://github.com/endurain-project/jasil/issues/53))
-
 - **`MailMessage.from_address`** sets the sender of one message (`From`, envelope sender and `Message-ID` domain) in place of `mail.from_address`, which becomes the default. It is validated like the configured sender, and JASIL keeps no allowlist: take it from your own configuration, never from user input. See [MailProvider](docs/providers-and-backends.md#mailprovider). ([#54](https://github.com/endurain-project/jasil/issues/54))
-
 - **`MailMessage.list_unsubscribe`** adds RFC 8058 one-click unsubscribe: an `https` URL emitted as `List-Unsubscribe` together with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, which Gmail and Yahoo require of bulk senders. The URL is written on one line, never folded or RFC 2047-encoded, and is limited to 978 printable ASCII characters. See [One-click unsubscribe](docs/providers-and-backends.md#one-click-unsubscribe). ([#56](https://github.com/endurain-project/jasil/issues/56))
-
 - **`MailMessage.message_id`** lets the host supply the `Message-ID`, so it can store the key before sending and find the message in the relay's logs even if the process dies before recording the result. It must be an RFC 5322 `<left@right>` dot-atom `msg-id` of at most 250 characters, is sent and returned unchanged, and must be an opaque value, never derived from personal data. Without it, an ID is generated as before. See [Choosing the Message-ID](docs/providers-and-backends.md#choosing-the-message-id). ([#55](https://github.com/endurain-project/jasil/issues/55))
 
 ### Changed
 
 - `SmtpMail` sends `MAIL FROM`, `RCPT TO` and `DATA` itself instead of through `smtplib`'s `send_message`, so it knows which step failed. The conversation on the wire is unchanged, including the `SIZE` declaration and success with a warning when only some recipients are refused. A refused `MAIL FROM` is now reported as a sender refusal, no longer as a rejected message.
+
+### Fixed
+
+- **Plain local storage areas keep keys that differ only in letter case or Unicode normalization apart.** On a filesystem that folds them (macOS, Windows), `alice/Report.pdf` and `ALICE/report.PDF` opened one file, so one key could read, overwrite or delete another key's object. A key is now matched against the names on disk exactly: a read of the other spelling finds nothing, `delete` leaves the existing object alone, and a write or `url()` raises `StorageKeyConflictError`. Legacy-layout objects (`storage.local_legacy_layout`) are matched the same way. Every plain-area operation lists the directories along the key's path to do so. See [StorageProvider](docs/providers-and-backends.md#storageprovider).
+- **`SmtpMail` caps each server reply at 64 KiB.** `smtplib` limits the length of a reply line but not how many lines a reply has, so a relay, or anyone on the path before STARTTLS, could stream one reply into memory until the send deadline. A longer reply ends the send with a `MailError` whose `kind` is `unreachable` before the session is established and `connection_lost` after.
+- **The `rev0008` upgrade notes for MySQL and MariaDB are corrected.** They said processes of the previous release only insert into the audit log and are unaffected. Their audit maintenance treats the log as a plain table: its row `DELETE` is refused by the new trigger, failing on every pass after committing an `audit.retention.prune` entry for a prune that did not happen, and it never creates partitions, so inserts fail once the ones `rev0008` created run out (`audit.partition_days_ahead` days, 7 by default) unless a process of 0.16 or later runs maintenance. Upgrade every process that runs audit maintenance together with the migration. See [Audit trail](docs/audit.md#upgrading).
 
 ## [0.17.0] - 2026-11-04
 
@@ -63,7 +69,7 @@ This release brings the audit trail's guarantees to MySQL and MariaDB, lets a se
 
 ### Upgrading
 
-- On MySQL and MariaDB, run migration `rev0008` as the account that should own the audit procedures. With binary logging on (the MySQL 8 default) creating its triggers needs `SUPER` or `log_bin_trust_function_creators=1`, or the revision fails. Partitioning rebuilds the audit log, blocking writes to it while its rows are copied. It cannot be rendered with `--sql`. Processes of the previous release only insert into the log and are unaffected. Then grant the accounts with `grants_sql(..., dialect="mysql")`. Other databases are unchanged.
+- On MySQL and MariaDB, run migration `rev0008` as the account that should own the audit procedures. With binary logging on (the MySQL 8 default) creating its triggers needs `SUPER` or `log_bin_trust_function_creators=1`, or the revision fails. Partitioning rebuilds the audit log, blocking writes to it while its rows are copied. It cannot be rendered with `--sql`. Upgrade every process that runs audit maintenance together with it: the maintenance of the previous release cannot prune a partitioned log and never creates its partitions (corrected in 0.18.0; see [Audit trail](docs/audit.md#upgrading)). Then grant the accounts with `grants_sql(..., dialect="mysql")`. Other databases are unchanged.
 - Run migration `rev0009` before deploying the producers of this release: it adds the unique index on `jasil_event_outbox.event_id` that a reused event id relies on. Processes of the previous release always mint a fresh UUIDv4 id and keep working while it applies. The build fails if the outbox already holds two rows with the same `event_id`, which only a host that wrote rows with `jasil.jobs.outbox.add_to_outbox` directly can have: remove the duplicates and run it again. On PostgreSQL the index is built `CONCURRENTLY`, so producers keep writing; with your own Alembic history set `transaction_per_migration=True`.
 - If you call `retention_floor_sql`, run every statement of the list it now returns.
 
