@@ -328,7 +328,7 @@ knowing:
 | | Consequence |
 |---|---|
 | **`FOR UPDATE SKIP LOCKED`** | Available on PostgreSQL, MySQL 8.0.1+ and MariaDB 10.6+. Where it is missing, concurrent workers and relayers fall back to a compare-and-set claim plus the idempotent fan-out, which is correct but does more redundant work. |
-| **Timestamp precision** | MySQL's `DATETIME` stores whole seconds and *rounds*, so a persisted timestamp can differ from the one written by up to half a second, in either direction. Lease expiry, backoff and retention are all interval comparisons measured in seconds or days, so this does not affect them — but do not compare a timestamp JASIL persisted for equality with the value you passed in. |
+| **Timestamp precision** | JASIL's timestamp columns keep microseconds on every database: `DATETIME(6)` on MySQL and MariaDB once migration `rev0012` has run. Before it they are `DATETIME`, which stores whole seconds and *rounds*, so a persisted timestamp can differ from the one written by up to half a second, in either direction. |
 
 ### Logging
 

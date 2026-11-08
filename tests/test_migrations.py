@@ -9,17 +9,18 @@ is the guard for that.
 
 import importlib.util
 import logging
+import re
 import threading
 import time
-from pathlib import Path
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import (
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
+from sqlalchemy import (
     CheckConstraint,
     Column,
     Index,
@@ -200,7 +201,6 @@ class TestNoDrift:
 
         assert migrated == created
 
-    def test_the_indexes_match_the_models(self, engine, mapped_base):
     def _diff(self, engine, mapped_base) -> list:
         """What alembic's autogenerate would change to make the database match the models, for JASIL's tables."""
         with engine.connect() as connection:
@@ -246,6 +246,7 @@ class TestNoDrift:
             expected = {c.name for c in table.constraints if isinstance(c, CheckConstraint) and c.name}
             assert {c["name"] for c in inspector.get_check_constraints(table_name)} >= expected, table_name
 
+    def test_the_indexes_match_the_models(self, engine, mapped_base):
         migrations.upgrade(engine)
         migrated = _indexes(engine)
         _drop_everything(engine, mapped_base)
@@ -312,54 +313,6 @@ class TestDowngrade:
         assert claim["column_names"] == ["status", "queue", "available_at"]
 
 
-class TestPrefixRename:
-    def test_rows_survive_the_rename(self, engine):
-        migrations.upgrade(engine, "rev0002")
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    """INSERT INTO processing_jobs (
-                        id, event_id, event_type, subscriber_id, source, payload,
-                        max_attempts, available_at, created_at, updated_at
-                    ) VALUES (
-                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
-                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-                    )"""
-                )
-            )
-
-        migrations.upgrade(engine)
-
-        with engine.connect() as connection:
-            assert connection.execute(text("SELECT event_id FROM jasil_processing_jobs")).scalar_one() == "event-1"
-
-    def test_no_unprefixed_table_or_index_is_left_behind(self, engine):
-        migrations.upgrade(engine)
-
-        inspector = inspect(engine)
-        assert not set(inspector.get_table_names()) & legacy_table_names()
-        names = {index["name"] for table in jasil_table_names() for index in inspector.get_indexes(table)}
-        assert names
-        assert all(name.startswith(("idx_jasil_", "sqlite_autoindex_", "uq_jasil_")) for name in names), names
-
-    def test_the_unique_constraint_is_renamed(self, engine):
-        migrations.upgrade(engine)
-
-        constraints = inspect(engine).get_unique_constraints("jasil_processing_jobs")
-
-        assert [c["name"] for c in constraints if set(c["column_names"]) == {"event_id", "subscriber_id"}] == [
-            "uq_jasil_processing_jobs_event_subscriber"
-        ]
-
-    def test_the_rename_downgrades_to_the_unprefixed_schema_and_back(self, engine):
-        migrations.upgrade(engine)
-
-        migrations.downgrade(engine, "rev0002")
-
-        inspector = inspect(engine)
-        tables = set(inspector.get_table_names())
-        assert legacy_table_names() <= tables
-        assert not tables & jasil_table_names()
 class TestDowngradeOfAnInterruptedInstall:
     """A fresh install creates prefixed tables from ``rev0001`` on, so one stopped early has to downgrade as such."""
 
@@ -440,6 +393,54 @@ class TestPrefixDecisionUnderTheLock:
         assert not set(inspect(engine).get_table_names()) & jasil_table_names()
 
 
+class TestPrefixRename:
+    def test_rows_survive_the_rename(self, engine):
+        migrations.upgrade(engine, "rev0002")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """INSERT INTO processing_jobs (
+                        id, event_id, event_type, subscriber_id, source, payload,
+                        max_attempts, available_at, created_at, updated_at
+                    ) VALUES (
+                        'job-1', 'event-1', 'event.created', 'subscriber', 'test', '{}',
+                        3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )"""
+                )
+            )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT event_id FROM jasil_processing_jobs")).scalar_one() == "event-1"
+
+    def test_no_unprefixed_table_or_index_is_left_behind(self, engine):
+        migrations.upgrade(engine)
+
+        inspector = inspect(engine)
+        assert not set(inspector.get_table_names()) & legacy_table_names()
+        names = {index["name"] for table in jasil_table_names() for index in inspector.get_indexes(table)}
+        assert names
+        assert all(name.startswith(("idx_jasil_", "sqlite_autoindex_", "uq_jasil_")) for name in names), names
+
+    def test_the_unique_constraint_is_renamed(self, engine):
+        migrations.upgrade(engine)
+
+        constraints = inspect(engine).get_unique_constraints("jasil_processing_jobs")
+
+        assert [c["name"] for c in constraints if set(c["column_names"]) == {"event_id", "subscriber_id"}] == [
+            "uq_jasil_processing_jobs_event_subscriber"
+        ]
+
+    def test_the_rename_downgrades_to_the_unprefixed_schema_and_back(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0002")
+
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert legacy_table_names() <= tables
+        assert not tables & jasil_table_names()
         assert any(
             set(c["column_names"]) == {"event_id", "subscriber_id"}
             and c["name"] == "uq_processing_jobs_event_subscriber"
@@ -710,6 +711,79 @@ class TestAuditScope:
         assert "format_version" not in self._columns(engine, "jasil_audit_checkpoints")
         assert "idx_jasil_audit_log_scope" not in _indexes(engine)["jasil_audit_log"]
         assert migrations.db_revision(engine) == "rev0010"
+
+
+class TestMicrosecondTimestamps:
+    """rev0012 makes every timestamp column ``DATETIME(6)`` on MySQL and MariaDB and changes nothing elsewhere."""
+
+    @staticmethod
+    def _render(url: str, span: str, *, downgrade: bool = False) -> str:
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", url)
+        config.output_buffer = io.StringIO()
+        (command.downgrade if downgrade else command.upgrade)(config, span, sql=True)
+        return config.output_buffer.getvalue()
+
+    @staticmethod
+    def _timestamp_columns() -> list[Column]:
+        """The timestamp columns of the schema rev0012 starts from."""
+        from sqlalchemy import DateTime
+
+        metadata = _revision_metadata("rev0011")
+        return [
+            column
+            for table in metadata.tables.values()
+            for column in table.columns
+            if isinstance(column.type, DateTime)
+        ]
+
+    @pytest.mark.parametrize("url", ["mysql+pymysql://offline/none", "mariadb+pymysql://offline/none"])
+    def test_on_mysql_it_restates_every_timestamp_column_in_one_alter_per_table(self, url):
+        """``MODIFY COLUMN`` drops whatever it does not restate, so nullability, default and comment all must be."""
+        sql = self._render(url, "rev0011:rev0012")
+        columns = self._timestamp_columns()
+
+        for column in columns:
+            default = " DEFAULT CURRENT_TIMESTAMP(6)" if column.server_default is not None else ""
+            nullability = "NULL" if column.nullable else "NOT NULL"
+            assert f"MODIFY COLUMN {column.name} DATETIME(6) {nullability}{default} COMMENT '{column.comment}'" in sql
+        assert sql.count("MODIFY COLUMN") == len(columns)
+        assert sorted(re.findall(r"ALTER TABLE (\w+) ", sql)) == sorted({column.table.name for column in columns})
+
+    def test_on_mysql_the_downgrade_restores_whole_second_columns(self):
+        sql = self._render("mysql+pymysql://offline/none", "rev0012:rev0011", downgrade=True)
+
+        assert "(6)" not in sql
+        assert "MODIFY COLUMN occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT" in sql
+        assert sql.count("MODIFY COLUMN") == len(self._timestamp_columns())
+
+    def test_it_renders_nothing_for_postgresql(self):
+        sql = self._render("postgresql://offline/none", "rev0011:rev0012")
+
+        assert "ALTER TABLE" not in sql
+        assert "rev0012" in sql  # only the version stamp
+
+    def test_it_downgrades_and_upgrades_again_changing_only_mysql_timestamps(self, engine):
+        migrations.upgrade(engine, "rev0011")
+        before = _schema(engine)
+
+        migrations.upgrade(engine)
+        after = _schema(engine)
+        migrations.downgrade(engine, "rev0011")
+
+        assert _schema(engine) == before
+        if engine.dialect.name in ("mysql", "mariadb"):
+            expected = {
+                table: {name: "DATETIME(6)" if type_ == "DATETIME" else type_ for name, type_ in columns.items()}
+                for table, columns in before.items()
+            }
+            assert after == expected
+        else:
+            assert after == before
 
 
 class TestRevisionTransactions:

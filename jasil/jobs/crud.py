@@ -250,9 +250,10 @@ def claim_jobs(
                 # transitioned: a row a competing worker won carries its id, and
                 # a row this worker claimed in an earlier round was never
                 # ``pending`` to be selected here. Deliberately not also matching
-                # ``locked_at == now`` — MySQL's DATETIME keeps whole seconds and
-                # rounds anything finer, so that equality silently matched
-                # nothing and the worker claimed batches it then never ran.
+                # ``locked_at == now``: a MySQL ``DATETIME`` from before ``rev0012``
+                # keeps whole seconds and rounds anything finer, so that equality
+                # would match nothing and the worker would claim batches it then
+                # never ran.
                 ProcessingJob.locked_by == worker_id,
             )
         )

@@ -245,6 +245,14 @@ starts instead of refusing.
     run drops and builds again. Processes of the previous release always mint a fresh UUIDv4 and keep running
     while it applies.
 
+!!! note "Revision `rev0012`: microsecond timestamps on MySQL and MariaDB"
+    MySQL and MariaDB only; other databases already keep microseconds and the revision does nothing there. Every
+    timestamp column of JASIL's tables becomes `DATETIME(6)` (it was `DATETIME`, which rounds to whole seconds),
+    with one `ALTER TABLE` per table. Each one rebuilds its table and blocks writes to it until it finishes, the
+    audit log and `jasil_processing_jobs` included, so schedule it for a quiet period. Processes of the previous
+    release keep running against the converted tables. Downgrading rounds every stored timestamp to whole seconds,
+    so audit checkpoints sealed over rows with a fraction then report `row_mismatch`.
+
 !!! note "One schema: the connection's default"
     The migrations create JASIL's tables in the connection's default schema. `upgrade`, `downgrade` and
     `adopt_existing_schema` refuse a base whose `MetaData` names a `schema`, because the models would then look

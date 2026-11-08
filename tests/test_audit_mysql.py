@@ -8,7 +8,7 @@ break them.
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from sqlalchemy import create_engine, func, select, table, text
+from sqlalchemy import DateTime, create_engine, func, select, table, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
@@ -22,6 +22,7 @@ from jasil.audit import AuditAction, Category, Outcome, Severity
 from jasil.audit import _mysql as audit_mysql
 from jasil.audit.models import AuditCheckpoint, AuditLog
 from jasil.backends.clock_system import SystemClock
+from jasil.orm import jasil_table_names
 
 pytest.importorskip("alembic", reason="migrations require the 'migrations' extra")
 
@@ -261,6 +262,103 @@ class TestMigration:
 
     def test_the_migrated_schema_matches_the_models(self, migrated):
         migrations.verify_schema_current(migrated)
+
+
+class TestMicrosecondTimestamps:
+    """rev0012: a ``DATETIME`` keeps whole seconds and rounds, so every JASIL timestamp column is ``DATETIME(6)``."""
+
+    @staticmethod
+    def _expected(mapped_base) -> dict[tuple[str, str], bool]:
+        """``{(table, column): has a server default}`` for every timestamp column of the models."""
+        return {
+            (table_name, column.name): column.server_default is not None
+            for table_name in jasil_table_names()
+            for column in mapped_base.metadata.tables[table_name].columns
+            if isinstance(column.type, DateTime)
+        }
+
+    @staticmethod
+    def _datetime_columns(engine) -> dict[tuple[str, str], tuple[int, str | None]]:
+        """``{(table, column): (DATETIME_PRECISION, COLUMN_DEFAULT)}`` for every datetime column of JASIL's tables."""
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    "SELECT TABLE_NAME, COLUMN_NAME, DATETIME_PRECISION, COLUMN_DEFAULT FROM information_schema.COLUMNS "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND DATA_TYPE = 'datetime' AND TABLE_NAME LIKE 'jasil\\_%'"
+                )
+            ).all()
+        return {(table_name, column): (precision, default) for table_name, column, precision, default in rows}
+
+    def test_every_timestamp_column_keeps_microseconds(self, migrated, mapped_base):
+        columns = self._datetime_columns(migrated)
+
+        assert set(columns) == set(self._expected(mapped_base))
+        assert {key: precision for key, (precision, _) in columns.items()} == dict.fromkeys(columns, 6)
+
+    def test_every_server_default_is_the_microsecond_clock(self, migrated, mapped_base):
+        """MySQL reports ``CURRENT_TIMESTAMP(6)``, MariaDB ``current_timestamp(6)``."""
+        columns = self._datetime_columns(migrated)
+
+        for key, defaulted in self._expected(mapped_base).items():
+            default = columns[key][1]
+            assert (default.lower() if default else None) == ("current_timestamp(6)" if defaulted else None), key
+
+    def test_a_server_default_stamps_a_fraction_of_a_second(self, migrated):
+        """The session's clock is pinned (``SET timestamp``), so the default's value is known to the microsecond."""
+        with migrated.begin() as connection:
+            connection.execute(text("SET time_zone = '+00:00', timestamp = 1767268800.123456"))
+            connection.execute(text("DELETE FROM jasil_instance"))
+            connection.execute(text("INSERT INTO jasil_instance (id, instance_id) VALUES (1, 'stamped')"))
+            stamped = connection.execute(text("SELECT created_at FROM jasil_instance")).scalar_one()
+            connection.execute(text("SET timestamp = DEFAULT"))
+
+        assert as_utc(stamped) == datetime(2026, 1, 1, 12, 0, 0, 123456, tzinfo=UTC)
+
+    def test_an_occurred_at_with_microseconds_round_trips(self, migrated, action):
+        """``get_entry`` looks a row up by the ``occurred_at`` it was staged with, to the microsecond."""
+        platform = jasil_testing.install_test_platform(".", clock=jasil_testing.FixedClock())
+        now = datetime.now(UTC)
+        staged_at = (now - timedelta(minutes=1)).replace(microsecond=123456)
+        platform.clock.moment = staged_at
+        with sessionmaker(bind=migrated)() as db:
+            jasil_audit.stage(db, action, outcome=Outcome.SUCCESS, target_id="7")
+            db.commit()
+        platform.clock.moment = now
+
+        (entry,) = [entry for entry in jasil_audit.list_entries().entries if entry.action_id == action.id]
+
+        assert entry.occurred_at == staged_at
+        assert jasil_audit.get_entry(entry.id, staged_at) is not None
+
+    def test_a_partitioned_log_keeps_its_rows_partitions_and_triggers(self, engine):
+        migrations.upgrade(engine, "rev0011")
+        today = datetime.now(UTC).date()
+        with engine.begin() as connection:
+            _insert_row(connection, _at_one_pm(today))
+
+        migrations.upgrade(engine)
+
+        assert _rows_in(engine, today) == 1
+        assert f"p{today:%Y%m%d}" in _partitions(engine)
+        assert as_utc(_scalar(engine, "SELECT occurred_at FROM jasil_audit_log")) == _at_one_pm(today)
+        with pytest.raises(DBAPIError, match="append-only"), engine.begin() as connection:
+            connection.execute(text("DELETE FROM jasil_audit_log"))
+
+    def test_the_downgrade_drops_the_fraction_and_the_upgrade_restores_the_precision(self, migrated, mapped_base):
+        """A fraction below half a second, so rounding and ``TIME_TRUNCATE_FRACTIONAL`` agree."""
+        today = datetime.now(UTC).date()
+        with migrated.begin() as connection:
+            _insert_row(connection, _at_one_pm(today).replace(microsecond=400000))
+
+        migrations.downgrade(migrated, "rev0011")
+
+        assert {precision for precision, _ in self._datetime_columns(migrated).values()} == {0}
+        assert as_utc(_scalar(migrated, "SELECT occurred_at FROM jasil_audit_log")) == _at_one_pm(today)
+
+        migrations.upgrade(migrated)
+
+        assert {precision for precision, _ in self._datetime_columns(migrated).values()} == {6}
+        assert _rows_in(migrated, today) == 1
 
 
 class TestAppendOnly:

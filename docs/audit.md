@@ -284,8 +284,8 @@ The differences that remain:
   prune with no record.
 - **Grants only grant.** MySQL and MariaDB cannot revoke a privilege that was never granted without failing, so
   `grants_sql(..., dialect="mysql")` does not reset the roles first; see [Roles and grants](#roles-and-grants).
-- **Whole seconds.** `DATETIME` keeps whole seconds and rounds (see [Configuration](configuration.md)), so a row
-  staged in the last half second of a day is stored, and partitioned, as the next day's first second.
+- **Microseconds from `rev0012`.** Before it, `occurred_at` is a `DATETIME` that keeps whole seconds and rounds, so a
+  row staged in the last half second of a day is stored, and partitioned, as the next day's first second.
 
 ### On SQLite
 
@@ -676,6 +676,9 @@ to `jasil_audit_checkpoints`:
   which verify but do not cover `scope`, so upgrade every process that runs maintenance soon after.
 - Downgrading drops both columns, and every `scope` with them; the previous release then verifies each checkpoint as
   format 1, so windows sealed in format 2 report `row_mismatch`.
+
+On MySQL and MariaDB, migration `rev0012` makes `occurred_at` and the other timestamp columns `DATETIME(6)`. Rebuilding
+the log blocks audit writes while it runs; see [Revision `rev0012`](observability.md#migrations).
 
 ## For the host's architecture tests
 

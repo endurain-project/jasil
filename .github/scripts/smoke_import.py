@@ -60,6 +60,7 @@ EXPECTED_REVISIONS = {
     "rev0009_event_outbox_unique_event_id.py",
     "rev0010_audit_instance_row.py",
     "rev0011_audit_scope.py",
+    "rev0012_mysql_microsecond_timestamps.py",
 }
 
 

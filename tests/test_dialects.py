@@ -6,10 +6,16 @@ server rejects; a false negative silently downgrades concurrency. Both matter,
 so every branch is pinned here rather than being discovered on a real server.
 """
 
+import re
+
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import DateTime, create_engine
+from sqlalchemy.dialects import mysql, postgresql, sqlite
+from sqlalchemy.engine import make_url
+from sqlalchemy.schema import CreateColumn, CreateTable
 
 from jasil._core.dialects import needs_locking_read, supports_skip_locked
+from jasil.orm import jasil_table_names
 
 
 class FakeDialect:
@@ -98,3 +104,54 @@ class TestNeedsLockingRead:
     )
     def test_per_dialect(self, name, expected):
         assert needs_locking_read(_bind(name)) is expected
+
+
+def _timestamp_columns(mapped_base) -> list:
+    """Every timestamp column of JASIL's tables."""
+    return [
+        column
+        for table_name in sorted(jasil_table_names())
+        for column in mapped_base.metadata.tables[table_name].columns
+        if isinstance(column.type, DateTime)
+    ]
+
+
+class TestTimestampColumns:
+    """``DateTime`` alone is a whole-second ``DATETIME`` on MySQL and MariaDB, which rounds what JASIL writes."""
+
+    MYSQL_DIALECTS = (mysql.dialect(), make_url("mariadb+pymysql://").get_dialect()())
+
+    def test_every_jasil_table_has_timestamp_columns_to_check(self, mapped_base):
+        assert {column.table.name for column in _timestamp_columns(mapped_base)} == jasil_table_names()
+
+    @pytest.mark.parametrize("dialect", MYSQL_DIALECTS, ids=lambda dialect: dialect.name)
+    def test_on_mysql_and_mariadb_every_timestamp_keeps_microseconds(self, mapped_base, dialect):
+        for table_name in sorted(jasil_table_names()):
+            ddl = str(CreateTable(mapped_base.metadata.tables[table_name]).compile(dialect=dialect))
+            assert re.findall(r"DATETIME(?!\(6\))", ddl) == [], table_name
+            assert re.findall(r"CURRENT_TIMESTAMP(?!\(6\))|now\(\)", ddl) == [], table_name
+
+    @pytest.mark.parametrize("dialect", MYSQL_DIALECTS, ids=lambda dialect: dialect.name)
+    def test_on_mysql_and_mariadb_a_server_default_is_the_microsecond_clock(self, mapped_base, dialect):
+        """A ``DATETIME(6)`` column refuses a ``CURRENT_TIMESTAMP`` default of lower precision."""
+        for column in _timestamp_columns(mapped_base):
+            spec = str(CreateColumn(column).compile(dialect=dialect))
+            assert spec.startswith(f"{column.name} DATETIME(6)"), spec
+            assert ("DEFAULT CURRENT_TIMESTAMP(6)" in spec) is (column.server_default is not None), spec
+
+    @pytest.mark.parametrize(
+        ("dialect", "rendered_type", "rendered_default"),
+        [
+            (postgresql.dialect(), "TIMESTAMP WITH TIME ZONE", "DEFAULT now()"),
+            (sqlite.dialect(), "DATETIME", "DEFAULT CURRENT_TIMESTAMP"),
+        ],
+        ids=["postgresql", "sqlite"],
+    )
+    def test_other_dialects_render_what_datetime_with_a_time_zone_always_did(
+        self, mapped_base, dialect, rendered_type, rendered_default
+    ):
+        for column in _timestamp_columns(mapped_base):
+            spec = str(CreateColumn(column).compile(dialect=dialect))
+            assert spec.startswith(f"{column.name} {rendered_type}"), spec
+            assert "(6)" not in spec, spec
+            assert (rendered_default in spec) is (column.server_default is not None), spec

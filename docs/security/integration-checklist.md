@@ -37,8 +37,9 @@ through.
 - [ ] Run the packaged migrations (`jasil.migrations.upgrade`) rather than
       `create_all` in production, and keep them in your deploy pipeline. JASIL
       uses its own `jasil_alembic_version` table and never touches yours.
-- [ ] On MySQL, note that `DATETIME` stores whole seconds and rounds. Do not
-      compare a timestamp JASIL persisted for equality with the value you passed.
+- [ ] On MySQL and MariaDB, run migration `rev0012` so JASIL's timestamps keep
+      microseconds; until then they are `DATETIME`, which stores whole seconds
+      and rounds.
 - [ ] On MySQL and MariaDB, run migration `rev0008` as the account that should
       own the audit procedures, with `log_bin_trust_function_creators=1` (or
       `SUPER`) when binary logging is on, and give the application only the

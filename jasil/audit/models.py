@@ -3,11 +3,12 @@
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Index, Integer, String
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import false, func
+from sqlalchemy.sql import false
 
+from jasil._core.dialects import MICROSECOND_DATETIME, MicrosecondNow
 from jasil._core.limits import (
     MAX_AUDIT_ACTION_ID_LENGTH,
     MAX_AUDIT_APP_NAME_LENGTH,
@@ -80,10 +81,10 @@ class AuditLog(Base):
         String(MAX_EVENT_ID_LENGTH), primary_key=True, comment="UUIDv7 (time-ordered); part of the primary key"
     )
     occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         primary_key=True,
         autoincrement=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the action was staged; partition key",
     )
     action_id: Mapped[str] = mapped_column(
@@ -184,10 +185,13 @@ class AuditActionRecord(Base):
         Boolean, nullable=False, default=False, server_default=false(), comment="No longer emitted"
     )
     first_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="First synchronization"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="First synchronization"
     )
     last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="Last synchronization that saw it"
+        MICROSECOND_DATETIME,
+        nullable=False,
+        server_default=MicrosecondNow(),
+        comment="Last synchronization that saw it",
     )
 
 
@@ -215,11 +219,9 @@ class AuditCheckpoint(Base):
     __tablename__ = "jasil_audit_checkpoints"
 
     window_start: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), primary_key=True, autoincrement=False, comment="Window start, inclusive"
+        MICROSECOND_DATETIME, primary_key=True, autoincrement=False, comment="Window start, inclusive"
     )
-    window_end: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, comment="Window end, exclusive"
-    )
+    window_end: Mapped[datetime] = mapped_column(MICROSECOND_DATETIME, nullable=False, comment="Window end, exclusive")
     row_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="Rows in the window when sealed")
     hash: Mapped[str] = mapped_column(String(64), nullable=False, comment="SHA-256 hex of the rows plus prev_hash")
     prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="Previous checkpoint's hash")
@@ -231,7 +233,7 @@ class AuditCheckpoint(Base):
         Integer, nullable=False, server_default="1", comment="Row format the hash covers"
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the checkpoint was written"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="When the checkpoint was written"
     )
 
 
@@ -258,7 +260,7 @@ class Instance(Base):
         String(MAX_EVENT_ID_LENGTH), nullable=False, comment="Random deployment id"
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the id was generated"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="When the id was generated"
     )
     retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="Retention last seen")
     legal_hold: Mapped[bool | None] = mapped_column(Boolean, nullable=True, comment="Legal hold last seen")
@@ -266,5 +268,5 @@ class Instance(Base):
         Date, nullable=True, comment="Last day with a partition"
     )
     last_checkpoint_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, comment="End of the latest sealed window"
+        MICROSECOND_DATETIME, nullable=True, comment="End of the latest sealed window"
     )

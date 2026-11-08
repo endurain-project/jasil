@@ -3,11 +3,11 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, Index, Integer, String, Text
+from sqlalchemy import JSON, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import func
 
+from jasil._core.dialects import MICROSECOND_DATETIME, MicrosecondNow
 from jasil._core.limits import MAX_HANDLER_NAME_LENGTH, MAX_WORKER_ID_LENGTH
 from jasil.events import MAX_EVENT_ID_LENGTH, MAX_EVENT_TYPE_LENGTH, MAX_SOURCE_LENGTH
 from jasil.orm import get_active_base
@@ -114,18 +114,18 @@ class EventLog(Base):
         comment="Handler execution time in milliseconds",
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the event was published",
     )
     processed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When a consumer picked the event up",
     )
     completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When processing finished (success or failure)",
     )
