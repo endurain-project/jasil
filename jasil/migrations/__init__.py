@@ -548,6 +548,10 @@ class _MetadataOps:
         """Report a dialect no migration branches on, so the portable path is taken."""
         return SimpleNamespace(dialect=SimpleNamespace(name="metadata"))
 
+    def get_context(self) -> Any:
+        """Report offline mode: as when rendering SQL, there is no database to inspect, so no check of one runs."""
+        return SimpleNamespace(as_sql=True)
+
     def drop_table(self, table_name: str, **kwargs: Any) -> None:
         self._metadata.remove(self._metadata.tables[table_name])
 
