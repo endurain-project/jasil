@@ -469,6 +469,22 @@ class TestListUnsubscribe:
         assert f"List-Unsubscribe: <{url}>".encode() in lines
         assert max(len(line) for line in lines) <= 998
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/u?x=?utf-8?q?=3E=2C=3Chttps://evil.example/?=",
+            "https://example.com/u?t==?utf-8?q?=0D=0ABcc:=20victim@evil.example?=",
+            "https://example.com/u?t==?utf-8?b?PiwgPGh0dHBzOi8vZXZpbC5leGFtcGxlLz4=?=",
+        ],
+    )
+    def test_an_encoded_word_in_the_url_is_sent_as_written(self, url):
+        """An RFC 2047 encoded-word is printable ASCII, so it passes the check; decoded, it could hold a second
+        URL or a line break the check refuses."""
+        mime = build_mime(_message(list_unsubscribe=url), sender=SENDER, now=NOW)
+
+        assert mime["List-Unsubscribe"] == f"<{url}>"
+        assert f"List-Unsubscribe: <{url}>".encode() in mime.as_bytes().split(b"\r\n")
+
     def test_other_headers_are_still_folded(self):
         mime = build_mime(_message(list_unsubscribe=self.URL, subject="word " * 40), sender=SENDER, now=NOW)
 

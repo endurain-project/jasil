@@ -19,7 +19,7 @@ from email.headerregistry import Address, BaseHeader, HeaderRegistry, Unstructur
 from email.message import EmailMessage
 from email.policy import Policy
 from email.utils import format_datetime, getaddresses, make_msgid
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from jasil._core.network import is_valid_hostname
@@ -36,6 +36,16 @@ class _VerbatimHeader(UnstructuredHeader, BaseHeader):
     encoded-words, and a URL encoded that way is not one a mailbox provider reads.
     Only for values already checked to be printable ASCII that fit on one line.
     """
+
+    @classmethod
+    def parse(cls, value: str, kwds: dict[str, Any]) -> None:
+        """Keep ``value`` as written: the inherited parse decodes RFC 2047 encoded-words.
+
+        An encoded-word is printable ASCII, so it passes the URL check, and decoded it could hold a line break,
+        ``<``, ``>`` or ``,``; the header must carry the checked characters, not what they decode to.
+        """
+        kwds["parse_tree"] = cls.value_parser(value)
+        kwds["decoded"] = value
 
     def fold(self, *, policy: Policy) -> str:
         """Return the header unfolded, ending with the policy's line separator."""
