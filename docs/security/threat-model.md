@@ -31,6 +31,11 @@ whenever configuration is.
   changes its answer after the check (see the limits below).
 - Redirects are refused on every request, so a permitted host cannot `3xx`-pivot
   onto an internal target.
+- An `https` request goes through the egress proxy the environment names
+  (`HTTPS_PROXY`, `ALL_PROXY`), as `requests` does by default. The proxy resolves
+  and dials the geocoder's host itself, so the address check does not cover that
+  connection; the proxy is yours to trust. The cleartext `+http` forms never use a
+  proxy, which would read the coordinates.
 - The response body is read under a 1 MiB cap, streamed, so a hostile upstream
   cannot exhaust memory. The request, headers and body, runs under a 30-second
   deadline: a watchdog shuts its sockets down when it passes, which ends a blocked
