@@ -676,15 +676,15 @@ to `jasil_audit_checkpoints`:
   which verify but do not cover `scope`, so upgrade every process that runs maintenance soon after. Upgrade the
   processes that verify checkpoints first, or together with those that seal: a 0.18 verifier hashes without
   `scope` and checks the format 1 signature prefix, so it reports a format 2 window as `row_mismatch` or a bad
-  signature.
+  signature, except a window with no rows, which both formats hash alike and which it may report `ok`. An error is
+  not a reliable sign of an old verifier.
 - Downgrading drops both columns, and every `scope` with them; the previous release then verifies each checkpoint as
   format 1, so windows sealed in format 2 report `row_mismatch`.
 
 On MySQL and MariaDB, migration `rev0012` makes `occurred_at` and the other timestamp columns `DATETIME(6)`. Rebuilding
 the log blocks audit writes while it runs; see [Revision `rev0012`](observability.md#migrations). Adopting an
 unversioned schema with `adopt_existing_schema` does not compare column precision, so a schema that already had
-`rev0011` and lost its version table is stamped at `rev0012` unconverted: check `DATETIME_PRECISION` and, if it
-is 0, call `migrations.downgrade(engine, "rev0011")` and then `migrations.upgrade(engine)`.
+`rev0011` and lost its version table is stamped at `rev0012` unconverted, as is one whose `rev0012` stopped part way: check every timestamp column, not only `occurred_at`: `SELECT table_name, column_name FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name LIKE 'jasil\_%' AND data_type = 'datetime' AND datetime_precision = 0`. If it returns rows, set the version back without converting anything, with `UPDATE jasil_alembic_version SET version_num = 'rev0011'`, and call `migrations.upgrade(engine)`; the upgrade widens each column and keeps the fractions already stored. Do not use `migrations.downgrade`, which rounds them away.
 
 ## For the host's architecture tests
 
