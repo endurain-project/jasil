@@ -248,7 +248,7 @@ class Instance(Base):
         retention_days: The ``audit.retention_days`` last seen by maintenance, to detect a change.
         legal_hold: The ``audit.legal_hold`` last seen by maintenance, to detect a change.
         furthest_partition_date: The last day with a partition, as the latest maintenance run found it
-            (PostgreSQL), so every replica's :func:`jasil.audit.get_audit_health` reports it.
+            (partitioned dialects), so every replica's :func:`jasil.audit.get_audit_health` reports it.
         last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run left it.
     """
 

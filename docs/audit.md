@@ -123,7 +123,8 @@ value that would be one.** The row is meant to be read by operators, kept for mo
 storage. Keys the model does not declare are dropped, not stored: `AuditAction` refuses a `details_model` that sets
 `extra="allow"`, and the default (`ignore`) and `forbid` are both accepted. As a guard against a payload that has grown
 into a data dump, a serialized payload over `audit.max_details_bytes` (4096 by default) is refused with
-`AuditDetailsError`.
+`AuditDetailsError`, as is one holding a NUL character or a number that is not finite (PostgreSQL's `jsonb` rejects
+both, so every dialect refuses them alike).
 
 When validation fails, `stage` raises the Pydantic `ValidationError`; `record_detached` logs the error locations
 and types only, never the input.
@@ -142,7 +143,7 @@ An `AuditAction` is declared once and registered in the process-wide catalog (`j
 | `id` | `<module>.<resource>.<verb>`, three lower-case snake_case segments, at most 100 characters. Stable forever: it is stored in rows that outlive the code. |
 | `category` | One of `authentication`, `credential`, `authorization`, `identity`, `admin`, `data_change`, `data_transfer`, `integration`, `system`. |
 | `severity` | `info`, `low`, `medium`, `high`. |
-| `description_key`, `description_default` | A translation key owned by the host's i18n, and the text used when the key has no translation. |
+| `description_key`, `description_default` | A translation key owned by the host's i18n (at most 200 characters), and the text used when the key has no translation (at most 500). Both are required. |
 | `details_model` | The versioned model `details` are validated against. Defaults to `NoDetails`. |
 | `deprecated` | The action is no longer emitted. |
 
@@ -231,7 +232,7 @@ string or an audit row could not store, and `publish()` logs the refusal and ret
 | `jasil_audit_log` | The trail. Append-only. |
 | `jasil_audit_actions` | The catalog, as last synchronized. |
 | `jasil_audit_checkpoints` | The sealed, chained [checkpoints](#tamper-evidence). |
-| `jasil_instance` | One row: a random UUID, created by migration `rev0010` (or on first use in a database built with `create_all`), stamped on every audit row as `instance_id`, and the retention settings maintenance last saw. |
+| `jasil_instance` | One row: a random UUID, created by migration `rev0010` (or on first use in a database built with `create_all`), stamped on every audit row as `instance_id`, the retention settings maintenance last saw, and the `furthest_partition_date` and `last_checkpoint_at` it last recorded for `get_audit_health()`. |
 
 `jasil_audit_log` rows have a UUIDv7 `id` (time-ordered) and an `occurred_at` that together form the primary key.
 `occurred_at` is taken from the platform clock when the row is staged. Indexes: `(occurred_at)`,
@@ -265,7 +266,8 @@ stop, and `get_audit_health()["furthest_partition_date"]` is what to alert on.
 Migration `rev0008` (MySQL 8.0.1+, MariaDB 10.6+) gives the log the same guarantees:
 
 - It is **`RANGE COLUMNS` partitioned by `occurred_at`, one partition per UTC day**, named `p<YYYYMMDD>`. There is
-  no catch-all partition, so **a row whose day has no partition is rejected**, as on PostgreSQL.
+  no catch-all partition, so **a row whose day has no partition is rejected**, as on PostgreSQL, and
+  `get_audit_health()["furthest_partition_date"]` is again what to alert on.
 - `BEFORE UPDATE` and `BEFORE DELETE` triggers raise an error. These servers have no `TRUNCATE` trigger: `TRUNCATE`
   needs the `DROP` privilege, which [`grants_sql`](#roles-and-grants) gives no role.
 - `jasil_audit_ensure_partitions(days_ahead)` and `jasil_audit_drop_partitions(cutoff, prune_at)` are `SQL SECURITY
@@ -365,7 +367,8 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
 4. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
    checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
    `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
-   is pruned. On PostgreSQL, MySQL and MariaDB call `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
+   is pruned. On PostgreSQL, MySQL and MariaDB the cutoff is also held to the retention floor measured on the
+   database's own clock, and maintenance calls `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
    `audit.retention.prune` row itself, so the row belongs to the window that clock is sealing. On SQLite, or a plain table, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
    it, as a partition drop is) and write that row from Python.
 
@@ -646,8 +649,8 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   part-way can be run again: it replaces what the failed run created.
 - It cannot be rendered as SQL (`--sql`) for MySQL or MariaDB: the partitions depend on the rows in the table.
 - `adopt_existing_schema` adopts a plain MySQL audit log from a database at `rev0006` or `rev0007` (built by those
-  migrations, or by `create_all` with JASIL 0.15 or earlier) at `rev0007`, so the next `upgrade` partitions and
-  protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
+  migrations, or by `create_all` with JASIL 0.15 or earlier) at whichever of the two its schema matches, so the next
+  `upgrade` partitions and protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
   `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
 - Upgrade every process that runs audit maintenance (`run_audit_maintenance`, or the job
   `schedule_audit_maintenance` adds) together with this revision. Processes of JASIL 0.15 and earlier keep inserting,
@@ -688,6 +691,6 @@ unversioned schema with `adopt_existing_schema` does not compare column precisio
 
 ## For the host's architecture tests
 
-If the host enforces that it imports only JASIL's public surface, treat `jasil.audit` (everything it exports) as
+If the host enforces that it imports only JASIL's public surface, treat `jasil.audit` (everything it exports except `reset`) as
 public, and `jasil._core` and the underscore modules of `jasil.audit` as private. `jasil.audit` is safe to import at
 any point, before `jasil.orm.map_models`; the models load on first use.

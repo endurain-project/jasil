@@ -35,9 +35,11 @@ platform.state.incr("rate:1.2.3.4", ttl_seconds=60)
 Beyond plain key/value access it exposes the primitives whose correctness would
 otherwise depend on the backend:
 
-- **`set_if_absent(key, value, ttl)`** — atomic claim. Returns `True` for exactly
-  one caller.
+- **`set_if_absent(key, value, ttl_seconds=None)`** — atomic claim. Returns `True` for
+  exactly one caller.
 - **`get_and_delete(key)`** — atomic read-and-consume, for single-use tokens.
+- **`iter_keys(prefix)`** — the live keys under a literal prefix. An empty prefix
+  matches every key, on Redis every key in the database, so name one.
 - **`record_tiered_failure(counter_key, gate_key, tiers, counter_ttl_seconds)`**
   — an atomic escalating gate over any repeated event (failed attempts, abusive
   requests, repeated errors; what they are is yours). Each call counts one
@@ -421,7 +423,7 @@ the outbox is unaffected, and an injected event recorder records nothing for the
 
 In-process dispatch is a direct function call. Every handler of the event runs
 even when one raises; the bus logs the failure (several together as an
-`ExceptionGroup`) and `publish` still returns the event's id. Under Redis Streams, replicas
+`ExceptionGroup`) and `publish` returns normally. Under Redis Streams, replicas
 form one consumer group, giving competing-consumer semantics: each derived
 computation runs once per event across the cluster, while in-process fan-out to
 every handler of an event type happens on whichever replica claims the entry.
@@ -479,8 +481,8 @@ interrupted: JASIL sees the loss only when it releases the lock, and logs it at
 
 ## ClockProvider
 
-`SystemClock` returns timezone-aware UTC. It exists so time can be injected in
-tests without patching `datetime` globally — the modules that stamp or compare
+`SystemClock` returns timezone-aware UTC from `now()` and `time.monotonic()` from `monotonic()`. It
+exists so time can be injected in tests without patching `datetime` globally — the modules that stamp or compare
 rows take "now" from the platform. The two state backends are the exception:
 `MemoryState` and `RedisState` read the process clock for expiry and for the
 lockout gate in `record_tiered_failure`, so a test of their expiry patches the
@@ -543,7 +545,8 @@ CR/LF in a header value). `MemoryMail` validates through the same builder as
     TLS is up. `mail.secure = False` sends in cleartext, and is accepted only
     for `smtp://` to a host resolving exclusively to private, loopback or
     link-local addresses, and never with credentials. A bad configuration fails
-    `build_platform`; no connection is made at startup.
+    `build_platform`; no connection is made at startup, only a DNS lookup of a
+    cleartext host.
 
 `MailError` messages carry a failure category and SMTP status code only — never
 an address, subject, body or server text.
@@ -663,7 +666,8 @@ backend and returns a list of `MailProblem(code, field, message)`; `code` is a
 `invalid_from_address`, `invalid_ehlo_hostname`, `credentials_incomplete`,
 `credentials_not_ascii`, `memory_has_host`, `memory_cleartext_unsupported`,
 `cleartext_with_implicit_tls`, `cleartext_with_credentials`,
-`cleartext_public_host`, `cleartext_host_unresolvable` (the lookup failed; a build retries it).
+`cleartext_public_host`, `cleartext_host_unresolvable` (the lookup failed: transient, so a startup build fails with it and a
+runtime source retries it).
 
 ## RealtimeProvider
 
@@ -730,7 +734,8 @@ channel name. `Platform.close()` (and `jasil.lifecycle.shutdown()`) stops the
 subscriber.
 
 In a test, `jasil.testing.capture_hints(platform)` returns a list that collects
-every hint published afterwards as `(key, hint)`.
+every hint published afterwards as `(key, hint)`. It needs the in-process backend and raises `TypeError`
+otherwise.
 
 ## Writing your own backend
 
@@ -854,7 +859,7 @@ platform = Platform(
 ## AuditSink
 
 A write-once copy of the [audit checkpoints](audit.md#the-external-sink), kept outside the audited database.
-`Platform.audit_sink` is `None` unless `audit.external_sink_uri` is set.
+`Platform.audit_sink` is `None` unless `audit.external_sink_uri` is set and auditing is enabled.
 
 | Backend | URI | Notes |
 |---|---|---|
@@ -862,4 +867,4 @@ A write-once copy of the [audit checkpoints](audit.md#the-external-sink), kept o
 | `StorageAuditSink` | `s3://bucket/prefix` | Over the S3 storage backend; use a separate bucket with Object Lock and a default retention period. |
 
 `write_once(name, content)` never replaces an object: the same bytes again are a no-op, different bytes raise
-`AuditSinkConflictError`.
+`AuditSinkConflictError`. `read(name)` returns the stored bytes, or `None` when there is none.

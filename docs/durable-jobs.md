@@ -7,6 +7,8 @@ database row that is retried with backoff and dead-lettered if it never succeeds
 Requires the `jobs` extra and a database.
 
 ```python
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         jobs=jasil_settings.JobSettings(enabled=True),
@@ -82,8 +84,8 @@ ends (returning, raising, deferring, continuing, or the worker losing its claim)
 
 Both scopes win over an installed provider and over `set_context` /
 `set_correlation_id`, which know nothing about the request a queued job came
-from. Best-effort handlers on the Redis event bus run in the same two scopes. A handler that knows who it acts for opens its own block on top; it keeps
-`source`, `event_id` and `scope`:
+from. Best-effort handlers on the Redis event bus run in the same two scopes. A handler that knows who it acts for
+opens its own block on top; it keeps `source`, `event_id` and `scope`:
 
 ```python
 import jasil.audit as jasil_audit
@@ -268,7 +270,8 @@ expired on the last attempt, or the reaper recovered a worker that died.
 * **Dead letters before this feature** are not called back; the migration marks them
   as delivered.
 
-A subscriber registered without `on_dead_letter` behaves exactly as before.
+A subscriber registered without `on_dead_letter` behaves exactly as before. Registering a `subscriber_id` again
+without it removes an earlier callback.
 
 ## The job state machine
 
@@ -300,7 +303,8 @@ front, and a worker that stops early (shutdown, a lost lease, or a run past
 
 A worker claims a batch of due jobs, taking a time-bounded lease. On PostgreSQL
 the claim uses `FOR UPDATE SKIP LOCKED`, so concurrent workers take disjoint
-batches with no coordinating lock.
+batches with no coordinating lock; MySQL and MariaDB do the same where the server supports it. Where the clause is
+unavailable (SQLite) the claim is a compare-and-set on `status`, and only the worker that wins a row runs it.
 
 A worker can select a non-empty queue allowlist. Omitting it consumes every
 queue, preserving the original behavior. A selective claim includes the queue
@@ -405,7 +409,7 @@ NETS = [
 ]
 ```
 
-Exactly one of `backfill` / `exempt_reason` must be set — neither is refused at
+Exactly one of `backfill` / `exempt_reason` must be set — both or neither raises `ValueError` at
 construction. A subscriber with no net and no stated reason is one whose derived
 state goes missing silently, which is the failure the type exists to prevent.
 
@@ -432,7 +436,7 @@ when you want to report the gap rather than fail on it.
 import jasil.jobs.service as jobs_service
 
 jobs_service.start_job_worker()  # in-process worker thread
-jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
+jobs_service.schedule_job_maintenance(scheduler)  # relay, reaper and dead-letter delivery on APScheduler
 ```
 
 This worker consumes all named queues serially and rotates the starting queue
@@ -445,7 +449,7 @@ requires `job_worker_mode=in_process`, which is the default.
 
 ### Distributed: API plumbing and PostgreSQL workers
 
-The API process schedules the relay and reaper but does not start a domain-job
+The API process schedules the relay, reaper and dead-letter delivery but does not start a domain-job
 consumer:
 
 ```python
@@ -511,8 +515,9 @@ idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
 unnecessary. The relay fans an event out to the durable subscribers registered
 **in its own process**, so register every durable subscriber in each process
 that runs it, the API processes included. An event it finds no subscriber for is
-marked relayed with no jobs and logged as a warning. Durable jobs use the database only; Redis is not a job-queue
-dependency.
+marked relayed with no jobs and logged as a warning.
+
+Durable jobs use the database only; Redis is not a job-queue dependency.
 
 ## Dead letters
 
@@ -530,8 +535,8 @@ which returns the job to `pending` with a fresh attempt budget.
 `jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
 throughput, backlog age, handler durations, and the dead-letter list (each with
 the worker that ran its last attempt) for an operations dashboard.
-`jasil_admin.get_job(job_id)` returns a dead letter's whole history: which worker
-ran each attempt, how long it took, and why it failed.
+`jasil_admin.get_job(job_id)` returns a job's attempt history, newest first and up to `attempt_limit` (default 50):
+which worker ran each attempt, how long it took, and why it failed.
 `jasil_admin.get_workers_summary()` reports running, stale, and gracefully
 stopped worker instances one bounded page at a time; pass its `next_cursor` into
 the next call. See [Observability](observability.md#worker-registry).
@@ -572,8 +577,8 @@ failure.
   not retry.
 - **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
   SMTP send can take up to `jasil.providers.MAIL_SEND_DEADLINE_SECONDS` (90
-  seconds), and the DNS lookups before it are not counted against that deadline. A handler that sends N messages can take N times
-  that. The worker's heartbeat keeps the job's lease alive while it runs, so the
+  seconds), and the DNS lookups before it are not counted against that deadline. A handler that sends N messages
+  can take N times that. The worker's heartbeat keeps the job's lease alive while it runs, so the
   lease itself no longer needs to be that long; the cap is
   `max_runtime_seconds` (default 30 minutes). Past it the job is abandoned and a
   retry may deliver the same message again.

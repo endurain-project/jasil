@@ -1,7 +1,8 @@
 # Observability
 
-JASIL owns five operational tables — and four more for the [audit trail](audit.md) — every one named with a `jasil_` prefix so none can collide with a table of your own. The event/outbox/job tables are append-only;
-the worker registry updates one row per restart-unique instance. This page covers
+JASIL owns five operational tables — and four more for the [audit trail](audit.md) — every one named with a `jasil_` prefix so none can collide with a table of your own. The event, outbox and job
+tables only grow until [retention](#retention) prunes them; the worker registry updates one row per restart-unique
+instance. This page covers
 what goes in them, how to create them, and how to bound their growth.
 
 | Table | Written by | Purpose |
@@ -413,7 +414,7 @@ The two windows are independent, and `<= 0` disables either.
 | Relayed `jasil_event_outbox` rows | `pending` / `claimed` jobs — in flight |
 | `completed` jobs | `dead_letter` jobs — human-actionable |
 | Stopped or stale worker rows past job retention | Recent/running worker rows |
-| `jasil_job_attempts` past the window, and orphans of pruned jobs | Attempts of `pending`, `claimed` and `dead_letter` jobs |
+| `jasil_job_attempts` past the window whose job row no longer exists | Attempts of every job that still exists, whatever its status |
 
 Every `jasil_event_log` row is prunable regardless of status: it is a safe-to-lose
 observability trail, and nothing in it is a source of truth. The job tables are
@@ -432,13 +433,13 @@ are idempotent, but duplicating them is pointless load.
 
 JASIL uses `logging.getLogger(__name__)` throughout — no configuration, no
 adapter. Records propagate to whatever handlers you have set up, and structured
-fields arrive via `extra`:
+fields arrive via `extra`. The failure record of a best-effort subscriber carries:
 
 ```python
 {"event_type": ..., "event_id": ..., "subscriber": ..., "event_metadata": {...}}
 ```
 
-Every job-outcome record from `jasil.jobs.runner` also carries `job_id`,
+Every job-outcome record from `jasil.jobs.runner` carries `job_id`, `subscriber`,
 `worker_id`, `queue`, `attempts` and, once the handler has run, `duration_ms`,
 so a log line names the worker that ran the job. The reaper's "Reaped N expired
 job lease(s)" warning carries `workers`, a `{instance id: count}` breakdown, so a
@@ -448,6 +449,7 @@ alerts are built on them, so they are listed here.
 Loggers are named after their module (`jasil.publisher`, `jasil.jobs.runner`,
 `jasil._core.network`, …), so you can raise or lower verbosity per subsystem.
 
-One worth routing deliberately: `jasil._core.network` logs at INFO every time the
-SSRF allowlist permits a private destination. That is an audit trail — it tells
-you what the exception is being used for.
+One worth routing deliberately: `jasil._core.network` logs every time the SSRF
+allowlist permits a private destination, at INFO for a CIDR entry and at WARNING
+for a hostname entry. That is an audit trail — it tells you what the exception is
+being used for.

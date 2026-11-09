@@ -192,7 +192,8 @@ and workers alike: the API process must know that workers exist for its own
 The entry points enforce the declaration. `start_job_worker()` requires
 `in_process` and `run_job_worker()` requires `standalone`; starting the wrong one
 raises `RuntimeError` even with `enforce_deployment_consistency=False`, because
-it is the entry point's contract rather than capability wiring.
+it is the entry point's contract rather than capability wiring. Both also raise `RuntimeError` on SQLite when the
+topology is multi-process, since one SQLite file cannot be shared by competing consumers.
 
 On a development machine you may knowingly want an inconsistent setup — the
 distributed profile without Redis, say. Set

@@ -270,7 +270,7 @@ class AuditHealth(TypedDict):
         write_failures: Detached writes that failed since this process started.
         last_failure_at: When the latest of them failed.
         furthest_partition_date: The last day with a partition, as the latest maintenance run on any
-            replica recorded it (PostgreSQL only; ``None`` before the first run or elsewhere).
+            replica recorded it (``None`` before the first run, and on SQLite, which has no partitions).
         last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run on any
             replica recorded it.
     """

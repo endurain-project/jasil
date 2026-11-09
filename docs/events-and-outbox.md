@@ -72,7 +72,7 @@ inlining it.
 
 Identifiers *are* bounded, because they are indexed columns: `event_type` is
 capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
-Going over raises at `new_event` rather than failing at the write. The functions
+Going over raises at `new_event` (at `register` for a `subscriber_id`) rather than failing at the write. The functions
 tied to your commit (`publish_committing`, `publish_on_commit` and their batch
 forms) raise it before committing or staging anything, on the durable and the
 best-effort route alike; `publish` logs and swallows it with every other failure.
@@ -234,12 +234,13 @@ contains only `a-z`, `0-9`, `.`, `_` and `-`: the rule durable queue names
 follow, so that two ids are equal on every database (MySQL's default collation
 ignores case and accents) and an id is safe in a log line or a URL. A UUID
 string passes. Any other id raises `ValueError` before anything is committed or
-staged, on both routes; `publish` logs and swallows it.
+staged, on both routes; `publish` logs and swallows it. In the batch forms the best-effort route instead skips that
+one event (logged) and returns `None` for it.
 
 Know the limits:
 
 - **Dedup lasts as long as the outbox row.** Relayed rows are pruned after
-  `jobs.retention_days`; after that the same id is a new event. The fan-out's
+  `jobs.retention_days` by the scheduled retention maintenance; after that the same id is a new event. The fan-out's
   `(event_id, subscriber_id)` uniqueness holds only while the completed jobs are
   retained, which the same setting prunes.
 - **The bus route does not dedup.** A reused id is dispatched again and the
@@ -281,6 +282,7 @@ eventually dead-letter. A bus subscriber must **not**, so derived work cannot
 fail the request that produced the event. Write the raising core once and wrap it:
 
 ```python
+from jasil.events import Event
 from jasil.subscribers import best_effort
 
 
@@ -303,6 +305,8 @@ the wrong thing quietly.
 
 ```python
 from typing import ClassVar
+
+from jasil.events import Event
 from jasil.event_versioning import VersionedPayload, parse_payload
 
 

@@ -20,10 +20,11 @@ through.
 - [ ] Leave `enforce_deployment_consistency` on. It refuses to build a platform
       whose wiring contradicts its topology. Turning it off downgrades those to
       warnings — reasonable on a development machine, not in production.
-- [ ] Under the `custom` profile, check the wiring yourself. `custom` is exempt
-      from the state, event bus, realtime, lock and mail rules, so
-      `enforce_deployment_consistency` does not refuse process-local memory, a
-      `noop` lock or `memory://` mail there, however many processes run.
+- [ ] Under the `custom` profile, declare the topology truthfully. `custom` has no
+      URI defaults, and the state, event bus, realtime, lock and mail rules compare
+      your URIs with the `web_workers` and `job_worker_mode` you declared, so a
+      process-local backend is refused only when you declared several processes.
+      A process you did not declare is invisible to the checks.
 - [ ] Under the `distributed` profile, point `audit.external_sink_uri` at `s3://`.
       A `file://` sink is refused there, because each node would keep its own
       share of the checkpoint copies.
@@ -126,7 +127,8 @@ through.
 - [ ] Remember that durable jobs do not require Redis. Do not introduce a second
       queue as a source of truth beside `jasil_processing_jobs`.
 - [ ] Set `max_runtime_seconds` above the longest handler you expect, and keep
-      `lease_seconds` at least three `heartbeat_interval_seconds`. The heartbeat
+      `lease_seconds` at least three `heartbeat_interval_seconds` and no more than
+      `max_runtime_seconds` (`JobSettings` refuses both otherwise). The heartbeat
       renews a running job's lease, so `lease_seconds` bounds how long a worker may
       go silent, not how long a handler may run. A handler past
       `max_runtime_seconds` is abandoned and may be run again, and a stale worker
@@ -165,7 +167,7 @@ through.
       [maintenance grants](../audit.md#roles-and-grants) (or run it from a separate maintenance process), and alert
       on `get_audit_health()` (`write_failures`, `furthest_partition_date`, `last_checkpoint_at`): a missing
       partition fails audited writes, and the runtime grants cannot seal checkpoints or apply retention.
-- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock and a default compliance-mode retention period),
+- [ ] Set `audit.signing_key` (kept out of the database) and `audit.external_sink_uri` (a separate bucket with Object Lock),
       give the bucket a default compliance-mode retention period and a policy denying any `PutObject` without
       `If-None-Match: *`, and verify on a schedule with `verify_checkpoints`, passing every key the trail was signed with.
       Reconcile the sink with `jasil_audit_checkpoints` from outside the database operators' reach: against the table
@@ -180,8 +182,9 @@ through.
       published and every job batch claimed, and at `DEBUG` the `urllib3` logger
       writes each geocoding request line, with the coordinates and, for
       `geocode://`, the API key in its query string.
-- [ ] Do not parse or alert on log *wording* — only levels and structured fields
-      are stable. See [API stability](../api-stability.md).
+- [ ] Log wording, levels and structured fields are not covered by SemVer. Re-check
+      every alert built on one (the ones named on this page included) when you
+      upgrade. See [API stability](../api-stability.md#log-messages).
 - [ ] Wire `jasil.correlation.configure_provider` to your request-id middleware so
       events carry it.
 
