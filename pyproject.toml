@@ -92,37 +92,37 @@ all = [
 
 [dependency-groups]
 typecheck = [
-    "mypy>=2.3.1",
-    "ty>=0.0.84",
-    "types-requests>=2.33.0.20260906",
-    "boto3-stubs[s3]>=1.43.105",
+    "mypy>=2.4.1",
+    "ty>=0.0.95",
+    "types-requests>=2.33.0.20261030",
+    "boto3-stubs[s3]>=1.43.123",
 ]
 lint = [
-    "ruff>=0.16.9",
+    "ruff>=0.17.3",
     "import-linter>=2.15",
 ]
 test = [
-    "faker>=40.40.0",
-    "hypothesis>=6.168.3",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
+    "faker>=40.44.0",
+    "hypothesis>=6.170.14",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
     "pytest-cov>=7.1.0",
     # The state and event-bus backends are tested hermetically against fakeredis.
     # The [lua] extra is required: the tiered-lockout path runs a Lua script, and
     # Earlier fakeredis releases do not implement XREADGROUP well enough for
     # the Redis Streams bus suite.
     "redis>=8.1.0",
-    "fakeredis[lua]>=2.38.0",
+    "fakeredis[lua]>=2.40.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.105",
+    "boto3>=1.43.123",
     "apscheduler>=3.11.3",
-    "fastapi>=0.141.1",
+    "fastapi>=0.162.0",
     "requests>=2.34.2",
     "responses>=0.26.3",
     # The migrations suite drives the packaged Alembic revisions.
-    "alembic>=1.20.0",
+    "alembic>=1.20.1",
     # The audit checkpoint tests sign and verify with Ed25519.
-    "cryptography>=46.0.0",
+    "cryptography>=50.0.2",
 ]
 # Real database drivers for the CI database matrix. The default test run uses
 # in-memory SQLite (built into Python) and needs neither; set
@@ -132,14 +132,14 @@ test-db = [
     "pymysql>=1.2.3",
 ]
 dev = [
-    "hatch>=1.18.1",
+    "hatch>=1.18.2",
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
 ]
 docs = [
-    "mkdocs-material>=9.7.7",
-    "mkdocstrings[python]>=1.0.6",
+    "mkdocs-material>=9.8.0",
+    "mkdocstrings[python]>=1.0.8",
 ]
 
 [tool.uv]

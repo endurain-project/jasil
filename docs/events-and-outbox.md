@@ -233,9 +233,12 @@ An id is at most 36 characters, starts with a lowercase letter or digit, and
 contains only `a-z`, `0-9`, `.`, `_` and `-`: the rule durable queue names
 follow, so that two ids are equal on every database (MySQL's default collation
 ignores case and accents) and an id is safe in a log line or a URL. A UUID
-string passes. Any other id raises `ValueError` before anything is committed or
-staged, on both routes; `publish` logs and swallows it. In the batch forms the best-effort route instead skips that
-one event (logged) and returns `None` for it.
+string passes. Any other id raises `ValueError` before anything is committed, on
+both routes; `publish` logs and swallows it. In the batch forms the best-effort
+route instead skips that one event (logged) and returns `None` for it. On the
+durable route a batch stages its events one by one, so when a later event has a
+bad id the earlier ones are already staged: roll the transaction back after the
+error rather than committing it, or a partial batch persists.
 
 Know the limits:
 
