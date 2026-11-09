@@ -113,6 +113,8 @@ class LocalStorage:
             ``{base_dir}/{area}/{key}`` layout. A key cannot coexist with its
             descendants in these areas, nor with a key the filesystem stores
             under the same name (another letter case or Unicode normalization).
+            The filesystem must support hard links, which publish a new object
+            atomically; without them writes to these areas fail.
     """
 
     def __init__(
@@ -329,19 +331,19 @@ class LocalStorage:
         except ValueError:
             return False
 
-    def _abandon_new_object(self, area: str, path: Path) -> None:
+    def _abandon_new_object(self, area: str, key: str, path: Path) -> None:
         """After a failed write, remove what preparing it left of an object that was never committed.
 
         The identity file of an opaque object is written before its payload, so a refused or failed write of a
         new key would otherwise leave it, and the directories around it, for good. An existing object keeps its.
         """
         if area not in self._plain_areas:
-            with suppress(OSError):
+            with suppress(OSError, StorageBackendUnavailableError):
                 if not path.exists():
-                    (path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
+                    self._remove_key_identity(key, path)
         self._prune_empty_directories(path.parent)
 
-    def _write_object_bytes(self, area: str, path: Path, data: bytes) -> None:
+    def _write_object_bytes(self, area: str, key: str, path: Path, data: bytes) -> None:
         """Write ``data`` to a temporary file and move it over ``path``, so a failed overwrite leaves the old bytes."""
         temporary_path = self._temporary_object_path(area, path)
         try:
@@ -350,11 +352,11 @@ class LocalStorage:
             with temporary_path.open("xb") as destination:
                 destination.write(data)
                 _sync(destination)
-            self._install(temporary_path, path)
+            self._install_object(area, key, temporary_path, path)
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            self._abandon_new_object(area, path)
+            self._abandon_new_object(area, key, path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
     @staticmethod
@@ -371,6 +373,44 @@ class LocalStorage:
             except FileNotFoundError:
                 if attempt:
                     raise
+        _sync_directory(destination.parent)
+
+    def _install_object(self, area: str, key: str, temporary_path: Path, destination: Path) -> None:
+        """Publish a synced temporary file as the object ``area``/``key`` and make the new name durable.
+
+        An opaque object is installed with :meth:`_install`. A plain area is published with a hard link, which
+        fails when the name exists under any spelling the filesystem folds together, so of two first writes of
+        keys that differ only in spelling exactly one wins; the other raises ``StorageKeyConflictError``. An
+        existing entry of the same spelling is replaced. Recreates a parent that a concurrent prune removed, once.
+
+        Raises:
+            StorageKeyConflictError: When the key names an existing entry under another spelling.
+            OSError: When the filesystem refuses the write, including one without hard links.
+        """
+        if area not in self._plain_areas:
+            self._install(temporary_path, destination)
+            return
+        for attempt in range(2):
+            _make_directories(destination.parent)
+            try:
+                if self._names_another_entry(area, key):
+                    raise self._spelling_conflict(area, key)
+                try:
+                    os.link(temporary_path, destination)
+                except FileExistsError:
+                    if self._names_another_entry(area, key):
+                        raise self._spelling_conflict(area, key) from None
+                    os.replace(temporary_path, destination)
+                else:
+                    temporary_path.unlink()
+                break
+            except FileNotFoundError:
+                if attempt:
+                    raise
+            except (StorageKeyConflictError, StorageBackendUnavailableError):
+                with suppress(OSError):
+                    temporary_path.unlink(missing_ok=True)
+                raise
         _sync_directory(destination.parent)
 
     def _finish_commit(self, area: str, key: str) -> None:
@@ -392,7 +432,7 @@ class LocalStorage:
             if path is None:
                 return
             path.unlink()
-            (path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
+            self._remove_key_identity(key, path)
             self._prune_empty_directories(path.parent)
         except (OSError, ValueError, StorageBackendUnavailableError) as error:
             if best_effort:
@@ -401,6 +441,19 @@ class LocalStorage:
             if isinstance(error, OSError):
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
             raise
+
+    def _remove_key_identity(self, key: str, path: Path) -> None:
+        """Remove the key identity file beside the opaque payload ``path``, unless a save has committed meanwhile.
+
+        A save writes the identity, installs the payload, then writes the identity again, so one that commits
+        between the caller's payload check and this unlink would be left without an identity and unreadable.
+        When a payload is present after the unlink the identity is therefore written back; it holds the same
+        key, since the address is derived from it.
+        """
+        identity_path = path.parent / _OBJECT_KEY_FILE
+        identity_path.unlink(missing_ok=True)
+        if self._is_regular_file(path):
+            self._write_identity(identity_path, key)
 
     def _verify_object_identity(self, area: str, key: str, path: Path) -> None:
         area_file = self._resolve_area(area).parent / _OBJECT_AREA_FILE
@@ -599,7 +652,7 @@ class LocalStorage:
     def save(self, area: str, key: str, data: bytes, content_type: str | None = None) -> str:
         """Write ``data`` to a temporary file and move it over the object; ``content_type`` is ignored."""
         path = self._prepare_object(area, key)
-        self._write_object_bytes(area, path, data)
+        self._write_object_bytes(area, key, path, data)
         self._finish_commit(area, key)
         return key
 
@@ -622,7 +675,7 @@ class LocalStorage:
                 _make_directories(path.parent)
             destination = temporary_path.open("xb")
         except OSError as error:
-            self._abandon_new_object(area, path)
+            self._abandon_new_object(area, key, path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
 
         total = 0
@@ -644,7 +697,7 @@ class LocalStorage:
             try:
                 _sync(destination)
                 destination.close()
-                self._install(temporary_path, path)
+                self._install_object(area, key, temporary_path, path)
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
@@ -653,7 +706,7 @@ class LocalStorage:
                     destination.close()
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            self._abandon_new_object(area, path)
+            self._abandon_new_object(area, key, path)
             raise
         self._finish_commit(area, key)
         return total
@@ -805,16 +858,16 @@ class LocalStorage:
                     if copied != part.size or f'"sha256-{digest.hexdigest()}"' != part.validator:
                         raise StorageUploadSessionError(f"Upload part {part.part_number} does not match its reference")
                 _sync(destination)
-            self._install(temporary_path, destination_path)
+            self._install_object(session.area, session.key, temporary_path, destination_path)
         except OSError as error:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            self._abandon_new_object(session.area, destination_path)
+            self._abandon_new_object(session.area, session.key, destination_path)
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         except BaseException:
             with suppress(OSError):
                 temporary_path.unlink(missing_ok=True)
-            self._abandon_new_object(session.area, destination_path)
+            self._abandon_new_object(session.area, session.key, destination_path)
             raise
         self._finish_commit(session.area, session.key)
         try:
@@ -989,7 +1042,7 @@ class LocalStorage:
         if current_path is not None:
             try:
                 current_path.unlink()
-                (current_path.parent / _OBJECT_KEY_FILE).unlink(missing_ok=True)
+                self._remove_key_identity(key, current_path)
                 self._prune_empty_directories(current_path.parent)
             except OSError as error:
                 raise StorageBackendUnavailableError("Local storage backend is unavailable") from error

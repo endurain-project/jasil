@@ -34,10 +34,14 @@ The envelope is frozen. Handlers share one instance, so a mutation would be
 visible to every other handler.
 
 Event types and payload shapes are **owned by the publishing domain**, not
-defined here. JASIL only knows the envelope. The one metadata key it defines is
-`META_REQUEST_ID`; everything else in `metadata` is yours to name. Its value is
-a string or absent: `new_event` (and so every publish) raises `TypeError` for
-anything else, because a durable handler runs under it as its correlation id.
+defined here. JASIL only knows the envelope. The metadata keys it defines are
+`META_REQUEST_ID` and `META_SCOPE`; everything else in `metadata` is yours to
+name. Each value is a string or absent: `new_event` raises `TypeError` for anything
+else (`publish()` logs it and returns `None`), because a durable handler runs under the
+first as its correlation id and the second as its [audit scope](audit.md#scope).
+A `META_SCOPE` longer than 64 characters or holding a NUL character raises
+`ValueError`. The publisher stamps the ambient request id for you; it never sets
+`META_SCOPE`.
 
 ### What not to put in one
 
@@ -68,7 +72,7 @@ inlining it.
 
 Identifiers *are* bounded, because they are indexed columns: `event_type` is
 capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
-Going over raises at `new_event` rather than failing at the write. The functions
+Going over raises at `new_event` (at `register` for a `subscriber_id`) rather than failing at the write. The functions
 tied to your commit (`publish_committing`, `publish_on_commit` and their batch
 forms) raise it before committing or staging anything, on the durable and the
 best-effort route alike; `publish` logs and swallows it with every other failure.
@@ -229,13 +233,17 @@ An id is at most 36 characters, starts with a lowercase letter or digit, and
 contains only `a-z`, `0-9`, `.`, `_` and `-`: the rule durable queue names
 follow, so that two ids are equal on every database (MySQL's default collation
 ignores case and accents) and an id is safe in a log line or a URL. A UUID
-string passes. Any other id raises `ValueError` before anything is committed or
-staged, on both routes; `publish` logs and swallows it.
+string passes. Any other id raises `ValueError` before anything is committed, on
+both routes; `publish` logs and swallows it. In the batch forms the best-effort
+route instead skips that one event (logged) and returns `None` for it. On the
+durable route a batch stages its events one by one, so when a later event has a
+bad id the earlier ones are already staged: roll the transaction back after the
+error rather than committing it, or a partial batch persists.
 
 Know the limits:
 
 - **Dedup lasts as long as the outbox row.** Relayed rows are pruned after
-  `jobs.retention_days`; after that the same id is a new event. The fan-out's
+  `jobs.retention_days` by the scheduled retention maintenance; after that the same id is a new event. The fan-out's
   `(event_id, subscriber_id)` uniqueness holds only while the completed jobs are
   retained, which the same setting prunes.
 - **The bus route does not dedup.** A reused id is dispatched again and the
@@ -277,6 +285,7 @@ eventually dead-letter. A bus subscriber must **not**, so derived work cannot
 fail the request that produced the event. Write the raising core once and wrap it:
 
 ```python
+from jasil.events import Event
 from jasil.subscribers import best_effort
 
 
@@ -299,6 +308,8 @@ the wrong thing quietly.
 
 ```python
 from typing import ClassVar
+
+from jasil.events import Event
 from jasil.event_versioning import VersionedPayload, parse_payload
 
 

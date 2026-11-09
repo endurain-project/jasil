@@ -756,6 +756,9 @@ class EventBusProvider(Protocol):
     def publish(self, event: Event) -> None:
         """Hand ``event`` to the bus for delivery to the handlers subscribed to its ``event_type``.
 
+        A handler that raises is logged by the bus, not raised here; an error that escapes means the event
+        was not dispatched.
+
         Args:
             event: The event to deliver.
         """
@@ -788,7 +791,7 @@ class EventRecorder(Protocol):
     ``record_processing`` is False, for a synchronous single-process dispatch
     where the intermediate state is never observed) and *completed* / *failed* on
     exit, re-raising any handler exception so the bus keeps its own error
-    semantics (propagate in-process, logged and acked on Redis Streams).
+    semantics (logged by the bus in-process, logged and acked on Redis Streams).
 
     Implementations may additionally offer ``record_queued_in(event, db)``, which
     stages the ``queued`` row on the caller's session so it commits or rolls back

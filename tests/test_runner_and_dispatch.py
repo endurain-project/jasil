@@ -4,7 +4,7 @@ These are the three places a handler exception is caught, and each has a
 different contract:
 
 * the **runner** turns a failure into a retry or a dead-letter;
-* the **in-process bus** re-raises to the publisher (dispatch is a direct call);
+* the **in-process bus** logs the failure and returns, as the Redis consumer does;
 * the **subscriber wrapper** swallows, so one bad subscriber cannot fail a request.
 """
 
@@ -18,7 +18,7 @@ import jasil.audit as jasil_audit
 import jasil.correlation as correlation
 import jasil.jobs.crud as jobs_crud
 from jasil.backends.events_inprocess import InProcessEventBus
-from jasil.events import META_REQUEST_ID, new_event
+from jasil.events import META_REQUEST_ID, META_SCOPE, new_event
 from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
@@ -202,6 +202,30 @@ class TestJobRunner:
 
         assert seen[0][1] == "req-7"
 
+    def test_the_handler_context_carries_the_scope_its_event_named(self, runner, registry, db):
+        seen = self._record_context(registry)
+        event = new_event("activity.created", {"id": 1}, source="test", metadata={META_SCOPE: "ws-1"})
+        jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        assert seen[0][0] == jasil_audit.AuditContext(
+            actor_type="system", source="worker", event_id=event.event_id, scope="ws-1"
+        )
+
+    def test_a_scope_an_audit_row_could_not_store_fails_the_attempt(self, runner, registry, db):
+        """Only an envelope built without new_event can carry one; the handler must not run unscoped."""
+        seen = self._record_context(registry)
+        event = new_event("activity.created", {"id": 1}, source="test")
+        event.metadata[META_SCOPE] = "x" * 65
+        job_id = jobs_crud.insert_job(event, "s", queue="default", max_attempts=3, now=T0, db=db)
+
+        runner.run_once()
+
+        db.expire_all()
+        assert seen == []
+        assert "scope is 65 characters" in db.get(ProcessingJob, job_id).last_error
+
     def test_a_job_without_a_request_id_runs_with_none(self, runner, registry, db):
         """A worker thread's leftover id or a request-scoped provider must not be stamped on the handler's rows."""
         correlation.set_correlation_id("leftover")
@@ -314,16 +338,48 @@ class TestJobRunner:
 
         assert stored_job(db).last_error == recorded
 
-    def test_a_job_with_no_registered_handler_fails_rather_than_vanishing(self, runner, db):
-        """A subscriber removed from the code while jobs are still queued must
-        surface, not silently succeed."""
-        self._enqueue(db, subscriber="gone", max_attempts=1)
+    def test_a_handler_gone_between_the_claim_and_the_run_fails_rather_than_vanishing(
+        self, runner, registry, db, monkeypatch
+    ):
+        """Only a registry reset mid-batch gets here: the job must surface, not silently succeed."""
+        registry.register("activity.created", "s", lambda _event: None)
+        self._enqueue(db, max_attempts=1)
+        monkeypatch.setattr(registry, "get", lambda _subscriber_id: None)
 
         runner.run_once()
 
         job = stored_job(db)
         assert job.status == jobs_crud.STATUS_DEAD_LETTER
         assert "no durable handler" in job.last_error
+
+    def test_a_job_of_an_unregistered_subscriber_stays_pending_for_a_worker_that_has_it(self, runner, registry, db):
+        """A rolling deploy adds a subscriber: an old worker must leave its jobs alone, not dead-letter them."""
+        seen = []
+        registry.register("activity.created", "s", lambda event: seen.append(event.event_id))
+        unknown = self._enqueue(db, subscriber="x", max_attempts=1)
+        known = self._enqueue(db, subscriber="s")
+
+        assert runner.run_once() == 1
+
+        db.rollback()
+        db.refresh(unknown)
+        db.refresh(known)
+        assert (unknown.status, unknown.attempts, unknown.last_error) == (jobs_crud.STATUS_PENDING, 0, None)
+        assert known.status == jobs_crud.STATUS_COMPLETED
+        assert seen == [known.event_id]
+
+    def test_a_subscriber_registered_after_the_runner_was_built_is_claimed_on_the_next_batch(
+        self, runner, registry, db
+    ):
+        self._enqueue(db, subscriber="late")
+        assert runner.run_once() == 0
+
+        seen = []
+        registry.register("activity.created", "late", lambda event: seen.append(event.event_id))
+
+        assert runner.run_once() == 1
+        assert stored_job(db).status == jobs_crud.STATUS_COMPLETED
+        assert len(seen) == 1
 
     def test_one_failing_job_does_not_abort_the_batch(self, runner, registry, db):
         """Each job is finalised independently; the rest of the batch must run."""
@@ -339,7 +395,8 @@ class TestJobRunner:
         assert processed == 2
         assert len(seen) == 1
 
-    def test_a_finalization_error_does_not_abort_the_batch(self, runner, db, monkeypatch, caplog):
+    def test_a_finalization_error_does_not_abort_the_batch(self, runner, registry, db, monkeypatch, caplog):
+        registry.register("activity.created", "s", lambda _event: None)
         self._enqueue(db, payload={"id": 1})
         self._enqueue(db, payload={"id": 2})
         finalized = []
@@ -540,7 +597,7 @@ class TestJobRunner:
             queues=queues,
         )
 
-    def test_a_selective_default_runner_still_dead_letters_an_unknown_subscriber(
+    def test_a_selective_default_runner_leaves_an_unknown_subscriber_pending(
         self,
         registry,
         clock,
@@ -563,10 +620,9 @@ class TestJobRunner:
             queues=("default",),
         )
 
-        assert runner.run_once() == 1
+        assert runner.run_once() == 0
         job = stored_job(db)
-        assert job.status == jobs_crud.STATUS_DEAD_LETTER
-        assert "no durable handler" in job.last_error
+        assert (job.status, job.attempts) == (jobs_crud.STATUS_PENDING, 0)
 
     def test_an_empty_queue_allowlist_is_refused(self, registry, clock, session_factory):
         with pytest.raises(ValueError, match="queues"):
@@ -740,36 +796,44 @@ class TestInProcessBus:
 
         assert len(first) == len(second) == 1
 
-    def test_a_handler_exception_propagates_to_the_publisher(self):
-        """Dispatch is a direct call in the local profile, so the caller sees it;
-        the scheduler backfill is the safety net."""
+    def test_a_handler_exception_is_logged_not_raised(self, caplog):
+        """Every handler has run by the time publish returns, so a raise would make a retrying producer run them twice."""
         bus = InProcessEventBus()
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
+        event = new_event("activity.created", {"secret": "payload-value"}, source="test")
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(new_event("activity.created", {}, source="test"))
+        with caplog.at_level("ERROR"):
+            bus.publish(event)
 
-    def test_every_handler_runs_before_the_failure_propagates(self):
+        records = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert event.event_type in records[0].getMessage()
+        assert event.event_id in records[0].getMessage()
+        assert "payload-value" not in caplog.text
+
+    def test_every_handler_runs_when_one_raises(self):
         bus = InProcessEventBus()
         calls = []
         bus.subscribe("activity.created", lambda _e: calls.append("first"))
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
         bus.subscribe("activity.created", lambda _e: calls.append("third"))
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(new_event("activity.created", {}, source="test"))
+        bus.publish(new_event("activity.created", {}, source="test"))
 
         assert calls == ["first", "third"]
 
-    def test_several_failures_propagate_together(self):
+    def test_several_failures_are_logged_together(self, caplog):
         bus = InProcessEventBus()
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("one")))
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(ValueError("two")))
 
-        with pytest.raises(ExceptionGroup) as excinfo:
+        with caplog.at_level("ERROR"):
             bus.publish(new_event("activity.created", {}, source="test"))
 
-        assert [type(error) for error in excinfo.value.exceptions] == [RuntimeError, ValueError]
+        records = [record for record in caplog.records if record.levelname == "ERROR"]
+        assert len(records) == 1
+        assert [type(error) for error in records[0].exc_info[1].exceptions] == [RuntimeError, ValueError]
 
     def test_start_and_stop_are_no_ops(self):
         bus = InProcessEventBus()
@@ -857,12 +921,11 @@ class TestInProcessBusRecording:
 
         assert len(seen) == 1
 
-    def test_a_failure_is_recorded_and_still_propagates(self, bus, recorder):
+    def test_a_failure_is_recorded_and_publish_returns(self, bus, recorder):
         event = new_event("activity.created", {}, source="test")
         bus.subscribe("activity.created", lambda _e: (_ for _ in ()).throw(RuntimeError("boom")))
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(event)
+        bus.publish(event)
 
         assert recorder.failed == [event.event_id]
 

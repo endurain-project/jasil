@@ -56,17 +56,20 @@ def check_segment(value: str, label: str) -> None:
 
     Raises:
         ValueError: When the segment is empty, absolute, contains a ``..``
-            component or a control character, is not a canonical slash-delimited
+            component, a control character or a character XML 1.0 cannot carry
+            (U+FFFE, U+FFFF), is not a canonical slash-delimited
             path, or is longer than :data:`MAX_KEY_BYTES` in UTF-8.
     """
     if not value:
         # An empty segment collapses the address onto the container itself, so
         # ``save("", "")`` would target the storage root.
         raise ValueError(f"Storage {label} must not be empty")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-        # S3 cannot list or batch-delete such a key (XML 1.0 has no way to carry most of them), and a local
-        # path cannot hold a NUL.
-        raise ValueError(f"Storage {label} must not contain a control character: {value!r}")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F or char in "\ufffe\uffff" for char in value):
+        # S3 cannot list or batch-delete a key XML 1.0 cannot carry (most C0 controls, U+FFFE, U+FFFF), and a
+        # local path cannot hold a NUL.
+        raise ValueError(
+            f"Storage {label} must not contain a control character or a character XML cannot carry: {value!r}"
+        )
     check_key_length(value, label)
     normalized_parts = value.replace("\\", "/").split("/")
     if value.startswith(("/", "\\")) or ".." in normalized_parts:

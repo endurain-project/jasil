@@ -5,11 +5,12 @@ SQLite has no timezone type, so a ``DateTime(timezone=True)`` column reads back
 provider clock therefore has to normalise first, or it raises ``TypeError`` on
 SQLite and silently compares wrong offsets elsewhere.
 
-MySQL's ``DATETIME`` also keeps only whole seconds, and **rounds** rather than
-truncates — a timestamp written at ``.65`` reads back a third of a second in the
-future. Nothing JASIL persists may therefore be compared for equality with the
-value that was written, and an age measured against one can come out negative;
-:func:`age_seconds` is where that is absorbed.
+JASIL's columns keep microseconds on every database (``DATETIME(6)`` on MySQL and
+MariaDB from migration ``rev0012``). A MySQL database not yet migrated keeps whole
+seconds and **rounds** rather than truncates, so a timestamp written at ``.65``
+reads back a third of a second in the future, and a row stamped by the database's
+clock can be ahead of the process's: an age measured against a stored timestamp
+can come out negative, and :func:`age_seconds` is where that is absorbed.
 """
 
 from datetime import UTC, datetime
@@ -43,9 +44,9 @@ def age_seconds(moment: datetime | None, now: datetime) -> float | None:
     Returns:
         The age in seconds, never negative, or ``None`` when ``moment`` is
         ``None``. A row written moments ago can carry a timestamp fractionally
-        *ahead* of ``now`` — MySQL rounds a stored ``DATETIME`` to the nearest
-        second — and "this has been pending for -0.3 seconds" is not something a
-        dashboard should have to explain.
+        *ahead* of ``now`` — stamped by another clock, or rounded to the nearest
+        second by a MySQL ``DATETIME`` from before ``rev0012`` — and "this has been
+        pending for -0.3 seconds" is not something a dashboard should have to explain.
     """
     if moment is None:
         return None

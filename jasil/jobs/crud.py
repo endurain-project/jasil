@@ -140,6 +140,7 @@ def claim_jobs(
     queue_cursor: str | None = None,
     default_queue_subscribers: Iterable[str] | None = None,
     excluded_default_queue_subscribers: Iterable[str] | None = None,
+    subscribers: Iterable[str] | None = None,
     record_attempts: bool = True,
 ) -> list[ProcessingJob]:
     """
@@ -169,6 +170,11 @@ def claim_jobs(
         excluded_default_queue_subscribers: Registered subscribers assigned to
             unselected queues. When ``default`` is selected, their legacy rows
             must remain available to the worker for their assigned queue.
+        subscribers: Optional allowlist of subscriber ids, applied on top of every
+            queue rule. A worker passes the subscribers it has a handler for, so
+            it never claims (and burns an attempt on) a job it cannot run; the
+            rest stay pending for a worker that can. Empty claims nothing, and
+            omitting it places no restriction.
         record_attempts: Open one ``job_attempts`` row per claimed job, in the
             claim's own transaction, so the history can never disagree with the
             claim.
@@ -181,6 +187,12 @@ def claim_jobs(
     if queue_cursor is not None:
         validate_queue_name(queue_cursor)
     filters = [ProcessingJob.status == STATUS_PENDING, ProcessingJob.available_at <= now]
+    if subscribers is not None:
+        allowed_subscribers = tuple(dict.fromkeys(subscribers))
+        if not allowed_subscribers:
+            db.commit()  # same as an empty selection: end the transaction
+            return []
+        filters.append(ProcessingJob.subscriber_id.in_(allowed_subscribers))
     if selected_queues is not None:
         queue_filter = ProcessingJob.queue.in_(selected_queues)
         legacy_subscribers = tuple(dict.fromkeys(default_queue_subscribers or ()))
@@ -238,9 +250,10 @@ def claim_jobs(
                 # transitioned: a row a competing worker won carries its id, and
                 # a row this worker claimed in an earlier round was never
                 # ``pending`` to be selected here. Deliberately not also matching
-                # ``locked_at == now`` — MySQL's DATETIME keeps whole seconds and
-                # rounds anything finer, so that equality silently matched
-                # nothing and the worker claimed batches it then never ran.
+                # ``locked_at == now``: a MySQL ``DATETIME`` from before ``rev0012``
+                # keeps whole seconds and rounds anything finer, so that equality
+                # would match nothing and the worker would claim batches it then
+                # never ran.
                 ProcessingJob.locked_by == worker_id,
             )
         )

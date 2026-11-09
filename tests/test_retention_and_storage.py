@@ -5,6 +5,7 @@ storage backend's contract is mostly about refusing to write outside its root.
 """
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -1929,6 +1930,199 @@ class TestLocalStorageConcurrentDelete:
         assert storage.get("thumbnails", "1.webp") == b"new"
         assert storage.exists("thumbnails", "1.webp")
         assert storage.list_keys("thumbnails") == ["1.webp"]
+
+
+def _files_under(root: Path) -> set[str]:
+    return {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()}
+
+
+class TestLocalStoragePlainFirstWriteRace:
+    """Two first writes of keys that a case-folding filesystem stores under one name must not overwrite each other:
+    exactly one wins and the other raises ``StorageKeyConflictError``."""
+
+    AREA = "activity_files"
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        if not _folds(tmp_path, "probe", "PROBE"):
+            pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
+        return LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+
+    @staticmethod
+    def _after_first_call(monkeypatch, owner, name, action):
+        """Run ``action`` once, right after the first call of ``owner.name`` returns."""
+        original = getattr(owner, name)
+        done: list[bool] = []
+
+        def wrapper(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if not done:
+                done.append(True)
+                action()
+            return result
+
+        monkeypatch.setattr(owner, name, wrapper)
+
+    def test_a_write_prepared_before_another_spelling_was_stored_loses(self, storage, tmp_path, monkeypatch):
+        self._after_first_call(
+            monkeypatch, storage, "_prepare_object", lambda: storage.save(self.AREA, "alice/x", b"bob")
+        )
+
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save(self.AREA, "Alice/x", b"alice")
+
+        monkeypatch.undo()
+        assert storage.get(self.AREA, "alice/x") == b"bob"
+        assert _files_under(tmp_path / "data") == {"activity_files/alice/x"}
+
+    def test_a_write_beaten_to_the_file_between_check_and_publish_loses(self, storage, tmp_path, monkeypatch):
+        original = storage_local.os.link
+        done: list[bool] = []
+
+        def link_after_rival(source, destination, *args, **kwargs):
+            if not done:
+                done.append(True)
+                storage.save(self.AREA, "u/x", b"bob")
+            return original(source, destination, *args, **kwargs)
+
+        monkeypatch.setattr(storage_local.os, "link", link_after_rival)
+
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save(self.AREA, "u/X", b"alice")
+
+        monkeypatch.undo()
+        assert storage.get(self.AREA, "u/x") == b"bob"
+        assert _files_under(tmp_path / "data") == {"activity_files/u/x"}
+
+    def test_a_write_beaten_to_the_directory_loses(self, storage, tmp_path, monkeypatch):
+        original = storage_local._make_directories
+        done: list[bool] = []
+
+        def mkdir_after_rival(directory):
+            if not done:
+                done.append(True)
+                storage.save(self.AREA, "alice/x", b"bob")
+            original(directory)
+
+        monkeypatch.setattr(storage_local, "_make_directories", mkdir_after_rival)
+
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            storage.save(self.AREA, "Alice/x", b"alice")
+
+        monkeypatch.undo()
+        assert storage.get(self.AREA, "alice/x") == b"bob"
+        assert _files_under(tmp_path / "data") == {"activity_files/alice/x"}
+
+    @pytest.mark.parametrize("via", ["save_stream", "complete_upload"])
+    def test_streamed_writes_lose_and_leave_no_temporary_file(self, storage, tmp_path, monkeypatch, via):
+        if via == "save_stream":
+
+            def write():
+                storage.save_stream(self.AREA, "Alice/x", io.BytesIO(b"alice"))
+        else:
+
+            def write():
+                session = storage.begin_upload(self.AREA, "Alice/x")
+                part = _upload_part(storage, session, 1, b"alice")
+                storage.complete_upload(session, [part])
+
+        self._after_first_call(
+            monkeypatch, storage, "_prepare_object", lambda: storage.save(self.AREA, "alice/x", b"bob")
+        )
+
+        with pytest.raises(StorageKeyConflictError, match="another spelling"):
+            write()
+
+        monkeypatch.undo()
+        assert storage.get(self.AREA, "alice/x") == b"bob"
+        assert not [name for name in _files_under(tmp_path / "data") if name.endswith(".tmp")]
+
+    def test_the_same_spelling_still_overwrites(self, storage):
+        storage.save(self.AREA, "u/x", b"one")
+        storage.save(self.AREA, "u/x", b"two")
+
+        assert storage.get(self.AREA, "u/x") == b"two"
+
+
+class TestLocalStoragePlainRequiresHardLinks:
+    def test_a_filesystem_without_hard_links_cannot_write_a_plain_area(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({"activity_files"}))
+
+        def refuse(*args, **kwargs):
+            raise OSError(errno.EPERM, "hard links are not supported")
+
+        monkeypatch.setattr(storage_local.os, "link", refuse)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("activity_files", "u/x", b"data")
+
+        monkeypatch.undo()
+        assert storage.get("activity_files", "u/x") is None
+        assert _files_under(tmp_path / "data") == set()
+
+
+class TestLocalStoragePlainPublishFailures:
+    def test_a_directory_that_cannot_be_listed_when_publishing_leaves_no_temporary_file(self, tmp_path, monkeypatch):
+        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({"activity_files"}))
+        original = storage._prepare_object
+
+        def prepare_then_fail_listing(area, key):
+            path = original(area, key)
+            monkeypatch.setattr(storage_local.os, "listdir", lambda *_: (_ for _ in ()).throw(PermissionError()))
+            return path
+
+        monkeypatch.setattr(storage, "_prepare_object", prepare_then_fail_listing)
+
+        with pytest.raises(StorageBackendUnavailableError):
+            storage.save("activity_files", "u/x", b"data")
+
+        monkeypatch.undo()
+        assert not [name for name in _files_under(tmp_path / "data") if name.endswith(".tmp")]
+
+
+class TestLocalStorageIdentityRemovalRace:
+    """A save that commits between a remover's payload unlink and its identity unlink must stay readable."""
+
+    @pytest.fixture
+    def storage(self, tmp_path):
+        return LocalStorage(str(tmp_path))
+
+    @staticmethod
+    def _save_before_identity_unlink(monkeypatch, storage, key):
+        identity = storage._resolve("docs", key).parent / "key"
+        original = Path.unlink
+        done: list[bool] = []
+
+        def unlink(self, *args, **kwargs):
+            if self == identity and not done:
+                done.append(True)
+                storage.save("docs", key, b"v2")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", unlink)
+
+    def test_a_delete_does_not_orphan_a_concurrent_save(self, storage, monkeypatch):
+        storage.save("docs", "k", b"v1")
+        self._save_before_identity_unlink(monkeypatch, storage, "k")
+
+        storage.delete("docs", "k")
+
+        monkeypatch.undo()
+        assert storage.get("docs", "k") == b"v2"
+        assert storage.exists("docs", "k")
+        assert storage.list_keys("docs") == ["k"]
+        storage.delete("docs", "k")
+        assert not storage.exists("docs", "k")
+
+    def test_a_failed_new_write_does_not_orphan_a_concurrent_save(self, storage, monkeypatch):
+        self._save_before_identity_unlink(monkeypatch, storage, "k")
+
+        with pytest.raises(StorageSizeLimitError):
+            storage.save_stream("docs", "k", io.BytesIO(b"too long"), max_bytes=2)
+
+        monkeypatch.undo()
+        assert storage.get("docs", "k") == b"v2"
+        assert storage.list_keys("docs") == ["k"]
 
 
 class TestLocalStorageFilesystemFailures:

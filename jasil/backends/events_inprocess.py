@@ -1,5 +1,6 @@
 """In-process (synchronous) ``EventBusProvider`` backend."""
 
+import logging
 from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -9,6 +10,8 @@ from jasil.events import Event
 if TYPE_CHECKING:
     from jasil.providers import EventRecorder
 
+logger = logging.getLogger(__name__)
+
 # Worker label recorded for in-process dispatch (single process, no consumer).
 _INPROCESS_WORKER = "inprocess"
 
@@ -17,17 +20,17 @@ class InProcessEventBus:
     """Synchronous ``EventBusProvider`` — ``publish`` runs subscribers inline.
 
     Correct for the ``local`` profile: dispatch is a direct function call in the
-    same thread. Every handler runs even when one raises; the failure then
-    propagates to the caller (several together as an ``ExceptionGroup``), and the
-    scheduler backfill is the safety net. ``start`` / ``stop`` are no-ops because
-    there is no background consumer.
+    same thread. Every handler runs even when one raises; the bus logs the failure
+    (several together as an ``ExceptionGroup``) and ``publish`` returns normally,
+    as the Redis consumer does, and the scheduler backfill is the safety net.
+    ``start`` / ``stop`` are no-ops because there is no background consumer.
 
     When an :class:`~jasil.providers.EventRecorder` is injected, each
     ``publish`` records the event's lifecycle (published -> completed/failed)
     around the inline dispatch in two writes: the intermediate ``processing``
     state is skipped because dispatch is synchronous and single-process, so that
     state is never observed. A handler exception is recorded as a failure and
-    then re-raised, preserving the propagate-to-caller contract.
+    then logged by the bus.
     """
 
     def __init__(self, recorder: "EventRecorder | None" = None) -> None:
@@ -37,19 +40,23 @@ class InProcessEventBus:
     def publish(self, event: Event) -> None:
         """Run the handlers subscribed to ``event.event_type`` inline, in subscription order.
 
-        Raises:
-            Exception: The handler's error when one handler fails, or an ``ExceptionGroup`` when several do, after
-                every handler has run.
+        A handler failure is logged with its traceback, never raised, once every handler has run.
         """
         handlers = self._handlers.get(event.event_type, [])
         recorder = self._recorder
-        if recorder is None:
-            _call_each(handlers, event)
-            return
-        recorder.record_published(event)
-        handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
-        with recorder.track(event, worker_id=_INPROCESS_WORKER, handler_name=handler_name, record_processing=False):
-            _call_each(handlers, event)
+        if recorder is not None:
+            recorder.record_published(event)
+        try:
+            if recorder is None:
+                _call_each(handlers, event)
+            else:
+                handler_name = ",".join(getattr(handler, "__name__", repr(handler)) for handler in handlers) or None
+                with recorder.track(
+                    event, worker_id=_INPROCESS_WORKER, handler_name=handler_name, record_processing=False
+                ):
+                    _call_each(handlers, event)
+        except Exception as error:  # the handlers have run: a raise would make a retrying producer run them twice
+            logger.error("Event handling failed for %s (%s)", event.event_type, event.event_id, exc_info=error)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
         """Register ``handler`` for ``event_type``."""

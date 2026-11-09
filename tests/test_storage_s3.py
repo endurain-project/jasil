@@ -25,6 +25,7 @@ import pytest
 from botocore.awsrequest import AWSResponse
 from botocore.config import Config
 from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
+from botocore.parsers import ResponseParserError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
 
@@ -1255,6 +1256,44 @@ class TestUploadPartThroughBotocore:
             _upload_part(wire.storage, _upload_session(), 1, data, size=4)
 
         assert wire.puts == 0
+
+
+class TestMalformedResponse:
+    """A 2xx whose XML botocore cannot parse (a proxy or an S3-compatible store) is still a backend failure.
+
+    botocore itself retries a malformed ``200`` as a ``500``; any other 2xx reaches its parser, which raises
+    ``ResponseParserError``.
+    """
+
+    def test_an_unparseable_listing_is_provider_neutral(self):
+        client = boto3.client(
+            "s3",
+            region_name="us-east-1",
+            endpoint_url="http://s3.test",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+        )
+        client.meta.events.register(
+            "before-send.s3",
+            lambda request, **_kwargs: AWSResponse(request.url, 202, {}, _Raw(b"<not-xml")),
+        )
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            S3Storage(client, BUCKET, PREFIX).list_keys(AREA)
+
+        assert isinstance(excinfo.value.__cause__, ResponseParserError)
+
+    def test_an_unparseable_body_read_is_provider_neutral(self, storage, stub):
+        class _UnparseableBody(_FailingBody):
+            def read(self, *_args):
+                raise ResponseParserError("malformed")
+
+        stub.add_response("get_object", {"Body": _UnparseableBody()}, {"Bucket": BUCKET, "Key": OBJECT_KEY})
+
+        with storage.open_stream(AREA, KEY) as stream, pytest.raises(StorageBackendUnavailableError) as excinfo:
+            stream.read()
+
+        assert isinstance(excinfo.value.__cause__, ResponseParserError)
 
 
 class TestGet:

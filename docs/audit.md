@@ -123,7 +123,8 @@ value that would be one.** The row is meant to be read by operators, kept for mo
 storage. Keys the model does not declare are dropped, not stored: `AuditAction` refuses a `details_model` that sets
 `extra="allow"`, and the default (`ignore`) and `forbid` are both accepted. As a guard against a payload that has grown
 into a data dump, a serialized payload over `audit.max_details_bytes` (4096 by default) is refused with
-`AuditDetailsError`.
+`AuditDetailsError`, as is one holding a NUL character or a number that is not finite (PostgreSQL's `jsonb` rejects
+both, so every dialect refuses them alike).
 
 When validation fails, `stage` raises the Pydantic `ValidationError`; `record_detached` logs the error locations
 and types only, never the input.
@@ -142,7 +143,7 @@ An `AuditAction` is declared once and registered in the process-wide catalog (`j
 | `id` | `<module>.<resource>.<verb>`, three lower-case snake_case segments, at most 100 characters. Stable forever: it is stored in rows that outlive the code. |
 | `category` | One of `authentication`, `credential`, `authorization`, `identity`, `admin`, `data_change`, `data_transfer`, `integration`, `system`. |
 | `severity` | `info`, `low`, `medium`, `high`. |
-| `description_key`, `description_default` | A translation key owned by the host's i18n, and the text used when the key has no translation. |
+| `description_key`, `description_default` | A translation key owned by the host's i18n (at most 200 characters), and the text used when the key has no translation (at most 500). Both are required. |
 | `details_model` | The versioned model `details` are validated against. Defaults to `NoDetails`. |
 | `deprecated` | The action is no longer emitted. |
 
@@ -177,6 +178,9 @@ registers only JASIL's own actions.
 | `source` | `api` (the default), `worker`, `cli` or `migration` |
 | `ip_address`, `user_agent` | The client. `user_agent` is clipped to 512 characters with a trailing `...`; `ip_address` to 45. |
 | `event_id` | The domain event being handled, when running in a handler |
+| `scope` | The host's partition key: see [Scope](#scope) |
+
+The text fields must be a `str` or `None`; anything else raises `TypeError`.
 
 `request_id` is not part of it: it is always read from [`jasil.correlation`](configuration.md#correlation-ids), so
 there is one source of truth.
@@ -198,6 +202,29 @@ system in a host whose provider only knows about requests. Durable job handlers 
 a worker for the event that queued them (see [Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)). With no context set the row says `anonymous`/`api`. That is wrong for anything but an unauthenticated request:
 set the context in every entry point.
 
+### Scope
+
+A host that partitions its data (by organisation, workspace, project or customer) puts the partition's id in
+`scope`, so every row says which partition it belongs to. The trail can then answer "everything that happened in
+X" (`AuditFilters(scope="X")`, served by an index on `(scope, occurred_at)`), and the
+[checkpoints](#tamper-evidence) prove those rows were not altered:
+
+```python
+jasil_audit.set_context(jasil_audit.AuditContext(actor_type="user", actor_id="42", scope=str(workspace.id)))
+```
+
+`scope` is **opaque**. JASIL stores it, filters on it and hashes it into checkpoints; it never parses it, compares
+it with anything else on the row, or uses it to authorize anything. Whether an actor may act in a scope, or read a
+scope's rows, is the host's to decide. It is an id like `actor_id`: at most 64 characters, no NUL character, and
+never a name or other personal data. Leave it `None` where the host has no partitions, or for work that belongs to
+none.
+
+A durable handler takes its scope from the event that queued it: publish with
+`metadata={jasil.events.META_SCOPE: str(workspace.id)}` and the handler's audit context carries it (see
+[Durable jobs](durable-jobs.md#the-context-a-handler-runs-in)). The publisher does not copy the publishing request's
+scope into the event; name it where the event is published. `new_event` refuses a value that is not a
+string or an audit row could not store, and `publish()` logs the refusal and returns `None`.
+
 ## Storage
 
 | Table | Holds |
@@ -205,11 +232,12 @@ set the context in every entry point.
 | `jasil_audit_log` | The trail. Append-only. |
 | `jasil_audit_actions` | The catalog, as last synchronized. |
 | `jasil_audit_checkpoints` | The sealed, chained [checkpoints](#tamper-evidence). |
-| `jasil_instance` | One row: a random UUID, created by migration `rev0010` (or on first use in a database built with `create_all`), stamped on every audit row as `instance_id`, and the retention settings maintenance last saw. |
+| `jasil_instance` | One row: a random UUID, created by migration `rev0010` (or on first use in a database built with `create_all`), stamped on every audit row as `instance_id`, the retention settings maintenance last saw, and the `furthest_partition_date` and `last_checkpoint_at` it last recorded for `get_audit_health()`. |
 
 `jasil_audit_log` rows have a UUIDv7 `id` (time-ordered) and an `occurred_at` that together form the primary key.
 `occurred_at` is taken from the platform clock when the row is staged. Indexes: `(occurred_at)`,
-`(action_id, occurred_at)`, `(actor_id, occurred_at)`, `(target_type, target_id)` and `(request_id)`.
+`(action_id, occurred_at)`, `(actor_id, occurred_at)`, `(target_type, target_id)`, `(request_id)` and
+`(scope, occurred_at)`.
 
 ### On PostgreSQL
 
@@ -238,7 +266,8 @@ stop, and `get_audit_health()["furthest_partition_date"]` is what to alert on.
 Migration `rev0008` (MySQL 8.0.1+, MariaDB 10.6+) gives the log the same guarantees:
 
 - It is **`RANGE COLUMNS` partitioned by `occurred_at`, one partition per UTC day**, named `p<YYYYMMDD>`. There is
-  no catch-all partition, so **a row whose day has no partition is rejected**, as on PostgreSQL.
+  no catch-all partition, so **a row whose day has no partition is rejected**, as on PostgreSQL, and
+  `get_audit_health()["furthest_partition_date"]` is again what to alert on.
 - `BEFORE UPDATE` and `BEFORE DELETE` triggers raise an error. These servers have no `TRUNCATE` trigger: `TRUNCATE`
   needs the `DROP` privilege, which [`grants_sql`](#roles-and-grants) gives no role.
 - `jasil_audit_ensure_partitions(days_ahead)` and `jasil_audit_drop_partitions(cutoff, prune_at)` are `SQL SECURITY
@@ -257,8 +286,8 @@ The differences that remain:
   prune with no record.
 - **Grants only grant.** MySQL and MariaDB cannot revoke a privilege that was never granted without failing, so
   `grants_sql(..., dialect="mysql")` does not reset the roles first; see [Roles and grants](#roles-and-grants).
-- **Whole seconds.** `DATETIME` keeps whole seconds and rounds (see [Configuration](configuration.md)), so a row
-  staged in the last half second of a day is stored, and partitioned, as the next day's first second.
+- **Microseconds from `rev0012`.** Before it, `occurred_at` is a `DATETIME` that keeps whole seconds and rounds, so a
+  row staged in the last half second of a day is stored, and partitioned, as the next day's first second.
 
 ### On SQLite
 
@@ -338,7 +367,8 @@ separate function from [`prune_expired_records`](observability.md#retention) wit
 4. **Apply retention**, unless `legal_hold` is set or `retention_days <= 0`, and no further than the newest sealed
    checkpoint allows: the cutoff is the earlier of `now - retention_days` and that checkpoint's `window_end` minus the
    `retention_days` it was sealed under; with no such checkpoint (none yet, or one sealed under legal hold) nothing
-   is pruned. On PostgreSQL, MySQL and MariaDB call `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
+   is pruned. On PostgreSQL, MySQL and MariaDB the cutoff is also held to the retention floor measured on the
+   database's own clock, and maintenance calls `jasil_audit_drop_partitions(cutoff, now)` with the platform clock's `now`, which writes the
    `audit.retention.prune` row itself, so the row belongs to the window that clock is sealing. On SQLite, or a plain table, `DELETE` rows older than the cutoff (floored to the start of the sealed window holding
    it, as a partition drop is) and write that row from Python.
 
@@ -409,16 +439,23 @@ only visible once its transaction commits: sealing at the end would let a slow t
 insertion. Choose a grace period longer than your longest audited transaction plus the clock skew between replicas.
 
 To seal a window, JASIL serializes its rows canonically, ordered by `(occurred_at, id)`, and computes
-`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the
-deployment's instance id, the window, row count, hash, previous hash and the `retention_days` and `legal_hold` in
+`SHA-256(serialization || previous checkpoint's hash)`, so the checkpoints form a chain. It then signs the format,
+the deployment's instance id, the window, row count, hash, previous hash and the `retention_days` and `legal_hold` in
 force with Ed25519 (if configured),
 stores the checkpoint in `jasil_audit_checkpoints` (window start and end, row count, hash, previous hash, retention
-days, legal hold, signature, key id), and copies it to the external sink (if configured). Empty
+days, legal hold, format, signature, key id), and copies it to the external sink (if configured). Empty
 windows are sealed too, so a row inserted into one later is detected.
 
 A window ends on the `checkpoint_window_minutes` grid; after the setting changes, the first window is shortened to
 rejoin it. If the newest checkpoint ends after now (one inserted ahead of time, or a clock that went back), sealing
 raises on every run instead of resuming from it, until someone investigates.
+
+Each checkpoint records the **format** it was sealed in, which names the columns its rows' serialization holds.
+Format 2, written by this release, hashes every column of the row, `scope` included. Format 1 is every column but
+`scope`: it is what JASIL 0.18 and earlier sealed, and what a process of such a release still seals during a rolling
+deploy, since it does not see the column. Verification hashes each window in its own format, so windows sealed
+before the upgrade keep verifying, but a format 1 window does not cover its rows' `scope`. The format is part of
+what a checkpoint signs, and the external copy records it as `v`.
 
 There is deliberately **no per-row hash chain**: it would serialize every insert across replicas.
 
@@ -456,10 +493,11 @@ The contract (`jasil.providers.AuditSink`) is that an object is never replaced: 
 is a no-op, with different bytes it raises `AuditSinkConflictError`, and `read` returns what is stored. The sink is written **before** the database row, so if it
 is unreachable the checkpoint is not stored and the window is retried on the next run; the external copy is never
 missing a checkpoint the database has. Sealing the same rows gives the same bytes (Ed25519 signatures are
-deterministic), apart from the `retention_days` and `legal_hold` taken from the settings in force. So when a retry
-after a crash between the two writes finds the window already in the sink, and those settings changed meanwhile,
-the window is resealed under the values the copy records and stored if that reproduces the copy byte for byte;
-anything else is an `AuditSinkConflictError`. The S3 sink's "never replace" is a conditional `PutObject`
+deterministic), apart from the `retention_days` and `legal_hold` taken from the settings in force and the
+[format](#tamper-evidence) of the release sealing. So when a retry after a crash between the two writes finds the
+window already in the sink, and those settings or the release changed meanwhile, the window is resealed under the
+values and in the format the copy records, and stored if that reproduces the copy byte for byte; anything else is an
+`AuditSinkConflictError`. The S3 sink's "never replace" is a conditional `PutObject`
 (`If-None-Match: *`): S3 refuses it when the key holds an object, and the sink then reads that object to tell a retry
 from a conflict. Object Lock keeps a locked version from being deleted or overwritten in place, but without the
 bucket policy above a `PutObject` that omits the header could still create a new current version, and a delete
@@ -491,7 +529,7 @@ where that checkpoint starts. Time after the newest checkpoint is not sealed yet
 | Status | Meaning |
 |---|---|
 | `ok` | Rows, count, chain link and (if keys were given) signature all match |
-| `row_mismatch` | The rows of the window are not the rows that were sealed: one was modified, deleted or inserted; or rows are dated before the first checkpoint |
+| `row_mismatch` | The rows of the window are not the rows that were sealed: one was modified, deleted or inserted; or rows are dated before the first checkpoint; or the checkpoint names a format this release cannot hash |
 | `missing_window` | There is a gap between two checkpoints (a checkpoint was deleted) |
 | `broken_chain` | The checkpoint's `prev_hash` is not the previous checkpoint's hash |
 | `bad_signature` | The signature is absent, or does not verify with the key its key id names among the keys given (also for a checkpoint signed for another deployment) |
@@ -563,7 +601,7 @@ while page.next_cursor is not None:
 | `verify_checkpoints(public_key, from_ts, to_ts)` | A `VerificationReport` |
 
 Filters: `action_ids`, `categories`, `severities`, `outcomes`, `actor_id`, `actor_type`, `target_type`, `target_id`,
-`target_owner_id`, `request_id`, `event_id`, `source`, `from_ts`, `to_ts` (both inclusive). Pagination is keyset
+`target_owner_id`, `request_id`, `event_id`, `source`, `scope`, `from_ts`, `to_ts` (both inclusive). Pagination is keyset
 over `(occurred_at, id)`, never offset. The time range is **always bounded** so partition pruning applies: it
 defaults to the 24 hours before `to_ts`, which defaults to now, and may cover at most 31 days (`summary(hours)`
 takes 1 to 744); an inverted or longer range raises `ValueError`, so read a longer period one range at a time.
@@ -611,8 +649,8 @@ On MySQL and MariaDB, migration `rev0008` then partitions the log and adds the t
   part-way can be run again: it replaces what the failed run created.
 - It cannot be rendered as SQL (`--sql`) for MySQL or MariaDB: the partitions depend on the rows in the table.
 - `adopt_existing_schema` adopts a plain MySQL audit log from a database at `rev0006` or `rev0007` (built by those
-  migrations, or by `create_all` with JASIL 0.15 or earlier) at `rev0007`, so the next `upgrade` partitions and
-  protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
+  migrations, or by `create_all` with JASIL 0.15 or earlier) at whichever of the two its schema matches, so the next
+  `upgrade` partitions and protects it. A schema `create_all` builds with this release is refused, as on PostgreSQL: it already has the
   `rev0009` outbox index, so it matches no revision. Build a new database with `upgrade`.
 - Upgrade every process that runs audit maintenance (`run_audit_maintenance`, or the job
   `schedule_audit_maintenance` adds) together with this revision. Processes of JASIL 0.15 and earlier keep inserting,
@@ -629,8 +667,30 @@ Migration `rev0010` creates the `jasil_instance` row if it is missing, so the fi
 create. A row that exists keeps its id, and downgrading leaves the row. A script rendered with `--sql` seeds nothing: its id would be one literal shared by every database it runs on, so those databases create the row on their first audited write. Processes of the previous release read the
 row and create it only when it is missing, so they are unaffected during a rolling deploy.
 
+Migration `rev0011` adds `scope` to `jasil_audit_log`, with its `(scope, occurred_at)` index, and `format_version`
+to `jasil_audit_checkpoints`:
+
+- Every checkpoint already sealed becomes format 1 and verifies as before.
+- On PostgreSQL the index is built after the columns commit, partition by partition and `CONCURRENTLY`, so audit
+  writes continue while it builds; a run that failed during the build picks up where it stopped. A script rendered
+  with `--sql` builds it with one plain `CREATE INDEX`, which blocks writes to the log while it runs. On MySQL and
+  MariaDB both columns and the index are added with `ALTER TABLE`, which InnoDB runs without blocking inserts.
+- Processes of the previous release keep writing rows without a scope. Their maintenance seals format 1 checkpoints,
+  which verify but do not cover `scope`, so upgrade every process that runs maintenance soon after. Upgrade the
+  processes that verify checkpoints first, or together with those that seal: a 0.18 verifier hashes without
+  `scope` and checks the format 1 signature prefix, so it reports a format 2 window as `row_mismatch` or a bad
+  signature, except a window with no rows, which both formats hash alike and which it may report `ok`. An error is
+  not a reliable sign of an old verifier.
+- Downgrading drops both columns, and every `scope` with them; the previous release then verifies each checkpoint as
+  format 1, so windows sealed in format 2 report `row_mismatch`.
+
+On MySQL and MariaDB, migration `rev0012` makes `occurred_at` and the other timestamp columns `DATETIME(6)`. Rebuilding
+the log blocks audit writes while it runs; see [Revision `rev0012`](observability.md#migrations). Adopting an
+unversioned schema with `adopt_existing_schema` does not compare column precision, so a schema that already had
+`rev0011` and lost its version table is stamped at `rev0012` unconverted, as is one whose `rev0012` stopped part way: check every timestamp column, not only `occurred_at`: `SELECT table_name, column_name FROM information_schema.COLUMNS WHERE table_schema = DATABASE() AND table_name IN ('jasil_event_log', 'jasil_event_outbox', 'jasil_processing_jobs', 'jasil_job_workers', 'jasil_job_attempts', 'jasil_audit_log', 'jasil_audit_actions', 'jasil_audit_checkpoints', 'jasil_instance') AND data_type = 'datetime' AND datetime_precision = 0`. If it returns rows, set the version back without converting anything, with `UPDATE jasil_alembic_version SET version_num = 'rev0011'`, and call `migrations.upgrade(engine)`; the upgrade widens each column and keeps the fractions already stored. Do not use `migrations.downgrade`, which rounds them away.
+
 ## For the host's architecture tests
 
-If the host enforces that it imports only JASIL's public surface, treat `jasil.audit` (everything it exports) as
+If the host enforces that it imports only JASIL's public surface, treat `jasil.audit` (everything it exports except `reset`) as
 public, and `jasil._core` and the underscore modules of `jasil.audit` as private. `jasil.audit` is safe to import at
 any point, before `jasil.orm.map_models`; the models load on first use.

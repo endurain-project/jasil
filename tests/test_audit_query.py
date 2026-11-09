@@ -40,7 +40,7 @@ class TestFilters:
             target_type="record",
             target_id="r1",
             target_owner_id="2",
-            context={"actor_id": "1", "actor_type": "user", "source": "cli", "event_id": "evt-1"},
+            context={"actor_id": "1", "actor_type": "user", "source": "cli", "event_id": "evt-1", "scope": "ws-1"},
         )
         _write(
             audit_env,
@@ -79,6 +79,8 @@ class TestFilters:
             ({"target_owner_id": "2"}, ["r1"]),
             ({"event_id": "evt-1"}, ["r1"]),
             ({"source": "worker"}, ["r2"]),
+            ({"scope": "ws-1"}, ["r1"]),
+            ({"scope": "ws-2"}, []),
             ({"actor_id": "1", "outcomes": ["success"]}, [None]),
             ({"actor_id": "nobody"}, []),
             ({"action_ids": []}, []),
@@ -86,6 +88,11 @@ class TestFilters:
     )
     def test_each_filter_narrows(self, filters, expected):
         assert self._ids(**filters) == expected
+
+    def test_an_entry_carries_its_scope(self):
+        entries = jasil_audit.list_entries().entries
+
+        assert [(entry.target_id, entry.scope) for entry in entries] == [("r2", None), ("r1", "ws-1"), (None, None)]
 
     def test_the_request_id_filter(self, audit_env, actions):
         import jasil.correlation as correlation

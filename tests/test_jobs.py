@@ -237,6 +237,26 @@ class TestClaim:
         assert claimed[0].status == jobs_crud.STATUS_CLAIMED
         assert claimed[0].attempts == 1
 
+    def test_a_worker_claims_only_the_subscribers_it_names(self, db, event):
+        """A job of a subscriber the worker has no handler for must stay pending, not burn an attempt."""
+        other = _enqueue(event, db, subscriber="other")
+        mine = _enqueue(event, db, subscriber="mine")
+
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db, subscribers={"mine"})
+
+        assert [job.id for job in claimed] == [mine.id]
+        db.refresh(other)
+        assert (other.status, other.attempts, other.locked_by) == (jobs_crud.STATUS_PENDING, 0, None)
+
+    def test_a_worker_naming_no_subscribers_claims_nothing(self, db, event):
+        job = _enqueue(event, db)
+
+        claimed = jobs_crud.claim_jobs(worker_id="w1", limit=10, lease_seconds=60, now=T0, db=db, subscribers=())
+
+        assert claimed == []
+        db.refresh(job)
+        assert (job.status, job.attempts) == (jobs_crud.STATUS_PENDING, 0)
+
     def test_every_returned_job_carries_this_workers_lease(self, db, event):
         """A row a competing worker won must never come back from our claim.
 

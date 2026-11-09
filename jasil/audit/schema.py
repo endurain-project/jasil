@@ -54,6 +54,7 @@ class AuditEntry(BaseModel):
         instance_id: The deployment id.
         app_name: The host application's name.
         app_version: The host application's version.
+        scope: The host's partition key.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -82,6 +83,7 @@ class AuditEntry(BaseModel):
     instance_id: str | None = None
     app_name: str | None = None
     app_version: str | None = None
+    scope: str | None = None
 
     @field_validator("occurred_at")
     @classmethod
@@ -110,6 +112,7 @@ class AuditFilters(BaseModel):
         request_id: Match this request.
         event_id: Match this domain event.
         source: Match this source.
+        scope: Match this scope.
         from_ts: Earliest ``occurred_at``, inclusive.
         to_ts: Latest ``occurred_at``, inclusive.
     """
@@ -126,6 +129,7 @@ class AuditFilters(BaseModel):
     request_id: str | None = None
     event_id: str | None = None
     source: str | None = None
+    scope: str | None = None
     from_ts: datetime | None = None
     to_ts: datetime | None = None
 
@@ -266,7 +270,7 @@ class AuditHealth(TypedDict):
         write_failures: Detached writes that failed since this process started.
         last_failure_at: When the latest of them failed.
         furthest_partition_date: The last day with a partition, as the latest maintenance run on any
-            replica recorded it (PostgreSQL only; ``None`` before the first run or elsewhere).
+            replica recorded it (``None`` before the first run, and on SQLite, which has no partitions).
         last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run on any
             replica recorded it.
     """

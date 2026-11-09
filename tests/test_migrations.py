@@ -9,13 +9,17 @@ is the guard for that.
 
 import importlib.util
 import logging
+import re
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
+from alembic.autogenerate import compare_metadata
+from alembic.runtime.migration import MigrationContext
 from sqlalchemy import (
     CheckConstraint,
     Column,
@@ -87,11 +91,17 @@ def _revision_metadata(revision: str) -> MetaData:
 
 
 def _schema(engine) -> dict[str, dict]:
-    """Snapshot JASIL's tables as {table: {column: type_string}}."""
+    """Snapshot JASIL's tables as {table: {column: type_string}}, the types as the database dialect spells them.
+
+    ``str(type)`` compiles for the default dialect, which leaves out a MySQL ``DATETIME(6)``'s precision.
+    """
     inspector = inspect(engine)
     present = set(inspector.get_table_names()) & jasil_table_names()
     return {
-        table: {column["name"]: str(column["type"]) for column in inspector.get_columns(table)} for table in present
+        table: {
+            column["name"]: column["type"].compile(dialect=engine.dialect) for column in inspector.get_columns(table)
+        }
+        for table in present
     }
 
 
@@ -197,6 +207,71 @@ class TestNoDrift:
 
         assert migrated == created
 
+    @staticmethod
+    def _same_boolean_default(
+        context, inspected_column, metadata_column, inspected_default, metadata_default, rendered
+    ):
+        """Compare a boolean column's default as a boolean; ``None`` leaves every other default to alembic.
+
+        The models say ``false()`` and MySQL reflects the stored ``0`` as the text ``'0'``, which alembic reads as a
+        different default. A default that is not the same boolean is still a difference.
+        """
+        from sqlalchemy import Boolean
+        from sqlalchemy.sql.elements import False_, True_
+
+        if not isinstance(metadata_column.type, Boolean) or inspected_default is None:
+            return None
+        wanted = {False_: False, True_: True}.get(type(getattr(metadata_default, "arg", None)))
+        found = {"0": False, "false": False, "1": True, "true": True}.get(str(inspected_default).strip("'\"()").lower())
+        if wanted is None or found is None:
+            return None
+        return wanted != found
+
+    def _diff(self, engine, mapped_base) -> list:
+        """What alembic's autogenerate would change to make the database match the models, for JASIL's tables."""
+        with engine.connect() as connection:
+            context = MigrationContext.configure(
+                connection,
+                opts={
+                    "compare_type": True,
+                    "compare_server_default": self._same_boolean_default,
+                    "include_object": migrations.jasil_include_object,
+                    "version_table": migrations.VERSION_TABLE,
+                },
+            )
+            diff = compare_metadata(context, mapped_base.metadata)
+        # The PostgreSQL-only GIN index (see DIALECT_ONLY_INDEXES) is the one intended difference.
+        return [
+            change
+            for change in diff
+            if not (change[0] == "remove_index" and change[1].name in self.DIALECT_ONLY_INDEXES)
+        ]
+
+    def test_a_fresh_install_has_nothing_to_autogenerate(self, engine, mapped_base):
+        """Types, nullability, server defaults, indexes, unique constraints and foreign keys all compare equal."""
+        migrations.upgrade(engine)
+
+        assert self._diff(engine, mapped_base) == []
+
+    def test_a_legacy_install_migrated_through_the_rename_has_nothing_to_autogenerate(self, engine, mapped_base):
+        migrations.upgrade(engine, "rev0002")
+        migrations.upgrade(engine)
+
+        assert self._diff(engine, mapped_base) == []
+
+    def test_primary_keys_and_check_constraints_match_the_models(self, engine, mapped_base):
+        """Autogenerate does not compare either, so they are read back and compared here."""
+        migrations.upgrade(engine)
+        inspector = inspect(engine)
+
+        for table_name in sorted(jasil_table_names()):
+            table = mapped_base.metadata.tables[table_name]
+            assert inspector.get_pk_constraint(table_name)["constrained_columns"] == [
+                column.name for column in table.primary_key.columns
+            ], table_name
+            expected = {c.name for c in table.constraints if isinstance(c, CheckConstraint) and c.name}
+            assert {c["name"] for c in inspector.get_check_constraints(table_name)} >= expected, table_name
+
     def test_the_indexes_match_the_models(self, engine, mapped_base):
         migrations.upgrade(engine)
         migrated = _indexes(engine)
@@ -262,6 +337,86 @@ class TestDowngrade:
             if index["name"] == "idx_jasil_processing_jobs_queue_claim"
         )
         assert claim["column_names"] == ["status", "queue", "available_at"]
+
+
+class TestDowngradeOfAnInterruptedInstall:
+    """A fresh install creates prefixed tables from ``rev0001`` on, so one stopped early has to downgrade as such."""
+
+    @pytest.fixture
+    def interrupted(self, engine, monkeypatch):
+        def install_to(revision: str) -> None:
+            with monkeypatch.context() as patch:
+                patch.setattr(migrations, "_fresh_install_prefix", lambda _connection, _revision: "jasil_")
+                migrations.upgrade(engine, revision)
+
+        return install_to
+
+    @pytest.mark.parametrize("revision", ["rev0001", "rev0002"])
+    def test_it_downgrades_to_base_and_leaves_no_jasil_table(self, engine, interrupted, revision):
+        interrupted(revision)
+        assert migrations.db_revision(engine) == revision
+        assert set(inspect(engine).get_table_names()) & jasil_table_names()
+
+        migrations.downgrade(engine, "base")
+
+        assert migrations.db_revision(engine) is None
+        assert not set(inspect(engine).get_table_names()) & (jasil_table_names() | legacy_table_names())
+
+    def test_it_downgrades_one_revision_and_upgrades_again(self, engine, interrupted):
+        interrupted("rev0002")
+
+        migrations.downgrade(engine, "rev0001")
+        migrations.upgrade(engine)
+
+        assert migrations.db_revision(engine) == migrations.head_revision()
+        assert jasil_table_names() <= set(inspect(engine).get_table_names())
+
+    def test_a_legacy_install_at_rev0002_downgrades_to_base(self, engine):
+        migrations.upgrade(engine, "rev0002")
+        assert legacy_table_names() <= set(inspect(engine).get_table_names())
+
+        migrations.downgrade(engine, "base")
+
+        assert not set(inspect(engine).get_table_names()) & (jasil_table_names() | legacy_table_names())
+
+
+class TestPrefixDecisionUnderTheLock:
+    """Another process may be part-way through ``rev0001`` while the lock is held, so the decision waits for the lock."""
+
+    @pytest.fixture
+    def events(self, monkeypatch):
+        events: list[str] = []
+        lock = migrations._one_run_at_a_time
+        decide = migrations._migration_prefix
+
+        @contextmanager
+        def recording_lock(connection):
+            with lock(connection):
+                events.append("locked")
+                yield
+            events.append("unlocked")
+
+        def recording_decision(connection, command_name, revision):
+            events.append("decided")
+            return decide(connection, command_name, revision)
+
+        monkeypatch.setattr(migrations, "_one_run_at_a_time", recording_lock)
+        monkeypatch.setattr(migrations, "_migration_prefix", recording_decision)
+        return events
+
+    def test_an_upgrade_decides_while_the_lock_is_held(self, engine, events):
+        migrations.upgrade(engine)
+
+        assert events == ["locked", "decided", "unlocked"]
+
+    def test_a_downgrade_decides_while_the_lock_is_held(self, engine, events):
+        migrations.upgrade(engine)
+        events.clear()
+
+        migrations.downgrade(engine, "base")
+
+        assert events == ["locked", "decided", "unlocked"]
+        assert not set(inspect(engine).get_table_names()) & jasil_table_names()
 
 
 class TestPrefixRename:
@@ -478,6 +633,183 @@ class TestInstanceRowSeed:
         command.upgrade(config, "rev0009:rev0010", sql=True)
 
         assert "jasil_instance" not in config.output_buffer.getvalue()
+
+
+class TestAuditScope:
+    """rev0011 adds ``scope`` to the audit log and the format a checkpoint was sealed in."""
+
+    @staticmethod
+    def _columns(engine, table: str) -> set[str]:
+        return {column["name"] for column in inspect(engine).get_columns(table)}
+
+    def test_the_upgrade_adds_the_columns_and_the_index(self, engine):
+        migrations.upgrade(engine)
+
+        assert "scope" in self._columns(engine, "jasil_audit_log")
+        assert "format_version" in self._columns(engine, "jasil_audit_checkpoints")
+        index = next(
+            i for i in inspect(engine).get_indexes("jasil_audit_log") if i["name"] == "idx_jasil_audit_log_scope"
+        )
+        assert index["column_names"] == ["scope", "occurred_at"]
+
+    def test_checkpoints_sealed_before_it_are_format_1(self, engine):
+        migrations.upgrade(engine, "rev0010")
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO jasil_audit_checkpoints "
+                    "(window_start, window_end, row_count, hash, retention_days, legal_hold) "
+                    "VALUES ('2026-01-01 12:00:00', '2026-01-01 12:15:00', 0, :hash, 90, :hold)"
+                ),
+                {"hash": "0" * 64, "hold": False},
+            )
+
+        migrations.upgrade(engine)
+
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT format_version FROM jasil_audit_checkpoints")).scalars().all() == [1]
+
+    @staticmethod
+    def _scope_index_state(engine) -> tuple[bool, set[str]]:
+        """Whether the parent's index is valid, and the partitions that still have no index attached to it."""
+        with engine.connect() as connection:
+            valid = connection.execute(
+                text("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('idx_jasil_audit_log_scope')")
+            ).scalar_one()
+            missing = connection.execute(
+                text(
+                    "SELECT member.relname FROM pg_inherits AS link JOIN pg_class AS member ON member.oid = link.inhrelid"
+                    " WHERE link.inhparent = to_regclass('jasil_audit_log') AND NOT EXISTS ("
+                    "  SELECT 1 FROM pg_inherits AS attached JOIN pg_index AS built"
+                    "  ON built.indexrelid = attached.inhrelid"
+                    "  WHERE attached.inhparent = to_regclass('idx_jasil_audit_log_scope')"
+                    "  AND built.indrelid = link.inhrelid)"
+                )
+            ).scalars()
+            return valid, set(missing)
+
+    def test_on_postgresql_every_partition_is_indexed_and_the_parent_index_is_valid(self, engine):
+        if engine.dialect.name != "postgresql":
+            pytest.skip("partitioned indexes are PostgreSQL-only")
+
+        migrations.upgrade(engine)
+
+        assert self._scope_index_state(engine) == (True, set())
+        with engine.begin() as connection:
+            connection.execute(text("SELECT jasil_audit_ensure_partitions(30)"))
+        assert self._scope_index_state(engine) == (True, set())
+
+    def test_on_postgresql_a_build_that_failed_part_way_is_resumed(self, engine):
+        """The columns committed and one partition was indexed before the run failed; the next run finishes it."""
+        if engine.dialect.name != "postgresql":
+            pytest.skip("partitioned indexes are PostgreSQL-only")
+        migrations.upgrade(engine, "rev0010")
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE jasil_audit_log ADD COLUMN scope VARCHAR(64)"))
+            connection.execute(
+                text("ALTER TABLE jasil_audit_checkpoints ADD COLUMN format_version INTEGER DEFAULT 1 NOT NULL")
+            )
+            connection.execute(
+                text("CREATE INDEX idx_jasil_audit_log_scope ON ONLY jasil_audit_log (scope, occurred_at)")
+            )
+            first = connection.execute(
+                text(
+                    "SELECT inhrelid::regclass::text FROM pg_inherits WHERE inhparent = 'jasil_audit_log'::regclass LIMIT 1"
+                )
+            ).scalar_one()
+            connection.execute(text(f"CREATE INDEX {first}_scope_occurred_at_idx ON {first} (scope, occurred_at)"))
+            connection.execute(
+                text(f"ALTER INDEX idx_jasil_audit_log_scope ATTACH PARTITION {first}_scope_occurred_at_idx")
+            )
+        assert self._scope_index_state(engine)[0] is False
+
+        migrations.upgrade(engine)
+
+        assert self._scope_index_state(engine) == (True, set())
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+    def test_the_downgrade_removes_them(self, engine):
+        migrations.upgrade(engine)
+
+        migrations.downgrade(engine, "rev0010")
+
+        assert "scope" not in self._columns(engine, "jasil_audit_log")
+        assert "format_version" not in self._columns(engine, "jasil_audit_checkpoints")
+        assert "idx_jasil_audit_log_scope" not in _indexes(engine)["jasil_audit_log"]
+        assert migrations.db_revision(engine) == "rev0010"
+
+
+class TestMicrosecondTimestamps:
+    """rev0012 makes every timestamp column ``DATETIME(6)`` on MySQL and MariaDB and changes nothing elsewhere."""
+
+    @staticmethod
+    def _render(url: str, span: str, *, downgrade: bool = False) -> str:
+        import io
+
+        from alembic import command
+
+        config = migrations._config()
+        config.set_main_option("sqlalchemy.url", url)
+        config.output_buffer = io.StringIO()
+        (command.downgrade if downgrade else command.upgrade)(config, span, sql=True)
+        return config.output_buffer.getvalue()
+
+    @staticmethod
+    def _timestamp_columns() -> list[Column]:
+        """The timestamp columns of the schema rev0012 starts from."""
+        from sqlalchemy import DateTime
+
+        metadata = _revision_metadata("rev0011")
+        return [
+            column
+            for table in metadata.tables.values()
+            for column in table.columns
+            if isinstance(column.type, DateTime)
+        ]
+
+    @pytest.mark.parametrize("url", ["mysql+pymysql://offline/none", "mariadb+pymysql://offline/none"])
+    def test_on_mysql_it_restates_every_timestamp_column_in_one_alter_per_table(self, url):
+        """``MODIFY COLUMN`` drops whatever it does not restate, so nullability, default and comment all must be."""
+        sql = self._render(url, "rev0011:rev0012")
+        columns = self._timestamp_columns()
+
+        for column in columns:
+            default = " DEFAULT CURRENT_TIMESTAMP(6)" if column.server_default is not None else ""
+            nullability = "NULL" if column.nullable else "NOT NULL"
+            assert f"MODIFY COLUMN {column.name} DATETIME(6) {nullability}{default} COMMENT '{column.comment}'" in sql
+        assert sql.count("MODIFY COLUMN") == len(columns)
+        assert sorted(re.findall(r"ALTER TABLE (\w+) ", sql)) == sorted({column.table.name for column in columns})
+
+    def test_on_mysql_the_downgrade_restores_whole_second_columns(self):
+        sql = self._render("mysql+pymysql://offline/none", "rev0012:rev0011", downgrade=True)
+
+        assert "(6)" not in sql
+        assert "MODIFY COLUMN occurred_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT" in sql
+        assert sql.count("MODIFY COLUMN") == len(self._timestamp_columns())
+
+    def test_it_renders_nothing_for_postgresql(self):
+        sql = self._render("postgresql://offline/none", "rev0011:rev0012")
+
+        assert "ALTER TABLE" not in sql
+        assert "rev0012" in sql  # only the version stamp
+
+    def test_it_downgrades_and_upgrades_again_changing_only_mysql_timestamps(self, engine):
+        migrations.upgrade(engine, "rev0011")
+        before = _schema(engine)
+
+        migrations.upgrade(engine)
+        after = _schema(engine)
+        migrations.downgrade(engine, "rev0011")
+
+        assert _schema(engine) == before
+        if engine.dialect.name in ("mysql", "mariadb"):
+            expected = {
+                table: {name: "DATETIME(6)" if type_ == "DATETIME" else type_ for name, type_ in columns.items()}
+                for table, columns in before.items()
+            }
+            assert after == expected
+        else:
+            assert after == before
 
 
 class TestRevisionTransactions:

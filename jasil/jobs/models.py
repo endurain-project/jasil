@@ -5,7 +5,6 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
-    DateTime,
     Index,
     Integer,
     String,
@@ -14,8 +13,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import func
 
+from jasil._core.dialects import MICROSECOND_DATETIME, MicrosecondNow
 from jasil._core.limits import (
     MAX_WORKER_ID_LENGTH,
     MAX_WORKER_LABEL_LENGTH,
@@ -201,9 +200,9 @@ class ProcessingJob(Base):
         comment="Attempt ceiling before the job is dead-lettered",
     )
     available_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="Earliest instant the job may be claimed (backoff gate)",
     )
     locked_by: Mapped[str | None] = mapped_column(
@@ -212,12 +211,12 @@ class ProcessingJob(Base):
         comment="Worker holding the current lease, when claimed",
     )
     locked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the current lease was taken",
     )
     lease_expires_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the current lease expires (drives reaping)",
     )
@@ -227,29 +226,29 @@ class ProcessingJob(Base):
         comment="Most recent failure reason (truncated for storage)",
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the job was enqueued",
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the job last changed state",
     )
     completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the job reached a terminal state (completed/dead_letter)",
     )
     dead_letter_notified_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the on_dead_letter callback last succeeded; NULL while one is owed",
     )
     dead_letter_notify_after: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="Earliest instant an on_dead_letter delivery may be claimed (lease or backoff)",
     )
@@ -356,17 +355,17 @@ class JobAttempt(Base):
         comment="The worker instance that claimed the job",
     )
     claimed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
         comment="When the worker took the lease",
     )
     started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the handler began; NULL if it never ran",
     )
     finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the attempt ended; NULL while open",
     )
@@ -402,17 +401,17 @@ class JobWorker(Base):
         comment="Restart-unique worker instance UUID",
     )
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
         comment="When this worker instance started",
     )
     last_heartbeat_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
         comment="Most recent successful worker heartbeat",
     )
     stopped_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When this worker stopped gracefully; NULL after a crash",
     )
@@ -519,13 +518,13 @@ class EventOutbox(Base):
         comment="Correlation context (request_id, plus any host-defined keys)",
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the event was written to the outbox",
     )
     relayed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         nullable=True,
         comment="When the relay fanned the event out; NULL while pending",
     )

@@ -7,6 +7,8 @@ database row that is retried with backoff and dead-lettered if it never succeeds
 Requires the `jobs` extra and a database.
 
 ```python
+import jasil.settings as jasil_settings
+
 jasil_settings.configure(
     jasil_settings.JasilSettings(
         jobs=jasil_settings.JobSettings(enabled=True),
@@ -73,16 +75,17 @@ The runner opens two scopes around every handler, closed however the handler
 ends (returning, raising, deferring, continuing, or the worker losing its claim):
 
 - **Audit context:** `actor_type=system`, `source=worker`, `event_id` set to the
-  event that queued the job, and every other field empty. An audit row staged in
-  the handler is attributed to that event instead of to an anonymous API call.
+  event that queued the job, `scope` set to the event's `META_SCOPE` metadata
+  (see [Scope](audit.md#scope)), and every other field empty. An audit row staged
+  in the handler is attributed to that event instead of to an anonymous API call.
 - **Correlation id:** the `request_id` the event carried in its metadata, or
   `None` when it carried none. Audit rows and events written in the handler carry
   the id of the request that started the chain.
 
 Both scopes win over an installed provider and over `set_context` /
 `set_correlation_id`, which know nothing about the request a queued job came
-from. A handler that knows who it acts for opens its own block on top; it keeps
-`source` and `event_id`:
+from. Best-effort handlers on the Redis event bus run in the same two scopes. A handler that knows who it acts for
+opens its own block on top; it keeps `source`, `event_id` and `scope`:
 
 ```python
 import jasil.audit as jasil_audit
@@ -267,7 +270,8 @@ expired on the last attempt, or the reaper recovered a worker that died.
 * **Dead letters before this feature** are not called back; the migration marks them
   as delivered.
 
-A subscriber registered without `on_dead_letter` behaves exactly as before.
+A subscriber registered without `on_dead_letter` behaves exactly as before. Registering a `subscriber_id` again
+without it removes an earlier callback.
 
 ## The job state machine
 
@@ -299,7 +303,8 @@ front, and a worker that stops early (shutdown, a lost lease, or a run past
 
 A worker claims a batch of due jobs, taking a time-bounded lease. On PostgreSQL
 the claim uses `FOR UPDATE SKIP LOCKED`, so concurrent workers take disjoint
-batches with no coordinating lock.
+batches with no coordinating lock; MySQL and MariaDB do the same where the server supports it. Where the clause is
+unavailable (SQLite) the claim is a compare-and-set on `status`, and only the worker that wins a row runs it.
 
 A worker can select a non-empty queue allowlist. Omitting it consumes every
 queue, preserving the original behavior. A selective claim includes the queue
@@ -404,7 +409,7 @@ NETS = [
 ]
 ```
 
-Exactly one of `backfill` / `exempt_reason` must be set — neither is refused at
+Exactly one of `backfill` / `exempt_reason` must be set — both or neither raises `ValueError` at
 construction. A subscriber with no net and no stated reason is one whose derived
 state goes missing silently, which is the failure the type exists to prevent.
 
@@ -431,7 +436,7 @@ when you want to report the gap rather than fail on it.
 import jasil.jobs.service as jobs_service
 
 jobs_service.start_job_worker()  # in-process worker thread
-jobs_service.schedule_job_maintenance(scheduler)  # relay + reaper on APScheduler
+jobs_service.schedule_job_maintenance(scheduler)  # relay, reaper and dead-letter delivery on APScheduler
 ```
 
 This worker consumes all named queues serially and rotates the starting queue
@@ -444,7 +449,7 @@ requires `job_worker_mode=in_process`, which is the default.
 
 ### Distributed: API plumbing and PostgreSQL workers
 
-The API process schedules the relay and reaper but does not start a domain-job
+The API process schedules the relay, reaper and dead-letter delivery but does not start a domain-job
 consumer:
 
 ```python
@@ -490,22 +495,29 @@ queue isolation remains intact while old writers drain. Conversely, a selective
 `default` worker excludes legacy rows for subscribers now assigned to a named
 queue; the two workers cannot race for the same compatibility row.
 
-Both rules are decided from the registrations of the worker process that makes
-the claim, so **every worker process must register every durable subscriber**,
-even those it will not consume, before it starts. A worker that has not
-registered a subscriber cannot tell that a legacy `default` row belongs to
-another queue, and will claim it, find no handler, and dead-letter it. Routing
-reads the registrations on every claim, but the one-time retag of legacy rows
-runs on the worker's first batch, so register subscribers before starting the
-worker. Alternatively, let the `default` queue drain before rolling out.
+A worker claims only the jobs of subscribers registered in its own process. A job
+whose subscriber no running worker has registered (a subscriber added by a rolling
+deploy, for example) stays `pending` with its attempts untouched, and shows as
+backlog in the jobs summary until a worker that registered it runs; it is not
+dead-lettered. Registrations are read on every claim, so a subscriber registered
+after the worker started is picked up on its next batch.
+
+The legacy `default` routing rules above are decided from the same registrations,
+so register every durable subscriber, even those the worker will not consume,
+before it starts: a selective worker that has not registered a subscriber cannot
+tell that a legacy `default` row belongs to another queue, and leaves it pending
+for the worker that can. The one-time retag of legacy rows runs on the worker's
+first batch, so register subscribers before starting the worker. Alternatively,
+let the `default` queue drain before rolling out.
 
 The relay and reaper may run on every API replica. Their locking and the
 idempotent `(event_id, subscriber_id)` fan-out make a single-runner lock
 unnecessary. The relay fans an event out to the durable subscribers registered
 **in its own process**, so register every durable subscriber in each process
 that runs it, the API processes included. An event it finds no subscriber for is
-marked relayed with no jobs and logged as a warning. Durable jobs use the database only; Redis is not a job-queue
-dependency.
+marked relayed with no jobs and logged as a warning.
+
+Durable jobs use the database only; Redis is not a job-queue dependency.
 
 ## Dead letters
 
@@ -523,8 +535,8 @@ which returns the job to `pending` with a fresh attempt budget.
 `jasil_admin.get_jobs_summary()` gives counts by status and queue, recent
 throughput, backlog age, handler durations, and the dead-letter list (each with
 the worker that ran its last attempt) for an operations dashboard.
-`jasil_admin.get_job(job_id)` returns a dead letter's whole history: which worker
-ran each attempt, how long it took, and why it failed.
+`jasil_admin.get_job(job_id)` returns a job's attempt history, newest first and up to `attempt_limit` (default 50):
+which worker ran each attempt, how long it took, and why it failed.
 `jasil_admin.get_workers_summary()` reports running, stale, and gracefully
 stopped worker instances one bounded page at a time; pass its `next_cursor` into
 the next call. See [Observability](observability.md#worker-registry).
@@ -565,8 +577,8 @@ failure.
   not retry.
 - **Size `jobs.max_runtime_seconds` for the whole handler, not one send.** One
   SMTP send can take up to `jasil.providers.MAIL_SEND_DEADLINE_SECONDS` (90
-  seconds), and the DNS lookups before it are not counted against that deadline. A handler that sends N messages can take N times
-  that. The worker's heartbeat keeps the job's lease alive while it runs, so the
+  seconds), and the DNS lookups before it are not counted against that deadline. A handler that sends N messages
+  can take N times that. The worker's heartbeat keeps the job's lease alive while it runs, so the
   lease itself no longer needs to be that long; the cap is
   `max_runtime_seconds` (default 30 minutes). Past it the job is abandoned and a
   retry may deliver the same message again.

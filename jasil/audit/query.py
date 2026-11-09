@@ -92,6 +92,7 @@ def list_entries(
         (AuditLog.request_id, filters.request_id),
         (AuditLog.event_id, filters.event_id),
         (AuditLog.source, filters.source),
+        (AuditLog.scope, filters.scope),
     ):
         if value is not None:
             conditions.append(column == value)

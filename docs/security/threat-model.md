@@ -136,8 +136,8 @@ pair.
 
 - Both segments are validated before any filesystem or client access: empty,
   absolute, dot-component, parent-traversing, repeated-separator,
-  trailing-separator, backslash-bearing, control-character-bearing and over-1024-byte
-  values raise `ValueError`. The check
+  trailing-separator, backslash-bearing, control-character-bearing (U+FFFE and U+FFFF
+  included), over-1024-byte and, for an area, reserved `.jasil-` values raise `ValueError`. The check
   is pure and shared, so **both** backends enforce one canonical slash-delimited
   grammar. Without it, local paths normalize aliases such as `.` and `a//b`
   while S3 preserves them as distinct literal keys. An area is exactly one
@@ -157,6 +157,9 @@ pair.
   `alice/x`. Every existing component of such a path must be listed by its
   directory exactly as the key spells it: a read of another spelling finds nothing,
   and a write or `url()` of it raises `StorageKeyConflictError`.
+  A plain area publishes a new object with a hard link, which fails if the name exists under any
+  spelling, so two simultaneous first writes cannot overwrite each other; the filesystem must support
+  hard links.
 - URLs percent-encode the area and key, so a key holding `?`, `#`, or `%` cannot
   alter the URL it lands in.
 

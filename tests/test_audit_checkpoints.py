@@ -27,6 +27,11 @@ def at(minutes: int) -> datetime:
     return T0 + timedelta(minutes=minutes)
 
 
+def canonical(row) -> bytes:
+    """The bytes a window sealed now hashes for ``row``."""
+    return checkpoints.canonical_row(row, checkpoints._FORMAT_VERSION)
+
+
 @pytest.fixture
 def action(audit_env):
     return jasil_audit.get_catalog().register(
@@ -77,7 +82,7 @@ class Trail:
         """Rewrite a checkpoint the way an attacker holding the database would: consistent, but re-linked."""
         with self.session_factory() as db:
             checkpoint = db.get(AuditCheckpoint, at(minute))
-            digest = checkpoints._digest(db, at(minute), at(minute) + WINDOW, prev_hash)
+            digest = checkpoints._digest(db, at(minute), at(minute) + WINDOW, prev_hash, checkpoint.format_version)
             checkpoint.prev_hash, checkpoint.hash = prev_hash, digest.hash
             db.commit()
 
@@ -207,6 +212,19 @@ class TestSealing:
 
         assert {(cp.retention_days, cp.legal_hold) for cp in trail.all()} == {(45, True)}
 
+    def test_a_checkpoint_is_sealed_in_the_current_format(self, sealed):
+        assert {cp.format_version for cp in sealed.all()} == {checkpoints._FORMAT_VERSION}
+
+    def test_a_checkpoint_written_without_a_format_is_format_1(self, trail):
+        """What an earlier release, which does not know the column, leaves in the table during a rolling upgrade."""
+        trail.execute(
+            insert(AuditCheckpoint).values(
+                window_start=at(0), window_end=at(15), row_count=0, hash="0" * 64, retention_days=90, legal_hold=False
+            )
+        )
+
+        assert [cp.format_version for cp in trail.all()] == [1]
+
     def test_unsigned_checkpoints_warn_once(self, trail, caplog):
         checkpoints._unsigned_warned = False
         trail.write(3)
@@ -247,6 +265,31 @@ class TestVerification:
         sealed.execute(update(AuditLog).where(AuditLog.target_id == "c").values(details={"x": 1}))
 
         assert sealed.statuses() == ["ok", "ok", "row_mismatch"]
+
+    def test_a_modified_scope_is_reported(self, sealed):
+        sealed.execute(update(AuditLog).where(AuditLog.target_id == "b").values(scope="ws-2"))
+
+        assert sealed.statuses() == ["row_mismatch", "ok", "ok"]
+
+    def test_a_removed_scope_is_reported(self, trail):
+        with jasil_audit.audit_context(scope="ws-1"):
+            trail.write(3, target_id="a")
+        trail.seal(60)
+        trail.execute(update(AuditLog).values(scope=None))
+
+        assert trail.statuses() == ["row_mismatch", "ok", "ok"]
+
+    @pytest.mark.parametrize("format_version", [1, 3, 0])
+    def test_a_rewritten_format_is_a_row_mismatch(self, sealed, format_version):
+        """Rows hashed in another format, or in one this release does not know, cannot match the stored hash."""
+        sealed.execute(
+            update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(format_version=format_version)
+        )
+
+        report = sealed.verify()
+
+        assert [w.status.value for w in report.windows] == ["row_mismatch", "ok", "ok"]
+        assert report.windows[0].actual_rows == (2 if format_version == 1 else None)
 
     def test_a_deleted_row_is_reported(self, sealed):
         sealed.execute(delete(AuditLog).where(AuditLog.target_id == "a"))
@@ -368,6 +411,53 @@ class TestVerification:
         assert sealed.statuses(start=15) == ["broken_chain", "broken_chain"]  # and the next link no longer fits
 
 
+class TestFormat1Windows:
+    """Windows sealed before ``scope`` existed: by an earlier release, or by one still running during an upgrade."""
+
+    @pytest.fixture
+    def earlier(self, trail, monkeypatch):
+        trail.write(3, target_id="a")
+        with jasil_audit.audit_context(scope="ws-1"):
+            trail.write(35, target_id="c")
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoints, "_FORMAT_VERSION", 1)
+            trail.seal(60)
+        return trail
+
+    def test_they_still_verify(self, earlier):
+        assert {cp.format_version for cp in earlier.all()} == {1}
+        assert earlier.verify().ok is True
+
+    def test_their_rows_are_still_checked(self, earlier):
+        earlier.execute(update(AuditLog).where(AuditLog.target_id == "a").values(outcome="failure"))
+
+        assert earlier.statuses() == ["row_mismatch", "ok", "ok"]
+
+    def test_their_scope_is_not_covered(self, earlier):
+        earlier.execute(update(AuditLog).where(AuditLog.target_id == "c").values(scope="ws-2"))
+
+        assert earlier.verify().ok is True
+
+    def test_the_windows_sealed_after_them_are_in_the_current_format_and_chain_on(self, earlier):
+        earlier.write(63, target_id="d")
+        earlier.seal(100)
+
+        assert [cp.format_version for cp in earlier.all()] == [1, 1, 1, 2, 2, 2]
+        assert earlier.verify().ok is True
+
+    def test_their_signatures_verify(self, trail, audit_env, keys, monkeypatch):
+        private, public = keys()
+        audit_env.configure(signing_key=private)
+        trail.write(3, target_id="a")
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoints, "_FORMAT_VERSION", 1)
+            trail.seal(60)
+        trail.seal(100)
+
+        assert [cp.format_version for cp in trail.all()] == [1, 1, 1, 2, 2, 2]
+        assert trail.verify(public).ok is True
+
+
 class TestSignatures:
     @pytest.fixture
     def signed(self, trail, audit_env, keys):
@@ -415,7 +505,9 @@ class TestSignatures:
         # An attacker who rewrites a row and re-seals its window cannot sign the new hash.
         trail.execute(update(AuditLog).where(AuditLog.target_id == "c").values(outcome="failure"))
         with trail.session_factory() as db:
-            forged = checkpoints._digest(db, rows[2].window_start, rows[2].window_end, rows[2].prev_hash)
+            forged = checkpoints._digest(
+                db, rows[2].window_start, rows[2].window_end, rows[2].prev_hash, rows[2].format_version
+            )
         trail.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(30)).values(hash=forged.hash))
 
         assert trail.statuses(public)[2] == "bad_signature"
@@ -426,6 +518,18 @@ class TestSignatures:
         trail.execute(update(AuditCheckpoint).where(AuditCheckpoint.window_start == at(0)).values(**change))
 
         assert trail.statuses(public)[0] == "bad_signature"
+
+    def test_the_signed_message_names_the_format(self, signed):
+        """Domain separation: a signature over a window in one format is never a signature over it in another."""
+        trail, _, _ = signed
+        checkpoint = trail.all()[0]
+        relabelled = AuditCheckpoint(
+            **{column.name: getattr(checkpoint, column.name) for column in AuditCheckpoint.__table__.columns}
+        )
+        relabelled.format_version = 1
+
+        assert checkpoints._message(checkpoint, "i").startswith(b"jasil-audit-checkpoint-v2|")
+        assert checkpoints._message(relabelled, "i").startswith(b"jasil-audit-checkpoint-v1|")
 
     def test_the_signature_binds_the_checkpoint_to_its_deployment(self, signed):
         trail, public, _ = signed
@@ -611,25 +715,26 @@ class TestCanonicalForm:
             "instance_id": None,
             "app_name": None,
             "app_version": None,
+            "scope": None,
         }
         return type("Row", (), {**values, **overrides})
 
     def test_key_order_inside_details_does_not_matter(self):
-        one = checkpoints.canonical_row(self._row(details={"a": 1, "b": {"c": 2, "d": 3}}))
-        two = checkpoints.canonical_row(self._row(details={"b": {"d": 3, "c": 2}, "a": 1}))
+        one = canonical(self._row(details={"a": 1, "b": {"c": 2, "d": 3}}))
+        two = canonical(self._row(details={"b": {"d": 3, "c": 2}, "a": 1}))
 
         assert one == two
 
     def test_a_naive_timestamp_is_taken_as_utc(self):
-        naive = checkpoints.canonical_row(self._row(occurred_at=T0.replace(tzinfo=None)))
+        naive = canonical(self._row(occurred_at=T0.replace(tzinfo=None)))
 
-        assert naive == checkpoints.canonical_row(self._row())
+        assert naive == canonical(self._row())
 
     def test_an_offset_timestamp_is_the_same_instant_in_utc(self):
         """A driver hands ``timestamptz`` back in the session's TimeZone; the bytes must not depend on it."""
         berlin = T0.astimezone(timezone(timedelta(hours=1)))
 
-        assert checkpoints.canonical_row(self._row(occurred_at=berlin)) == checkpoints.canonical_row(self._row())
+        assert canonical(self._row(occurred_at=berlin)) == canonical(self._row())
         assert (
             checkpoints._sink_name(berlin, "i")
             == checkpoints._sink_name(T0, "i")
@@ -637,17 +742,29 @@ class TestCanonicalForm:
         )
 
     def test_every_column_is_part_of_the_bytes(self):
-        base = checkpoints.canonical_row(self._row())
+        base = canonical(self._row())
 
-        for column in checkpoints._COLUMNS:
+        for column in checkpoints._COLUMNS[checkpoints._FORMAT_VERSION]:
             if column in {"occurred_at", "details_version"}:
                 continue
-            assert checkpoints.canonical_row(self._row(**{column: "changed"})) != base, column
-        assert checkpoints.canonical_row(self._row(details_version=2)) != base
-        assert checkpoints.canonical_row(self._row(occurred_at=T0 + timedelta(microseconds=1))) != base
+            assert canonical(self._row(**{column: "changed"})) != base, column
+        assert canonical(self._row(details_version=2)) != base
+        assert canonical(self._row(occurred_at=T0 + timedelta(microseconds=1))) != base
 
-    def test_the_columns_are_exactly_the_model_columns(self):
-        assert set(checkpoints._COLUMNS) == {column.name for column in AuditLog.__table__.columns}
+    def test_the_current_format_hashes_exactly_the_model_columns(self):
+        current = checkpoints._COLUMNS[checkpoints._FORMAT_VERSION]
+
+        assert set(current) == {column.name for column in AuditLog.__table__.columns}
+
+    def test_format_1_is_the_bytes_sealed_before_scope_existed(self):
+        """Every checkpoint sealed by 0.18 and earlier hashed exactly these bytes; they must never change."""
+        assert checkpoints.canonical_row(self._row(scope="ws-1"), 1) == (
+            b'["i","2026-01-01T12:00:00.000000+00:00","a.b.c","system","info","success","system",null,null,null,'
+            b'null,null,null,null,null,null,"api",null,null,null,1,null,null,null]'
+        )
+
+    def test_the_current_format_appends_the_scope(self):
+        assert canonical(self._row(scope="ws-1")).endswith(b',"ws-1"]')
 
     def test_rows_sharing_a_timestamp_are_ordered_by_id_whatever_the_database_returns(self, trail, session_factory):
         trail.write(3, target_id="x")

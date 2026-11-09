@@ -29,6 +29,7 @@ except ModuleNotFoundError as error:
 from boto3.exceptions import Boto3Error
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.parsers import ResponseParserError
 
 import jasil._core.network as network
 from jasil._core.storage_keys import (
@@ -87,12 +88,17 @@ class _S3UploadState:
     created_epoch: float
 
 
+#: What a failing S3 call raises. ``ResponseParserError`` is a plain ``Exception``, not a ``BotoCoreError``:
+#: botocore raises it for a malformed non-200 2xx body (a proxy, or an S3-compatible store).
+_S3_ERRORS = (Boto3Error, BotoCoreError, ClientError, ResponseParserError)
+
+
 def _error_code(error: ClientError) -> str:
     return str(error.response.get("Error", {}).get("Code", ""))
 
 
 def _translate_s3_stream_error(error: Exception) -> None:
-    if isinstance(error, (Boto3Error, BotoCoreError, ClientError)):
+    if isinstance(error, _S3_ERRORS):
         raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
 
 
@@ -103,7 +109,7 @@ def _translate_s3_errors[**P, R](
     def wrapper(self: "S3Storage", *args: P.args, **kwargs: P.kwargs) -> R:
         try:
             return method(self, *args, **kwargs)
-        except (Boto3Error, BotoCoreError, ClientError) as error:
+        except _S3_ERRORS as error:
             raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
 
     return wrapper
@@ -538,7 +544,7 @@ class S3Storage:
                         Key=object_key,
                         UploadId=upload_id,
                     )
-                except (BotoCoreError, ClientError):
+                except _S3_ERRORS:
                     logger.warning("Failed to abort an incomplete S3 multipart upload")
             raise
 
@@ -586,14 +592,14 @@ class S3Storage:
                 Body=self._encode_upload_state(state),
                 ContentType=_UPLOAD_MANIFEST_CONTENT_TYPE,
             )
-        except (Boto3Error, BotoCoreError, ClientError):
+        except _S3_ERRORS:
             try:
                 self._client.abort_multipart_upload(
                     Bucket=self._bucket,
                     Key=object_key,
                     UploadId=state.upload_id,
                 )
-            except (Boto3Error, BotoCoreError, ClientError):
+            except _S3_ERRORS:
                 logger.warning("Failed to abort an S3 multipart upload whose session manifest could not be stored")
             raise
         return session
@@ -682,7 +688,7 @@ class S3Storage:
                 Bucket=self._bucket,
                 Key=self._upload_manifest_key(session.session_id),
             )
-        except (Boto3Error, BotoCoreError, ClientError):
+        except _S3_ERRORS:
             logger.warning("Failed to remove a completed S3 upload session manifest")
         return total
 
@@ -724,7 +730,7 @@ class S3Storage:
         if not math.isfinite(older_than_epoch):
             raise ValueError("older_than_epoch must be finite")
         removed = 0
-        first_error: Boto3Error | BotoCoreError | ClientError | StorageUploadSessionError | None = None
+        first_error: Exception | None = None
         start_after: str | None = None
         while True:
             request = {
@@ -748,7 +754,7 @@ class S3Storage:
                     if first_error is None:
                         first_error = error
                     continue
-                except (Boto3Error, BotoCoreError, ClientError) as error:
+                except _S3_ERRORS as error:
                     logger.warning("Could not read upload session manifest %s: %s", manifest_key, type(error).__name__)
                     if first_error is None:
                         first_error = error
@@ -762,14 +768,14 @@ class S3Storage:
                         Key=object_key,
                         UploadId=state.upload_id,
                     )
-                except (Boto3Error, BotoCoreError, ClientError) as error:
+                except _S3_ERRORS as error:
                     if not (isinstance(error, ClientError) and _error_code(error) in _MISSING_UPLOAD_CODES):
                         if first_error is None:
                             first_error = error
                         continue
                 try:
                     self._client.delete_object(Bucket=self._bucket, Key=manifest_key)
-                except (Boto3Error, BotoCoreError, ClientError) as error:
+                except _S3_ERRORS as error:
                     if first_error is None:
                         first_error = error
                     continue
@@ -968,7 +974,7 @@ class S3Storage:
                 for page in paginator.paginate(Bucket=self._bucket, Prefix=object_prefix):
                     for entry in page.get("Contents", []):
                         yield entry["Key"][strip_from:], entry["LastModified"].timestamp()
-            except (BotoCoreError, ClientError) as error:
+            except _S3_ERRORS as error:
                 raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
 
         return objects()

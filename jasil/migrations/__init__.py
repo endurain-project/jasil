@@ -179,7 +179,9 @@ def _run(engine: "Engine", command_name: str, *args: Any) -> None:
     from alembic import command
 
     with engine.connect() as connection:
-        getattr(command, command_name)(_config(connection), *args)
+        config = _config(connection)
+        config.attributes["command"] = command_name
+        getattr(command, command_name)(config, *args)
 
 
 def _fresh_install_prefix(connection: Any, revision: str) -> str:
@@ -223,6 +225,38 @@ def _fresh_install_prefix(connection: Any, revision: str) -> str:
     return _names.PREFIX if _PREFIXED_FROM in steps else ""
 
 
+def _downgrade_prefix(connection: Any) -> str:
+    """Return the table prefix the revisions below :data:`_PREFIXED_FROM` find their tables under on a downgrade.
+
+    ``jasil_`` when the recorded revision precedes :data:`_PREFIXED_FROM` and the prefixed tables are present: a
+    fresh install stopped early created them with that name. Empty otherwise: from :data:`_PREFIXED_FROM` on,
+    its downgrade renames the tables back before the older revisions run, and a database from 0.8 or earlier
+    holds the unprefixed names.
+    """
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import inspect
+
+    from jasil.orm import jasil_table_names
+
+    current = MigrationContext.configure(connection, opts={"version_table": VERSION_TABLE}).get_current_revision()
+    if current is None or not set(inspect(connection).get_table_names()) & jasil_table_names():
+        return ""
+    reached = {script.revision for script in ScriptDirectory.from_config(_config()).iterate_revisions(current, "base")}
+    return "" if _PREFIXED_FROM in reached else _names.PREFIX
+
+
+def _migration_prefix(connection: Any, command_name: str, revision: str) -> str:
+    """Return the table prefix the Alembic ``command_name`` run to ``revision`` should use.
+
+    Called by the migration environment once it holds :func:`_one_run_at_a_time`, so the answer is not taken
+    from a database another run is part-way through changing.
+    """
+    if command_name == "downgrade":
+        return _downgrade_prefix(connection)
+    return _fresh_install_prefix(connection, revision)
+
+
 def upgrade(engine: "Engine", revision: str = "head") -> None:
     """Create or upgrade JASIL's tables to ``revision`` (default ``head``).
 
@@ -235,12 +269,7 @@ def upgrade(engine: "Engine", revision: str = "head") -> None:
     """
     _require_alembic()
     _refuse_schema_qualified_base()
-    # On its own connection: inspecting begins a transaction, and Alembic only
-    # commits one it began itself.
-    with engine.connect() as connection:
-        prefix = _fresh_install_prefix(connection, revision)
-    with _names.use_prefix(prefix):
-        _run(engine, "upgrade", revision)
+    _run(engine, "upgrade", revision)
 
 
 def downgrade(engine: "Engine", revision: str) -> None:

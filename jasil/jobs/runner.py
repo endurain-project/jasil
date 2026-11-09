@@ -9,14 +9,15 @@ without failing or using up an attempt; one that raises
 :class:`~jasil.jobs.ContinueJob` is requeued with its failure budget restarted.
 
 A handler runs as the system, in the worker, for the event that queued it: its
-audit context names the event, and its correlation id is the request id that
-event carried, so the audit rows and events it writes trace back to the request.
+audit context names the event and takes the scope the event carried, and its
+correlation id is the request id that event carried, so the audit rows and
+events it writes trace back to the request.
 """
 
 import logging
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import timedelta
 
 from sqlalchemy.orm import Session
@@ -25,9 +26,8 @@ import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
-from jasil.audit.context import ActorType, AuditContext, Source, audit_context
-from jasil.correlation import correlation_scope
-from jasil.events import META_REQUEST_ID, Event
+from jasil.audit.context import event_handler_scope
+from jasil.events import Event
 from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
@@ -179,6 +179,9 @@ class JobRunner:
                 queue_cursor=self._queue_cursor,
                 default_queue_subscribers=default_subscribers,
                 excluded_default_queue_subscribers=excluded_subscribers,
+                # Read on every claim, so a subscriber registered later is picked up. A job whose subscriber this
+                # process lacks stays pending for a worker that has it, rather than failing here.
+                subscribers=self._registry.subscriber_ids(),
                 record_attempts=self._record_attempts,
             )
             snapshots = [self._snapshot(job) for job in claimed]
@@ -334,13 +337,7 @@ class JobRunner:
         try:
             if handler is None:
                 raise LookupError(f"no durable handler registered for subscriber_id {job.subscriber_id!r}")
-            # Every field is passed, so nothing is inherited from the worker thread or a request-scoped provider.
-            context = AuditContext(actor_type=ActorType.SYSTEM, source=Source.WORKER, event_id=job.event_id)
-            with (
-                job_lease(lost),
-                correlation_scope(event.metadata.get(META_REQUEST_ID)),
-                audit_context(**asdict(context)),
-            ):
+            with job_lease(lost), event_handler_scope(event):
                 handler(event)
         except DeferJob as deferral:
             self._leases.finalize(job.id)

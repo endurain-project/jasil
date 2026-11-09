@@ -56,6 +56,14 @@ end
 return {count, 0, 0}
 """
 
+# Increment and re-arm the expiry (KEYS: counter; ARGV: amount, ttl_seconds). A refused INCRBY raises and ends
+# the script before EXPIRE, so a refused increment leaves the key's expiry as it was; a MULTI would still run it.
+_INCR_WITH_TTL_SCRIPT = """
+local count = redis.call("INCRBY", KEYS[1], ARGV[1])
+redis.call("EXPIRE", KEYS[1], ARGV[2])
+return count
+"""
+
 
 # What Redis says when it refuses a command because of the key's value rather than its own condition.
 _VALUE_REFUSALS = ("WRONGTYPE", "not an integer", "would overflow")
@@ -97,6 +105,7 @@ class RedisState:
     def __init__(self, client: Any) -> None:
         self._client = client
         self._record_failure_script = client.register_script(_RECORD_TIERED_FAILURE_SCRIPT)
+        self._incr_with_ttl_script = client.register_script(_INCR_WITH_TTL_SCRIPT)
 
     @classmethod
     def from_uri(cls, uri: str) -> "RedisState":
@@ -135,12 +144,8 @@ class RedisState:
         _check_ttl(ttl_seconds)
         if ttl_seconds is None:
             return int(self._client.incrby(key, amount))
-        # One MULTI/EXEC, so a failure between the two cannot leave a counter that never expires.
-        with self._client.pipeline(transaction=True) as pipeline:
-            pipeline.incrby(key, amount)
-            pipeline.expire(key, ttl_seconds)
-            new_value, _ = pipeline.execute()
-        return int(new_value)
+        # One script, so a failure between the two cannot leave a counter that never expires.
+        return int(self._incr_with_ttl_script(keys=[key], args=[str(amount), str(ttl_seconds)]))
 
     @_translate_state_errors
     def set_if_absent(self, key: str, value: bytes, ttl_seconds: int | None = None) -> bool:

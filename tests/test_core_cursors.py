@@ -29,6 +29,13 @@ class TestRoundTrip:
 
         assert decode_cursor(encode_cursor(local, "job-1"), name="jobs")[0] == MOMENT
 
+    @pytest.mark.parametrize("offset", ["+05:00", "-03:30", "+00:00", "Z"])
+    def test_a_forged_offset_decodes_to_the_same_instant_in_utc(self, offset):
+        moment, _ = decode_cursor(_raw([f"2026-01-01T12:00:00.123456{offset}", "job-1"]), name="jobs")
+
+        assert moment.tzinfo is UTC
+        assert moment == datetime.fromisoformat(f"2026-01-01T12:00:00.123456{offset}")
+
     def test_the_cursor_is_url_safe_and_unpadded(self):
         cursor = encode_cursor(MOMENT, "id/with+chars?")
 
@@ -54,3 +61,8 @@ class TestRefusal:
     def test_anything_this_module_did_not_produce_is_a_value_error(self, cursor):
         with pytest.raises(ValueError, match="invalid workers cursor"):
             decode_cursor(cursor, name="workers")
+
+    @pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00"])
+    def test_an_offset_that_leaves_the_representable_range_is_a_value_error(self, stamp):
+        with pytest.raises(ValueError, match="invalid workers cursor"):
+            decode_cursor(_raw([stamp, "job-1"]), name="workers")

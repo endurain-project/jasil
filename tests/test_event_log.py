@@ -531,8 +531,7 @@ class TestAReusedEventIdOnTheBus:
         bus = InProcessEventBus(EventLogRecorder(FixedClock()))
         bus.subscribe("order.created", _boom)
 
-        with pytest.raises(RuntimeError, match="boom"):
-            bus.publish(_event(event_id="evt-1"))
+        bus.publish(_event(event_id="evt-1"))
 
         row = _row(db, "evt-1")
         assert (row.status, row.error_message) == ("failed", "boom")

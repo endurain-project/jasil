@@ -36,9 +36,9 @@ fields.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `profile` | `DeploymentProfile.LOCAL` | The deployment shape. Supplies capability-URI defaults. |
+| `profile` | `DeploymentProfile.LOCAL` | The deployment shape. Supplies capability-URI defaults. A name (`"distributed"`, case and surrounding space ignored) is parsed too; an unknown one raises `ValueError`. |
 | `web_workers` | `1` | How many web-server worker processes you run. Drives the [consistency checks](deployment-profiles.md#consistency-checks) as much as the profile does. |
-| `job_worker_mode` | `JobWorkerMode.IN_PROCESS` | Where durable-job consumers run: `in_process` (each API process calls `start_job_worker()`) or `standalone` (dedicated processes call `run_job_worker()`). A fact about the shape, not a count: **load the same value in every process.** Drives the [consistency checks](deployment-profiles.md#job-workers-are-processes-too); `standalone` requires `jobs.enabled`. Parse an environment value with `jasil.profile.parse_job_worker_mode`. |
+| `job_worker_mode` | `JobWorkerMode.IN_PROCESS` | Where durable-job consumers run: `in_process` (each API process calls `start_job_worker()`) or `standalone` (dedicated processes call `run_job_worker()`). A fact about the shape, not a count: **load the same value in every process.** Drives the [consistency checks](deployment-profiles.md#job-workers-are-processes-too); `standalone` requires `jobs.enabled`. A name is parsed too, as for `profile`; `jasil.profile.parse_job_worker_mode` parses an environment value. |
 | `enforce_deployment_consistency` | `True` | Refuse to build a platform whose wiring contradicts its topology. `False` logs the issues as warnings instead. |
 | `data_dir` | `"data"` | Root directory for the local storage backend. |
 | `state_uri` | `None` | `memory://`, or `redis://` / `rediss://` / `unix://`. |
@@ -47,8 +47,8 @@ fields.
 | `lock_uri` | `None` | `noop://` or `postgres-advisory://`. |
 | `realtime_uri` | `None` | `memory://`, `redis://` / `rediss://` / `unix://`, or `none://` to disable realtime: the channel carrying [realtime hints](providers-and-backends.md#realtimeprovider) to every process. Unset, it follows the resolved `events_uri` in every profile, so it is `memory://` under the `local` defaults and the event bus's Redis otherwise. `memory://` is refused in a multi-process deployment. |
 | `realtime_channel` | `"jasil:realtime"` | The Redis Pub/Sub channel carrying realtime hints. Pub/Sub channels are server-wide (the database number does not separate them), so deployments sharing one Redis server must set different channels. Ignored for `memory://`. |
-| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Must not be empty for Redis, checked when the platform is built; ignored for `memory://`. |
-| `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Ignored for `memory://`. |
+| `events_stream` | `"jasil:events"` | The Redis Stream key carrying best-effort events. Streams live in one Redis database, so two deployments sharing a database must use different streams. Must not be empty for Redis, checked when the platform is built (as is `events_group`); ignored for `memory://`. |
+| `events_group` | `"jasil"` | The Redis consumer group the event bus reads as. Replicas of one deployment share it, so each event is handled once; deployments reading the same stream must not. Must not be empty for Redis, checked when the platform is built; ignored for `memory://`. |
 | `jobs` | `JobSettings()` | Durable-job pipeline. |
 | `event_log` | `EventLogSettings()` | Observability trail. |
 | `audit` | `AuditSettings()` | [Audit trail](audit.md). |
@@ -104,7 +104,7 @@ sink.
 | `legal_hold` | `False` | Suspend all pruning. |
 | `partition_days_ahead` | `7` | Days of daily partitions maintenance keeps created ahead of today (PostgreSQL). A row whose day has none is rejected, so this is the margin by which maintenance may stop. Between `1` and `366`. |
 | `checkpoint_window_minutes` | `15` | Length of a tamper-evidence window. At least `1`, and it must divide a day (1440). |
-| `checkpoint_grace_minutes` | `5` | How long past its end a window waits before it is sealed. Longer than your longest audited transaction plus replica clock skew. |
+| `checkpoint_grace_minutes` | `5` | How long past its end a window waits before it is sealed. At least `0`; longer than your longest audited transaction plus replica clock skew. |
 | `signing_key` | `None` | Ed25519 private key, base64 of the 32 raw bytes. `None` writes unsigned, hash-chained checkpoints. A value that is not base64 of 32 bytes raises `ValueError` when the settings are built. Needs `jasil[audit]`. Not shown in `repr`. |
 | `external_sink_uri` | `None` | `file:///directory` or `s3://bucket/prefix`: a write-once copy of every checkpoint kept outside the database. |
 | `max_details_bytes` | `4096` | Largest serialized `details` payload a row may carry. At least `1`. |
@@ -114,7 +114,7 @@ sink.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network: refused for a host that resolves to any public address), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
+| `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network: refused for a host that resolves to any public address, and a private host must also be listed in `network.ssrf_allowed_hosts`), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
 | `rate_limit` | `1.0` | Maximum requests per second **per process**; `<= 0` disables throttling. Each process throttles on its own, so a deployment of N processes sends up to N times this rate: divide a provider's limit (Nominatim's public instance allows one request a second) by the number of processes that geocode. |
 | `api_key` | `None` | Required by `geocode://`. |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
@@ -133,7 +133,7 @@ Settings of the `local://` backend; `s3://` takes none.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path or query. The host is a DNS name or an IP literal. `memory://` is refused in a multi-process deployment. |
+| `uri` | `None` | `memory://`, `smtp://host[:port]` (STARTTLS, port 587) or `smtps://host[:port]` (implicit TLS, port 465). Unset disables mail: `send` raises `MailNotConfiguredError`. No userinfo, path, query or fragment. The host is a DNS name or an IP literal. `memory://` is refused in a multi-process deployment. |
 | `secure` | `True` | Verified TLS. `False` allows cleartext `smtp://` and only to a host that resolves exclusively to private, loopback or link-local addresses (re-checked on every send, and the connection is pinned to the checked addresses, tried in order; the shared address space `100.64.0.0/10` used by carrier-grade NAT and Tailscale is not private for this purpose), with no `username` / `password`; anything else, including `memory://`, fails `build_platform`. |
 | `from_address` | `""` | `"addr"` or `"Name <addr>"`: the default sender, used when a `MailMessage` sets no `from_address`. Required for the SMTP schemes. Independent of `username`. |
 | `username` | `None` | SMTP login. Must be set together with `password`. |
@@ -164,6 +164,7 @@ Each capability resolves its backend by URI scheme, independently of the profile
 | `state_uri` | `memory://`, `redis://`, `rediss://`, `unix://` |
 | `storage_uri` | `local://`, `local://<path>`, `s3://<bucket>[/<prefix>][?region=...&endpoint_url=...]`, `none://` (disabled) |
 | `events_uri` | `memory://`, `redis://`, `rediss://`, `unix://`, `none://` (disabled) |
+| `realtime_uri` | `memory://`, `redis://`, `rediss://`, `unix://`, `none://` (disabled); unset, it follows `events_uri` |
 | `lock_uri` | `noop://`, `postgres-advisory://` |
 
 An unrecognised scheme raises `ValueError` at startup. Failing to start beats
@@ -229,7 +230,7 @@ again.
 | Situation | Mail | Geocoding |
 |---|---|---|
 | The source raises, and the last build produced a working backend | That backend is used, **including its credentials, for as long as the source keeps failing**: revoking them in a store that is down does not take effect until it answers. A warning logs on the first failure of a run, debug after, until the source works again. | Same. |
-| The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception chained. | `reverse` returns `None`. |
+| The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception deliberately not chained (its text may carry a secret). | `reverse` returns `None`. |
 | The settings are invalid | `send` raises `MailNotConfiguredError` whose message carries the reason (never a setting's value), also logged once. The previous backend and its credentials are **never** reused. | `NullGeocoding`; the reason is logged once, as at startup. |
 | The relay or geocoding host does not resolve (mail `secure=False`, geocoding) | `send` raises a plain `MailError`, retryable. The build is retried after 30 seconds, not remembered as a rejection. | `reverse` returns `None`; the build is retried after 30 seconds. |
 | The settings are unset (`uri` empty) | As `NullMail`: `send` raises `MailNotConfiguredError`. | As `NullGeocoding`. |
@@ -328,7 +329,7 @@ knowing:
 | | Consequence |
 |---|---|
 | **`FOR UPDATE SKIP LOCKED`** | Available on PostgreSQL, MySQL 8.0.1+ and MariaDB 10.6+. Where it is missing, concurrent workers and relayers fall back to a compare-and-set claim plus the idempotent fan-out, which is correct but does more redundant work. |
-| **Timestamp precision** | MySQL's `DATETIME` stores whole seconds and *rounds*, so a persisted timestamp can differ from the one written by up to half a second, in either direction. Lease expiry, backoff and retention are all interval comparisons measured in seconds or days, so this does not affect them — but do not compare a timestamp JASIL persisted for equality with the value you passed in. |
+| **Timestamp precision** | JASIL's timestamp columns keep microseconds on every database: `DATETIME(6)` on MySQL and MariaDB once migration `rev0012` has run. Before it they are `DATETIME`, which stores whole seconds and *rounds*, so a persisted timestamp can differ from the one written by up to half a second, in either direction. |
 
 ### Logging
 

@@ -3,11 +3,12 @@
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, CheckConstraint, Date, DateTime, Index, Integer, String
+from sqlalchemy import JSON, Boolean, CheckConstraint, Date, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
-from sqlalchemy.sql import false, func
+from sqlalchemy.sql import false
 
+from jasil._core.dialects import MICROSECOND_DATETIME, MicrosecondNow
 from jasil._core.limits import (
     MAX_AUDIT_ACTION_ID_LENGTH,
     MAX_AUDIT_APP_NAME_LENGTH,
@@ -61,6 +62,8 @@ class AuditLog(Base):
         instance_id: The deployment's id from ``jasil_instance``.
         app_name: The host application's name.
         app_version: The host application's version.
+        scope: The host's partition key (an organisation, workspace or project id). Opaque: JASIL never parses
+            it or uses it to authorize anything.
     """
 
     __tablename__ = "jasil_audit_log"
@@ -71,16 +74,17 @@ class AuditLog(Base):
         Index("idx_jasil_audit_log_actor", "actor_id", "occurred_at"),
         Index("idx_jasil_audit_log_target", "target_type", "target_id"),
         Index("idx_jasil_audit_log_request", "request_id"),
+        Index("idx_jasil_audit_log_scope", "scope", "occurred_at"),
     )
 
     id: Mapped[str] = mapped_column(
         String(MAX_EVENT_ID_LENGTH), primary_key=True, comment="UUIDv7 (time-ordered); part of the primary key"
     )
     occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
+        MICROSECOND_DATETIME,
         primary_key=True,
         autoincrement=False,
-        server_default=func.now(),
+        server_default=MicrosecondNow(),
         comment="When the action was staged; partition key",
     )
     action_id: Mapped[str] = mapped_column(
@@ -143,6 +147,9 @@ class AuditLog(Base):
     app_version: Mapped[str | None] = mapped_column(
         String(MAX_AUDIT_APP_VERSION_LENGTH), nullable=True, comment="Host application version"
     )
+    scope: Mapped[str | None] = mapped_column(
+        String(MAX_AUDIT_ID_LENGTH), nullable=True, comment="Host-defined partition key; opaque to JASIL"
+    )
 
 
 class AuditActionRecord(Base):
@@ -178,10 +185,13 @@ class AuditActionRecord(Base):
         Boolean, nullable=False, default=False, server_default=false(), comment="No longer emitted"
     )
     first_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="First synchronization"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="First synchronization"
     )
     last_seen_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="Last synchronization that saw it"
+        MICROSECOND_DATETIME,
+        nullable=False,
+        server_default=MicrosecondNow(),
+        comment="Last synchronization that saw it",
     )
 
 
@@ -201,17 +211,17 @@ class AuditCheckpoint(Base):
             accepts as the age past which a window may have been pruned.
         legal_hold: ``audit.legal_hold`` when the window was sealed; a checkpoint sealed under a hold allows
             no prune.
+        format_version: Which columns of each row ``hash`` covers: 1 for windows sealed before ``scope`` existed,
+            2 with it. A release that does not know the column writes 1.
         created_at: When the checkpoint was written.
     """
 
     __tablename__ = "jasil_audit_checkpoints"
 
     window_start: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), primary_key=True, autoincrement=False, comment="Window start, inclusive"
+        MICROSECOND_DATETIME, primary_key=True, autoincrement=False, comment="Window start, inclusive"
     )
-    window_end: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, comment="Window end, exclusive"
-    )
+    window_end: Mapped[datetime] = mapped_column(MICROSECOND_DATETIME, nullable=False, comment="Window end, exclusive")
     row_count: Mapped[int] = mapped_column(Integer, nullable=False, comment="Rows in the window when sealed")
     hash: Mapped[str] = mapped_column(String(64), nullable=False, comment="SHA-256 hex of the rows plus prev_hash")
     prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="Previous checkpoint's hash")
@@ -219,8 +229,11 @@ class AuditCheckpoint(Base):
     key_id: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="Signing-key fingerprint")
     retention_days: Mapped[int] = mapped_column(Integer, nullable=False, comment="Retention when sealed")
     legal_hold: Mapped[bool] = mapped_column(Boolean, nullable=False, comment="Legal hold when sealed")
+    format_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="1", comment="Row format the hash covers"
+    )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the checkpoint was written"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="When the checkpoint was written"
     )
 
 
@@ -235,7 +248,7 @@ class Instance(Base):
         retention_days: The ``audit.retention_days`` last seen by maintenance, to detect a change.
         legal_hold: The ``audit.legal_hold`` last seen by maintenance, to detect a change.
         furthest_partition_date: The last day with a partition, as the latest maintenance run found it
-            (PostgreSQL), so every replica's :func:`jasil.audit.get_audit_health` reports it.
+            (partitioned dialects), so every replica's :func:`jasil.audit.get_audit_health` reports it.
         last_checkpoint_at: The end of the latest sealed window, as the latest maintenance run left it.
     """
 
@@ -247,7 +260,7 @@ class Instance(Base):
         String(MAX_EVENT_ID_LENGTH), nullable=False, comment="Random deployment id"
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), comment="When the id was generated"
+        MICROSECOND_DATETIME, nullable=False, server_default=MicrosecondNow(), comment="When the id was generated"
     )
     retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="Retention last seen")
     legal_hold: Mapped[bool | None] = mapped_column(Boolean, nullable=True, comment="Legal hold last seen")
@@ -255,5 +268,5 @@ class Instance(Base):
         Date, nullable=True, comment="Last day with a partition"
     )
     last_checkpoint_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True, comment="End of the latest sealed window"
+        MICROSECOND_DATETIME, nullable=True, comment="End of the latest sealed window"
     )

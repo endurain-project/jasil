@@ -430,8 +430,10 @@ class TestTheRunnerRecordsTheRun:
         started = [name for name, row in rows.items() if row.started_at is not None]
         assert len(started) == 1, "only the job that ran was stamped"
 
-    def test_a_missing_handler_is_a_recorded_failure(self, runner, db):
+    def test_a_missing_handler_is_a_recorded_failure(self, runner, registry, db, monkeypatch):
+        registry.register("a.b", "s", lambda _event: None)
         job = _enqueue(db)
+        monkeypatch.setattr(registry, "get", lambda _subscriber_id: None)
 
         runner.run_once()
 

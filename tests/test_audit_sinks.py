@@ -284,6 +284,7 @@ class TestSealingThroughTheSink:
         assert copy["hash"] == stored.hash
         assert (copy["row_count"], copy["prev_hash"], copy["signature"], copy["key_id"]) == (1, None, None, None)
         assert (copy["retention_days"], copy["legal_hold"]) == (stored.retention_days, stored.legal_hold)
+        assert copy["v"] == stored.format_version == 2
         assert copy["window_start"] == "2026-01-01T12:00:00.000000+00:00"
         assert copy["instance_id"]
 
@@ -339,6 +340,69 @@ class TestSealingThroughTheSink:
         assert (newest.retention_days, newest.legal_hold) == (90, False)
         assert newest.signature == copy["signature"]
         assert jasil_audit.verify_checkpoints(None, T0, T0 + timedelta(hours=1)).ok
+
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_a_retry_after_an_upgrade_keeps_the_format_of_the_copy_the_sink_holds(self, trail, monkeypatch, signed):
+        """An earlier release wrote the copy and crashed; the release that retries must not stop sealing for good."""
+        if signed:
+            trail.configure(signing_key=base64.b64encode(bytes(range(32))).decode())
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoints, "_FORMAT_VERSION", 1)
+            checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+
+        assert checkpoints.seal_pending_windows() == 1
+
+        newest = self._stored()[-1]
+        copy = json.loads((self.directory / self._name("20260101T123000Z")).read_text())
+        assert (newest.format_version, copy["v"]) == (1, 1)
+        assert (newest.hash, newest.signature) == (copy["hash"], copy["signature"])
+        assert jasil_audit.verify_checkpoints(None, T0, T0 + timedelta(hours=1)).ok
+
+    @pytest.mark.parametrize("signed", [False, True])
+    def test_the_window_after_one_resealed_in_its_copy_format_chains_onto_the_stored_hash(
+        self, trail, monkeypatch, signed
+    ):
+        """A window with rows hashes differently in each format, so the next window must chain onto the stored one."""
+        if signed:
+            trail.configure(signing_key=base64.b64encode(bytes(range(32))).decode())
+        action = jasil_audit.get_catalog().get("shop.order.place")
+        trail.clock.moment = T0 + timedelta(minutes=35)
+        jasil_audit.record_detached(action, outcome=Outcome.SUCCESS, target_id="b")
+        trail.clock.moment = T0 + timedelta(minutes=60)
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoints, "_FORMAT_VERSION", 1)
+            checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+        trail.clock.moment = T0 + timedelta(minutes=120)
+
+        assert checkpoints.seal_pending_windows() == 5
+
+        assert [checkpoint.format_version for checkpoint in self._stored()] == [1, 1, 1, 2, 2, 2, 2]
+        public_key = None
+        if signed:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            raw = (
+                Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+                .public_key()
+                .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+            )
+            public_key = base64.b64encode(raw).decode()
+        assert jasil_audit.verify_checkpoints(public_key, T0, T0 + timedelta(hours=2)).ok
+
+    @pytest.mark.parametrize("version", [3, "2", None])
+    def test_a_copy_in_a_format_this_release_does_not_know_is_a_conflict(self, trail, version):
+        checkpoints.seal_pending_windows()
+        self._lose_the_newest_database_write()
+        target = self.directory / self._name("20260101T123000Z")
+        copy = json.loads(target.read_text())
+        target.chmod(0o600)
+        target.write_text(json.dumps({**copy, "v": version}, sort_keys=True, separators=(",", ":")))
+
+        with pytest.raises(AuditSinkConflictError):
+            checkpoints.seal_pending_windows()
 
     def test_a_copy_of_other_rows_is_still_a_conflict(self, trail):
         checkpoints.seal_pending_windows()

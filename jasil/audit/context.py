@@ -20,7 +20,7 @@ import logging
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -31,7 +31,8 @@ from jasil._core.limits import (
     MAX_USER_AGENT_LENGTH,
     fit_length,
 )
-from jasil.events import MAX_EVENT_ID_LENGTH
+from jasil.correlation import correlation_scope
+from jasil.events import MAX_EVENT_ID_LENGTH, META_REQUEST_ID, META_SCOPE, Event
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ __all__ = [
     "Source",
     "audit_context",
     "configure_provider",
+    "event_handler_scope",
     "get_context",
     "reset",
     "set_context",
@@ -66,6 +68,18 @@ class Source(StrEnum):
     MIGRATION = "migration"
 
 
+_TEXT_FIELDS = (
+    "actor_id",
+    "credential_type",
+    "credential_id",
+    "on_behalf_of_id",
+    "ip_address",
+    "user_agent",
+    "event_id",
+    "scope",
+)
+
+
 @dataclass(frozen=True)
 class AuditContext:
     """Who is acting, and from where. Every field is optional; the defaults describe an anonymous API call.
@@ -82,6 +96,8 @@ class AuditContext:
         user_agent: The client's ``User-Agent``. Clipped to :data:`MAX_USER_AGENT_LENGTH`
             characters, with a trailing ``...`` marking the cut.
         event_id: The domain event that triggered the work, when it runs in a handler.
+        scope: The host's partition key for the work (an organisation, workspace or project id). Opaque:
+            stored, filtered on and covered by checkpoints, never parsed or used to authorize anything.
     """
 
     actor_type: ActorType = ActorType.ANONYMOUS
@@ -93,15 +109,21 @@ class AuditContext:
     ip_address: str | None = None
     user_agent: str | None = None
     event_id: str | None = None
+    scope: str | None = None
 
     def __post_init__(self) -> None:
         """Coerce the enums and clip the client-controlled strings.
 
         Raises:
+            TypeError: When a text field is neither a ``str`` nor ``None``.
             ValueError: When ``actor_type`` or ``source`` is not a known value, or an id exceeds its column or contains a NUL character.
         """
         object.__setattr__(self, "actor_type", ActorType(self.actor_type))
         object.__setattr__(self, "source", Source(self.source))
+        for name in _TEXT_FIELDS:
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"audit context {name} must be a str, not {type(value).__name__}")
         # A NUL cannot be stored in PostgreSQL text; a client controls these two, so they are repaired, not refused.
         for name, limit in (("user_agent", MAX_USER_AGENT_LENGTH), ("ip_address", MAX_IP_ADDRESS_LENGTH)):
             value = getattr(self, name)
@@ -112,6 +134,7 @@ class AuditContext:
             ("credential_id", MAX_AUDIT_ID_LENGTH),
             ("on_behalf_of_id", MAX_AUDIT_ID_LENGTH),
             ("event_id", MAX_EVENT_ID_LENGTH),
+            ("scope", MAX_AUDIT_ID_LENGTH),
         ):
             value = getattr(self, name)
             if value is not None and len(value) > limit:
@@ -202,6 +225,33 @@ def audit_context(**fields: Any) -> Generator[AuditContext]:
         yield context
     finally:
         _override.reset(token)
+
+
+@contextmanager
+def event_handler_scope(event: Event) -> Generator[AuditContext]:
+    """Run a block as the system working for ``event``, restoring the ambient state afterwards.
+
+    Opens the event's correlation id and a ``system`` / ``worker`` audit context carrying the event's id
+    and scope. Every field is passed, so nothing is inherited from the thread or a request-scoped provider.
+
+    Args:
+        event: The event being handled.
+
+    Yields:
+        The audit context in force inside the block.
+
+    Raises:
+        ValueError: When the event's stored scope is invalid.
+        TypeError: When the event's stored scope is not a ``str``.
+    """
+    context = AuditContext(
+        actor_type=ActorType.SYSTEM,
+        source=Source.WORKER,
+        event_id=event.event_id,
+        scope=event.metadata.get(META_SCOPE),
+    )
+    with correlation_scope(event.metadata.get(META_REQUEST_ID)), audit_context(**asdict(context)):
+        yield context
 
 
 def reset() -> None:

@@ -39,15 +39,19 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from jasil._core.limits import check_length
+from jasil._core.limits import MAX_AUDIT_ID_LENGTH, check_length
 from jasil._core.timestamps import as_utc
 
-# --- Standard metadata key (correlation context, not domain data) ---
+# --- Standard metadata keys (correlation context, not domain data) ---
 #
-# Only the correlation id is defined here. Domain keys (user id, tenant id, the
-# id of whatever the event is about) are the *host's* to name, and travel in the
-# same ``metadata`` dict without JASIL needing to know them.
+# Only the correlation id and the audit scope are defined here. Domain keys (user
+# id, the id of whatever the event is about) are the *host's* to name, and travel
+# in the same ``metadata`` dict without JASIL needing to know them.
 META_REQUEST_ID = "request_id"
+#: The host's partition key (an organisation, workspace or project id) for the
+#: work the event starts. A durable handler's audit context takes it as its
+#: ``scope``; it is never read anywhere else. The publisher does not set it.
+META_SCOPE = "scope"
 
 #: Version assumed for an event that carries none — every event written before
 #: ``schema_version`` existed. Persisted rows default to this on read.
@@ -175,8 +179,11 @@ def new_event(
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
             than the column it is persisted in.
+        ValueError: When the ``metadata`` :data:`META_SCOPE` is longer than an
+            audit row's scope or contains a NUL character.
         TypeError: When ``payload`` or ``metadata`` is not a ``dict``, or the
-            ``metadata`` :data:`META_REQUEST_ID` is neither a ``str`` nor ``None``.
+            ``metadata`` :data:`META_REQUEST_ID` or :data:`META_SCOPE` is neither
+            a ``str`` nor ``None``.
     """
     resolved_event_id = event_id or str(uuid.uuid4())
     check_length(resolved_event_id, field="event_id", limit=MAX_EVENT_ID_LENGTH)
@@ -193,8 +200,15 @@ def new_event(
         schema_version=schema_version,
     )
     # Checked here, not in Event, so a stored envelope is still rebuilt and handled rather than wedging its reader:
-    # a durable handler runs under this id as its correlation id, which audit rows store as text.
-    request_id = event.metadata.get(META_REQUEST_ID)
-    if request_id is not None and not isinstance(request_id, str):
-        raise TypeError(f"metadata {META_REQUEST_ID} must be a str, not {type(request_id).__name__}")
+    # a durable handler runs under the id as its correlation id and under the scope as its audit scope, which audit
+    # rows store as text.
+    for key in (META_REQUEST_ID, META_SCOPE):
+        value = event.metadata.get(key)
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"metadata {key} must be a str, not {type(value).__name__}")
+    scope = event.metadata.get(META_SCOPE)
+    if scope is not None:
+        check_length(scope, field=f"metadata {META_SCOPE}", limit=MAX_AUDIT_ID_LENGTH)
+        if "\x00" in scope:
+            raise ValueError(f"metadata {META_SCOPE} must not contain a NUL character")
     return event

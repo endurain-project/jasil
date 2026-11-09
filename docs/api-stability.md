@@ -20,7 +20,7 @@ modules:
 | Module | Surface |
 |---|---|
 | `jasil.providers` | The capability protocols and their method signatures, the value types they exchange (`GeocodedPlace`, `MailMessage`, `UploadSession`, ...), `AuditSink` and `AuditSinkConflictError`, `MAX_REALTIME_KEY_LENGTH`, and `MAIL_SEND_DEADLINE_SECONDS` (its value may change in a minor release). |
-| `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
+| `jasil.events` | `Event`, `new_event`, `META_REQUEST_ID`, `META_SCOPE`, `INITIAL_SCHEMA_VERSION`, `MAX_EVENT_ID_LENGTH`, `MAX_EVENT_TYPE_LENGTH`, `MAX_SOURCE_LENGTH`. |
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri` with its `StateBackendKind`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
 | `jasil.settings` | The settings dataclasses and `configure` / `get_settings` / `is_configured`, `RuntimeSources`, and `mail_problems` with `MailProblem` and `MailProblemCode` (the set of codes may grow in a minor release; a code is never renamed or reused). |

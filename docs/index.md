@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.18.0"
+!!! warning "Status: 0.19.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -121,7 +121,7 @@ jasil_lifecycle.shutdown()
 ```
 
 It stops the durable-job worker, then releases the platform — the event-bus
-consumer thread and the shared Redis clients it took, each closed once no other
+consumer thread, the realtime subscriber thread and the shared Redis clients it took, each closed once no other
 platform in the process still uses it — and unpublishes it. That order
 matters: the worker runs subscribers, and a subscriber that publishes needs the
 bus still up. It never raises, and it is safe to call when nothing was started.

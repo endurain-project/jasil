@@ -19,6 +19,7 @@ from jasil.events import (
     MAX_EVENT_TYPE_LENGTH,
     MAX_SOURCE_LENGTH,
     META_REQUEST_ID,
+    META_SCOPE,
     Event,
     new_event,
 )
@@ -167,6 +168,23 @@ class TestEnvelopeContentTypes:
 
     @pytest.mark.parametrize("metadata", [{}, {META_REQUEST_ID: None}, {META_REQUEST_ID: "req-1"}])
     def test_a_string_or_absent_request_id_is_accepted(self, metadata):
+        assert new_event("activity.created", {}, source="test", metadata=metadata).metadata == metadata
+
+    @pytest.mark.parametrize("scope", [7, ["ws-1"], b"ws-1"])
+    def test_a_scope_that_is_not_a_string_is_refused(self, scope):
+        with pytest.raises(TypeError, match="scope must be a str"):
+            new_event("activity.created", {}, source="test", metadata={META_SCOPE: scope})
+
+    @pytest.mark.parametrize(
+        ("scope", "message"), [("x" * 65, "scope is 65 characters"), ("ws\x001", "scope must not contain a NUL")]
+    )
+    def test_a_scope_an_audit_row_could_not_store_is_refused(self, scope, message):
+        """A durable handler's audit context takes it; refused here, it fails the publish rather than every attempt."""
+        with pytest.raises(ValueError, match=message):
+            new_event("activity.created", {}, source="test", metadata={META_SCOPE: scope})
+
+    @pytest.mark.parametrize("metadata", [{META_SCOPE: None}, {META_SCOPE: "ws-1"}, {META_SCOPE: "x" * 64}])
+    def test_a_string_or_absent_scope_is_accepted(self, metadata):
         assert new_event("activity.created", {}, source="test", metadata=metadata).metadata == metadata
 
     def test_an_envelope_built_by_hand_is_checked_too(self):

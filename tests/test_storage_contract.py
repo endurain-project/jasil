@@ -919,11 +919,11 @@ class TestSegmentValidationConformance:
         with pytest.raises(ValueError, match="escapes base directory"):
             call(arguments["area"], arguments["key"], *extra)
 
-    @pytest.mark.parametrize("bad", ["a\x00b", "line\nbreak", "tab\there", "del\x7f"])
+    @pytest.mark.parametrize("bad", ["a\x00b", "line\nbreak", "tab\there", "del\x7f", "a\ufffe", "a\uffff"])
     @pytest.mark.parametrize("field", ["area", "key"])
     @pytest.mark.parametrize("operation", ["save", "save_stream", "get", "exists", "delete", "url"])
     def test_a_control_character_is_refused_by_every_backend(self, storage, bad, field, operation):
-        """S3 cannot list or batch-delete such a key, and a local path cannot hold a NUL."""
+        """S3 cannot list or batch-delete a key XML 1.0 cannot carry, and a local path cannot hold a NUL."""
         arguments = {"area": "avatars", "key": "42.webp", field: bad}
         call = getattr(storage, operation)
         extra = (b"x",) if operation == "save" else (_ReadOnceSource(b"x"),) if operation == "save_stream" else ()
