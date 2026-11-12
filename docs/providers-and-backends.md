@@ -723,7 +723,8 @@ Handlers run on the provider's subscriber thread (`InProcessRealtime`: on the
 publisher's thread). Keep them short — on an async server, hand the hint to the
 event loop with `loop.call_soon_threadsafe` — and note that a handler that
 raises is logged and skipped, never retried. A hint arrives as JSON decodes it:
-tuples become lists and keys become strings, in both backends.
+tuples become lists and keys become strings, in both backends, and a
+`uuid.UUID` anywhere in a hint arrives as its string.
 
 The Redis subscriber holds a **dedicated** connection, not one from the shared
 pool, reconnects with capped exponential backoff and jitter, and PINGs an idle

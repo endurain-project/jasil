@@ -25,6 +25,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from jasil._core.json_ids import stringify_uuids
+
 __all__ = [
     "DEFAULT_MAX_ENVELOPE_BYTES",
     "ENVELOPE_VERSION",
@@ -73,7 +75,7 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
 
     Args:
         key: The audience of the hint; opaque to JASIL.
-        hint: A JSON-serialisable mapping.
+        hint: A JSON-serialisable mapping; a :class:`uuid.UUID` in it is sent as its string.
         max_bytes: Cap on the serialised envelope.
 
     Returns:
@@ -91,8 +93,8 @@ def encode(key: str, hint: dict, *, max_bytes: int = DEFAULT_MAX_ENVELOPE_BYTES)
         raise ValueError(problem)
     if not isinstance(hint, dict):
         raise ValueError(f"hint must be a dict, not {type(hint).__name__}")
-    envelope = {"v": ENVELOPE_VERSION, "key": key, "hint": hint}
     try:
+        envelope = {"v": ENVELOPE_VERSION, "key": key, "hint": stringify_uuids(hint)}
         encoded = json.dumps(envelope, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode()
     except (TypeError, ValueError, RecursionError) as error:
         raise ValueError(f"hint is not JSON-serialisable: {error}") from None

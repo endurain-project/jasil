@@ -70,6 +70,14 @@ in every row it reaches, and each durable subscriber gets its own copy. Referenc
 a blob through the [storage provider](providers-and-backends.md) rather than
 inlining it.
 
+**UUIDs are allowed.** A `uuid.UUID` anywhere in `payload` or `metadata` (as a
+value, in a nested dict, list or tuple, or as a dict key) is replaced by its
+canonical string when the `Event` is built, so every route carries the same
+value: a subscriber receives a `str`, never a `UUID`, whether the event arrives
+in process, from the outbox, as a durable job or from Redis. Other values JSON
+cannot encode, such as a `datetime`, `Decimal` or `set`, are still refused at
+the write.
+
 Identifiers *are* bounded, because they are indexed columns: `event_type` is
 capped at 100 characters, `source` at 50, and a durable `subscriber_id` at 200.
 Going over raises at `new_event` (at `register` for a `subscriber_id`) rather than failing at the write. The functions

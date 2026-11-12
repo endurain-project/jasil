@@ -913,6 +913,16 @@ class TestOutboxRelay:
 
         assert "8" not in str(exc_info.value).replace(event.event_id, "")
 
+    def test_the_same_event_with_a_uuid_in_its_payload_is_recognised_as_the_same(self, db):
+        import uuid
+
+        first = new_event("activity.created", {"id": uuid.UUID(int=1)}, source="test")
+        again = new_event("activity.created", {"id": uuid.UUID(int=1)}, source="test", event_id=first.event_id)
+        jobs_outbox.add_to_outbox(first, now=T0, db=db)
+
+        assert jobs_outbox.add_to_outbox(again, now=T0, db=db) is None
+        assert db.query(EventOutbox).one().payload == {"id": str(uuid.UUID(int=1))}
+
     def test_the_same_event_id_with_another_type_is_refused(self, db, event):
         jobs_outbox.add_to_outbox(event, now=T0, db=db)
         other = new_event("activity.deleted", event.payload, source="test", event_id=event.event_id)

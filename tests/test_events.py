@@ -192,6 +192,59 @@ class TestEnvelopeContentTypes:
             Event(event_id="e", event_type="t", source="s", timestamp="2026-01-01T00:00:00+00:00", payload=[])
 
 
+class TestUuidValues:
+    """A UUID is stored as its canonical string, so every route carries the same payload."""
+
+    ID = uuid.UUID("12345678-1234-5678-1234-567812345678")
+    TEXT = "12345678-1234-5678-1234-567812345678"
+
+    def test_a_uuid_in_the_payload_becomes_its_string(self):
+        event = new_event("activity.created", {"id": self.ID}, source="test")
+
+        assert event.payload == {"id": self.TEXT}
+
+    def test_a_uuid_in_the_metadata_becomes_its_string(self):
+        event = new_event("activity.created", {}, source="test", metadata={"user_id": self.ID})
+
+        assert event.metadata == {"user_id": self.TEXT}
+
+    def test_a_uuid_nested_in_dicts_lists_and_tuples_becomes_its_string(self):
+        payload = {"a": {"b": [self.ID, (self.ID, 1)]}, self.ID: "key"}
+
+        event = new_event("activity.created", payload, source="test")
+
+        assert event.payload == {"a": {"b": [self.TEXT, (self.TEXT, 1)]}, self.TEXT: "key"}
+
+    def test_the_callers_payload_is_left_as_it_was(self):
+        payload = {"id": self.ID}
+
+        new_event("activity.created", payload, source="test")
+
+        assert payload == {"id": self.ID}
+
+    def test_other_values_are_kept_as_they_are(self):
+        payload = {"n": 1, "f": 1.5, "s": "x", "b": True, "none": None}
+
+        assert new_event("activity.created", payload, source="test").payload == payload
+
+    def test_a_uuid_request_id_is_accepted_as_a_string(self):
+        event = new_event("activity.created", {}, source="test", metadata={META_REQUEST_ID: self.ID})
+
+        assert event.metadata[META_REQUEST_ID] == self.TEXT
+
+    def test_an_envelope_built_by_hand_converts_too(self):
+        event = Event(
+            event_id="e", event_type="t", source="s", timestamp="2026-01-01T00:00:00+00:00", payload={"id": self.ID}
+        )
+
+        assert event.payload == {"id": self.TEXT}
+
+    def test_a_value_that_is_still_not_json_native_is_left_for_the_writer_to_refuse(self):
+        marker = object()
+
+        assert new_event("activity.created", {"x": marker}, source="test").payload == {"x": marker}
+
+
 class TestParsePayload:
     def test_a_current_version_payload_validates_directly(self):
         event = _event_at(3, {"name": "n", "added_in_v2": "a", "added_in_v3": "b"})

@@ -10,6 +10,7 @@ log line) with a timeout rather than sleeping or polling.
 import json
 import logging
 import threading
+import uuid
 
 import fakeredis
 import pytest
@@ -104,6 +105,18 @@ class TestPublish:
     def test_a_hint_that_is_not_json_raises(self, make_realtime):
         with pytest.raises(ValueError, match="not JSON-serialisable"):
             make_realtime().notify("7", {"when": object()})
+
+    def test_a_uuid_in_a_hint_is_published_as_its_string(self, server, make_realtime):
+        listener = fakeredis.FakeStrictRedis(server=server, decode_responses=True).pubsub(
+            ignore_subscribe_messages=True
+        )
+        listener.subscribe(CHANNEL)
+        listener.get_message(timeout=0.1)  # consume the subscribe confirmation
+
+        make_realtime().notify("7", {"id": uuid.UUID(int=1)})
+
+        message = listener.get_message(timeout=1.0)
+        assert json.loads(message["data"])["hint"] == {"id": str(uuid.UUID(int=1))}
 
     def test_a_transport_failure_is_logged_and_dropped(self, server, make_realtime, caplog):
         realtime = make_realtime()
