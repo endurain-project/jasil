@@ -15,6 +15,7 @@ the bottom, where it is the subject.
 import json
 import logging
 import threading
+import uuid
 
 import fakeredis
 import pytest
@@ -89,6 +90,14 @@ class TestSerialization:
         )
 
         assert deserialize_event(serialize_event(event)) == event
+
+    def test_a_uuid_in_the_payload_survives_the_round_trip_as_a_string(self):
+        event = new_event("order.created", {"id": uuid.UUID(int=1)}, source="api", metadata={"user": uuid.UUID(int=2)})
+
+        restored = deserialize_event(serialize_event(event))
+
+        assert restored.payload == {"id": str(uuid.UUID(int=1))}
+        assert restored.metadata == {"user": str(uuid.UUID(int=2))}
 
     def test_every_field_is_a_string_on_the_wire(self):
         """Redis stream fields are flat strings; a non-string would fail at XADD."""

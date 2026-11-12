@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.19.0"
+version = "0.20.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -93,9 +93,9 @@ all = [
 [dependency-groups]
 typecheck = [
     "mypy>=2.4.1",
-    "ty>=0.0.95",
+    "ty>=0.0.97",
     "types-requests>=2.33.0.20261030",
-    "boto3-stubs[s3]>=1.43.123",
+    "boto3-stubs[s3]>=1.43.124",
 ]
 lint = [
     "ruff>=0.17.3",
@@ -114,7 +114,7 @@ test = [
     "redis>=8.1.0",
     "fakeredis[lua]>=2.40.0",
     # The remaining backends and integrations are all exercised by the suite.
-    "boto3>=1.43.123",
+    "boto3>=1.43.124",
     "apscheduler>=3.11.3",
     "fastapi>=0.162.0",
     "requests>=2.34.2",
@@ -128,7 +128,7 @@ test = [
 # in-memory SQLite (built into Python) and needs neither; set
 # JASIL_TEST_DATABASE_URL to run the suite against another backend.
 test-db = [
-    "psycopg[binary]>=3.3.6",
+    "psycopg[binary]>=3.3.8",
     "pymysql>=1.2.3",
 ]
 dev = [

@@ -39,6 +39,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from jasil._core.json_ids import stringify_uuids
 from jasil._core.limits import MAX_AUDIT_ID_LENGTH, check_length
 from jasil._core.timestamps import as_utc
 
@@ -78,7 +79,8 @@ MAX_SOURCE_LENGTH = 50
 class Event:
     """Envelope wrapping every event in the system.
 
-    ``payload`` and ``metadata`` are stored and transmitted verbatim: both are
+    ``payload`` and ``metadata`` are stored and transmitted as given, except that a
+    :class:`uuid.UUID` anywhere in them becomes its string. Both are
     written to ``event_outbox`` and ``processing_jobs``, to ``event_log`` when the
     trail is enabled, and serialized onto the Redis stream on the ``redis://``
     bus — and ``metadata`` is additionally logged in full when a best-effort
@@ -125,17 +127,22 @@ class Event:
     continuation_count: int = 0
 
     def __post_init__(self) -> None:
-        """Refuse a payload or metadata that is not a dict.
+        """Refuse a payload or metadata that is not a dict, and store any UUID in them as a string.
 
         Both are written to JSON columns that accept any JSON value, and read back with ``dict(...)``, so a
         list stored today would fail the outbox relay's read on every pass and stall everything queued behind it.
+        JSON has no UUID, so each :class:`uuid.UUID` anywhere in them is replaced by its canonical string, and
+        every route (in-process, outbox, durable job, event log, Redis) then delivers the same value.
 
         Raises:
             TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
+            ValueError: When a dict in them holds a UUID key and the string of that UUID as another key.
         """
         for name in ("payload", "metadata"):
-            if not isinstance(getattr(self, name), dict):
-                raise TypeError(f"{name} must be a dict, not {type(getattr(self, name)).__name__}")
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} must be a dict, not {type(value).__name__}")
+            object.__setattr__(self, name, stringify_uuids(value))
 
     @property
     def attempt(self) -> int | None:
@@ -178,7 +185,8 @@ def new_event(
 
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
-            than the column it is persisted in.
+            than the column it is persisted in, or a dict in ``payload`` or
+            ``metadata`` holds a UUID key and the string of that UUID as another key.
         ValueError: When the ``metadata`` :data:`META_SCOPE` is longer than an
             audit row's scope or contains a NUL character.
         TypeError: When ``payload`` or ``metadata`` is not a ``dict``, or the

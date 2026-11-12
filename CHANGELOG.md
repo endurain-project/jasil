@@ -8,6 +8,19 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-12
+
+This release lets an event's payload and metadata, and a realtime hint, hold UUIDs. It also updates the locked development dependencies and the pinned `uv` of the publish workflow. Nothing in the public API is removed or renamed, and no migration is added.
+
+### Added
+
+- **An event's payload and metadata may hold UUIDs.** A `uuid.UUID` anywhere in them (a value, a nested dict, list or tuple, or a dict key) is replaced by its canonical string when the `Event` is built. It raised `TypeError` at the write before: on the Redis bus, in the outbox, in durable jobs and in the event log. Every route now delivers the same `str`, so a handler never sees a `UUID` on one route and a `str` on another. A dict holding a UUID key and the string of that UUID as another key raises `ValueError` instead of silently merging the two entries. Other values JSON cannot encode are still refused. See [Events and the outbox](docs/events-and-outbox.md).
+- **A realtime hint may hold UUIDs.** `RealtimeProvider.notify` sends a `uuid.UUID` anywhere in a hint as its string, on both backends. It raised `ValueError` ("hint is not JSON-serialisable") before; a hint dict with a UUID key and the string of that UUID as another key still raises `ValueError`. See [Providers and backends](docs/providers-and-backends.md).
+
+### Changed
+
+- **Updated the locked dependencies and raised the development-group floors to match.** `uv.lock` moves to the newest releases outside the 7-day cooldown (among them SQLAlchemy 2.1.8, Pydantic 2.14.3, psycopg 3.3.8, boto3 1.43.124 and ty 0.0.97), and the `ty`, `boto3`, `boto3-stubs` and `test-db` `psycopg` floors follow. The runtime and extras floors are unchanged, so installing JASIL accepts the same versions as before. The publish workflow pins `uv` 0.13.7, up from 0.13.6.
+
 ## [0.19.0] - 2026-11-09
 
 This release lets a host partition its audit trail by tenant: an audit row carries an opaque `scope`, checkpoints cover it, and an event can hand it to the handlers that process it. Durable and Redis bus event handlers now run in one consistent context, a handler's failure no longer makes the in-process `publish()` report a failure, and a durable-job worker never claims a job it has no handler for. On MySQL and MariaDB timestamps keep microseconds. Four security issues are fixed, in mail headers, local storage, storage keys and geocoding, along with races in local storage and errors in Redis state, S3, audit checkpoints, cursors and migrations. Two migrations are added (`rev0011`, `rev0012`), and some values and filesystems that were accepted before are refused; see **Upgrading**.
