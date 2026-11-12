@@ -25,11 +25,18 @@ def stringify_uuids(value: Any) -> Any:
 
     Returns:
         The value with its UUIDs as strings.
+
+    Raises:
+        ValueError: When a dict holds a UUID key and the string of that UUID as another key, which would merge
+            into one entry and lose a value. The message never names the keys or values.
     """
     if isinstance(value, uuid.UUID):
         return str(value)
     if isinstance(value, dict):
-        return {stringify_uuids(key): stringify_uuids(item) for key, item in value.items()}
+        converted = {stringify_uuids(key): stringify_uuids(item) for key, item in value.items()}
+        if len(converted) != len(value):
+            raise ValueError("two dict keys become the same string once UUIDs are converted")
+        return converted
     if isinstance(value, list):
         return [stringify_uuids(item) for item in value]
     if isinstance(value, tuple):

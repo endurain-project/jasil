@@ -72,8 +72,9 @@ inlining it.
 
 **UUIDs are allowed.** A `uuid.UUID` anywhere in `payload` or `metadata` (as a
 value, in a nested dict, list or tuple, or as a dict key) is replaced by its
-canonical string when the `Event` is built, so every route carries the same
-value: a subscriber receives a `str`, never a `UUID`, whether the event arrives
+canonical string when the `Event` is built (a dict holding a UUID key and the
+string of that same UUID as another key raises `ValueError`, rather than
+merging into one entry), so every route carries the same value: a subscriber receives a `str`, never a `UUID`, whether the event arrives
 in process, from the outbox, as a durable job or from Redis. Other values JSON
 cannot encode, such as a `datetime`, `Decimal` or `set`, are still refused at
 the write.

@@ -74,6 +74,12 @@ class TestEnvelope:
 
         assert json.loads(encoded)["hint"] == {"id": str(uuid.UUID(int=1)), "ids": [str(uuid.UUID(int=2))]}
 
+    def test_a_uuid_key_and_its_string_key_in_a_hint_are_refused(self):
+        hint = {uuid.UUID(int=1): "first", str(uuid.UUID(int=1)): "second"}
+
+        with pytest.raises(ValueError, match="same string"):
+            realtime_envelope.encode("k", hint)
+
     @pytest.mark.parametrize("hint", [["a"], "a", None])
     def test_a_hint_that_is_not_a_dict_is_refused(self, hint):
         with pytest.raises(ValueError, match="hint must be a dict"):

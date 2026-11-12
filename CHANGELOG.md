@@ -14,8 +14,8 @@ This release lets an event's payload and metadata, and a realtime hint, hold UUI
 
 ### Added
 
-- **An event's payload and metadata may hold UUIDs.** A `uuid.UUID` anywhere in them (a value, a nested dict, list or tuple, or a dict key) is replaced by its canonical string when the `Event` is built. It raised `TypeError` at the write before: on the Redis bus, in the outbox, in durable jobs and in the event log. Every route now delivers the same `str`, so a handler never sees a `UUID` on one route and a `str` on another. Other values JSON cannot encode are still refused. See [Events and the outbox](docs/events-and-outbox.md).
-- **A realtime hint may hold UUIDs.** `RealtimeProvider.notify` sends a `uuid.UUID` anywhere in a hint as its string, on both backends. It raised `ValueError` ("hint is not JSON-serialisable") before. See [Providers and backends](docs/providers-and-backends.md).
+- **An event's payload and metadata may hold UUIDs.** A `uuid.UUID` anywhere in them (a value, a nested dict, list or tuple, or a dict key) is replaced by its canonical string when the `Event` is built. It raised `TypeError` at the write before: on the Redis bus, in the outbox, in durable jobs and in the event log. Every route now delivers the same `str`, so a handler never sees a `UUID` on one route and a `str` on another. A dict holding a UUID key and the string of that UUID as another key raises `ValueError` instead of silently merging the two entries. Other values JSON cannot encode are still refused. See [Events and the outbox](docs/events-and-outbox.md).
+- **A realtime hint may hold UUIDs.** `RealtimeProvider.notify` sends a `uuid.UUID` anywhere in a hint as its string, on both backends. It raised `ValueError` ("hint is not JSON-serialisable") before; a hint dict with a UUID key and the string of that UUID as another key still raises `ValueError`. See [Providers and backends](docs/providers-and-backends.md).
 
 ### Changed
 

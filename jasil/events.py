@@ -136,6 +136,7 @@ class Event:
 
         Raises:
             TypeError: When ``payload`` or ``metadata`` is not a ``dict``.
+            ValueError: When a dict in them holds a UUID key and the string of that UUID as another key.
         """
         for name in ("payload", "metadata"):
             value = getattr(self, name)
@@ -184,7 +185,8 @@ def new_event(
 
     Raises:
         ValueError: When ``event_id``, ``event_type`` or ``source`` is longer
-            than the column it is persisted in.
+            than the column it is persisted in, or a dict in ``payload`` or
+            ``metadata`` holds a UUID key and the string of that UUID as another key.
         ValueError: When the ``metadata`` :data:`META_SCOPE` is longer than an
             audit row's scope or contains a NUL character.
         TypeError: When ``payload`` or ``metadata`` is not a ``dict``, or the

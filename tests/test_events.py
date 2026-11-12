@@ -239,6 +239,25 @@ class TestUuidValues:
 
         assert event.payload == {"id": self.TEXT}
 
+    def test_a_uuid_key_and_its_string_key_are_refused_rather_than_merged(self):
+        payload = {self.ID: "first", self.TEXT: "second"}
+
+        with pytest.raises(ValueError, match="same string") as exc_info:
+            new_event("activity.created", payload, source="test")
+
+        assert "first" not in str(exc_info.value)
+        assert "second" not in str(exc_info.value)
+
+    def test_a_key_collision_in_a_nested_dict_is_refused(self):
+        payload = {"a": [{self.ID: 1, self.TEXT: 2}]}
+
+        with pytest.raises(ValueError, match="same string"):
+            new_event("activity.created", payload, source="test")
+
+    def test_a_key_collision_in_the_metadata_is_refused(self):
+        with pytest.raises(ValueError, match="same string"):
+            new_event("activity.created", {}, source="test", metadata={self.ID: 1, self.TEXT: 2})
+
     def test_a_value_that_is_still_not_json_native_is_left_for_the_writer_to_refuse(self):
         marker = object()
 
