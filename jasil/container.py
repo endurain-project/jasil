@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 import jasil._core.network as network
 import jasil._core.redis_clients as redis_clients
+import jasil._core.state_keys as state_keys
 import jasil.capabilities as capabilities
 from jasil._core.mail_problems import SMTP_PORTS, MailProblemCode, mail_problems
 from jasil._reloading import ReloadingGeocoding, ReloadingMail, TransientBuildError
@@ -198,12 +199,15 @@ def build_platform(
     # Built first: it does no I/O beyond a DNS lookup (``secure=False`` only), so a
     # mistyped mail setting fails before any Redis client is connected and left open.
     mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
-    geocoding = (
-        _build_runtime_geocoding(settings, sources.geocoding) if sources.geocoding else _build_geocoding(settings)
-    )
     with redis_clients.track_acquisitions() as shared_redis:
         try:
             state = _build_state(settings)
+            # After the state, which holds its rate gate. It never raises for a bad setting: it disables itself.
+            geocoding = (
+                _build_runtime_geocoding(settings, state, clock, sources.geocoding)
+                if sources.geocoding
+                else _build_geocoding(settings, state, clock)
+            )
             storage = _build_storage(settings)
             events = _build_events(settings, recorder)
             lock = _build_lock(settings)
@@ -363,10 +367,17 @@ def _build_lock(settings: JasilSettings) -> LockProvider:
     raise _unsupported_scheme("lock_uri", lock_uri)
 
 
-def _build_runtime_geocoding(settings: JasilSettings, source: Callable[[], GeocodingSettings]) -> ReloadingGeocoding:
-    """Wrap ``source`` so geocoding is rebuilt, with the captured network policy, when it changes."""
+def _build_runtime_geocoding(
+    settings: JasilSettings, state: StateProvider, clock: ClockProvider, source: Callable[[], GeocodingSettings]
+) -> ReloadingGeocoding:
+    """Wrap ``source`` so geocoding is rebuilt, with the captured network policy, when it changes.
+
+    Every rebuild shares ``state``, so a reload keeps the upstream's rate budget.
+    """
     return ReloadingGeocoding(
-        source, lambda fresh: _build_geocoding(replace(settings, geocoding=fresh), retry_unresolved=True)
+        source,
+        lambda fresh: _build_geocoding(replace(settings, geocoding=fresh), state, clock, retry_unresolved=True),
+        clock,
     )
 
 
@@ -394,7 +405,9 @@ def _build_runtime_mail(
     return ReloadingMail(source, build)
 
 
-def _build_geocoding(settings: JasilSettings, *, retry_unresolved: bool = False) -> GeocodingProvider:
+def _build_geocoding(
+    settings: JasilSettings, state: StateProvider, clock: ClockProvider, *, retry_unresolved: bool = False
+) -> GeocodingProvider:
     """Resolve the reverse-geocoding backend, falling back to a no-op.
 
     Unlike the other capabilities this never raises on a bad configuration:
@@ -410,6 +423,8 @@ def _build_geocoding(settings: JasilSettings, *, retry_unresolved: bool = False)
 
     Args:
         settings: The application settings.
+        state: The platform's state, which holds the rate gate every backend for one upstream shares.
+        clock: The platform clock.
         retry_unresolved: Raise :class:`TransientBuildError` instead of falling back
             when the host does not resolve, for a caller that will try again.
 
@@ -423,6 +438,12 @@ def _build_geocoding(settings: JasilSettings, *, retry_unresolved: bool = False)
     if not geo.uri:
         # Unset means "not wanted", not "misconfigured" — so this stays quiet.
         logger.debug("Reverse geocoding is not configured; using the no-op backend")
+        return NullGeocoding()
+    if min_interval > state_keys.MAX_SLOT_INTERVAL_SECONDS:
+        logger.warning(
+            "geocoding.rate_limit allows fewer than one request a day; reverse geocoding is disabled. "
+            "Set it to <= 0 to disable throttling."
+        )
         return NullGeocoding()
 
     # The URI is never echoed: it is operator input, and keeping it out of the
@@ -476,6 +497,8 @@ def _build_geocoding(settings: JasilSettings, *, retry_unresolved: bool = False)
     return HttpGeocoding(
         service,
         base_url,
+        state=state,
+        clock=clock,
         api_key=api_key,
         min_interval_seconds=min_interval,
         user_agent=geo.user_agent,

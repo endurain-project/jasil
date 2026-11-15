@@ -16,9 +16,13 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 
+import jasil._core.state_keys as state_keys
 from jasil.providers import (
+    ClockProvider,
     GeocodedPlace,
+    GeocodingOutcome,
     GeocodingProvider,
     MailError,
     MailFailure,
@@ -192,14 +196,24 @@ class ReloadingMail:
 
 
 class ReloadingGeocoding:
-    """``GeocodingProvider`` that reverses through the backend the latest settings describe."""
+    """``GeocodingProvider`` that reverses through the backend the latest settings describe.
+
+    Args:
+        source: Returns the current geocoding settings; may raise.
+        build: Builds a backend from settings.
+        clock: Sets ``retry_at`` when the settings cannot be loaded or verified.
+    """
 
     def __init__(
-        self, source: Callable[[], GeocodingSettings], build: Callable[[GeocodingSettings], GeocodingProvider]
+        self,
+        source: Callable[[], GeocodingSettings],
+        build: Callable[[GeocodingSettings], GeocodingProvider],
+        clock: ClockProvider,
     ) -> None:
         self._backend: ReloadingBackend[GeocodingSettings, GeocodingProvider] = ReloadingBackend(
             "Geocoding", source, build
         )
+        self._clock = clock
 
     def current_backend(self) -> GeocodingProvider | None:
         """The backend built from the latest settings, without consulting the source."""
@@ -214,3 +228,27 @@ class ReloadingGeocoding:
         if outcome.backend is None:
             return None
         return outcome.backend.reverse(latitude, longitude)
+
+    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+        """Look up through the current backend.
+
+        Settings that could not be loaded, or a host that could not be resolved to verify them, may work on a
+        later call, so they say to retry after :data:`TRANSIENT_RETRY_SECONDS`. Rejected or unset settings are
+        a final answer of nothing, as ``NullGeocoding`` gives.
+
+        Raises:
+            ValueError: When ``max_wait_seconds`` is negative or not finite.
+        """
+        state_keys.check_max_wait(max_wait_seconds)
+        try:
+            outcome = self._backend.resolve()
+        except SourceUnavailableError:
+            return self._retry_later()
+        if outcome.transient:
+            return self._retry_later()
+        if outcome.backend is None:
+            return GeocodingOutcome()
+        return outcome.backend.lookup(latitude, longitude, max_wait_seconds=max_wait_seconds)
+
+    def _retry_later(self) -> GeocodingOutcome:
+        return GeocodingOutcome(retry_at=self._clock.now() + timedelta(seconds=TRANSIENT_RETRY_SECONDS))

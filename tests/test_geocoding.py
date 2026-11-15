@@ -17,12 +17,15 @@ intercepts the requests.
 
 import contextlib
 import itertools
+import math
 import os
 import socket
 import ssl
 import threading
+from datetime import timedelta
 
 import pytest
+import requests
 import responses
 
 import jasil._core.network as network
@@ -34,7 +37,9 @@ from jasil.backends.geocoding_http import (
     _failure_detail,
     resolve_reverse_endpoint,
 )
-from jasil.providers import GeocodedPlace, GeocodingProvider
+from jasil.backends.state_memory import MemoryState
+from jasil.providers import GeocodedPlace, GeocodingOutcome, GeocodingProvider, StateBackendUnavailableError
+from jasil.testing import FixedClock
 
 # Windows: shutdown() does not wake a thread blocked in recv(), so the watchdog cannot interrupt a read there; only the per-read timeout bounds one.
 CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
@@ -43,6 +48,14 @@ CANNOT_INTERRUPT_A_READ = pytest.mark.skipif(
 
 PUBLIC_IP = "93.184.216.34"
 PRIVATE_IP = "10.0.0.5"
+URL = "https://geo.test/reverse"
+
+
+def _geocoder(service="nominatim", base_url=URL, *, state=None, clock=None, **kwargs) -> HttpGeocoding:
+    """An ``HttpGeocoding`` on a gate of its own, unless the test shares one."""
+    return HttpGeocoding(
+        service, base_url, state=state if state is not None else MemoryState(), clock=clock or FixedClock(), **kwargs
+    )
 
 
 @pytest.fixture
@@ -67,6 +80,14 @@ class TestNullGeocoding:
     def test_it_resolves_nothing(self):
         """'Disabled' is an explicit backend so callers never branch on availability."""
         assert NullGeocoding().reverse(38.7, -9.1) is None
+
+    def test_a_lookup_is_a_final_answer_of_nothing(self):
+        assert NullGeocoding().lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    @pytest.mark.parametrize("max_wait", [-1.0, math.inf, math.nan])
+    def test_a_lookup_refuses_a_max_wait_out_of_range(self, max_wait):
+        with pytest.raises(ValueError, match="max_wait_seconds"):
+            NullGeocoding().lookup(38.7, -9.1, max_wait_seconds=max_wait)
 
 
 class TestEndpointConstruction:
@@ -187,18 +208,18 @@ class TestUrlBuilding:
         ],
     )
     def test_each_service_gets_its_own_query(self, service, expected):
-        backend = HttpGeocoding(service, "https://geo.test/reverse")
+        backend = _geocoder(service, "https://geo.test/reverse")
 
         assert backend._build_url(38.7, -9.1) == f"https://geo.test/reverse?{expected}"
 
     def test_the_api_key_is_sent_where_one_is_required(self):
-        backend = HttpGeocoding("geocode", "https://geo.test/reverse", api_key="secret")
+        backend = _geocoder("geocode", "https://geo.test/reverse", api_key="secret")
 
         assert "api_key=secret" in backend._build_url(38.7, -9.1)
 
     def test_a_missing_api_key_still_produces_a_url(self):
         """The container refuses this combination; the backend must not crash on it."""
-        backend = HttpGeocoding("geocode", "https://geo.test/reverse")
+        backend = _geocoder("geocode", "https://geo.test/reverse")
 
         assert "api_key=" in backend._build_url(38.7, -9.1)
 
@@ -206,7 +227,7 @@ class TestUrlBuilding:
 class TestResponseParsing:
     @pytest.fixture
     def backend(self):
-        return HttpGeocoding("nominatim", "https://geo.test/reverse")
+        return _geocoder("nominatim", "https://geo.test/reverse")
 
     @responses.activate
     def test_a_nominatim_answer_is_mapped(self, backend):
@@ -256,7 +277,7 @@ class TestResponseParsing:
     @responses.activate
     def test_a_photon_answer_is_mapped(self):
         """Photon names things differently, but lands on the same levels."""
-        backend = HttpGeocoding("photon", "https://geo.test/reverse")
+        backend = _geocoder("photon", "https://geo.test/reverse")
         responses.add(
             responses.GET,
             "https://geo.test/reverse",
@@ -281,7 +302,7 @@ class TestResponseParsing:
 
     @responses.activate
     def test_an_empty_photon_feature_list_resolves_to_nothing(self):
-        backend = HttpGeocoding("photon", "https://geo.test/reverse")
+        backend = _geocoder("photon", "https://geo.test/reverse")
         responses.add(responses.GET, "https://geo.test/reverse", json={"features": []})
 
         assert backend.reverse(38.7, -9.1) is None
@@ -339,7 +360,7 @@ class TestResponseParsing:
 class TestRequestBehaviour:
     @pytest.fixture
     def backend(self):
-        return HttpGeocoding("nominatim", "https://geo.test/reverse", user_agent="my-app/1.0")
+        return _geocoder("nominatim", "https://geo.test/reverse", user_agent="my-app/1.0")
 
     @responses.activate
     def test_the_user_agent_identifies_the_caller(self, backend):
@@ -379,7 +400,7 @@ class TestEnvironmentProxies:
     def test_a_cleartext_request_ignores_an_environment_proxy(self):
         responses.add(responses.GET, "http://10.0.0.5/reverse", json={"address": {"country": "Portugal"}})
 
-        HttpGeocoding("nominatim", "http://10.0.0.5/reverse").reverse(38.7, -9.1)
+        _geocoder("nominatim", "http://10.0.0.5/reverse").reverse(38.7, -9.1)
 
         assert not responses.calls[0].request.req_kwargs["proxies"]
 
@@ -387,7 +408,7 @@ class TestEnvironmentProxies:
     def test_an_https_request_goes_through_an_environment_proxy(self):
         responses.add(responses.GET, "https://geo.test/reverse", json={"address": {"country": "Portugal"}})
 
-        HttpGeocoding("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1)
+        _geocoder("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1)
 
         assert responses.calls[0].request.req_kwargs["proxies"]["https"] == "http://proxy.test:3128"
 
@@ -397,7 +418,7 @@ class TestFailuresNeverPropagate:
 
     @pytest.fixture
     def backend(self):
-        return HttpGeocoding("nominatim", "https://geo.test/reverse")
+        return _geocoder("nominatim", "https://geo.test/reverse")
 
     @responses.activate
     @pytest.mark.parametrize("status", [400, 401, 429, 500, 503])
@@ -437,7 +458,7 @@ class TestTheFailureLogIsRedacted:
     @responses.activate
     @pytest.mark.parametrize("status", [401, 403, 429, 500])
     def test_the_api_key_never_reaches_the_log(self, status, caplog):
-        backend = HttpGeocoding("geocode", "https://geo.test/reverse", api_key="super-secret-key")
+        backend = _geocoder("geocode", "https://geo.test/reverse", api_key="super-secret-key")
         responses.add(responses.GET, "https://geo.test/reverse", status=status, json={})
 
         with caplog.at_level("ERROR"):
@@ -449,7 +470,7 @@ class TestTheFailureLogIsRedacted:
     @responses.activate
     def test_the_status_code_survives_the_redaction(self, caplog):
         """An operator still has to be able to tell a 401 from a 429."""
-        backend = HttpGeocoding("nominatim", "https://geo.test/reverse")
+        backend = _geocoder("nominatim", "https://geo.test/reverse")
         responses.add(responses.GET, "https://geo.test/reverse", status=429, json={})
 
         with caplog.at_level("ERROR"):
@@ -474,7 +495,7 @@ class TestTheResponseBodyIsCapped:
 
     @pytest.fixture
     def backend(self):
-        return HttpGeocoding("nominatim", "https://geo.test/reverse")
+        return _geocoder("nominatim", "https://geo.test/reverse")
 
     @responses.activate
     def test_an_oversized_body_resolves_to_none(self, backend, caplog):
@@ -519,7 +540,7 @@ class TestTheTransferHasADeadline:
         )
 
         with caplog.at_level("ERROR"):
-            assert HttpGeocoding("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1) is None
+            assert _geocoder("nominatim", "https://geo.test/reverse").reverse(38.7, -9.1) is None
 
         assert "TimeoutError" in caplog.text
 
@@ -613,7 +634,7 @@ class TestTheWatchdog:
         monkeypatch.setattr("urllib3.util.connection.create_connection", lambda *args, **kwargs: ours)
         try:
             with caplog.at_level("ERROR"):
-                assert HttpGeocoding("nominatim", "http://geo.test/reverse").reverse(38.7, -9.1) is None
+                assert _geocoder("nominatim", "http://geo.test/reverse").reverse(38.7, -9.1) is None
         finally:
             ours.close()
             theirs.close()
@@ -632,50 +653,273 @@ class TestTheWatchedAdapter:
         assert proxy_manager.pool_classes_by_scheme == adapter.poolmanager.pool_classes_by_scheme
 
 
-class TestThrottling:
-    def test_no_rate_limit_means_no_wait(self, monkeypatch):
-        slept = []
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", slept.append)
-        backend = HttpGeocoding("nominatim", "https://geo.test/reverse", min_interval_seconds=0)
+PORTUGAL = {"address": {"country": "Portugal"}}
 
-        backend._throttle()
-        backend._throttle()
+
+@pytest.fixture
+def slept(monkeypatch):
+    """Record each wait instead of sleeping, on a monotonic clock that stands still."""
+    waits = []
+    monkeypatch.setattr(geocoding_http.time, "sleep", waits.append)
+    monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0)
+    return waits
+
+
+class TestTheRateGate:
+    """One budget per upstream, shared by every backend on the same state, so N processes never send N times the
+    rate and a settings reload does not reset it."""
+
+    @responses.activate
+    def test_no_rate_limit_means_no_wait(self, slept):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(min_interval_seconds=0)
+
+        backend.reverse(38.7, -9.1)
+        backend.reverse(38.7, -9.1)
 
         assert slept == []
+        assert len(responses.calls) == 2
 
-    def test_a_second_call_waits_out_the_interval(self, monkeypatch):
+    @responses.activate
+    def test_a_second_call_waits_out_the_interval(self, slept):
         """Nominatim's policy is one request per second; exceeding it gets you banned."""
-        slept = []
-        clock = iter([100.0, 100.0, 100.2, 100.2])
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.monotonic", lambda: next(clock))
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", slept.append)
-        backend = HttpGeocoding("nominatim", "https://geo.test/reverse", min_interval_seconds=1.0)
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(min_interval_seconds=1.0)
 
-        backend._throttle()
-        backend._throttle()
+        backend.reverse(38.7, -9.1)
+        backend.reverse(38.7, -9.1)
 
-        assert slept == [pytest.approx(0.8)]
+        assert slept == [pytest.approx(1.0)]
 
-    def test_a_call_after_the_interval_does_not_wait(self, monkeypatch):
-        slept = []
-        clock = iter([100.0, 100.0, 105.0, 105.0])
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.monotonic", lambda: next(clock))
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", slept.append)
-        backend = HttpGeocoding("nominatim", "https://geo.test/reverse", min_interval_seconds=1.0)
+    @responses.activate
+    def test_two_backends_on_one_state_share_the_budget(self, slept):
+        """What two processes on one Redis, or a backend and its rebuild after a reload, look like."""
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        state = MemoryState()
+        first = _geocoder(state=state, min_interval_seconds=1.0)
+        second = _geocoder(state=state, min_interval_seconds=1.0)
 
-        backend._throttle()
-        backend._throttle()
+        first.reverse(38.7, -9.1)
+        second.reverse(38.7, -9.1)
+
+        assert slept == [pytest.approx(1.0)]
+        assert state.get("jasil:geocoding:gate:nominatim:geo.test") is not None
+
+    def test_the_host_is_matched_without_regard_to_case(self):
+        """``GEO.test`` and ``geo.test`` are one upstream, so a spelling must not split its budget or back-off."""
+        upper, lower = _geocoder(base_url="https://GEO.test/reverse"), _geocoder()
+
+        assert (upper._gate_key, upper._back_off_key) == (lower._gate_key, lower._back_off_key)
+
+    @responses.activate
+    def test_a_back_off_recorded_while_waiting_for_a_slot_stops_the_request(self, monkeypatch):
+        """A peer's 429 can arrive while this request sleeps for its slot; it must not then send anyway."""
+        monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0)
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        clock, state = FixedClock(), MemoryState()
+        backend = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
+        peer = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
+        state.reserve_slot(backend._gate_key, 1.0, max_wait_seconds=0)  # the next slot is a second away
+        monkeypatch.setattr(geocoding_http.time, "sleep", lambda _seconds: peer._back_off("120"))
+
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
+
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=120))
+        assert len(responses.calls) == 0
+
+    @responses.activate
+    def test_backends_for_different_hosts_do_not_share_a_budget(self, slept):
+        responses.add(responses.GET, "https://a.test/reverse", json=PORTUGAL)
+        responses.add(responses.GET, "https://b.test/reverse", json=PORTUGAL)
+        state = MemoryState()
+
+        _geocoder(base_url="https://a.test/reverse", state=state, min_interval_seconds=1.0).reverse(38.7, -9.1)
+        _geocoder(base_url="https://b.test/reverse", state=state, min_interval_seconds=1.0).reverse(38.7, -9.1)
 
         assert slept == []
 
-    def test_two_backends_do_not_throttle_each_other(self, monkeypatch):
-        """Throttle state is per-instance, so one capability cannot stall another."""
-        slept = []
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", slept.append)
-        first = HttpGeocoding("nominatim", "https://a.test/reverse", min_interval_seconds=1.0)
-        second = HttpGeocoding("photon", "https://b.test/reverse", min_interval_seconds=1.0)
+    @responses.activate
+    def test_a_wait_past_the_bound_says_when_to_retry_without_sending(self, slept):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        clock = FixedClock()
+        backend = _geocoder(clock=clock, min_interval_seconds=1.0)
+        backend.lookup(38.7, -9.1, max_wait_seconds=0)
 
-        first._throttle()
-        second._throttle()
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0.5)
 
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=1))
+        assert len(responses.calls) == 1
         assert slept == []
+
+    @responses.activate
+    def test_reverse_gives_up_on_a_wait_past_its_bound(self, slept):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(min_interval_seconds=geocoding_http._REVERSE_MAX_WAIT_SECONDS + 1)
+        backend.reverse(38.7, -9.1)
+
+        assert backend.reverse(38.7, -9.1) is None
+        assert len(responses.calls) == 1
+        assert slept == []
+
+    @responses.activate
+    def test_an_unreachable_state_defers_without_sending(self, caplog):
+        class _Down(MemoryState):
+            def reserve_slot(self, key, interval_seconds, *, max_wait_seconds):
+                raise StateBackendUnavailableError("down")
+
+        clock = FixedClock()
+        backend = _geocoder(state=_Down(), clock=clock, min_interval_seconds=1.0)
+
+        with caplog.at_level("ERROR"):
+            outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
+
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=geocoding_http._RETRY_BACKOFF_SECONDS))
+        assert len(responses.calls) == 0
+        assert "StateBackendUnavailableError" in caplog.text
+
+    @pytest.mark.parametrize("max_wait", [-1.0, math.inf, math.nan])
+    def test_a_max_wait_out_of_range_is_refused(self, max_wait):
+        with pytest.raises(ValueError, match="max_wait_seconds"):
+            _geocoder().lookup(38.7, -9.1, max_wait_seconds=max_wait)
+
+
+class TestLookupOutcomes:
+    """``retry_at`` separates "ask again later" from "there is nothing here", so a host never records a throttled
+    or failed request as a permanent miss."""
+
+    @pytest.fixture
+    def clock(self):
+        return FixedClock()
+
+    @pytest.fixture
+    def state(self):
+        return MemoryState()
+
+    @pytest.fixture
+    def backend(self, clock, state):
+        return _geocoder(clock=clock, state=state)
+
+    def _after(self, clock, seconds):
+        return clock.now() + timedelta(seconds=seconds)
+
+    @responses.activate
+    def test_a_resolved_place_is_final(self, backend):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(GeocodedPlace(country="Portugal"))
+
+    @responses.activate
+    def test_an_answer_with_nothing_is_final(self, backend):
+        responses.add(responses.GET, URL, json={})
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [429, 503])
+    @pytest.mark.parametrize(
+        ("retry_after", "seconds"),
+        [
+            ("120", 120),
+            ("Thu, 01 Jan 2026 12:05:00 GMT", 300),
+            (None, geocoding_http._RETRY_BACKOFF_SECONDS),
+            ("soon", geocoding_http._RETRY_BACKOFF_SECONDS),
+            ("999999999", geocoding_http._MAX_RETRY_AFTER_SECONDS),
+            ("Thu, 01 Jan 2026 11:00:00 GMT", 0),
+        ],
+        ids=["delta-seconds", "http-date", "absent", "unreadable", "clamped", "past"],
+    )
+    def test_a_throttled_answer_says_when_to_retry(self, backend, clock, status, retry_after, seconds):
+        headers = {"Retry-After": retry_after} if retry_after is not None else {}
+        responses.add(responses.GET, URL, status=status, headers=headers, json={})
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, self._after(clock, seconds))
+
+    @responses.activate
+    def test_a_throttled_answer_holds_back_every_backend_on_the_state(self, backend, clock, state):
+        """An upstream that keeps being called after a 429 bans the client; every process backs off together."""
+        responses.add(responses.GET, URL, status=429, headers={"Retry-After": "120"}, json={})
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend.lookup(38.7, -9.1, max_wait_seconds=0)
+        peer = _geocoder(clock=clock, state=state)
+
+        assert peer.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, self._after(clock, 120))
+        assert len(responses.calls) == 1
+
+        clock.advance(121)
+
+        assert peer.lookup(38.7, -9.1, max_wait_seconds=0).place == GeocodedPlace(country="Portugal")
+
+    def test_a_shorter_back_off_never_cuts_a_longer_one_short(self, backend, clock):
+        """Two requests in flight can come back with different ``Retry-After`` values, in either order."""
+        backend._back_off("3600")
+        backend._back_off("60")
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, self._after(clock, 3600))
+
+    @responses.activate
+    def test_a_back_off_that_cannot_be_shared_still_says_when_to_retry(self, clock, caplog):
+        class _ReadOnly(MemoryState):
+            def index_add(self, key, member, score, ttl_seconds):
+                raise StateBackendUnavailableError("down")
+
+        responses.add(responses.GET, URL, status=429, headers={"Retry-After": "120"}, json={})
+        backend = _geocoder(clock=clock, state=_ReadOnly())
+
+        with caplog.at_level("ERROR"):
+            outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
+
+        assert outcome == GeocodingOutcome(None, self._after(clock, 120))
+        assert "StateBackendUnavailableError" in caplog.text
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [500, 502, 504])
+    def test_a_server_error_says_when_to_retry_without_holding_back_the_others(self, backend, clock, status):
+        responses.add(responses.GET, URL, status=status, json={})
+        responses.add(responses.GET, URL, json=PORTUGAL)
+
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
+
+        assert outcome == GeocodingOutcome(None, self._after(clock, geocoding_http._RETRY_BACKOFF_SECONDS))
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0).place == GeocodedPlace(country="Portugal")
+
+    @responses.activate
+    @pytest.mark.parametrize(
+        "failure", [requests.Timeout("slow"), requests.ConnectionError("refused")], ids=["timeout", "connection"]
+    )
+    def test_a_transport_failure_says_when_to_retry(self, backend, clock, failure):
+        responses.add(responses.GET, URL, body=failure)
+
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
+
+        assert outcome == GeocodingOutcome(None, self._after(clock, geocoding_http._RETRY_BACKOFF_SECONDS))
+
+    @responses.activate
+    @pytest.mark.parametrize("status", [400, 401, 403, 404])
+    def test_a_refused_request_is_final(self, backend, status):
+        """A retry would be refused the same way; the operator reads why in the log."""
+        responses.add(responses.GET, URL, status=status, json={})
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    @responses.activate
+    def test_an_unparseable_answer_is_final(self, backend):
+        responses.add(responses.GET, URL, body="<html>not json</html>", status=200)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    def test_a_missing_requests_install_is_final(self, backend, monkeypatch):
+        monkeypatch.setitem(__import__("sys").modules, "requests", None)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    @responses.activate
+    def test_a_transfer_past_the_deadline_says_when_to_retry(self, backend, clock, monkeypatch):
+        ticks = itertools.count(1000, 10)  # every read of the clock is ten seconds after the last
+        monkeypatch.setattr("jasil.backends.geocoding_http.time.monotonic", lambda: next(ticks))
+        responses.add(
+            responses.GET, URL, json={"address": {"country": "Portugal", "note": "P" * (_MAX_RESPONSE_BYTES // 2)}}
+        )
+
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
+
+        assert outcome == GeocodingOutcome(None, self._after(clock, geocoding_http._RETRY_BACKOFF_SECONDS))

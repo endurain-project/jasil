@@ -324,7 +324,9 @@ class GeocodingSettings:
             :class:`NetworkSettings`). Unset disables the capability; so does
             any value that cannot be used, which is logged. Geocoding never
             fails the platform build.
-        rate_limit: Maximum requests per second, per process; ``<= 0`` disables throttling.
+        rate_limit: Maximum requests per second to the upstream, shared by every process on the platform's
+            state (every process on one Redis, or the one process on ``memory://``); ``<= 0`` disables
+            throttling, and a rate below one request a day disables geocoding.
         api_key: API key, for the services requiring one (geocode.maps.co).
         user_agent: ``User-Agent`` sent upstream. Nominatim's usage policy
             requires an identifying value, so hosts should set their own.

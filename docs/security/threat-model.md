@@ -227,6 +227,9 @@ never interpolated from input.
 - Stored failure text is truncated; the joined subscriber list is clamped to its
   column width.
 - The geocoding response body is capped (above).
+- A geocoding upstream's `Retry-After` is clamped to one hour. A 429 or 503 holds
+  back every process sharing the state, so an upstream that is hostile or broken
+  can pause geocoding for at most an hour per answer, and never forever.
 - Streaming and resumable storage writes accept a host-owned `max_bytes` limit.
   Resumable parts are read under an exact declared size and never buffered whole
   in memory: S3 stages a part in memory up to 8 MiB and in a temporary file

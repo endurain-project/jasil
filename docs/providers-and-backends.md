@@ -55,6 +55,40 @@ otherwise depend on the backend:
   the gate is closed a call gets the count back *without* incrementing, so
   hammering cannot push the count into the next tier and extend its own penalty.
 
+### Rate gates
+
+`reserve_slot(key, interval_seconds, *, max_wait_seconds)` admits one caller per
+interval, across every process sharing the state. Each call takes the next free
+slot: now, or one interval after the last slot reserved, whichever is later. When
+that slot is no more than `max_wait_seconds` away the call reserves it and returns
+a `SlotReservation(reserved=True, wait_seconds=...)`. The caller waits that long
+before it acts, or acts at once on `0.0`. Otherwise the call reserves nothing and
+returns `reserved=False` with the wait until the next free slot.
+
+```python
+from jasil import SlotReservation
+
+slot = platform.state.reserve_slot("upstream:gate", 0.5, max_wait_seconds=5)
+if slot.reserved:
+    time.sleep(slot.wait_seconds)
+    call_the_upstream()
+```
+
+- Concurrent callers get distinct slots one interval apart; none shares one.
+- `interval_seconds` is positive, finite and at most a day, precise to the
+  microsecond (`0.01` for 100 a second). `max_wait_seconds` is zero or more and
+  finite.
+- Every caller reads one clock: the process's monotonic clock in memory, and the
+  server's `TIME` on Redis, inside the one Lua script. Replicas whose own clocks
+  disagree still share one gate.
+- The gate is a plain value holding the last slot in whole microseconds. It
+  expires one interval after that slot, so an idle gate leaves nothing behind. It
+  raises `ValueError` on an index key, or a plain value that is not an integer.
+- Each call is O(1): under the lock in memory, one Lua script on Redis.
+
+The geocoding rate limit is one of these gates; see
+[GeocodingProvider](#geocodingprovider).
+
 ### Ordered indexes
 
 An index is a key holding members ordered by score, each member with its own
@@ -129,7 +163,8 @@ Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
 zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
 Redis it would match every key in the database) or one that overlaps the reserved
 index namespace, an index score or cursor score
-that is not finite, an `index_range` limit below 1, and an operation the stored
+that is not finite, an `index_range` limit below 1, a `reserve_slot` interval or
+wait bound out of range, and an operation the stored
 value does not support, such as `incr` of a non-integer, an index operation on a
 plain key or, on Redis, a key that holds another type. Counters are signed 64-bit integers on both: an `incr` or
 `record_tiered_failure` whose stored value, amount or result falls outside that
@@ -556,7 +591,8 @@ exists so time can be injected in tests without patching `datetime` globally —
 rows take "now" from the platform. The two state backends are the exception:
 `MemoryState` and `RedisState` read the process clock for expiry and for the
 lockout gate in `record_tiered_failure`, so a test of their expiry patches the
-clock the backend module reads.
+clock the backend module reads. `reserve_slot` on Redis reads the server's clock
+(`TIME`); fakeredis answers `TIME` from `time.time()`.
 
 ## GeocodingProvider
 
@@ -571,6 +607,69 @@ administrative levels, filled the same way whichever service answered:
 `region` (state or province), `country`, `country_code` (ISO 3166-1 alpha-2) and
 `display_name` (where the service supplies one). Map them onto your own
 vocabulary in your own code.
+
+### Lookups that say when to retry
+
+`reverse` returns `None` for "nothing here" and for "the upstream failed" alike.
+`lookup(latitude, longitude, *, max_wait_seconds)` tells them apart. It returns a
+`GeocodingOutcome(place, retry_at)`:
+
+- `place` set: the upstream answered with a place.
+- both `None`: the answer is final. There is nothing at this coordinate, or the
+  request is one a retry would not change.
+- `retry_at` set (`place` is `None`): no final answer yet; ask again at
+  `retry_at`, a timezone-aware UTC instant.
+
+```python
+from jasil.jobs import DeferJob
+
+outcome = platform.geocoding.lookup(latitude, longitude, max_wait_seconds=5)
+if outcome.retry_at is not None:
+    raise DeferJob(outcome.retry_at, reason="geocoding not available yet")
+save_place(outcome.place)  # None: nothing to resolve here
+```
+
+| What happened | `lookup` returns |
+|---|---|
+| A 2xx answer with a place | `place` |
+| A 2xx answer with nothing usable, or one that cannot be read | final: both `None` |
+| Another 4xx (400, 401, 403, 404, ...) or a 3xx (redirects are refused) | final: both `None`, logged |
+| No request slot free within `max_wait_seconds` | `retry_at` = when the next slot frees; nothing is sent |
+| 429 or 503 | `retry_at` from `Retry-After` (seconds or an HTTP-date), clamped to 1 hour; 60 seconds when absent or unreadable |
+| Another 5xx, a timeout, a refused or dropped connection, the 30-second deadline | `retry_at` 60 seconds ahead |
+| The state is unreachable | `retry_at` 60 seconds ahead; nothing is sent |
+
+`lookup` never raises for an upstream or state failure; a `max_wait_seconds` that
+is negative or not finite raises `ValueError`. `reverse` is `lookup` with a
+60-second wait bound, returning its `place`. `NullGeocoding.lookup` always returns
+a final `GeocodingOutcome(None, None)`.
+
+### One rate limit for the whole deployment
+
+`geocoding.rate_limit` is enforced by a [rate gate](#rate-gates) in the platform's
+state, under `jasil:geocoding:gate:{service}:{host}`, where host is the upstream's
+`host[:port]`, lower-cased. Every backend for the same upstream on the same state
+shares one budget:
+
+- With Redis state, every process on that Redis, API replicas and workers alike,
+  sends at most `rate_limit` requests a second in total.
+- With `memory://` state it is shared within the process, which is the only
+  process a `memory://` deployment has.
+- A settings reload builds a new backend on the same gate, so it keeps the budget.
+
+Each lookup costs one `index_range` of the back-off and, with a rate limit, one
+`reserve_slot` before it sends. A request that waits for its slot sleeps in the
+calling thread.
+
+A 429 or 503 holds back every backend on that gate, not only the one that got it.
+Each back-off is a member of an [ordered index](#ordered-indexes) under
+`jasil:geocoding:back-off:{service}:{host}`, scored by and expiring at its
+`Retry-After` instant, so a shorter back-off recorded after a longer one never
+cuts it short. Until the longest one ends, lookups return its `retry_at` without
+sending, including a lookup that was already waiting for its slot when the
+back-off arrived. An upstream that keeps being called after a 429 may ban the
+client. Each lookup reads the back-off with one `index_range`, again after any
+wait for its slot.
 
 Geocoding is the one capability that never fails startup: an unsupported
 scheme, a missing API key, or a host that fails SSRF validation disables the
@@ -588,7 +687,9 @@ capability exists.
 Geocoding settings can also come from a runtime source: see
 [Runtime sources](configuration.md#runtime-sources). `Platform.geocoding` is then a
 reloading provider that rebuilds when the settings change; it satisfies the same
-protocol, and returns `None` when the source fails and nothing worked before.
+protocol. When the source fails and nothing worked before, or the host could not
+be resolved, `reverse` returns `None` and `lookup` returns a `retry_at` 30 seconds
+ahead.
 
 ## MailProvider
 

@@ -69,6 +69,10 @@ jasil_settings.configure(
     gate that never closes, a session that exists on one replica and not another.
     None of that fails loudly. A refusal to start does.
 
+    The geocoding rate limit is one of those limiters: it is a gate in the
+    platform's state, so with Redis state `geocoding.rate_limit` holds for the
+    whole deployment, and with `memory://` for the one process.
+
 Durable jobs have a separate database topology from the capability URIs above.
 In a distributed deployment, use PostgreSQL for the outbox, jobs, and worker
 registry. API replicas schedule relay/reaping but do not call

@@ -16,19 +16,29 @@ API key.
 """
 
 import contextlib
+import email.utils
 import functools
 import json
 import logging
+import math
 import socket
 import threading
 import time
 from collections.abc import Sequence
 from contextvars import ContextVar
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode, urlsplit
 
 import jasil._core.network as network
-from jasil.providers import GeocodedPlace
+import jasil._core.state_keys as state_keys
+from jasil.providers import (
+    ClockProvider,
+    GeocodedPlace,
+    GeocodingOutcome,
+    StateBackendUnavailableError,
+    StateProvider,
+)
 
 if TYPE_CHECKING:
     import requests
@@ -52,6 +62,19 @@ _READ_CHUNK_BYTES = 8192
 # would otherwise hold the caller for as long as the size cap allows. A watchdog
 # shuts the request's sockets down when it passes, which ends a blocked read.
 _DEADLINE_SECONDS = 30
+
+# How long ``reverse`` waits for its turn under the rate limit before giving up on the lookup.
+_REVERSE_MAX_WAIT_SECONDS = 60
+
+# When to retry a lookup that failed in a way that may pass, when the upstream did not say.
+_RETRY_BACKOFF_SECONDS = 60
+
+# The longest back-off taken from an upstream's ``Retry-After``. The upstream is untrusted, and a 429 or 503 holds
+# back every process sharing the state, so one answer must not stop geocoding for longer than this.
+_MAX_RETRY_AFTER_SECONDS = 3600
+
+# The answers that ask every caller to back off: the upstream is over its limit, or not serving.
+_BACK_OFF_STATUSES = frozenset({429, 503})
 
 
 class _Deadline:
@@ -208,9 +231,23 @@ class NullGeocoding:
         """Return ``None`` — no geocoding is configured."""
         return None
 
+    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+        """Return a final answer of nothing — no geocoding is configured.
+
+        Raises:
+            ValueError: When ``max_wait_seconds`` is negative or not finite.
+        """
+        state_keys.check_max_wait(max_wait_seconds)
+        return GeocodingOutcome()
+
 
 class HttpGeocoding:
     """``GeocodingProvider`` backed by a reverse-geocoding HTTP service.
+
+    The rate limit is a gate in the platform's state, keyed by service and upstream host, so every backend on the
+    same state shares one budget for that upstream: every process on one Redis, and a backend and its rebuild
+    after a settings reload. A 429 or 503 holds back every backend on that gate until the upstream's
+    ``Retry-After``.
 
     Args:
         service: Which upstream to call — ``"nominatim"``, ``"photon"`` or
@@ -218,9 +255,11 @@ class HttpGeocoding:
         base_url: Fully-qualified reverse endpoint, e.g.
             ``"https://nominatim.openstreetmap.org/reverse"``. Built by the
             composition root, which is also where the host was validated.
+        state: Holds the rate gate and the upstream's back-off.
+        clock: Sets ``retry_at`` and reads the back-off against it.
         api_key: API key, for the services that require one (geocode.maps.co).
-        min_interval_seconds: Minimum wall-clock gap between requests. ``0``
-            disables throttling.
+        min_interval_seconds: Minimum gap between two requests to this upstream, at most a day. ``0`` disables
+            throttling.
         user_agent: ``User-Agent`` sent upstream; Nominatim's usage policy
             requires an identifying value.
     """
@@ -230,20 +269,23 @@ class HttpGeocoding:
         service: str,
         base_url: str,
         *,
+        state: StateProvider,
+        clock: ClockProvider,
         api_key: str | None = None,
         min_interval_seconds: float = 0.0,
         user_agent: str = "jasil (ReverseGeocoding)",
     ) -> None:
         self._service = service
         self._base_url = base_url
+        self._state = state
+        self._clock = clock
         self._api_key = api_key
         self._min_interval = min_interval_seconds
         self._user_agent = user_agent
-        # Throttle state is per-instance, guarded by its own lock, so two
-        # configured backends cannot interfere and a test can drive the rate
-        # limit deterministically.
-        self._throttle_lock = threading.Lock()
-        self._last_call = 0.0
+        # Lower-cased: host names are case-insensitive, so two spellings of one upstream share one budget.
+        upstream = f"{service}:{urlsplit(base_url).netloc.lower()}"
+        self._gate_key = f"jasil:geocoding:gate:{upstream}"
+        self._back_off_key = f"jasil:geocoding:back-off:{upstream}"
 
     def _build_url(self, latitude: float, longitude: float) -> str:
         """Build the reverse-geocode URL for the configured service."""
@@ -285,15 +327,59 @@ class HttpGeocoding:
             )
         return place if any(vars(place).values()) else None
 
-    def _throttle(self) -> None:
-        """Sleep as needed to respect the configured request rate."""
-        if self._min_interval <= 0:
-            return
-        with self._throttle_lock:
-            wait = self._min_interval - (time.monotonic() - self._last_call)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call = time.monotonic()
+    def _admit(self, max_wait_seconds: float) -> datetime | None:
+        """Wait for this request's turn, or return when to retry instead of sending it.
+
+        It is not sent while the upstream's back-off lasts, nor when no slot is free within ``max_wait_seconds``.
+        The back-off is read again after waiting for a slot, since a peer may have been told to back off meanwhile.
+        Without the state the rate limit cannot be kept, so nothing is sent then either.
+        """
+        try:
+            if (until := self._backed_off_until()) is not None:
+                return until
+            if self._min_interval <= 0:
+                return None
+            slot = self._state.reserve_slot(self._gate_key, self._min_interval, max_wait_seconds=max_wait_seconds)
+            if not slot.reserved:
+                logger.debug("Reverse-geocoding via %s deferred: no request slot within the wait bound", self._service)
+                return self._clock.now() + timedelta(seconds=slot.wait_seconds)
+            if slot.wait_seconds > 0:
+                time.sleep(slot.wait_seconds)
+                return self._backed_off_until()
+            return None
+        except (StateBackendUnavailableError, ValueError) as error:
+            logger.error(
+                "Reverse-geocoding via %s could not read its rate gate - %s", self._service, type(error).__name__
+            )
+            return self._clock.now() + timedelta(seconds=_RETRY_BACKOFF_SECONDS)
+
+    def _backed_off_until(self) -> datetime | None:
+        """Return when the upstream's longest back-off ends, while one lasts."""
+        latest = self._state.index_range(self._back_off_key, limit=1)
+        if latest and (until := latest[0][1]) > self._clock.now().timestamp():
+            return datetime.fromtimestamp(until, UTC)
+        return None
+
+    def _back_off(self, retry_after: str | None) -> datetime:
+        """Hold back every backend on this gate until the upstream's ``Retry-After``, and return that instant.
+
+        Each back-off is a member of an index scored by its end, expiring with it, so a shorter one recorded
+        after a longer one never cuts the longer one short.
+        """
+        now = self._clock.now()
+        seconds = _retry_after_seconds(retry_after, now)
+        retry_at = now + timedelta(seconds=seconds)
+        if seconds > 0:
+            until = retry_at.timestamp()
+            try:
+                self._state.index_add(self._back_off_key, repr(until), until, ttl_seconds=math.ceil(seconds))
+            except StateBackendUnavailableError as error:
+                logger.error(
+                    "Reverse-geocoding via %s could not share the upstream's back-off - %s",
+                    self._service,
+                    type(error).__name__,
+                )
+        return retry_at
 
     @staticmethod
     def _read_capped(response: "requests.Response", deadline: float) -> bytes:
@@ -325,20 +411,53 @@ class HttpGeocoding:
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None:
         """Reverse-geocode a coordinate, returning ``None`` on any failure.
 
+        Waits up to :data:`_REVERSE_MAX_WAIT_SECONDS` for its turn under the rate limit, as :meth:`lookup`.
+
         Args:
             latitude: WGS-84 latitude in decimal degrees.
             longitude: WGS-84 longitude in decimal degrees.
 
         Returns:
-            The resolved place, or ``None`` when nothing resolved or the request
-            failed. Never raises — geocoding is best-effort enrichment and must
-            not fail the caller's own work.
+            The resolved place, or ``None`` when nothing resolved, the request
+            failed or it was not sent. Never raises — geocoding is best-effort
+            enrichment and must not fail the caller's own work.
         """
+        return self.lookup(latitude, longitude, max_wait_seconds=_REVERSE_MAX_WAIT_SECONDS).place
+
+    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+        """Reverse-geocode a coordinate, or say when to ask again.
+
+        A 2xx answer is final, as is a request the upstream refused (another 4xx) or an answer that cannot be
+        read. A 429 or 503 retries at the upstream's ``Retry-After``, clamped to :data:`_MAX_RETRY_AFTER_SECONDS`;
+        another 5xx, a timeout or a dropped connection after :data:`_RETRY_BACKOFF_SECONDS`.
+
+        Args:
+            latitude: WGS-84 latitude in decimal degrees.
+            longitude: WGS-84 longitude in decimal degrees.
+            max_wait_seconds: The longest this call sleeps for its turn under the rate limit.
+
+        Returns:
+            The outcome. Never raises for an upstream or state failure.
+
+        Raises:
+            ValueError: When ``max_wait_seconds`` is negative or not finite.
+        """
+        state_keys.check_max_wait(max_wait_seconds)
         # The coordinates are deliberately not logged: they are a location fix
         # belonging to the host's user, and this is a library — it does not get to
         # decide that someone's whereabouts are acceptable to write to their log.
         logger.debug("Reverse-geocoding via %s", self._service)
-        self._throttle()
+        try:
+            # Imported lazily: ``requests`` is the optional `geocoding` extra, and
+            # the composition root imports this module unconditionally for
+            # ``NullGeocoding``.
+            import requests
+        except ImportError as error:
+            logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
+            return GeocodingOutcome()
+        retry_at = self._admit(max_wait_seconds)
+        if retry_at is not None:
+            return GeocodingOutcome(retry_at=retry_at)
         deadline = time.monotonic() + _DEADLINE_SECONDS
         watched = _Deadline()
         finished = threading.Event()
@@ -346,11 +465,6 @@ class HttpGeocoding:
         token = _current_deadline.set(watched)
         watchdog.start()
         try:
-            # Imported lazily: ``requests`` is the optional `geocoding` extra, and
-            # the composition root imports this module unconditionally for
-            # ``NullGeocoding``.
-            import requests
-
             # A session of its own, so its connections are the watched ones and none outlives the request.
             with requests.Session() as session:
                 # ``requests`` takes a proxy from the environment. Over TLS the proxy only relays the tunnel; a
@@ -369,16 +483,60 @@ class HttpGeocoding:
                     allow_redirects=False,
                     stream=True,
                 ) as response:
+                    if response.status_code in _BACK_OFF_STATUSES:
+                        logger.error("Reverse-geocoding via %s failed - HTTP %s", self._service, response.status_code)
+                        return GeocodingOutcome(retry_at=self._back_off(response.headers.get("Retry-After")))
                     response.raise_for_status()
-                    return self._parse(json.loads(self._read_capped(response, deadline)))
+                    return GeocodingOutcome(self._parse(json.loads(self._read_capped(response, deadline))))
         except Exception as error:
             logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
-            return None
+            if _is_transient(error):
+                return GeocodingOutcome(retry_at=self._clock.now() + timedelta(seconds=_RETRY_BACKOFF_SECONDS))
+            return GeocodingOutcome()
         finally:
             finished.set()
             watchdog.join()
             watched.close()
             _current_deadline.reset(token)
+
+
+def _retry_after_seconds(value: str | None, now: datetime) -> float:
+    """Read a ``Retry-After`` header as seconds from ``now``, clamped to ``[0, _MAX_RETRY_AFTER_SECONDS]``.
+
+    Takes delta-seconds or an HTTP-date; an absent or unreadable value is :data:`_RETRY_BACKOFF_SECONDS`.
+    """
+    if value is None:
+        return _RETRY_BACKOFF_SECONDS
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        seconds = float(value)  # a float, so an absurdly long value saturates instead of overflowing
+    else:
+        try:
+            when = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return _RETRY_BACKOFF_SECONDS
+        # An HTTP-date is GMT; one written with "-0000" parses as naive.
+        seconds = (when if when.tzinfo is not None else when.replace(tzinfo=UTC)).timestamp() - now.timestamp()
+    return min(max(seconds, 0.0), _MAX_RETRY_AFTER_SECONDS)
+
+
+def _is_transient(error: Exception) -> bool:
+    """Whether a failed request may succeed later: a 5xx, a timeout, or a connection that failed or dropped."""
+    import requests  # already imported: only a request that was attempted fails this way
+
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    if status is not None:
+        return status >= 500
+    return isinstance(
+        error,
+        (
+            TimeoutError,
+            ConnectionError,
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    )
 
 
 def _watch(deadline: _Deadline, finished: threading.Event) -> None:

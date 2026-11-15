@@ -115,7 +115,7 @@ sink.
 | Field | Default | Meaning |
 |---|---|---|
 | `uri` | `None` | `nominatim://host[:port]` or `photon://host[:port]` (HTTPS), `nominatim+http://…` or `photon+http://…` (cleartext, for a self-hosted instance on a private network: refused for a host that resolves to any public address, and a private host must also be listed in `network.ssrf_allowed_hosts`), or `geocode://` (geocode.maps.co, a fixed host). A bare authority only: no userinfo, path, query or fragment. The host is SSRF-checked. Unset disables the capability; so does any value that cannot be used, which is logged. |
-| `rate_limit` | `1.0` | Maximum requests per second **per process**; `<= 0` disables throttling. Each process throttles on its own, so a deployment of N processes sends up to N times this rate: divide a provider's limit (Nominatim's public instance allows one request a second) by the number of processes that geocode. |
+| `rate_limit` | `1.0` | Maximum requests per second to the upstream, for every process sharing the platform's state: with Redis state the whole deployment, with `memory://` the one process. Set it to the provider's limit (Nominatim's public instance allows one request a second). `<= 0` disables throttling; a rate below one request a day disables geocoding, logged. See [One rate limit for the whole deployment](providers-and-backends.md#one-rate-limit-for-the-whole-deployment). |
 | `api_key` | `None` | Required by `geocode://`. |
 | `user_agent` | `"jasil (ReverseGeocoding)"` | Nominatim's usage policy requires an identifying value — set your own. |
 
@@ -230,9 +230,9 @@ again.
 | Situation | Mail | Geocoding |
 |---|---|---|
 | The source raises, and the last build produced a working backend | That backend is used, **including its credentials, for as long as the source keeps failing**: revoking them in a store that is down does not take effect until it answers. A warning logs on the first failure of a run, debug after, until the source works again. | Same. |
-| The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception deliberately not chained (its text may carry a secret). | `reverse` returns `None`. |
+| The source raises, and there is no working backend (never loaded, or the last settings were rejected) | `send` raises `MailError("Mail settings could not be loaded")`, retryable, the original exception deliberately not chained (its text may carry a secret). | `reverse` returns `None`; `lookup` returns a `retry_at` 30 seconds ahead. |
 | The settings are invalid | `send` raises `MailNotConfiguredError` whose message carries the reason (never a setting's value), also logged once. The previous backend and its credentials are **never** reused. | `NullGeocoding`; the reason is logged once, as at startup. |
-| The relay or geocoding host does not resolve (mail `secure=False`, geocoding) | `send` raises a plain `MailError`, retryable. The build is retried after 30 seconds, not remembered as a rejection. | `reverse` returns `None`; the build is retried after 30 seconds. |
+| The relay or geocoding host does not resolve (mail `secure=False`, geocoding) | `send` raises a plain `MailError`, retryable. The build is retried after 30 seconds, not remembered as a rejection. | `reverse` returns `None` and `lookup` a `retry_at` 30 seconds ahead; the build is retried after 30 seconds. |
 | The settings are unset (`uri` empty) | As `NullMail`: `send` raises `MailNotConfiguredError`. | As `NullGeocoding`. |
 
 Both mail errors have no SMTP status, so a durable job retries either one.
@@ -258,8 +258,8 @@ which needs the topology.
 
 ### Good to know
 
-- A geocoding rebuild creates a new `HttpGeocoding`, which resets its throttle: at
-  most one extra immediate request after an edit.
+- A geocoding rebuild creates a new `HttpGeocoding` on the same rate gate in the
+  platform's state, so an edit does not reset the rate budget.
 - A `memory://` mail source gets a fresh, empty outbox on every rebuild.
 - A rebuild happens under a lock, once per change, so concurrent senders wait for
   it. For `secure=False` that includes one DNS lookup.
