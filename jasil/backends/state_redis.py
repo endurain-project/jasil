@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, Concatenate
 
 import jasil._core.redis_clients as redis_clients
+import jasil._core.state_keys as state_keys
 from jasil.providers import StateBackendUnavailableError, TieredFailureOutcome
 
 # Atomic escalating-gate script (KEYS: gate, counter; ARGV: now, counter_ttl,
@@ -81,10 +82,6 @@ end
 return 0
 """
 
-#: Where an index's member deadlines live: a sorted set of the same members scored by the epoch second each one
-#: expires, under this prefix plus the index key. Kept apart from the index's own prefix, so ``iter_keys`` and
-#: ``delete_prefix`` over the host's prefix see one key per index, as on the memory backend.
-_INDEX_EXPIRY_PREFIX = "jasil:state:index-expiry:"
 
 # Opens every index script (KEYS: index, deadlines; ARGV[1]: the caller's epoch time). It refuses a key of another
 # type, discards deadlines an index left behind (``delete`` and ``delete_prefix`` remove only the index), and drops
@@ -295,7 +292,7 @@ class RedisState:
         """Delete every key starting with ``prefix``, matched literally; ``prefix`` must not be empty."""
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
         # in a caller's prefix would delete far beyond what it named.
-        _check_prefix(prefix)
+        state_keys.check_delete_prefix(prefix)
         return redis_clients.delete_matching_keys(self._client, f"{redis_clients.glob_escape(prefix)}*")
 
     @_translate_state_errors
@@ -358,17 +355,18 @@ class RedisState:
 
 
 def _index_keys(key: str) -> list[str]:
-    return [key, _INDEX_EXPIRY_PREFIX + key]
+    """Return the index key and the key of its deadlines.
+
+    The deadlines are a sorted set of the same members scored by the epoch second each one expires. They sit
+    under the reserved prefix rather than the index's own, so ``iter_keys`` and ``delete_prefix`` over the host's
+    prefix see one key per index, as on the memory backend.
+    """
+    return [key, state_keys.INDEX_EXPIRY_PREFIX + key]
 
 
 def _check_ttl(ttl_seconds: int | None) -> None:
     if ttl_seconds is not None and ttl_seconds <= 0:
         raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
-
-
-def _check_prefix(prefix: str) -> None:
-    if not prefix:
-        raise ValueError("delete_prefix needs a non-empty prefix")
 
 
 def _check_score(score: float) -> None:

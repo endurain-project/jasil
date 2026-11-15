@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Iterator
 
+import jasil._core.state_keys as state_keys
 from jasil.providers import TieredFailureOutcome
 
 #: An index: each member's score and its expiry deadline on the monotonic clock.
@@ -194,7 +195,7 @@ class MemoryState:
 
     def delete_prefix(self, prefix: str) -> int:
         """Delete every key, plain or index, starting with ``prefix``; ``prefix`` must not be empty."""
-        _check_prefix(prefix)
+        state_keys.check_delete_prefix(prefix)
         with self._lock:
             # An expired key the sweep has not dropped yet is not a key any more: Redis never counts it.
             matching = [key for key in self._data if key.startswith(prefix)]
@@ -297,11 +298,6 @@ class MemoryState:
 def _check_ttl(ttl_seconds: int | None) -> None:
     if ttl_seconds is not None and ttl_seconds <= 0:
         raise ValueError(f"ttl_seconds must be positive, or None for no expiry, not {ttl_seconds}")
-
-
-def _check_prefix(prefix: str) -> None:
-    if not prefix:
-        raise ValueError("delete_prefix needs a non-empty prefix")
 
 
 def _check_score(score: float) -> None:

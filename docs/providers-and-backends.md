@@ -42,7 +42,9 @@ otherwise depend on the backend:
   — free or renew a claim only while it still holds the value you stored, so a
   holder whose claim expired and was taken by someone else leaves the new claim
   alone. Each returns whether it acted. Under the lock in memory, one Lua script on
-  Redis.
+  Redis. They compare values, not acquisitions, so store a value unique to each
+  acquisition (a fresh job id or random token): a holder that stored the same
+  bytes as the next one would free or renew that one's claim.
 - **`iter_keys(prefix)`** — the live keys under a literal prefix. An empty prefix
   matches every key, on Redis every key in the database, so name one.
 - **`record_tiered_failure(counter_key, gate_key, tiers, counter_ttl_seconds)`**
@@ -106,7 +108,10 @@ On Redis an index is two sorted sets: the scores under the index key, and the
 member deadlines under `jasil:state:index-expiry:` followed by the index key.
 That prefix is reserved for JASIL; keep your own keys out of it. Because the
 deadlines sit outside your prefix, `iter_keys` and `delete_prefix` over your
-prefix see only the index key, as in memory. Deadlines left behind when you
+prefix see only the index key, as in memory. `delete_prefix` refuses, on both
+backends, a prefix that would reach the deadlines: one that starts the reserved
+prefix (`"jasil:"`) or lies inside it. Deleting them would leave their indexes
+with members that never expire on their own. Deadlines left behind when you
 `delete` an index expire with it, and the next index call on that key discards
 them. Deadlines are set from the calling process's clock, as
 `record_tiered_failure` is, so keep the replicas' clocks synchronised.
@@ -122,7 +127,8 @@ memory backend never raises it.
 
 Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
 zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
-Redis it would match every key in the database), an index score or cursor score
+Redis it would match every key in the database) or one that overlaps the reserved
+index namespace, an index score or cursor score
 that is not finite, an `index_range` limit below 1, and an operation the stored
 value does not support, such as `incr` of a non-integer, an index operation on a
 plain key or, on Redis, a key that holds another type. Counters are signed 64-bit integers on both: an `incr` or

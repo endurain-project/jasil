@@ -228,7 +228,8 @@ class StateProvider(Protocol):
         """Delete ``key`` only while its live value equals ``expected``, atomically.
 
         Frees a claim only for the holder that stored it: a holder whose claim expired and was taken by another
-        caller deletes nothing.
+        caller deletes nothing. The comparison is by value, so that holds only when each acquisition stores a
+        value no other acquisition stores, such as a fresh job id or random token.
 
         Args:
             key: The state key.
@@ -246,7 +247,8 @@ class StateProvider(Protocol):
         """Restart the expiry of ``key`` only while its live value equals ``expected``, atomically.
 
         Renews a claim only for the holder that stored it: a holder whose claim expired and was taken by another
-        caller leaves the new holder's claim alone.
+        caller leaves the new holder's claim alone. As for :meth:`delete_if_equals`, that holds only when each
+        acquisition stores a value no other acquisition stores.
 
         Args:
             key: The state key.
@@ -276,13 +278,14 @@ class StateProvider(Protocol):
         """Delete every key that starts with ``prefix``.
 
         Args:
-            prefix: A non-empty key prefix, matched literally.
+            prefix: A non-empty key prefix, matched literally. It must not overlap the reserved index namespace
+                ``jasil:state:index-expiry:``: neither start it (``"jasil:"``) nor lie inside it.
 
         Returns:
             The number of keys deleted.
 
         Raises:
-            ValueError: When ``prefix`` is empty.
+            ValueError: When ``prefix`` is empty or overlaps the reserved index namespace.
             StateBackendUnavailableError: When the backing store is unreachable.
         """
 

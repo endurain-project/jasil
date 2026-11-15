@@ -467,6 +467,23 @@ class TestIndexConformance:
 
         assert state.index_range("idx", limit=10) == [("b", 2.0)]
 
+    @pytest.mark.parametrize("prefix", ["j", "jasil:", "jasil:state:index-expiry:", "jasil:state:index-expiry:jobs"])
+    def test_delete_prefix_refuses_a_prefix_reaching_the_reserved_index_namespace(self, clock, state, prefix):
+        """On Redis it would delete index deadlines and keep their indexes, whose members would then never expire."""
+        state.index_add("jobs:idx", "short", 2.0, ttl_seconds=10)
+        state.index_add("jobs:idx", "long", 1.0, ttl_seconds=100)
+
+        with pytest.raises(ValueError, match="reserved"):
+            state.delete_prefix(prefix)
+
+        clock["seconds"] += 11
+        assert state.index_range("jobs:idx", limit=10) == [("long", 1.0)]
+
+    def test_delete_prefix_accepts_a_jasil_prefix_beside_the_reserved_index_namespace(self, state):
+        state.set("jasil:other:k", b"v")
+
+        assert state.delete_prefix("jasil:other:") == 1
+
 
 class TestIndexKeyTypeConformance:
     """A key holds a plain value or an index, and each kind of operation refuses the other kind the same way."""
@@ -610,23 +627,24 @@ class TestRedisIndexLayout:
     def client(self):
         return fakeredis.FakeStrictRedis(decode_responses=False)
 
-    def test_both_keys_expire_with_the_latest_member(self, client):
+    def test_both_keys_expire_with_the_latest_member(self, clock, client):
         state = RedisState(client)
         state.index_add("idx", "a", 1.0, ttl_seconds=10)
         state.index_add("idx", "b", 2.0, ttl_seconds=100)
 
-        assert 99_000 < client.pttl("idx") <= 100_000
-        assert 99_000 < client.pttl("jasil:state:index-expiry:idx") <= 100_000
+        assert client.pttl("idx") == 100_000
+        assert client.pttl("jasil:state:index-expiry:idx") == 100_000
 
-    def test_removing_the_latest_member_rearms_both_keys(self, client):
+    def test_removing_the_latest_member_rearms_both_keys(self, clock, client):
         state = RedisState(client)
         state.index_add("idx", "a", 1.0, ttl_seconds=10)
         state.index_add("idx", "b", 2.0, ttl_seconds=100)
+        clock["seconds"] += 4
 
         state.index_remove("idx", "b")
 
-        assert 0 < client.pttl("idx") <= 10_000
-        assert 0 < client.pttl("jasil:state:index-expiry:idx") <= 10_000
+        assert client.pttl("idx") == 6_000
+        assert client.pttl("jasil:state:index-expiry:idx") == 6_000
 
     def test_a_read_drops_expired_members_from_both_keys(self, clock, client):
         state = RedisState(client)

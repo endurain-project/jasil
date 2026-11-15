@@ -10,12 +10,16 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [0.21.0] - 2026-11-15
 
-This release adds an ordered index with per-member expiry and compare-and-delete and compare-and-expire to `StateProvider`. **It is breaking for a host that implements `StateProvider` itself**: the protocol has five new methods, and such a backend must add them (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in `MemoryState` and `RedisState` need no change. No migration is added.
+This release adds an ordered index with per-member expiry and compare-and-delete and compare-and-expire to `StateProvider`. **It is breaking for a host that implements `StateProvider` itself**: the protocol has five new methods, and such a backend must add them (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in `MemoryState` and `RedisState` need no change unless they call `delete_prefix` with a prefix such as `"jasil:"`, which is now refused; see **Changed**. No migration is added.
 
 ### Added
 
 - **Ordered state indexes.** `StateProvider.index_add(key, member, score, ttl_seconds)`, `index_remove(key, member)` and `index_range(key, *, limit, before=None)` keep members ordered by score, highest first and member descending at equal scores, each member with its own expiry. `index_range` pages with an exclusive `(score, member)` keyset cursor. An expired member is never listed, and the index key expires with its longest-lived member. Each call is atomic and costs O(n) in that one index in memory and O(log n + limit) on Redis, never a walk of the whole keyspace as `iter_keys` is. An index key is listed by `iter_keys` and removed by `delete` and `delete_prefix` like any other key. `set` replaces it, `set_if_absent` finds it taken, and the other plain-value operations raise `ValueError` on it, as the index operations do on a plain key. On Redis the member deadlines live in a second sorted set under the reserved prefix `jasil:state:index-expiry:`. See [Ordered indexes](docs/providers-and-backends.md#ordered-indexes).
-- **`StateProvider.delete_if_equals(key, expected)` and `expire_if_equals(key, expected, ttl_seconds)`** free or renew a key only while its live value equals `expected`, atomically, and return whether they did. A claim holder whose claim expired and was taken by another caller no longer frees or overwrites the new claim between a `get` and a `delete` or `set`. See [Providers and backends](docs/providers-and-backends.md#stateprovider).
+- **`StateProvider.delete_if_equals(key, expected)` and `expire_if_equals(key, expected, ttl_seconds)`** free or renew a key only while its live value equals `expected`, atomically, and return whether they did. A claim holder whose claim expired and was taken by another caller no longer frees or overwrites the new claim between a `get` and a `delete` or `set`. They compare values, so each acquisition must store a value of its own, such as a fresh job id or random token. See [Providers and backends](docs/providers-and-backends.md#stateprovider).
+
+### Changed
+
+- **`StateProvider.delete_prefix` refuses a prefix that overlaps the reserved index namespace `jasil:state:index-expiry:`**, one that starts it (`"jasil:"`, `"j"`) or lies inside it, with `ValueError` on both backends. On Redis such a prefix would delete index deadlines and keep their indexes, whose members would then never expire on their own. Other `jasil:` prefixes, such as `"jasil:other:"`, are still accepted.
 
 ## [0.20.0] - 2026-11-12
 
