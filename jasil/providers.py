@@ -151,13 +151,20 @@ class StateProvider(Protocol):
     process-local dict (``local``) or Redis (``distributed``). Beyond plain
     key/value access it exposes the few *atomic* primitives whose correctness
     would otherwise depend on the backend: one-winner claims and single-use values
-    (``set_if_absent``, ``get_and_delete``) and an escalating gate over repeated
-    events (``record_tiered_failure``).
+    (``set_if_absent``, ``get_and_delete``), changes only the current holder of a
+    value may make (``delete_if_equals``, ``expire_if_equals``), an escalating gate
+    over repeated events (``record_tiered_failure``) and an ordered index whose
+    members expire one by one (``index_add``, ``index_remove``, ``index_range``).
 
     ``ttl_seconds`` is a positive number of seconds, or ``None`` for no expiry; zero or a negative
     value raises ``ValueError``. ``delete_prefix`` needs a non-empty prefix. A value the operation
     cannot apply to (``incr`` of a non-integer) raises ``ValueError`` on every backend; only a backend
     that cannot serve raises :class:`StateBackendUnavailableError`.
+
+    A key holds either a plain value or an index. ``iter_keys``, ``delete`` and ``delete_prefix`` treat an
+    index key like any other key, ``set`` replaces it with a plain value and ``set_if_absent`` finds it taken.
+    The other plain-value operations raise ``ValueError`` on an index key, and the index operations raise it
+    on a plain key.
     """
 
     def get(self, key: str) -> bytes | None:
@@ -214,6 +221,44 @@ class StateProvider(Protocol):
             The stored bytes, or ``None`` when the key is absent or has expired.
 
         Raises:
+            StateBackendUnavailableError: When the backing store is unreachable.
+        """
+
+    def delete_if_equals(self, key: str, expected: bytes) -> bool:
+        """Delete ``key`` only while its live value equals ``expected``, atomically.
+
+        Frees a claim only for the holder that stored it: a holder whose claim expired and was taken by another
+        caller deletes nothing.
+
+        Args:
+            key: The state key.
+            expected: The value the key must hold.
+
+        Returns:
+            True when this call deleted the key; False when it was absent, had expired or held another value.
+
+        Raises:
+            ValueError: When ``key`` holds an index.
+            StateBackendUnavailableError: When the backing store is unreachable.
+        """
+
+    def expire_if_equals(self, key: str, expected: bytes, ttl_seconds: int) -> bool:
+        """Restart the expiry of ``key`` only while its live value equals ``expected``, atomically.
+
+        Renews a claim only for the holder that stored it: a holder whose claim expired and was taken by another
+        caller leaves the new holder's claim alone.
+
+        Args:
+            key: The state key.
+            expected: The value the key must hold.
+            ttl_seconds: Seconds from this call until the key expires.
+
+        Returns:
+            True when this call restarted the expiry; False when the key was absent, had expired or held another
+            value.
+
+        Raises:
+            ValueError: When ``ttl_seconds`` is zero or negative, or ``key`` holds an index.
             StateBackendUnavailableError: When the backing store is unreachable.
         """
 
@@ -299,6 +344,57 @@ class StateProvider(Protocol):
                 that tier's seconds; the highest tier reached wins.
             counter_ttl_seconds: How long the count survives without a new
                 occurrence.
+        """
+
+    def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
+        """Insert ``member`` into the index ``key`` with ``score``, or replace the score it has.
+
+        The member expires ``ttl_seconds`` after this call, and adding it again restarts that. The index key
+        lasts as long as its longest-lived member, so an index nobody writes to any more leaves nothing behind.
+
+        Args:
+            key: The index key.
+            member: The member to insert or replace.
+            score: Its position in the index; higher scores list first.
+            ttl_seconds: Seconds from this call until the member expires.
+
+        Raises:
+            ValueError: When ``ttl_seconds`` is zero or negative, ``score`` is not finite, or ``key`` holds a
+                plain value.
+            StateBackendUnavailableError: When the backing store is unreachable.
+        """
+
+    def index_remove(self, key: str, member: str) -> None:
+        """Remove ``member`` from the index ``key``; an absent index or member is not an error.
+
+        Args:
+            key: The index key.
+            member: The member to remove.
+
+        Raises:
+            ValueError: When ``key`` holds a plain value.
+            StateBackendUnavailableError: When the backing store is unreachable.
+        """
+
+    def index_range(self, key: str, *, limit: int, before: tuple[float, str] | None = None) -> list[tuple[str, float]]:
+        """Return a page of the live members of the index ``key``, highest score first.
+
+        Members with equal scores list by member, descending, so the order is total and ``before`` pages
+        through ties without skipping or repeating a member. An expired member is never listed.
+
+        Args:
+            key: The index key.
+            limit: The most members to return; at least 1.
+            before: A ``(score, member)`` keyset cursor, usually the last entry of the previous page. Only the
+                members that list strictly after it are returned. ``None`` starts at the top.
+
+        Returns:
+            Up to ``limit`` ``(member, score)`` pairs, in index order; empty when the index is absent.
+
+        Raises:
+            ValueError: When ``limit`` is less than 1, the cursor's score is not finite, or ``key`` holds a plain
+                value.
+            StateBackendUnavailableError: When the backing store is unreachable.
         """
 
 

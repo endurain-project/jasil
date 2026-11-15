@@ -8,6 +8,7 @@ cannot provide.
 """
 
 import functools
+import math
 import time
 from collections.abc import Callable, Iterator
 from typing import Any, Concatenate
@@ -64,6 +65,119 @@ redis.call("EXPIRE", KEYS[1], ARGV[2])
 return count
 """
 
+# Compare-and-delete and compare-and-expire (KEYS: key; ARGV: expected, then ttl_seconds). GET refuses a key of
+# another type with WRONGTYPE, as the memory backend refuses an index.
+_DELETE_IF_EQUALS_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+end
+return 0
+"""
+
+_EXPIRE_IF_EQUALS_SCRIPT = """
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+#: Where an index's member deadlines live: a sorted set of the same members scored by the epoch second each one
+#: expires, under this prefix plus the index key. Kept apart from the index's own prefix, so ``iter_keys`` and
+#: ``delete_prefix`` over the host's prefix see one key per index, as on the memory backend.
+_INDEX_EXPIRY_PREFIX = "jasil:state:index-expiry:"
+
+# Opens every index script (KEYS: index, deadlines; ARGV[1]: the caller's epoch time). It refuses a key of another
+# type, discards deadlines an index left behind (``delete`` and ``delete_prefix`` remove only the index), and drops
+# every member whose deadline has passed, so no script sees an expired member. ``rearm`` keeps both keys expiring
+# with the latest deadline, so an index nobody writes to leaves nothing behind.
+_INDEX_PRELUDE = """
+local key, deadlines = KEYS[1], KEYS[2]
+local now = tonumber(ARGV[1])
+local kind = redis.call("TYPE", key)["ok"]
+if kind == "none" then
+    redis.call("DEL", deadlines)
+elseif kind ~= "zset" then
+    return redis.error_reply("WRONGTYPE Operation against a key holding the wrong kind of value")
+end
+for _, member in ipairs(redis.call("ZRANGEBYSCORE", deadlines, "-inf", now)) do
+    redis.call("ZREM", key, member)
+end
+redis.call("ZREMRANGEBYSCORE", deadlines, "-inf", now)
+
+local function rearm()
+    local latest = redis.call("ZRANGE", deadlines, -1, -1, "WITHSCORES")
+    if #latest > 0 then
+        local ttl_ms = math.ceil((tonumber(latest[2]) - now) * 1000)
+        redis.call("PEXPIRE", key, ttl_ms)
+        redis.call("PEXPIRE", deadlines, ttl_ms)
+    end
+end
+"""
+
+# ARGV: now, ttl_seconds, score, member.
+_INDEX_ADD_SCRIPT = (
+    _INDEX_PRELUDE
+    + """
+redis.call("ZADD", key, ARGV[3], ARGV[4])
+redis.call("ZADD", deadlines, now + tonumber(ARGV[2]), ARGV[4])
+rearm()
+return 1
+"""
+)
+
+# ARGV: now, member.
+_INDEX_REMOVE_SCRIPT = (
+    _INDEX_PRELUDE
+    + """
+redis.call("ZREM", key, ARGV[2])
+redis.call("ZREM", deadlines, ARGV[2])
+rearm()
+return 1
+"""
+)
+
+# ARGV: now, limit, then the cursor's score and member when paging. Members tied at the cursor's score are compared
+# byte by byte, the order Redis keeps them in, rather than with Lua's locale-dependent string comparison.
+_INDEX_RANGE_SCRIPT = (
+    _INDEX_PRELUDE
+    + """
+local limit = tonumber(ARGV[2])
+if #ARGV == 2 then
+    return redis.call("ZREVRANGE", key, 0, limit - 1, "WITHSCORES")
+end
+
+local function precedes(a, b)
+    for i = 1, math.min(#a, #b) do
+        local x, y = string.byte(a, i), string.byte(b, i)
+        if x ~= y then
+            return x < y
+        end
+    end
+    return #a < #b
+end
+
+local page = {}
+local tied = redis.call("ZREVRANGEBYSCORE", key, ARGV[3], ARGV[3], "WITHSCORES")
+for i = 1, #tied, 2 do
+    if #page == 2 * limit then
+        return page
+    end
+    if precedes(tied[i], ARGV[4]) then
+        page[#page + 1] = tied[i]
+        page[#page + 1] = tied[i + 1]
+    end
+end
+local remaining = limit - #page / 2
+if remaining > 0 then
+    local lower = redis.call("ZREVRANGEBYSCORE", key, "(" .. ARGV[3], "-inf", "WITHSCORES", "LIMIT", 0, remaining)
+    for _, value in ipairs(lower) do
+        page[#page + 1] = value
+    end
+end
+return page
+"""
+)
+
 
 # What Redis says when it refuses a command because of the key's value rather than its own condition.
 _VALUE_REFUSALS = ("WRONGTYPE", "not an integer", "would overflow")
@@ -106,6 +220,11 @@ class RedisState:
         self._client = client
         self._record_failure_script = client.register_script(_RECORD_TIERED_FAILURE_SCRIPT)
         self._incr_with_ttl_script = client.register_script(_INCR_WITH_TTL_SCRIPT)
+        self._delete_if_equals_script = client.register_script(_DELETE_IF_EQUALS_SCRIPT)
+        self._expire_if_equals_script = client.register_script(_EXPIRE_IF_EQUALS_SCRIPT)
+        self._index_add_script = client.register_script(_INDEX_ADD_SCRIPT)
+        self._index_remove_script = client.register_script(_INDEX_REMOVE_SCRIPT)
+        self._index_range_script = client.register_script(_INDEX_RANGE_SCRIPT)
 
     @classmethod
     def from_uri(cls, uri: str) -> "RedisState":
@@ -161,6 +280,17 @@ class RedisState:
         return self._client.getdel(key)
 
     @_translate_state_errors
+    def delete_if_equals(self, key: str, expected: bytes) -> bool:
+        """Delete ``key`` while it holds ``expected``, in one Lua script; return True when deleted."""
+        return bool(self._delete_if_equals_script(keys=[key], args=[expected]))
+
+    @_translate_state_errors
+    def expire_if_equals(self, key: str, expected: bytes, ttl_seconds: int) -> bool:
+        """Restart the expiry of ``key`` while it holds ``expected``, in one Lua script; return True when restarted."""
+        _check_ttl(ttl_seconds)
+        return bool(self._expire_if_equals_script(keys=[key], args=[expected, str(ttl_seconds)]))
+
+    @_translate_state_errors
     def delete_prefix(self, prefix: str) -> int:
         """Delete every key starting with ``prefix``, matched literally; ``prefix`` must not be empty."""
         # Escaped, because Redis reads the pattern as a glob: an unescaped ``*``
@@ -200,6 +330,36 @@ class RedisState:
         newly_locked = bool(int(result[2]))
         return TieredFailureOutcome(count, gate_until or None, newly_locked)
 
+    @_translate_state_errors
+    def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
+        """Insert or replace ``member`` and its deadline, in one Lua script over the index and its deadlines."""
+        _check_ttl(ttl_seconds)
+        _check_score(score)
+        # The caller's clock sets the deadline, as ``record_tiered_failure`` takes the caller's time.
+        self._index_add_script(
+            keys=_index_keys(key), args=[repr(time.time()), str(ttl_seconds), repr(float(score)), member]
+        )
+
+    @_translate_state_errors
+    def index_remove(self, key: str, member: str) -> None:
+        """Remove ``member`` and its deadline, in one Lua script."""
+        self._index_remove_script(keys=_index_keys(key), args=[repr(time.time()), member])
+
+    @_translate_state_errors
+    def index_range(self, key: str, *, limit: int, before: tuple[float, str] | None = None) -> list[tuple[str, float]]:
+        """Return a page of live members, in one Lua script; O(log n + limit) plus the members tied at the cursor."""
+        _check_limit(limit)
+        args = [repr(time.time()), str(limit)]
+        if before is not None:
+            _check_score(before[0])
+            args += [repr(float(before[0])), before[1]]
+        flat = self._index_range_script(keys=_index_keys(key), args=args)
+        return [(flat[i].decode(), float(flat[i + 1])) for i in range(0, len(flat), 2)]
+
+
+def _index_keys(key: str) -> list[str]:
+    return [key, _INDEX_EXPIRY_PREFIX + key]
+
 
 def _check_ttl(ttl_seconds: int | None) -> None:
     if ttl_seconds is not None and ttl_seconds <= 0:
@@ -209,3 +369,13 @@ def _check_ttl(ttl_seconds: int | None) -> None:
 def _check_prefix(prefix: str) -> None:
     if not prefix:
         raise ValueError("delete_prefix needs a non-empty prefix")
+
+
+def _check_score(score: float) -> None:
+    if not math.isfinite(score):
+        raise ValueError(f"an index score must be a finite number, not {score}")
+
+
+def _check_limit(limit: int) -> None:
+    if limit < 1:
+        raise ValueError(f"limit must be at least 1, not {limit}")

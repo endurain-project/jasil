@@ -8,6 +8,15 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-15
+
+This release adds an ordered index with per-member expiry and compare-and-delete and compare-and-expire to `StateProvider`. **It is breaking for a host that implements `StateProvider` itself**: the protocol has five new methods, and such a backend must add them (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in `MemoryState` and `RedisState` need no change. No migration is added.
+
+### Added
+
+- **Ordered state indexes.** `StateProvider.index_add(key, member, score, ttl_seconds)`, `index_remove(key, member)` and `index_range(key, *, limit, before=None)` keep members ordered by score, highest first and member descending at equal scores, each member with its own expiry. `index_range` pages with an exclusive `(score, member)` keyset cursor. An expired member is never listed, and the index key expires with its longest-lived member. Each call is atomic and costs O(n) in that one index in memory and O(log n + limit) on Redis, never a walk of the whole keyspace as `iter_keys` is. An index key is listed by `iter_keys` and removed by `delete` and `delete_prefix` like any other key. `set` replaces it, `set_if_absent` finds it taken, and the other plain-value operations raise `ValueError` on it, as the index operations do on a plain key. On Redis the member deadlines live in a second sorted set under the reserved prefix `jasil:state:index-expiry:`. See [Ordered indexes](docs/providers-and-backends.md#ordered-indexes).
+- **`StateProvider.delete_if_equals(key, expected)` and `expire_if_equals(key, expected, ttl_seconds)`** free or renew a key only while its live value equals `expected`, atomically, and return whether they did. A claim holder whose claim expired and was taken by another caller no longer frees or overwrites the new claim between a `get` and a `delete` or `set`. See [Providers and backends](docs/providers-and-backends.md#stateprovider).
+
 ## [0.20.0] - 2026-11-12
 
 This release lets an event's payload and metadata, and a realtime hint, hold UUIDs. It also updates the locked development dependencies and the pinned `uv` of the publish workflow. Nothing in the public API is removed or renamed, and no migration is added.
