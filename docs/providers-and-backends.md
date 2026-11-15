@@ -648,8 +648,8 @@ a final `GeocodingOutcome(None, None)`.
 
 `geocoding.rate_limit` is enforced by a [rate gate](#rate-gates) in the platform's
 state, under `jasil:geocoding:gate:{service}:{host}`, where host is the upstream's
-`host[:port]`. Every backend for the same upstream on the same state shares one
-budget:
+`host[:port]`, lower-cased. Every backend for the same upstream on the same state
+shares one budget:
 
 - With Redis state, every process on that Redis, API replicas and workers alike,
   sends at most `rate_limit` requests a second in total.
@@ -657,13 +657,19 @@ budget:
   process a `memory://` deployment has.
 - A settings reload builds a new backend on the same gate, so it keeps the budget.
 
-Each lookup costs one state read and, with a rate limit, one `reserve_slot` before
-it sends. A request that waits for its slot sleeps in the calling thread.
+Each lookup costs one `index_range` of the back-off and, with a rate limit, one
+`reserve_slot` before it sends. A request that waits for its slot sleeps in the
+calling thread.
 
 A 429 or 503 holds back every backend on that gate, not only the one that got it.
-The back-off is stored under `jasil:geocoding:back-off:{service}:{host}` until the
-`Retry-After` instant, and lookups return that `retry_at` without sending
-meanwhile. An upstream that keeps being called after a 429 may ban the client.
+Each back-off is a member of an [ordered index](#ordered-indexes) under
+`jasil:geocoding:back-off:{service}:{host}`, scored by and expiring at its
+`Retry-After` instant, so a shorter back-off recorded after a longer one never
+cuts it short. Until the longest one ends, lookups return its `retry_at` without
+sending, including a lookup that was already waiting for its slot when the
+back-off arrived. An upstream that keeps being called after a 429 may ban the
+client. Each lookup reads the back-off with one `index_range`, again after any
+wait for its slot.
 
 Geocoding is the one capability that never fails startup: an unsupported
 scheme, a missing API key, or a host that fails SSRF validation disables the

@@ -225,21 +225,22 @@ class TestRebuild:
         assert builds["geocoding"] == 2
         assert provider.current_backend()._api_key == "key-two"
 
-    def test_rebuilding_geocoding_keeps_the_rate_budget(self):
-        """The gate lives in the platform state under the upstream's key, so a rebuilt backend shares the budget."""
+    def test_rebuilding_geocoding_keeps_the_rate_budget(self, monkeypatch):
+        """The gate lives in the platform state under the upstream's key, so a rebuilt backend finds its slots."""
+        monkeypatch.setattr("jasil.backends.state_memory.time.monotonic", lambda: 1000.0)
         state = MemoryState()
         source = Source(GOOD_GEO)
         provider = _geo(source, state=state)
         provider.reverse(1.0, 2.0)
         first = provider.current_backend()
+        assert state.reserve_slot(first._gate_key, 1.0, max_wait_seconds=0).reserved
 
         source.value = replace(GOOD_GEO, api_key="key-two")
         provider.reverse(1.0, 2.0)
         rebuilt = provider.current_backend()
 
         assert rebuilt is not first
-        assert rebuilt._state is state
-        assert rebuilt._gate_key == first._gate_key
+        assert not rebuilt._state.reserve_slot(rebuilt._gate_key, 1.0, max_wait_seconds=0).reserved
 
     def test_settings_are_followed_in_both_directions(self):
         source = Source(GOOD_MAIL)

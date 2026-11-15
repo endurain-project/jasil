@@ -282,7 +282,8 @@ class HttpGeocoding:
         self._api_key = api_key
         self._min_interval = min_interval_seconds
         self._user_agent = user_agent
-        upstream = f"{service}:{urlsplit(base_url).netloc}"
+        # Lower-cased: host names are case-insensitive, so two spellings of one upstream share one budget.
+        upstream = f"{service}:{urlsplit(base_url).netloc.lower()}"
         self._gate_key = f"jasil:geocoding:gate:{upstream}"
         self._back_off_key = f"jasil:geocoding:back-off:{upstream}"
 
@@ -330,36 +331,48 @@ class HttpGeocoding:
         """Wait for this request's turn, or return when to retry instead of sending it.
 
         It is not sent while the upstream's back-off lasts, nor when no slot is free within ``max_wait_seconds``.
+        The back-off is read again after waiting for a slot, since a peer may have been told to back off meanwhile.
         Without the state the rate limit cannot be kept, so nothing is sent then either.
         """
-        now = self._clock.now()
         try:
-            back_off = self._state.get(self._back_off_key)
-            if back_off is not None and (until := float(back_off)) > now.timestamp():
-                return datetime.fromtimestamp(until, UTC)
+            if (until := self._backed_off_until()) is not None:
+                return until
             if self._min_interval <= 0:
                 return None
             slot = self._state.reserve_slot(self._gate_key, self._min_interval, max_wait_seconds=max_wait_seconds)
+            if not slot.reserved:
+                logger.debug("Reverse-geocoding via %s deferred: no request slot within the wait bound", self._service)
+                return self._clock.now() + timedelta(seconds=slot.wait_seconds)
+            if slot.wait_seconds > 0:
+                time.sleep(slot.wait_seconds)
+                return self._backed_off_until()
+            return None
         except (StateBackendUnavailableError, ValueError) as error:
             logger.error(
                 "Reverse-geocoding via %s could not read its rate gate - %s", self._service, type(error).__name__
             )
-            return now + timedelta(seconds=_RETRY_BACKOFF_SECONDS)
-        if not slot.reserved:
-            logger.debug("Reverse-geocoding via %s deferred: no request slot within the wait bound", self._service)
-            return now + timedelta(seconds=slot.wait_seconds)
-        if slot.wait_seconds > 0:
-            time.sleep(slot.wait_seconds)
+            return self._clock.now() + timedelta(seconds=_RETRY_BACKOFF_SECONDS)
+
+    def _backed_off_until(self) -> datetime | None:
+        """Return when the upstream's longest back-off ends, while one lasts."""
+        latest = self._state.index_range(self._back_off_key, limit=1)
+        if latest and (until := latest[0][1]) > self._clock.now().timestamp():
+            return datetime.fromtimestamp(until, UTC)
         return None
 
     def _back_off(self, retry_after: str | None) -> datetime:
-        """Hold back every backend on this gate until the upstream's ``Retry-After``, and return that instant."""
+        """Hold back every backend on this gate until the upstream's ``Retry-After``, and return that instant.
+
+        Each back-off is a member of an index scored by its end, expiring with it, so a shorter one recorded
+        after a longer one never cuts the longer one short.
+        """
         now = self._clock.now()
         seconds = _retry_after_seconds(retry_after, now)
         retry_at = now + timedelta(seconds=seconds)
         if seconds > 0:
+            until = retry_at.timestamp()
             try:
-                self._state.set(self._back_off_key, repr(retry_at.timestamp()).encode(), ttl_seconds=math.ceil(seconds))
+                self._state.index_add(self._back_off_key, repr(until), until, ttl_seconds=math.ceil(seconds))
             except StateBackendUnavailableError as error:
                 logger.error(
                     "Reverse-geocoding via %s could not share the upstream's back-off - %s",

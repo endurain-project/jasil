@@ -705,6 +705,28 @@ class TestTheRateGate:
         assert slept == [pytest.approx(1.0)]
         assert state.get("jasil:geocoding:gate:nominatim:geo.test") is not None
 
+    def test_the_host_is_matched_without_regard_to_case(self):
+        """``GEO.test`` and ``geo.test`` are one upstream, so a spelling must not split its budget or back-off."""
+        upper, lower = _geocoder(base_url="https://GEO.test/reverse"), _geocoder()
+
+        assert (upper._gate_key, upper._back_off_key) == (lower._gate_key, lower._back_off_key)
+
+    @responses.activate
+    def test_a_back_off_recorded_while_waiting_for_a_slot_stops_the_request(self, monkeypatch):
+        """A peer's 429 can arrive while this request sleeps for its slot; it must not then send anyway."""
+        monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0)
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        clock, state = FixedClock(), MemoryState()
+        backend = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
+        peer = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
+        state.reserve_slot(backend._gate_key, 1.0, max_wait_seconds=0)  # the next slot is a second away
+        monkeypatch.setattr(geocoding_http.time, "sleep", lambda _seconds: peer._back_off("120"))
+
+        outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
+
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=120))
+        assert len(responses.calls) == 0
+
     @responses.activate
     def test_backends_for_different_hosts_do_not_share_a_budget(self, slept):
         responses.add(responses.GET, "https://a.test/reverse", json=PORTUGAL)
@@ -827,10 +849,17 @@ class TestLookupOutcomes:
 
         assert peer.lookup(38.7, -9.1, max_wait_seconds=0).place == GeocodedPlace(country="Portugal")
 
+    def test_a_shorter_back_off_never_cuts_a_longer_one_short(self, backend, clock):
+        """Two requests in flight can come back with different ``Retry-After`` values, in either order."""
+        backend._back_off("3600")
+        backend._back_off("60")
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0) == GeocodingOutcome(None, self._after(clock, 3600))
+
     @responses.activate
     def test_a_back_off_that_cannot_be_shared_still_says_when_to_retry(self, clock, caplog):
         class _ReadOnly(MemoryState):
-            def set(self, key, value, ttl_seconds=None):
+            def index_add(self, key, member, score, ttl_seconds):
                 raise StateBackendUnavailableError("down")
 
         responses.add(responses.GET, URL, status=429, headers={"Retry-After": "120"}, json={})
