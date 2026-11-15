@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterator
 
 import jasil._core.state_keys as state_keys
-from jasil.providers import TieredFailureOutcome
+from jasil.providers import SlotReservation, TieredFailureOutcome
 
 #: An index: each member's score and its expiry deadline on the monotonic clock.
 type _Index = dict[str, tuple[float, float]]
@@ -220,6 +220,20 @@ class MemoryState:
                 key for key in list(self._indexes) if key.startswith(prefix) and self._live_index(key) is not None
             ]
         return iter(live_keys)
+
+    def reserve_slot(self, key: str, interval_seconds: float, *, max_wait_seconds: float) -> SlotReservation:
+        """Reserve the gate's next free slot under the instance lock, on the monotonic clock in microseconds."""
+        interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
+        with self._lock:
+            self._sweep_if_due()
+            now = math.floor(time.monotonic() * 1_000_000)
+            last = self._live_value(key)
+            slot = now if last is None else max(now, _parse_integer(last) + interval)
+            wait = slot - now
+            if wait > max_wait:
+                return SlotReservation(False, state_keys.to_seconds(wait))
+            self._data[key] = (str(slot).encode(), state_keys.to_seconds(slot + interval))
+            return SlotReservation(True, state_keys.to_seconds(wait))
 
     def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
         """Insert or replace ``member`` with ``score``, expiring ``ttl_seconds`` from now."""

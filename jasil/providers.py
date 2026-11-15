@@ -142,6 +142,20 @@ class TieredFailureOutcome:
     newly_locked: bool
 
 
+@dataclass(frozen=True)
+class SlotReservation:
+    """Result of :meth:`StateProvider.reserve_slot`.
+
+    Attributes:
+        reserved: True when this call reserved a slot.
+        wait_seconds: When ``reserved``, the seconds the caller waits before acting (``0.0`` to act at once).
+            Otherwise the seconds until the gate's next free slot, which exceed the call's ``max_wait_seconds``.
+    """
+
+    reserved: bool
+    wait_seconds: float
+
+
 @runtime_checkable
 class StateProvider(Protocol):
     """Ephemeral keyed state (counters, TTL flags, small blobs).
@@ -153,8 +167,9 @@ class StateProvider(Protocol):
     would otherwise depend on the backend: one-winner claims and single-use values
     (``set_if_absent``, ``get_and_delete``), changes only the current holder of a
     value may make (``delete_if_equals``, ``expire_if_equals``), an escalating gate
-    over repeated events (``record_tiered_failure``) and an ordered index whose
-    members expire one by one (``index_add``, ``index_remove``, ``index_range``).
+    over repeated events (``record_tiered_failure``), a rate gate that admits one
+    caller per interval (``reserve_slot``) and an ordered index whose members
+    expire one by one (``index_add``, ``index_remove``, ``index_range``).
 
     ``ttl_seconds`` is a positive number of seconds, or ``None`` for no expiry; zero or a negative
     value raises ``ValueError``. ``delete_prefix`` needs a non-empty prefix. A value the operation
@@ -164,7 +179,7 @@ class StateProvider(Protocol):
     A key holds either a plain value or an index. ``iter_keys``, ``delete`` and ``delete_prefix`` treat an
     index key like any other key, ``set`` replaces it with a plain value and ``set_if_absent`` finds it taken.
     The other plain-value operations raise ``ValueError`` on an index key, and the index operations raise it
-    on a plain key.
+    on a plain key. A rate gate is a plain value holding its last reserved slot.
     """
 
     def get(self, key: str) -> bytes | None:
@@ -347,6 +362,30 @@ class StateProvider(Protocol):
                 that tier's seconds; the highest tier reached wins.
             counter_ttl_seconds: How long the count survives without a new
                 occurrence.
+        """
+
+    def reserve_slot(self, key: str, interval_seconds: float, *, max_wait_seconds: float) -> SlotReservation:
+        """Reserve the next free slot of the rate gate ``key``, which admits one caller per ``interval_seconds``.
+
+        Atomically, the next free slot is now or one interval after the last slot reserved, whichever is later.
+        When it is no more than ``max_wait_seconds`` away this call reserves it; otherwise it reserves nothing.
+        Concurrent callers get distinct slots ``interval_seconds`` apart. Every caller reads one clock, the
+        process's in memory and the server's on Redis, so callers whose own clocks disagree still share one
+        gate. The key expires one interval after its last slot, so an idle gate leaves nothing behind.
+
+        Args:
+            key: The gate key.
+            interval_seconds: Seconds between two slots: positive, finite and at most a day. Precise to the
+                microsecond.
+            max_wait_seconds: The longest wait the caller accepts: zero or more, and finite.
+
+        Returns:
+            Whether a slot was reserved, and the wait until it or, when none was, until the next free one.
+
+        Raises:
+            ValueError: When ``interval_seconds`` or ``max_wait_seconds`` is out of range, ``key`` holds an index,
+                or ``key`` holds a plain value that is not a slot.
+            StateBackendUnavailableError: When the backing store is unreachable.
         """
 
     def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
@@ -1032,6 +1071,21 @@ class GeocodedPlace:
     display_name: str | None = None
 
 
+@dataclass(frozen=True)
+class GeocodingOutcome:
+    """Result of :meth:`GeocodingProvider.lookup`.
+
+    Attributes:
+        place: The resolved place, when the upstream answered with one.
+        retry_at: When to ask again, set (and ``place`` is ``None``) when the lookup got no final answer: no
+            request slot was free in time, the upstream throttled or failed, or the request did not get through.
+            ``None`` means the answer is final: ``place``, or nothing at this coordinate.
+    """
+
+    place: GeocodedPlace | None = None
+    retry_at: datetime | None = None
+
+
 @runtime_checkable
 class GeocodingProvider(Protocol):
     """Reverse-geocoding — turn a coordinate into a place name.
@@ -1045,7 +1099,8 @@ class GeocodingProvider(Protocol):
 
     Implementations must not raise for an upstream failure — geocoding is
     best-effort enrichment, and a provider outage must never fail the caller's
-    own work. Return ``None`` when nothing resolves.
+    own work. ``reverse`` returns ``None`` when nothing resolves; ``lookup`` also
+    says when a lookup that got no final answer is worth asking again.
     """
 
     def reverse(self, latitude: float, longitude: float) -> GeocodedPlace | None:
@@ -1057,6 +1112,24 @@ class GeocodingProvider(Protocol):
 
         Returns:
             The resolved :class:`GeocodedPlace`, or ``None`` when nothing resolves or the upstream fails.
+        """
+
+    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+        """Resolve a coordinate to a place, or say when to ask again.
+
+        Never raises for an upstream or state failure; one that may pass sets ``retry_at``.
+
+        Args:
+            latitude: Latitude in decimal degrees.
+            longitude: Longitude in decimal degrees.
+            max_wait_seconds: The longest this call waits for its turn under the rate limit, zero or more and
+                finite. When the wait would be longer it sends nothing and returns when to retry.
+
+        Returns:
+            The :class:`GeocodingOutcome`: a place, a final "nothing here", or when to retry.
+
+        Raises:
+            ValueError: When ``max_wait_seconds`` is negative or not finite.
         """
 
 

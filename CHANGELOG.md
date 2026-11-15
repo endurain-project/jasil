@@ -8,6 +8,22 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-15
+
+This release makes the geocoding rate limit hold for the whole deployment instead of each process, and lets a caller tell a lookup worth retrying from a final "nothing here". **It is breaking for a host that implements `StateProvider` or `GeocodingProvider` itself**: each protocol has a new method (`reserve_slot`, `lookup`), and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` or `isinstance(backend, GeocodingProvider)` until it does). Hosts that use the built-in backends need no change; a deployment that divided `geocoding.rate_limit` by its number of processes should set it back to the provider's limit. No migration is added.
+
+### Added
+
+- **`StateProvider.reserve_slot(key, interval_seconds, *, max_wait_seconds)`**, a rate gate that admits one caller per interval across every process sharing the state. It reserves the next free slot (now, or one interval after the last one) when that slot is within `max_wait_seconds` and returns a `SlotReservation(reserved, wait_seconds)`: the wait before acting, or, when it reserved nothing, the wait until the next free slot. Concurrent callers get distinct slots. Redis reads the server's `TIME` in one Lua script, so replicas with skewed clocks share one gate; memory uses the process's monotonic clock under its lock. The interval is positive, finite, at most a day and precise to the microsecond. The gate is a plain value that expires one interval after its last slot. `SlotReservation` is exported from `jasil`. See [Rate gates](docs/providers-and-backends.md#rate-gates).
+- **`GeocodingProvider.lookup(latitude, longitude, *, max_wait_seconds)`** returns a `GeocodingOutcome(place, retry_at)` from `jasil.providers`. `retry_at` is set when the lookup got no final answer: no request slot was free within `max_wait_seconds`, the upstream answered 429 or 503 (its `Retry-After`, clamped to one hour, else 60 seconds), another 5xx, a timeout or a connection failure (60 seconds), the platform state was unreachable, or, for a runtime-sourced provider, the settings could not be loaded or the host could not be resolved (30 seconds). Both fields `None` is a final "nothing here". It never raises for an upstream or state failure, and raises `ValueError` for a `max_wait_seconds` that is negative or not finite. A durable handler can raise `DeferJob(outcome.retry_at)` instead of recording a miss. See [Lookups that say when to retry](docs/providers-and-backends.md#lookups-that-say-when-to-retry).
+
+### Changed
+
+- **The geocoding rate limit is shared by every process on the platform's state.** `HttpGeocoding` reserves each request's slot from a gate under `jasil:geocoding:gate:{service}:{host}`, so with Redis state `geocoding.rate_limit` holds for the whole deployment, and a settings reload keeps the budget instead of resetting it. With `memory://` state it holds for the one process, as before. A 429 or 503 now holds back every process on that gate until the upstream's `Retry-After`, under `jasil:geocoding:back-off:{service}:{host}`. See [One rate limit for the whole deployment](docs/providers-and-backends.md#one-rate-limit-for-the-whole-deployment).
+- **`reverse` waits at most 60 seconds for its slot**, then returns `None` without sending. It waited as long as the queue of callers in its process before.
+- **A `geocoding.rate_limit` below one request a day disables geocoding**, with a warning, since a rate gate's interval is at most a day.
+- **The platform builds geocoding after the state**, which holds its rate gate.
+
 ## [0.21.0] - 2026-11-15
 
 This release adds an ordered index with per-member expiry and compare-and-delete and compare-and-expire to `StateProvider`. **It is breaking for a host that implements `StateProvider` itself**: the protocol has five new methods, and such a backend must add them (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in `MemoryState` and `RedisState` need no change unless they call `delete_prefix` with a prefix such as `"jasil:"`, which is now refused; see **Changed**. No migration is added.

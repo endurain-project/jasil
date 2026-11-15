@@ -9,16 +9,20 @@ import logging
 import threading
 import traceback
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
 import jasil.container as container
 import jasil.settings as settings
+from jasil import _reloading as reloading
 from jasil.backends.geocoding_http import HttpGeocoding, NullGeocoding
 from jasil.backends.mail_memory import MemoryMail, NullMail
 from jasil.backends.mail_smtp import SmtpMail
+from jasil.backends.state_memory import MemoryState
 from jasil.providers import (
     GeocodedPlace,
+    GeocodingOutcome,
     GeocodingProvider,
     MailError,
     MailFailure,
@@ -27,6 +31,7 @@ from jasil.providers import (
     MailProvider,
 )
 from jasil.settings import GeocodingSettings, JasilSettings, MailSettings, NetworkSettings, RuntimeSources
+from jasil.testing import FixedClock
 
 MESSAGE = MailMessage(to=["to@example.com"], subject="s", text="t")
 GOOD_MAIL = MailSettings(uri="memory://", from_address="a@example.com")
@@ -91,14 +96,17 @@ def _mail(source, base: JasilSettings | None = None):
     return container._build_runtime_mail(base or JasilSettings(), container.SystemClock(), source)
 
 
-def _geo(source, base: JasilSettings | None = None):
-    return container._build_runtime_geocoding(base or JasilSettings(), source)
+def _geo(source, base: JasilSettings | None = None, state=None, clock=None):
+    return container._build_runtime_geocoding(
+        base or JasilSettings(), state or MemoryState(), clock or FixedClock(), source
+    )
 
 
 @pytest.fixture(autouse=True)
 def no_network(monkeypatch):
     """Geocoding backends built here must never reach the real upstream."""
     monkeypatch.setattr(HttpGeocoding, "reverse", lambda self, latitude, longitude: None)
+    monkeypatch.setattr(HttpGeocoding, "lookup", lambda self, latitude, longitude, *, max_wait_seconds: None)
 
 
 @pytest.fixture(autouse=True)
@@ -217,16 +225,21 @@ class TestRebuild:
         assert builds["geocoding"] == 2
         assert provider.current_backend()._api_key == "key-two"
 
-    def test_rebuilding_geocoding_resets_the_throttle(self):
+    def test_rebuilding_geocoding_keeps_the_rate_budget(self):
+        """The gate lives in the platform state under the upstream's key, so a rebuilt backend shares the budget."""
+        state = MemoryState()
         source = Source(GOOD_GEO)
-        provider = _geo(source)
+        provider = _geo(source, state=state)
         provider.reverse(1.0, 2.0)
         first = provider.current_backend()
 
-        source.value = replace(GOOD_GEO, rate_limit=2.0)
+        source.value = replace(GOOD_GEO, api_key="key-two")
         provider.reverse(1.0, 2.0)
+        rebuilt = provider.current_backend()
 
-        assert provider.current_backend() is not first
+        assert rebuilt is not first
+        assert rebuilt._state is state
+        assert rebuilt._gate_key == first._gate_key
 
     def test_settings_are_followed_in_both_directions(self):
         source = Source(GOOD_MAIL)
@@ -382,6 +395,36 @@ class TestSourceFailure:
         source.error = RuntimeError("db down")
 
         assert _geo(source).reverse(1.0, 2.0) is None
+
+    def test_a_lookup_without_a_good_backend_says_when_to_retry(self):
+        """The source may answer on a later call, so its outage is no final answer."""
+        clock = FixedClock()
+        source = Source(GOOD_GEO)
+        source.error = RuntimeError("db down")
+
+        outcome = _geo(source, clock=clock).lookup(1.0, 2.0, max_wait_seconds=0)
+
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=reloading.TRANSIENT_RETRY_SECONDS))
+
+    def test_a_lookup_goes_through_the_last_good_backend(self, monkeypatch):
+        answer = GeocodingOutcome(GeocodedPlace(locality="Porto"))
+        monkeypatch.setattr(HttpGeocoding, "lookup", lambda self, lat, lon, *, max_wait_seconds: answer)
+        source = Source(GOOD_GEO)
+        provider = _geo(source)
+        provider.lookup(1.0, 2.0, max_wait_seconds=0)
+
+        source.error = RuntimeError("db down")
+
+        assert provider.lookup(1.0, 2.0, max_wait_seconds=0) is answer
+
+    def test_a_lookup_after_a_rejection_is_a_final_answer_of_nothing(self):
+        provider = _geo(Source(GeocodingSettings(uri="mapquest://x")))
+
+        assert provider.lookup(1.0, 2.0, max_wait_seconds=0) == GeocodingOutcome(None, None)
+
+    def test_a_lookup_refuses_a_max_wait_out_of_range(self):
+        with pytest.raises(ValueError, match="max_wait_seconds"):
+            _geo(Source(GOOD_GEO)).lookup(1.0, 2.0, max_wait_seconds=-1)
 
     def test_geocoding_after_a_rejection_returns_none(self, monkeypatch):
         monkeypatch.setattr(HttpGeocoding, "reverse", lambda self, lat, lon: GeocodedPlace(locality="Porto"))
@@ -573,8 +616,6 @@ class TestTransientAndUnexpectedFailures:
         return calls
 
     def test_an_unresolved_mail_relay_is_retried_after_the_delay(self, monkeypatch):
-        from jasil import _reloading as reloading
-
         calls = self._resolver(monkeypatch, fail_first=1)
         now = [1000.0]
         monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
@@ -594,8 +635,6 @@ class TestTransientAndUnexpectedFailures:
         assert calls["n"] == 2
 
     def test_an_unresolved_geocoding_host_is_retried(self, monkeypatch):
-        from jasil import _reloading as reloading
-
         self._resolver(monkeypatch, fail_first=1)
         now = [1000.0]
         monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
@@ -605,12 +644,13 @@ class TestTransientAndUnexpectedFailures:
 
         assert provider.reverse(1.0, 2.0) is None
         assert provider.current_backend() is None
+        assert provider.lookup(1.0, 2.0, max_wait_seconds=0).retry_at is not None
         now[0] += reloading.TRANSIENT_RETRY_SECONDS
         provider.reverse(1.0, 2.0)
         assert isinstance(provider.current_backend(), HttpGeocoding)
 
     def test_an_unexpected_build_error_is_cached_not_raised(self, monkeypatch):
-        def boom(settings, **_kwargs):
+        def boom(settings, *_args, **_kwargs):
             raise AttributeError("secret-value")
 
         monkeypatch.setattr(container, "_build_geocoding", boom)
@@ -618,3 +658,4 @@ class TestTransientAndUnexpectedFailures:
 
         assert provider.reverse(1.0, 2.0) is None
         assert provider.reverse(1.0, 2.0) is None
+        assert provider.lookup(1.0, 2.0, max_wait_seconds=0) == GeocodingOutcome(None, None)

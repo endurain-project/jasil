@@ -10,6 +10,7 @@ Backend-specific behaviour (TTL expiry mechanics, Redis error translation) lives
 in the dedicated classes at the bottom.
 """
 
+import math
 import threading
 import time
 
@@ -18,7 +19,7 @@ import pytest
 
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
-from jasil.providers import StateBackendUnavailableError, StateProvider, TieredFailureOutcome
+from jasil.providers import SlotReservation, StateBackendUnavailableError, StateProvider, TieredFailureOutcome
 
 
 @pytest.fixture(params=["memory", "redis"])
@@ -618,6 +619,136 @@ class TestIndexConcurrency:
         self._run_writers(states)
 
         assert {member for member, _score in states[0].index_range("idx", limit=1000)} == self._expected()
+
+
+class TestSlotConformance:
+    """A rate gate admits one caller per interval, each in a slot of its own, on the backend's single clock."""
+
+    def test_the_first_reservation_may_act_at_once(self, clock, state):
+        assert state.reserve_slot("gate", 1.0, max_wait_seconds=0) == SlotReservation(True, 0.0)
+
+    def test_consecutive_reservations_are_spaced_by_the_interval(self, clock, state):
+        waits = [state.reserve_slot("gate", 0.5, max_wait_seconds=10).wait_seconds for _ in range(3)]
+
+        assert waits == pytest.approx([0.0, 0.5, 1.0])
+
+    def test_a_sub_second_interval_keeps_its_precision(self, clock, state):
+        waits = [state.reserve_slot("gate", 0.01, max_wait_seconds=10).wait_seconds for _ in range(4)]
+
+        assert waits == pytest.approx([0.0, 0.01, 0.02, 0.03])
+
+    def test_a_gate_idle_for_its_interval_admits_at_once(self, clock, state):
+        state.reserve_slot("gate", 1.0, max_wait_seconds=10)
+        state.reserve_slot("gate", 1.0, max_wait_seconds=10)
+        clock["seconds"] += 5
+
+        assert state.reserve_slot("gate", 1.0, max_wait_seconds=0) == SlotReservation(True, 0.0)
+
+    def test_a_wait_past_the_bound_reserves_nothing(self, clock, state):
+        state.reserve_slot("gate", 1.0, max_wait_seconds=0)
+
+        refused = state.reserve_slot("gate", 1.0, max_wait_seconds=0.5)
+
+        assert refused == SlotReservation(False, pytest.approx(1.0))
+        assert state.reserve_slot("gate", 1.0, max_wait_seconds=0.5) == refused
+        assert state.reserve_slot("gate", 1.0, max_wait_seconds=1.0) == SlotReservation(True, pytest.approx(1.0))
+
+    def test_gates_under_different_keys_are_independent(self, clock, state):
+        state.reserve_slot("gate:a", 1.0, max_wait_seconds=0)
+
+        assert state.reserve_slot("gate:b", 1.0, max_wait_seconds=0) == SlotReservation(True, 0.0)
+
+    def test_an_idle_gate_expires_after_its_last_slot(self, clock, state):
+        state.reserve_slot("gate", 1.0, max_wait_seconds=10)
+        state.reserve_slot("gate", 1.0, max_wait_seconds=10)  # the last slot is one second ahead
+        clock["seconds"] += 1.5
+        assert list(state.iter_keys("gate")) == ["gate"]
+
+        clock["seconds"] += 1.0
+
+        assert list(state.iter_keys("gate")) == []
+
+    def test_an_index_key_is_refused(self, state):
+        state.index_add("gate", "a", 1.0, ttl_seconds=60)
+
+        with pytest.raises(ValueError):
+            state.reserve_slot("gate", 1.0, max_wait_seconds=0)
+        assert state.index_range("gate", limit=1) == [("a", 1.0)]
+
+    def test_a_plain_value_that_is_not_a_slot_is_refused(self, state):
+        state.set("gate", b"abc")
+
+        with pytest.raises(ValueError):
+            state.reserve_slot("gate", 1.0, max_wait_seconds=0)
+        assert state.get("gate") == b"abc"
+
+    @pytest.mark.parametrize("interval", [0, -1.0, math.inf, math.nan, 86_400.5])
+    def test_an_interval_that_is_not_positive_finite_and_at_most_a_day_is_refused(self, state, interval):
+        with pytest.raises(ValueError, match="interval_seconds"):
+            state.reserve_slot("gate", interval, max_wait_seconds=0)
+
+        assert state.get("gate") is None
+
+    @pytest.mark.parametrize("max_wait", [-0.1, math.inf, math.nan])
+    def test_a_max_wait_that_is_negative_or_not_finite_is_refused(self, state, max_wait):
+        with pytest.raises(ValueError, match="max_wait_seconds"):
+            state.reserve_slot("gate", 1.0, max_wait_seconds=max_wait)
+
+        assert state.get("gate") is None
+
+
+class TestSlotConcurrency:
+    """Concurrent callers each get a slot of their own: none shares one, none is skipped."""
+
+    CALLERS = 8
+
+    def _reserve_concurrently(self, states):
+        waits = []
+        barrier = threading.Barrier(self.CALLERS)
+
+        def reserve(state):
+            barrier.wait()
+            waits.append(state.reserve_slot("gate", 0.1, max_wait_seconds=60).wait_seconds)
+
+        threads = [threading.Thread(target=reserve, args=(state,)) for state in states]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return sorted(waits)
+
+    def test_threads_sharing_a_memory_backend(self, clock):
+        waits = self._reserve_concurrently([MemoryState()] * self.CALLERS)
+
+        assert waits == pytest.approx([0.1 * n for n in range(self.CALLERS)])
+
+    def test_connections_sharing_a_redis_server(self, clock):
+        server = fakeredis.FakeServer()
+        states = [RedisState(fakeredis.FakeStrictRedis(server=server)) for _ in range(self.CALLERS)]
+
+        waits = self._reserve_concurrently(states)
+
+        assert waits == pytest.approx([0.1 * n for n in range(self.CALLERS)])
+
+
+class TestRedisSlotLayout:
+    @pytest.fixture
+    def client(self):
+        return fakeredis.FakeStrictRedis(decode_responses=False)
+
+    def test_the_gate_expires_one_interval_after_its_last_slot(self, clock, client):
+        state = RedisState(client)
+        state.reserve_slot("gate", 2.0, max_wait_seconds=10)
+        state.reserve_slot("gate", 2.0, max_wait_seconds=10)
+
+        assert client.pttl("gate") == 4_000
+
+    def test_the_slot_is_read_from_the_server_clock(self, clock, client, monkeypatch):
+        """Replicas with skewed clocks must agree on one gate, so the script reads Redis ``TIME``, not the caller's."""
+        monkeypatch.setattr("jasil.backends.state_redis.time", None)  # the backend module must not read its clock
+
+        assert RedisState(client).reserve_slot("gate", 1.0, max_wait_seconds=0) == SlotReservation(True, 0.0)
+        assert client.get("gate") == b"1800000000000000"
 
 
 class TestRedisIndexLayout:

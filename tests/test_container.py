@@ -63,6 +63,10 @@ def _settings(**kwargs) -> settings.JasilSettings:
     return settings.JasilSettings(**kwargs)
 
 
+def _geocoding(jasil_settings: settings.JasilSettings, state=None):
+    return container._build_geocoding(jasil_settings, state or MemoryState(), SystemClock())
+
+
 class TestStateResolution:
     def test_memory_uri_selects_the_in_process_backend(self):
         assert isinstance(container._build_state(_settings(state_uri="memory://")), MemoryState)
@@ -201,19 +205,19 @@ class TestGeocodingResolution:
     """
 
     def test_it_is_disabled_by_default(self):
-        assert isinstance(container._build_geocoding(_settings()), NullGeocoding)
+        assert isinstance(_geocoding(_settings()), NullGeocoding)
 
     def test_leaving_it_unconfigured_is_quiet(self, caplog):
         """An optional capability nobody asked for must not warn at every startup."""
         with caplog.at_level("WARNING"):
-            container._build_geocoding(_settings())
+            _geocoding(_settings())
 
         assert caplog.text == ""
 
     def test_an_unsupported_scheme_disables_it(self, caplog):
         """A non-empty typo *is* worth warning about \u2014 someone meant to enable it."""
         with caplog.at_level("WARNING"):
-            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri="mapquest://x")))
+            provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="mapquest://x")))
 
         assert isinstance(provider, NullGeocoding)
         assert "not supported" in caplog.text
@@ -231,38 +235,32 @@ class TestGeocodingResolution:
         ],
     )
     def test_a_malformed_uri_disables_it(self, uri):
-        provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri, api_key="k")))
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri, api_key="k")))
 
         assert isinstance(provider, NullGeocoding)
 
     def test_geocode_without_an_api_key_is_disabled(self, caplog):
         with caplog.at_level("WARNING"):
-            provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri="geocode://")))
+            provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="geocode://")))
 
         assert isinstance(provider, NullGeocoding)
         assert "api_key" in caplog.text
 
     def test_geocode_with_an_api_key_is_enabled(self):
-        provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(uri="geocode://", api_key="k"))
-        )
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="geocode://", api_key="k")))
 
         assert isinstance(provider, HttpGeocoding)
 
     def test_a_host_failing_ssrf_validation_disables_it(self, monkeypatch):
         """A private or malformed host must not be dialed, and must not stop startup."""
-        provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(uri="nominatim://127.0.0.1"))
-        )
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="nominatim://127.0.0.1")))
 
         assert isinstance(provider, NullGeocoding)
 
     def test_a_valid_host_is_enabled(self, monkeypatch):
         monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: (f"https://{host}/reverse", None))
 
-        provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(uri="nominatim://nominatim.test:8080"))
-        )
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="nominatim://nominatim.test:8080")))
 
         assert isinstance(provider, HttpGeocoding)
         assert provider._service == "nominatim"
@@ -286,7 +284,7 @@ class TestGeocodingResolution:
 
         monkeypatch.setattr(container, "resolve_reverse_endpoint", fake)
 
-        provider = container._build_geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri)))
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri=uri)))
 
         assert provider._service == service
         assert seen == {"host": "h.test", "https": use_https}
@@ -296,7 +294,7 @@ class TestGeocodingResolution:
         library must not hard-code a host application's name."""
         monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
-        provider = container._build_geocoding(
+        provider = _geocoding(
             _settings(geocoding=settings.GeocodingSettings(uri="photon://photon.test", user_agent="MyApp/1.0"))
         )
 
@@ -305,18 +303,36 @@ class TestGeocodingResolution:
     def test_the_rate_limit_becomes_a_minimum_interval(self, monkeypatch):
         monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
-        provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=2.0))
-        )
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=2.0)))
 
         assert provider._min_interval == 0.5
+
+    def test_a_rate_limit_slower_than_one_request_a_day_disables_it(self, monkeypatch, caplog):
+        """The rate gate takes an interval of at most a day."""
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
+
+        with caplog.at_level("WARNING"):
+            provider = _geocoding(
+                _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=1e-6))
+            )
+
+        assert isinstance(provider, NullGeocoding)
+        assert "rate_limit" in caplog.text
+
+    def test_the_backend_keeps_its_gate_in_the_platform_state(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
+
+        platform = container.build_platform(
+            _settings(data_dir=str(tmp_path), geocoding=settings.GeocodingSettings(uri="photon://p.test"))
+        )
+
+        assert platform.geocoding._state is platform.state
+        assert platform.geocoding._clock is platform.clock
 
     def test_a_zero_rate_limit_disables_throttling(self, monkeypatch):
         monkeypatch.setattr(container, "resolve_reverse_endpoint", lambda host, **kw: ("https://x/reverse", None))
 
-        provider = container._build_geocoding(
-            _settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=0))
-        )
+        provider = _geocoding(_settings(geocoding=settings.GeocodingSettings(uri="photon://p.test", rate_limit=0)))
 
         assert provider._min_interval == 0
 

@@ -15,7 +15,7 @@ from typing import Any, Concatenate
 
 import jasil._core.redis_clients as redis_clients
 import jasil._core.state_keys as state_keys
-from jasil.providers import StateBackendUnavailableError, TieredFailureOutcome
+from jasil.providers import SlotReservation, StateBackendUnavailableError, TieredFailureOutcome
 
 # Atomic escalating-gate script (KEYS: gate, counter; ARGV: now, counter_ttl,
 # then (threshold, lock_seconds) pairs ascending). Mirrors the in-memory backend:
@@ -82,6 +82,30 @@ end
 return 0
 """
 
+# Reserve a rate-gate slot (KEYS: gate; ARGV: interval, max_wait, both in microseconds). The slot is counted in
+# microseconds of the server's own clock, so replicas whose clocks disagree still share one gate; at today's epoch
+# that is below 2^53, where a Lua number is still an exact integer. GET refuses an index with WRONGTYPE, and a value
+# that is not a whole number is refused as INCR refuses one. Returns {reserved, wait}.
+_RESERVE_SLOT_SCRIPT = """
+local time = redis.call("TIME")
+local now = tonumber(time[1]) * 1000000 + tonumber(time[2])
+local interval = tonumber(ARGV[1])
+local slot = now
+local last = redis.call("GET", KEYS[1])
+if last then
+    local previous = tonumber(last)
+    if previous == nil or previous ~= math.floor(previous) then
+        return redis.error_reply("ERR value is not an integer or out of range")
+    end
+    slot = math.max(now, previous + interval)
+end
+local wait = slot - now
+if wait > tonumber(ARGV[2]) then
+    return {0, wait}
+end
+redis.call("SET", KEYS[1], string.format("%.0f", slot), "PX", math.ceil((slot + interval - now) / 1000))
+return {1, wait}
+"""
 
 # Opens every index script (KEYS: index, deadlines; ARGV[1]: the caller's epoch time). It refuses a key of another
 # type, discards deadlines an index left behind (``delete`` and ``delete_prefix`` remove only the index), and drops
@@ -209,7 +233,7 @@ class RedisState:
 
     Correct for the ``distributed`` profile and multi-worker deployments.
     ``get`` / ``set`` store opaque ``bytes``; ``incr`` is an atomic server-side
-    ``INCRBY``; ``record_tiered_failure`` runs an atomic Lua script; TTLs map to
+    ``INCRBY``; ``record_tiered_failure`` and ``reserve_slot`` run atomic Lua scripts; TTLs map to
     Redis key expiry.
     """
 
@@ -222,6 +246,7 @@ class RedisState:
         self._index_add_script = client.register_script(_INDEX_ADD_SCRIPT)
         self._index_remove_script = client.register_script(_INDEX_REMOVE_SCRIPT)
         self._index_range_script = client.register_script(_INDEX_RANGE_SCRIPT)
+        self._reserve_slot_script = client.register_script(_RESERVE_SLOT_SCRIPT)
 
     @classmethod
     def from_uri(cls, uri: str) -> "RedisState":
@@ -326,6 +351,13 @@ class RedisState:
         gate_until = int(result[1])
         newly_locked = bool(int(result[2]))
         return TieredFailureOutcome(count, gate_until or None, newly_locked)
+
+    @_translate_state_errors
+    def reserve_slot(self, key: str, interval_seconds: float, *, max_wait_seconds: float) -> SlotReservation:
+        """Reserve the gate's next free slot in one Lua script, on the Redis server's clock."""
+        interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
+        reserved, wait = self._reserve_slot_script(keys=[key], args=[str(interval), str(max_wait)])
+        return SlotReservation(bool(int(reserved)), state_keys.to_seconds(int(wait)))
 
     @_translate_state_errors
     def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
