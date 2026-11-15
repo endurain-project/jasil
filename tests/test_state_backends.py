@@ -10,6 +10,7 @@ Backend-specific behaviour (TTL expiry mechanics, Redis error translation) lives
 in the dedicated classes at the bottom.
 """
 
+import threading
 import time
 
 import fakeredis
@@ -281,6 +282,400 @@ class TestTtlConformance:
         assert state.set_if_absent("lock", b"first", ttl_seconds=60) is True
         assert state.set_if_absent("lock", b"second", ttl_seconds=60) is False
         assert state.get("lock") == b"first"
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Drive both clocks the backends read: the memory backend's monotonic clock, and the wall clock the Redis
+    backend sends its deadlines in and fakeredis expires keys by."""
+    offset = {"seconds": 0.0}
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0 + offset["seconds"])
+    monkeypatch.setattr(time, "monotonic", lambda: 1000.0 + offset["seconds"])
+    return offset
+
+
+def _whole_index(state, key, page_size):
+    """Walk an index page by page with the keyset cursor, as a caller would."""
+    walked, before = [], None
+    while page := state.index_range(key, limit=page_size, before=before):
+        walked += page
+        member, score = page[-1]
+        before = (score, member)
+    return walked
+
+
+class TestCompareConformance:
+    def test_delete_if_equals_deletes_the_value_it_names(self, state):
+        state.set("claim", b"job-1")
+
+        assert state.delete_if_equals("claim", b"job-1") is True
+        assert state.get("claim") is None
+
+    def test_delete_if_equals_leaves_another_holders_value(self, state):
+        state.set("claim", b"job-2")
+
+        assert state.delete_if_equals("claim", b"job-1") is False
+        assert state.get("claim") == b"job-2"
+
+    def test_delete_if_equals_on_an_absent_key_deletes_nothing(self, state):
+        assert state.delete_if_equals("claim", b"job-1") is False
+
+    def test_delete_if_equals_ignores_an_expired_value(self, clock, state):
+        state.set("claim", b"job-1", ttl_seconds=10)
+        clock["seconds"] += 11
+
+        assert state.delete_if_equals("claim", b"job-1") is False
+
+    def test_expire_if_equals_restarts_the_expiry_of_the_value_it_names(self, clock, state):
+        state.set("claim", b"job-1", ttl_seconds=10)
+        clock["seconds"] += 8
+
+        assert state.expire_if_equals("claim", b"job-1", ttl_seconds=10) is True
+        clock["seconds"] += 8
+        assert state.get("claim") == b"job-1"
+
+    def test_expire_if_equals_leaves_another_holders_expiry(self, clock, state):
+        state.set("claim", b"job-2", ttl_seconds=10)
+
+        assert state.expire_if_equals("claim", b"job-1", ttl_seconds=100) is False
+        clock["seconds"] += 11
+        assert state.get("claim") is None
+
+    def test_expire_if_equals_on_an_absent_key_creates_nothing(self, state):
+        assert state.expire_if_equals("claim", b"job-1", ttl_seconds=10) is False
+        assert state.get("claim") is None
+
+    @pytest.mark.parametrize("ttl", [0, -1])
+    def test_expire_if_equals_refuses_a_ttl_that_is_not_positive(self, state, ttl):
+        state.set("claim", b"job-1")
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            state.expire_if_equals("claim", b"job-1", ttl_seconds=ttl)
+
+
+class TestIndexConformance:
+    def test_members_list_by_score_then_member_both_descending(self, state):
+        for member, score in [("a", 1.0), ("b", 2.0), ("é", 2.0), ("z", 2.0), ("d", 3.0)]:
+            state.index_add("idx", member, score, ttl_seconds=60)
+
+        assert state.index_range("idx", limit=10) == [("d", 3.0), ("é", 2.0), ("z", 2.0), ("b", 2.0), ("a", 1.0)]
+
+    @pytest.mark.parametrize("page_size", [1, 2, 3, 10])
+    def test_the_cursor_pages_through_ties_without_skipping_or_repeating(self, state, page_size):
+        members = [("m1", 5.0), ("m2", 5.0), ("m3", 5.0), ("é", 5.0), ("n", 4.0), ("o", 4.0), ("p", 1.0)]
+        for member, score in members:
+            state.index_add("idx", member, score, ttl_seconds=60)
+
+        assert _whole_index(state, "idx", page_size) == state.index_range("idx", limit=100)
+        assert len(_whole_index(state, "idx", page_size)) == len(members)
+
+    def test_the_cursor_need_not_name_a_member_still_in_the_index(self, state):
+        for member, score in [("a", 1.0), ("c", 2.0), ("e", 2.0)]:
+            state.index_add("idx", member, score, ttl_seconds=60)
+
+        assert state.index_range("idx", limit=10, before=(2.0, "d")) == [("c", 2.0), ("a", 1.0)]
+        assert state.index_range("idx", limit=10, before=(1.5, "zzz")) == [("a", 1.0)]
+        assert state.index_range("idx", limit=10, before=(1.0, "a")) == []
+
+    def test_limit_caps_the_page(self, state):
+        for n in range(5):
+            state.index_add("idx", f"m{n}", float(n), ttl_seconds=60)
+
+        assert state.index_range("idx", limit=2) == [("m4", 4.0), ("m3", 3.0)]
+
+    def test_re_adding_a_member_replaces_its_score(self, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+        state.index_add("idx", "b", 2.0, ttl_seconds=60)
+
+        state.index_add("idx", "a", 3.0, ttl_seconds=60)
+
+        assert state.index_range("idx", limit=10) == [("a", 3.0), ("b", 2.0)]
+
+    def test_a_score_round_trips_exactly(self, state):
+        score = 1_731_000_000.123456
+        state.index_add("idx", "a", score, ttl_seconds=60)
+
+        [(_member, stored)] = state.index_range("idx", limit=1)
+        assert stored == score
+        assert state.index_range("idx", limit=1, before=(stored, "b")) == [("a", score)]
+
+    def test_remove_drops_a_member(self, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+        state.index_add("idx", "b", 2.0, ttl_seconds=60)
+
+        state.index_remove("idx", "b")
+
+        assert state.index_range("idx", limit=10) == [("a", 1.0)]
+
+    def test_removing_the_last_member_removes_the_index(self, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+
+        state.index_remove("idx", "a")
+
+        assert list(state.iter_keys("idx")) == []
+
+    def test_removing_from_an_absent_index_or_member_is_a_no_op(self, state):
+        state.index_remove("idx", "a")
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+        state.index_remove("idx", "b")
+
+        assert state.index_range("idx", limit=10) == [("a", 1.0)]
+
+    def test_an_absent_index_has_no_members(self, state):
+        assert state.index_range("idx", limit=10) == []
+
+    @pytest.mark.parametrize("ttl", [0, -1])
+    def test_index_add_refuses_a_ttl_that_is_not_positive(self, state, ttl):
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            state.index_add("idx", "a", 1.0, ttl_seconds=ttl)
+
+    @pytest.mark.parametrize("score", [float("nan"), float("inf"), float("-inf")])
+    def test_index_add_refuses_a_score_that_is_not_finite(self, state, score):
+        with pytest.raises(ValueError, match="finite"):
+            state.index_add("idx", "a", score, ttl_seconds=60)
+
+    def test_index_range_refuses_a_cursor_score_that_is_not_finite(self, state):
+        with pytest.raises(ValueError, match="finite"):
+            state.index_range("idx", limit=1, before=(float("nan"), "a"))
+
+    @pytest.mark.parametrize("limit", [0, -1])
+    def test_index_range_refuses_a_limit_below_one(self, state, limit):
+        with pytest.raises(ValueError, match="limit"):
+            state.index_range("idx", limit=limit)
+
+    def test_the_index_key_is_listed_once_and_deleted_by_prefix_as_one_key(self, state):
+        state.index_add("owner:1", "a", 1.0, ttl_seconds=60)
+        state.index_add("owner:1", "b", 2.0, ttl_seconds=60)
+        state.set("owner:2", b"x")
+
+        assert sorted(state.iter_keys("owner:")) == ["owner:1", "owner:2"]
+        assert state.delete_prefix("owner:") == 2
+        assert state.index_range("owner:1", limit=10) == []
+
+    def test_delete_removes_an_index(self, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+
+        state.delete("idx")
+
+        assert state.index_range("idx", limit=10) == []
+
+    def test_an_index_deleted_and_rebuilt_keeps_none_of_its_old_members(self, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=60)
+        state.delete_prefix("idx")
+
+        state.index_add("idx", "b", 2.0, ttl_seconds=60)
+
+        assert state.index_range("idx", limit=10) == [("b", 2.0)]
+
+    @pytest.mark.parametrize("prefix", ["j", "jasil:", "jasil:state:index-expiry:", "jasil:state:index-expiry:jobs"])
+    def test_delete_prefix_refuses_a_prefix_reaching_the_reserved_index_namespace(self, clock, state, prefix):
+        """On Redis it would delete index deadlines and keep their indexes, whose members would then never expire."""
+        state.index_add("jobs:idx", "short", 2.0, ttl_seconds=10)
+        state.index_add("jobs:idx", "long", 1.0, ttl_seconds=100)
+
+        with pytest.raises(ValueError, match="reserved"):
+            state.delete_prefix(prefix)
+
+        clock["seconds"] += 11
+        assert state.index_range("jobs:idx", limit=10) == [("long", 1.0)]
+
+    def test_delete_prefix_accepts_a_jasil_prefix_beside_the_reserved_index_namespace(self, state):
+        state.set("jasil:other:k", b"v")
+
+        assert state.delete_prefix("jasil:other:") == 1
+
+
+class TestIndexKeyTypeConformance:
+    """A key holds a plain value or an index, and each kind of operation refuses the other kind the same way."""
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda state: state.index_add("k", "a", 1.0, ttl_seconds=60),
+            lambda state: state.index_remove("k", "a"),
+            lambda state: state.index_range("k", limit=1),
+        ],
+    )
+    def test_an_index_operation_refuses_a_plain_key(self, state, operation):
+        state.set("k", b"x")
+
+        with pytest.raises(ValueError):
+            operation(state)
+        assert state.get("k") == b"x"
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            lambda state: state.get("k"),
+            lambda state: state.incr("k"),
+            lambda state: state.get_and_delete("k"),
+            lambda state: state.delete_if_equals("k", b"x"),
+            lambda state: state.expire_if_equals("k", b"x", ttl_seconds=60),
+            lambda state: state.record_tiered_failure("counter", "k", ((1, 60),), 900),
+        ],
+    )
+    def test_a_plain_value_operation_refuses_an_index_key(self, state, operation):
+        state.index_add("k", "a", 1.0, ttl_seconds=60)
+
+        with pytest.raises(ValueError):
+            operation(state)
+        assert state.index_range("k", limit=1) == [("a", 1.0)]
+
+    def test_set_if_absent_finds_an_index_key_taken(self, state):
+        state.index_add("k", "a", 1.0, ttl_seconds=60)
+
+        assert state.set_if_absent("k", b"x") is False
+        assert state.index_range("k", limit=1) == [("a", 1.0)]
+
+    def test_set_replaces_an_index_with_a_plain_value(self, state):
+        state.index_add("k", "a", 1.0, ttl_seconds=60)
+
+        state.set("k", b"x")
+
+        assert state.get("k") == b"x"
+
+    def test_an_expired_plain_value_frees_its_key_for_an_index(self, clock, state):
+        state.set("k", b"x", ttl_seconds=10)
+        clock["seconds"] += 11
+
+        state.index_add("k", "a", 1.0, ttl_seconds=60)
+
+        assert state.index_range("k", limit=1) == [("a", 1.0)]
+
+
+class TestIndexExpiryConformance:
+    def test_an_expired_member_is_never_listed(self, clock, state):
+        state.index_add("idx", "short", 2.0, ttl_seconds=10)
+        state.index_add("idx", "long", 1.0, ttl_seconds=100)
+
+        clock["seconds"] += 11
+
+        assert state.index_range("idx", limit=10) == [("long", 1.0)]
+        assert state.index_range("idx", limit=10, before=(3.0, "")) == [("long", 1.0)]
+
+    def test_re_adding_a_member_restarts_its_expiry(self, clock, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        clock["seconds"] += 8
+
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        clock["seconds"] += 8
+
+        assert state.index_range("idx", limit=10) == [("a", 1.0)]
+
+    def test_an_index_is_gone_once_its_last_member_expired(self, clock, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        state.index_add("idx", "b", 2.0, ttl_seconds=20)
+
+        clock["seconds"] += 21
+
+        assert list(state.iter_keys("idx")) == []
+        assert state.delete_prefix("idx") == 0
+        assert state.set_if_absent("idx", b"x") is True
+
+    def test_removing_the_longest_lived_member_shortens_the_index_lifetime(self, clock, state):
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        state.index_add("idx", "b", 2.0, ttl_seconds=100)
+
+        state.index_remove("idx", "b")
+        clock["seconds"] += 11
+
+        assert list(state.iter_keys("idx")) == []
+
+
+class TestIndexConcurrency:
+    """Each index call is atomic: concurrent adds and removes lose no update."""
+
+    WRITERS = 8
+    MEMBERS_PER_WRITER = 40
+
+    def _run_writers(self, states):
+        def write(writer, state):
+            for n in range(self.MEMBERS_PER_WRITER):
+                state.index_add("idx", f"w{writer}-{n}", float(n), ttl_seconds=60)
+                if n % 2:
+                    state.index_remove("idx", f"w{writer}-{n}")
+
+        threads = [threading.Thread(target=write, args=(w, states[w])) for w in range(self.WRITERS)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def _expected(self):
+        return {f"w{w}-{n}" for w in range(self.WRITERS) for n in range(0, self.MEMBERS_PER_WRITER, 2)}
+
+    def test_threads_sharing_a_memory_backend(self):
+        state = MemoryState()
+
+        self._run_writers([state] * self.WRITERS)
+
+        assert {member for member, _score in state.index_range("idx", limit=1000)} == self._expected()
+
+    def test_connections_sharing_a_redis_server(self):
+        server = fakeredis.FakeServer()
+        states = [RedisState(fakeredis.FakeStrictRedis(server=server)) for _ in range(self.WRITERS)]
+
+        self._run_writers(states)
+
+        assert {member for member, _score in states[0].index_range("idx", limit=1000)} == self._expected()
+
+
+class TestRedisIndexLayout:
+    """An index is a sorted set of scores plus a sorted set of deadlines under a reserved prefix."""
+
+    @pytest.fixture
+    def client(self):
+        return fakeredis.FakeStrictRedis(decode_responses=False)
+
+    def test_both_keys_expire_with_the_latest_member(self, clock, client):
+        state = RedisState(client)
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        state.index_add("idx", "b", 2.0, ttl_seconds=100)
+
+        assert client.pttl("idx") == 100_000
+        assert client.pttl("jasil:state:index-expiry:idx") == 100_000
+
+    def test_removing_the_latest_member_rearms_both_keys(self, clock, client):
+        state = RedisState(client)
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        state.index_add("idx", "b", 2.0, ttl_seconds=100)
+        clock["seconds"] += 4
+
+        state.index_remove("idx", "b")
+
+        assert client.pttl("idx") == 6_000
+        assert client.pttl("jasil:state:index-expiry:idx") == 6_000
+
+    def test_a_read_drops_expired_members_from_both_keys(self, clock, client):
+        state = RedisState(client)
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+        state.index_add("idx", "b", 2.0, ttl_seconds=100)
+        clock["seconds"] += 11
+
+        state.index_range("idx", limit=10)
+
+        assert client.zrange("idx", 0, -1) == [b"b"]
+        assert client.zrange("jasil:state:index-expiry:idx", 0, -1) == [b"b"]
+
+    def test_deadlines_an_index_left_behind_are_discarded(self, client):
+        state = RedisState(client)
+        state.index_add("idx", "a", 1.0, ttl_seconds=100)
+        state.delete("idx")
+
+        state.index_add("idx", "b", 2.0, ttl_seconds=10)
+
+        assert client.zrange("jasil:state:index-expiry:idx", 0, -1) == [b"b"]
+
+
+class TestMemoryIndexSweep:
+    def test_a_write_sweeps_index_members_that_expired_unread(self, clock):
+        state = MemoryState()
+        state.index_add("idx", "a", 1.0, ttl_seconds=10)
+
+        clock["seconds"] += 61
+        state.set("other", b"1")
+
+        assert state._indexes == {}
 
 
 class TestRedisTtlIsArmed:

@@ -38,6 +38,13 @@ otherwise depend on the backend:
 - **`set_if_absent(key, value, ttl_seconds=None)`** — atomic claim. Returns `True` for
   exactly one caller.
 - **`get_and_delete(key)`** — atomic read-and-consume, for single-use tokens.
+- **`delete_if_equals(key, expected)`** and **`expire_if_equals(key, expected, ttl_seconds)`**
+  — free or renew a claim only while it still holds the value you stored, so a
+  holder whose claim expired and was taken by someone else leaves the new claim
+  alone. Each returns whether it acted. Under the lock in memory, one Lua script on
+  Redis. They compare values, not acquisitions, so store a value unique to each
+  acquisition (a fresh job id or random token): a holder that stored the same
+  bytes as the next one would free or renew that one's claim.
 - **`iter_keys(prefix)`** — the live keys under a literal prefix. An empty prefix
   matches every key, on Redis every key in the database, so name one.
 - **`record_tiered_failure(counter_key, gate_key, tiers, counter_ttl_seconds)`**
@@ -47,6 +54,67 @@ otherwise depend on the backend:
   that tier's seconds. Under a lock in memory, as a Lua script on Redis. While
   the gate is closed a call gets the count back *without* incrementing, so
   hammering cannot push the count into the next tier and extend its own penalty.
+
+### Ordered indexes
+
+An index is a key holding members ordered by score, each member with its own
+expiry. One index per owner answers "this owner's entries, newest first, page by
+page" at the cost of that index alone, where `iter_keys` walks every key on the
+server.
+
+```python
+state = platform.state
+state.index_add("jobs:owner:42", str(job_id), created_at.timestamp(), ttl_seconds=3600)
+page = state.index_range("jobs:owner:42", limit=20)  # [(member, score), ...]
+member, score = page[-1]
+next_page = state.index_range("jobs:owner:42", limit=20, before=(score, member))
+state.index_remove("jobs:owner:42", str(job_id))
+```
+
+- **`index_add(key, member, score, ttl_seconds)`** inserts a member or replaces
+  its score. The member expires `ttl_seconds` after the call, and adding it again
+  restarts that. The score must be finite.
+- **`index_remove(key, member)`** removes a member; an absent index or member is
+  not an error.
+- **`index_range(key, *, limit, before=None)`** returns up to `limit` live
+  members, highest score first and, at equal scores, member descending, so the
+  order is total. `before` is an exclusive `(score, member)` keyset cursor; it
+  pages through ties without skipping or repeating a member, and need not name a
+  member still in the index. Build it from the score `index_range` returned, or
+  from the same `float` you added: scores round-trip exactly.
+
+An expired member is never listed, whether or not it has been cleaned up yet.
+Every call drops the expired members of the index it touches, and the index key
+expires with its longest-lived member, so an owner nobody writes to any more
+leaves nothing behind. Each call is atomic: under the lock in memory, one Lua
+script on Redis.
+
+| Call | Memory | Redis |
+|---|---|---|
+| `index_add`, `index_remove` | O(n) in the index | O(log n + e) |
+| `index_range` | O(n) in the index | O(log n + limit + t + e) |
+
+Here n is the size of that one index, e the expired members the call drops (each
+is dropped once) and t the members tied at the cursor's score. No call depends on
+the rest of the keyspace.
+
+A key holds either a plain value or an index. `iter_keys`, `delete` and
+`delete_prefix` treat an index key like any other key, and count it once.
+`set` replaces an index with a plain value and `set_if_absent` finds an index
+key taken. The other plain-value operations raise `ValueError` on an index key,
+and the index operations raise it on a plain key, on both backends.
+
+On Redis an index is two sorted sets: the scores under the index key, and the
+member deadlines under `jasil:state:index-expiry:` followed by the index key.
+That prefix is reserved for JASIL; keep your own keys out of it. Because the
+deadlines sit outside your prefix, `iter_keys` and `delete_prefix` over your
+prefix see only the index key, as in memory. `delete_prefix` refuses, on both
+backends, a prefix that would reach the deadlines: one that starts the reserved
+prefix (`"jasil:"`) or lies inside it. Deleting them would leave their indexes
+with members that never expire on their own. Deadlines left behind when you
+`delete` an index expire with it, and the next index call on that key discards
+them. Deadlines are set from the calling process's clock, as
+`record_tiered_failure` is, so keep the replicas' clocks synchronised.
 
 !!! note "One conformance suite, both backends"
     The two backends are held to a single shared test suite, because a
@@ -59,9 +127,11 @@ memory backend never raises it.
 
 Both backends refuse the same arguments with `ValueError`: a `ttl_seconds` of
 zero or less (pass `None` for no expiry), an empty `delete_prefix` prefix (on
-Redis it would match every key in the database), and an operation the stored
-value does not support, such as `incr` of a non-integer or, on Redis, a key that
-holds another type. Counters are signed 64-bit integers on both: an `incr` or
+Redis it would match every key in the database) or one that overlaps the reserved
+index namespace, an index score or cursor score
+that is not finite, an `index_range` limit below 1, and an operation the stored
+value does not support, such as `incr` of a non-integer, an index operation on a
+plain key or, on Redis, a key that holds another type. Counters are signed 64-bit integers on both: an `incr` or
 `record_tiered_failure` whose stored value, amount or result falls outside that
 range raises `ValueError` and leaves the counter unchanged.
 
