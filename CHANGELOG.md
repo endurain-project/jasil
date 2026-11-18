@@ -8,6 +8,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-18
+
+### Fixed
+
+- **`seal_pending_windows` no longer fails with `DetachedInstanceError` on a session factory that expires on commit.** The sealing loop read the stored checkpoint's hash after the session that committed it had closed, which fails with SQLAlchemy's default `expire_on_commit=True`, so no checkpoint chain could advance past its first window. It now reads the hash before the commit, still chaining onto the hash of the copy the sink returned. No change is needed in the host.
+
 ## [0.22.0] - 2026-11-15
 
 This release makes the geocoding rate limit hold for the whole deployment instead of each process, and lets a caller tell a lookup worth retrying from a final "nothing here". **It is breaking for a host that implements `StateProvider` or `GeocodingProvider` itself**: each protocol has a new method (`reserve_slot`, `lookup`), and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` or `isinstance(backend, GeocodingProvider)` until it does). Hosts that use the built-in backends need no change; a deployment that divided `geocoding.rate_limit` by its number of processes should set it back to the provider's limit. No migration is added.

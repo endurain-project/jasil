@@ -118,7 +118,7 @@ def db_engine(mapped_base):
 @pytest.fixture
 def session_factory(db_engine):
     """A session factory bound to the test database, installed on ``jasil.orm``."""
-    factory = sessionmaker(bind=db_engine, expire_on_commit=False)
+    factory = sessionmaker(bind=db_engine, expire_on_commit=True)
     orm.configure_sessionmaker(factory)
     return factory
 
@@ -150,7 +150,7 @@ def threaded_session_factory(mapped_base, database_url):
         engine = create_engine(database_url)
     mapped_base.metadata.drop_all(engine)
     mapped_base.metadata.create_all(engine)
-    yield sessionmaker(bind=engine, expire_on_commit=False)
+    yield sessionmaker(bind=engine, expire_on_commit=True)
     mapped_base.metadata.drop_all(engine)
     engine.dispose()
 
