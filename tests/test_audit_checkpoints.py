@@ -11,9 +11,11 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import delete, insert, select, update
+from sqlalchemy.orm import sessionmaker
 
 import jasil.audit as jasil_audit
 import jasil.audit.checkpoints as checkpoints
+import jasil.orm as jasil_orm
 from jasil._core.timestamps import as_utc
 from jasil._core.uuid7 import uuid7
 from jasil.audit import AuditAction, Category, Outcome, Severity
@@ -108,6 +110,21 @@ def sealed(trail):
 
 
 class TestSealing:
+    @pytest.mark.parametrize("with_sink", [False, True])
+    def test_several_windows_seal_on_a_sessionmaker_that_expires_on_commit(self, trail, db_engine, tmp_path, with_sink):
+        # The SQLAlchemy default: a committed instance is expired, and detached once its session closes.
+        jasil_orm.configure_sessionmaker(sessionmaker(bind=db_engine, expire_on_commit=True))
+        if with_sink:
+            trail.env.configure(external_sink_uri=(tmp_path / "sink").as_uri())
+        trail.write(3)
+        trail.write(35)
+
+        assert trail.seal(60) == 3
+
+        stored = trail.all()
+        assert [cp.prev_hash for cp in stored[1:]] == [cp.hash for cp in stored[:-1]]
+        assert trail.statuses() == ["ok", "ok", "ok"]
+
     def test_a_window_is_not_sealed_until_its_grace_period_has_passed(self, trail):
         trail.write(3)
 

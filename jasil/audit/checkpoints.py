@@ -423,14 +423,16 @@ def seal_pending_windows(now: datetime | None = None, settings: AuditSettings | 
         )
         if sink is not None:
             checkpoint = _copy_to_sink(sink, checkpoint, settings, instance_id)
+        # The stored checkpoint's hash, not this run's digest: a window resealed in its sink copy's format hashes
+        # differently, and the next window chains onto what verification reads. Read before the commit, which
+        # expires the instance and the closed session detaches it.
+        stored_hash = checkpoint.hash
         with sessionmaker() as db:
             db.add(checkpoint)
             service.note_maintenance(db, last_checkpoint_at=end)
             db.commit()
         written += 1
-        # The stored checkpoint's hash, not this run's digest: a window resealed in its sink copy's format hashes
-        # differently, and the next window chains onto what verification reads.
-        start, prev_hash = end, checkpoint.hash
+        start, prev_hash = end, stored_hash
     return written
 
 
