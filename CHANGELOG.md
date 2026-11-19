@@ -8,6 +8,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-19
+
+### Fixed
+
+- Added Pyhton 3.15 support in project metadata
+
 ## [0.22.1] - 2026-11-18
 
 ### Fixed
