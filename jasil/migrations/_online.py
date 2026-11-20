@@ -9,6 +9,11 @@ committed and the revision unrecorded. A revision that only builds an index has 
 :func:`resumed`: the build itself recognizes the index an earlier run left valid or invalid. On other databases
 both are the plain operation inside the revision's transaction.
 
+A concurrent build waits for every transaction, in any session, whose snapshot is older than the build's, including
+one that only waits for a lock. So nothing may wait for the migration lock while holding a snapshot: the run building
+the index holds that lock, and the two would wait for each other. ``_one_run_at_a_time`` asks for it outside a
+transaction.
+
 PostgreSQL cannot build an index on a partitioned table concurrently, so :func:`create_partitioned_index` builds
 the parent's index ``ON ONLY`` and each partition's concurrently, attaching each as it is built.
 """

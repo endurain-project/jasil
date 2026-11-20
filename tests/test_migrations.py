@@ -10,6 +10,8 @@ is the guard for that.
 import importlib.util
 import logging
 import re
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -1535,21 +1537,39 @@ class TestASchemaQualifiedBaseIsRefused:
 
 
 class _Connection:
-    """Records the statements a lock helper runs; ``acquired`` is what ``GET_LOCK`` answers."""
+    """Records the statements a lock helper runs and the isolation level each runs at.
 
-    def __init__(self, dialect: str, acquired: int | None = 1) -> None:
+    ``answers`` are what successive statements answer, the last one repeating; a lock request answers 1 when
+    granted.
+    """
+
+    def __init__(self, dialect: str, *answers: int | None) -> None:
         self.dialect = type("Dialect", (), {"name": dialect})()
         self.statements: list[str] = []
         self.parameters: list[dict] = []
-        self._acquired = acquired
+        self.levels: list[str] = []
+        self.isolation_level = "READ COMMITTED"
+        self._answers = list(answers or (1,))
 
     def execute(self, statement, parameters=None):
         self.statements.append(str(statement))
         self.parameters.append(parameters or {})
-        return type("Result", (), {"scalar": lambda _self: self._acquired})()
+        self.levels.append(self.isolation_level)
+        answer = self._answers.pop(0) if len(self._answers) > 1 else self._answers[0]
+        return type("Result", (), {"scalar": lambda _self: answer})()
+
+    def get_isolation_level(self) -> str:
+        return self.isolation_level
+
+    def execution_options(self, *, isolation_level: str) -> "_Connection":
+        self.isolation_level = isolation_level
+        return self
 
     def in_transaction(self) -> bool:
         return True
+
+    def commit(self) -> None:
+        self.statements.append("COMMIT")
 
     def rollback(self) -> None:
         self.statements.append("ROLLBACK")
@@ -1563,11 +1583,33 @@ class TestOneRunAtATime:
         connection = _Connection("postgresql")
 
         with migrations._one_run_at_a_time(connection):
-            assert connection.statements == ["SELECT pg_advisory_lock(hashtext(:name))"]
+            assert connection.statements == ["SELECT pg_try_advisory_lock(hashtext(:name))", "COMMIT"]
 
-        # A transaction still open is the caller's: adoption stamps inside one and commits it itself.
         assert connection.statements[-1] == "SELECT pg_advisory_unlock(hashtext(:name))"
         assert "ROLLBACK" not in connection.statements
+
+    def test_postgresql_asks_for_the_lock_outside_a_transaction_until_it_is_granted(self, monkeypatch):
+        """A session blocked in ``pg_advisory_lock`` holds a snapshot, which a concurrent index build waits for."""
+        monkeypatch.setattr(migrations, "_PG_LOCK_RETRY_SECONDS", 0)
+        connection = _Connection("postgresql", 0, 0, 1)
+
+        with migrations._one_run_at_a_time(connection):
+            assert connection.statements == ["SELECT pg_try_advisory_lock(hashtext(:name))"] * 3 + ["COMMIT"]
+            assert connection.levels == ["AUTOCOMMIT"] * 3
+            assert connection.isolation_level == "READ COMMITTED"  # the revisions run at the caller's level
+
+    def test_postgresql_gives_up_once_the_wait_runs_out(self, monkeypatch):
+        monkeypatch.setattr(migrations, "_RUN_LOCK_WAIT_SECONDS", 0)
+        connection = _Connection("postgresql", 0)
+
+        with (
+            pytest.raises(RuntimeError, match="'jasil_migrations'"),
+            migrations._one_run_at_a_time(connection),
+        ):
+            pytest.fail("ran without the lock")
+
+        assert connection.statements == ["SELECT pg_try_advisory_lock(hashtext(:name))", "COMMIT"]
+        assert connection.isolation_level == "READ COMMITTED"
 
     def test_postgresql_releases_the_lock_after_a_failed_run(self):
         connection = _Connection("postgresql")
@@ -1597,11 +1639,11 @@ class TestOneRunAtATime:
         with migrations._one_run_at_a_time(connection):
             pass
 
-        assert connection.parameters[0]["wait"] == migrations._MYSQL_LOCK_WAIT_SECONDS > 0
+        assert connection.parameters[0]["wait"] == migrations._RUN_LOCK_WAIT_SECONDS > 0
 
     @pytest.mark.parametrize("answer", [0, None])
     def test_mysql_refuses_to_run_without_the_lock(self, answer):
-        connection = _Connection("mysql", acquired=answer)
+        connection = _Connection("mysql", answer)
 
         with pytest.raises(RuntimeError, match="migration lock"), migrations._one_run_at_a_time(connection):
             pytest.fail("ran without the lock")
@@ -1634,13 +1676,47 @@ class TestOneRunAtATime:
         assert finished.is_set()
         assert migrations.db_revision(engine) == migrations.head_revision()
 
+    def test_a_run_waiting_for_the_lock_lets_the_one_holding_it_build_indexes_concurrently(
+        self, engine, database_url, monkeypatch
+    ):
+        """``CREATE INDEX CONCURRENTLY`` waits for every older snapshot, so the waiting run must hold none.
 
-#: Per dialect: take the migration lock in another session, give it back, count the sessions waiting for it.
+        The waiting run is another process: Alembic's ``context`` and ``op`` are module-wide, so two runs cannot
+        share one.
+        """
+        if engine.dialect.name != "postgresql":
+            pytest.skip("CONCURRENTLY is PostgreSQL's")
+        from jasil.migrations import _online
+
+        build = _online._create_concurrently
+        waiting_run: list[subprocess.Popen[str]] = []
+
+        def build_once_another_run_waits(*args, **kwargs):
+            if not waiting_run:
+                waiting_run.append(_upgrade_in_another_process(database_url))
+                waiting = _LOCK_PROBES["postgresql"][2]
+                assert _eventually(lambda: _scalar(engine, waiting) > 0, timeout=30), "it never waited for the lock"
+            return build(*args, **kwargs)
+
+        monkeypatch.setattr(_online, "_create_concurrently", build_once_another_run_waits)
+
+        migrations.upgrade(engine)
+
+        (other,) = waiting_run
+        _, log = other.communicate(timeout=60)
+        assert other.returncode == 0, log
+        assert "Running upgrade" not in log  # it found nothing left to do
+        assert migrations.db_revision(engine) == migrations.head_revision()
+
+
+#: Per dialect: take the migration lock in another session, give it back, count the sessions waiting for it. A
+#: PostgreSQL run waits between requests for it, so it is the session whose last statement asked.
 _LOCK_PROBES = {
     "postgresql": (
         "SELECT pg_advisory_lock(hashtext('jasil_migrations'))",
         "SELECT pg_advisory_unlock(hashtext('jasil_migrations'))",
-        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()"
+        " AND query LIKE '%pg_try_advisory_lock(%'",
     ),
     "mysql": (
         "SELECT GET_LOCK(CONCAT('jasil_migrations', ':', MD5(COALESCE(DATABASE(), ''))), 0)",
@@ -1648,6 +1724,28 @@ _LOCK_PROBES = {
         "SELECT count(*) FROM information_schema.processlist WHERE state = 'User lock'",
     ),
 }
+
+
+#: Upgrades the database at ``sys.argv[1]``, logging each revision it runs to stderr.
+_UPGRADE_SCRIPT = """
+import logging, sys
+from sqlalchemy import create_engine
+import jasil.orm
+from jasil import migrations
+jasil.orm.map_models()
+logging.basicConfig()
+logging.getLogger("alembic.runtime.migration").setLevel(logging.INFO)
+migrations.upgrade(create_engine(sys.argv[1]))
+"""
+
+
+def _upgrade_in_another_process(database_url: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(  # noqa: S603 - fixed interpreter, no shell, no user input
+        [sys.executable, "-c", _UPGRADE_SCRIPT, database_url],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def _scalar(engine, sql: str):

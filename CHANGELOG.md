@@ -8,6 +8,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-11-20
+
+### Fixed
+
+- **Migration runs started together on PostgreSQL no longer deadlock.** A run waiting for the migration lock blocked in `pg_advisory_lock`, holding a snapshot that the running revision's `CREATE INDEX CONCURRENTLY` waits for, so one of the two failed with `deadlock detected` (or `LockNotAvailable` under a `lock_timeout` shorter than `deadlock_timeout`). A waiting run now asks for the lock with `pg_try_advisory_lock` every half second, outside a transaction, and after an hour fails with `RuntimeError` naming the lock, as MySQL and MariaDB already did. `adopt_existing_schema` ends its inspection transaction before it records the revision, so it waits for the lock outside one too. No change is needed in the host.
+
 ## [0.22.2] - 2026-11-19
 
 ### Fixed

@@ -27,6 +27,7 @@ and ``rev0003`` renames them.
 """
 
 import logging
+import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -123,10 +124,12 @@ _MYSQL_AUDIT_REVISION = "rev0008"
 #: Name of the database lock a migration run holds; see :func:`_one_run_at_a_time`.
 _RUN_LOCK = "jasil_migrations"
 
-#: How long a MySQL or MariaDB run waits for the lock another run holds. Finite because MariaDB does not take a
-#: negative timeout as "forever" (``GET_LOCK`` then returns NULL), and so that a hung migration cannot block the
-#: others for good.
-_MYSQL_LOCK_WAIT_SECONDS = 3600
+#: How long a run waits for the lock another run holds. Finite so that a hung migration cannot block the others for
+#: good, and because MariaDB does not take a negative ``GET_LOCK`` timeout as "forever" (it then returns NULL).
+_RUN_LOCK_WAIT_SECONDS = 3600
+
+#: How long a PostgreSQL run waiting for the lock pauses before asking for it again.
+_PG_LOCK_RETRY_SECONDS = 0.5
 
 #: MySQL lock names are server-wide, so the database's name is part of the lock's: two databases on one server
 #: do not queue behind each other. Hashed to stay inside the 64-character limit.
@@ -143,18 +146,17 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
     and JASIL refuses a multi-process SQLite deployment.
 
     Raises:
-        RuntimeError: When MySQL or MariaDB does not grant the lock within the wait.
+        RuntimeError: When the database does not grant the lock within the wait.
     """
     from sqlalchemy import text
 
     dialect = connection.dialect.name
     if dialect == "postgresql":
-        connection.execute(text("SELECT pg_advisory_lock(hashtext(:name))"), {"name": _RUN_LOCK})
+        _wait_for_postgresql_lock(connection)
         try:
             yield
         except BaseException:
-            # A failure can leave the connection in an aborted transaction, where the unlock would fail too. On
-            # success a transaction still open is the caller's (adoption stamps inside one) and is left to it.
+            # A failure can leave the connection in an aborted transaction, where the unlock would fail too.
             if connection.in_transaction():
                 connection.rollback()
             raise
@@ -162,7 +164,7 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
             connection.execute(text("SELECT pg_advisory_unlock(hashtext(:name))"), {"name": _RUN_LOCK})
     elif dialect in ("mysql", "mariadb"):
         acquired = connection.execute(
-            text(f"SELECT GET_LOCK({_MYSQL_LOCK_NAME}, :wait)"), {"name": _RUN_LOCK, "wait": _MYSQL_LOCK_WAIT_SECONDS}
+            text(f"SELECT GET_LOCK({_MYSQL_LOCK_NAME}, :wait)"), {"name": _RUN_LOCK, "wait": _RUN_LOCK_WAIT_SECONDS}
         ).scalar()
         if acquired != 1:
             raise RuntimeError("MySQL did not grant the JASIL migration lock")
@@ -172,6 +174,38 @@ def _one_run_at_a_time(connection: Any) -> Generator[None]:
             connection.execute(text(f"SELECT RELEASE_LOCK({_MYSQL_LOCK_NAME})"), {"name": _RUN_LOCK})
     else:
         yield
+
+
+def _wait_for_postgresql_lock(connection: Any) -> None:
+    """Take the PostgreSQL run lock for ``connection``'s session, holding no snapshot while another run has it.
+
+    The run holding the lock builds indexes concurrently, and such a build waits for every transaction with an older
+    snapshot (see :mod:`jasil.migrations._online`). A session blocked in ``pg_advisory_lock`` holds one for as long
+    as it waits, so the two runs would deadlock. The lock is asked for with ``pg_try_advisory_lock`` instead, each
+    attempt autocommitted, so between attempts the session has no transaction open.
+
+    Raises:
+        RuntimeError: When the lock is not granted within the wait.
+    """
+    from sqlalchemy import text
+
+    level = connection.get_isolation_level()
+    # Raises if the caller left a transaction open: its snapshot would be held through the wait.
+    connection.execution_options(isolation_level="AUTOCOMMIT")
+    try:
+        attempt = text("SELECT pg_try_advisory_lock(hashtext(:name))")
+        deadline = time.monotonic() + _RUN_LOCK_WAIT_SECONDS
+        while not connection.execute(attempt, {"name": _RUN_LOCK}).scalar():
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"PostgreSQL did not grant the JASIL migration lock {_RUN_LOCK!r} within "
+                    f"{_RUN_LOCK_WAIT_SECONDS} seconds; another migration run still holds it"
+                )
+            time.sleep(_PG_LOCK_RETRY_SECONDS)
+    finally:
+        # SQLAlchemy tracks a transaction even under autocommit, and the level changes back only once it has ended.
+        connection.commit()
+        connection.execution_options(isolation_level=level)
 
 
 def _run(engine: "Engine", command_name: str, *args: Any) -> None:
@@ -758,8 +792,9 @@ def adopt_existing_schema(engine: "Engine") -> bool:
                 continue
             differences, weight = _schema_differences(connection, inspector, metadata, revision)
             if not differences:
-                command.stamp(_config(connection), revision)
+                # The stamp waits for the migration lock, which nothing may do with a transaction open.
                 connection.commit()
+                command.stamp(_config(connection), revision)
                 return True
             mismatches.append((weight, revision, differences))
 
