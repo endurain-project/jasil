@@ -8,6 +8,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-21
+
 ### Added
 
 - **`jasil.orm.is_database_unavailable(error)`** says whether a failure means the database could not be reached rather than that something is broken. It returns True for an exhausted pool, a connection SQLAlchemy invalidated as a disconnect, PostgreSQL SQLSTATE class `08`, `57P01`, `57P02`, `57P03` and `53300`, a PostgreSQL `OperationalError` with no SQLSTATE, and a MySQL client error (2000–2999). A host can use it to log its own failures by the same rule. Which errors it returns True for may change in a minor release.
