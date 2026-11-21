@@ -240,7 +240,11 @@ class SwitchableDatabase:
 
 
 class OutageRunner:
-    """Run the real runner once per entry of ``down``, with the database down or up as it says, then stop."""
+    """Run the real runner once per entry of ``down``, with the database down or up as it says, then stop.
+
+    The stop is set after the last real call, whether it succeeded or raised, so every iteration the worker sees
+    is a real one: a made-up empty batch at the end would count as a recovery.
+    """
 
     def __init__(self, runner: JobRunner, database: SwitchableDatabase, stop: threading.Event, *, down) -> None:
         self._runner = runner
@@ -249,11 +253,12 @@ class OutageRunner:
         self._down = list(down)
 
     def run_once(self, stop=None) -> int:
-        if not self._down:
-            self._stop.set()
-            return 0
         self._database.is_down = self._down.pop(0)
-        return self._runner.run_once(stop)
+        try:
+            return self._runner.run_once(stop)
+        finally:
+            if not self._down:
+                self._stop.set()
 
 
 class SignallingRunner:

@@ -120,6 +120,8 @@ test = [
     "fastapi>=0.163.0",
     "requests>=2.34.2",
     "responses>=0.26.3",
+    # The database-outage tests wrap real psycopg errors, and refuse connections through its dialect.
+    "psycopg[binary]>=3.3.9",
     # The migrations suite drives the packaged Alembic revisions.
     "alembic>=1.20.1",
     # The audit checkpoint tests sign and verify with Ed25519.

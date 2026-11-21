@@ -471,13 +471,18 @@ The test is `jasil.orm.is_database_unavailable(error)`. Use it in your own error
 handling to keep the two rules in step:
 
 ```python
+import logging
+
 import jasil.orm as jasil_orm
+
+logger = logging.getLogger(__name__)
 
 try:
     run_report()
 except Exception as error:
     if not jasil_orm.is_database_unavailable(error):
         raise
+    logger.warning("Report skipped; the database is unavailable", extra={"error": type(error).__name__})
 ```
 
 It returns True for:
