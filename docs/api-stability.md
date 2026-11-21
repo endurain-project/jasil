@@ -24,7 +24,7 @@ modules:
 | `jasil.event_versioning` | `VersionedPayload`, `parse_payload`, `UnsupportedEventVersionError`. |
 | `jasil.profile` | `DeploymentProfile`, `JobWorkerMode`, `parse_profile`, `parse_job_worker_mode`, `classify_state_uri` with its `StateBackendKind`, `DeploymentTopology` (`multi_process`, `multi_node`, `multi_process_causes`) and `resolve_topology`. |
 | `jasil.settings` | The settings dataclasses and `configure` / `get_settings` / `is_configured`, `RuntimeSources`, and `mail_problems` with `MailProblem` and `MailProblemCode` (the set of codes may grow in a minor release; a code is never renamed or reused). |
-| `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `is_models_mapped`, `is_sessionmaker_configured`, `Base`, `jasil_table_names`, `legacy_table_names`. |
+| `jasil.orm` | `map_models`, `configure_sessionmaker`, `get_sessionmaker`, `get_engine`, `is_models_mapped`, `is_sessionmaker_configured`, `Base`, `jasil_table_names`, `legacy_table_names`, `is_database_unavailable` (which errors it returns True for may change in a minor release). |
 | `jasil.correlation` | `configure_provider`, `correlation_scope`, `get_correlation_id`, `set_correlation_id`. |
 | `jasil.container` | `Platform`, `build_platform` (including its `sources` parameter). |
 | `jasil.capabilities` | `check_deployment_consistency`, `topology_of`, the individual `check_*` rules and the `StateSource` that `check_state_consistency` takes, and `build_capability_report` with the `CapabilityReport` (`topology`, `rows`, `render()`) and `CapabilityRow` (`name`, `backend`, `source`) it returns. The *rendered* report is not covered — see below. |

@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
+from jasil._core.db_outage import log_failure
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.audit.context import event_handler_scope
@@ -258,7 +259,7 @@ class JobRunner:
             with self._session_factory() as db:
                 moved = jobs_crud.backfill_legacy_queues(self._registry.queue_assignments(), db=db)
         except Exception as error:
-            logger.warning("Durable job queue backfill failed; will retry", exc_info=error)
+            log_failure(logger, "Durable job queue backfill failed; will retry", error, level=logging.WARNING)
             return
         self._legacy_queues_backfilled = True
         if moved:
@@ -277,11 +278,7 @@ class JobRunner:
             renewed = self._leases.renew()
         except Exception as error:
             # Not run: the lease is unknown, and the reaper requeues it.
-            logger.error(
-                "Durable job lease could not be renewed; skipping",
-                exc_info=error,
-                extra=self._context(job),
-            )
+            log_failure(logger, "Durable job lease could not be renewed; skipping", error, extra=self._context(job))
             self._leases.drop(job.id)
             return False
         if job.id in renewed:
@@ -321,7 +318,13 @@ class JobRunner:
                     job.id, worker_id=self._worker_id, attempt=job.attempts, now=self._clock.now(), db=db
                 )
         except Exception as error:
-            logger.warning("Durable job start could not be recorded", exc_info=error, extra=self._context(job))
+            log_failure(
+                logger,
+                "Durable job start could not be recorded",
+                error,
+                level=logging.WARNING,
+                extra=self._context(job),
+            )
 
     def _execute(self, job: ClaimedJob, lost: threading.Event) -> bool:
         """Run the handler and write its outcome.

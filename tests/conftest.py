@@ -131,6 +131,36 @@ def db(session_factory):
 
 
 @pytest.fixture
+def postgres_error():
+    """Build a PostgreSQL server error with a given SQLSTATE, wrapped as SQLAlchemy raises it from a statement."""
+    import psycopg
+    from psycopg import errors as pg_errors
+    from sqlalchemy.exc import DBAPIError
+
+    def build(sqlstate: str) -> DBAPIError:
+        return DBAPIError.instance("SELECT 1", {}, pg_errors.lookup(sqlstate)("server error"), psycopg.Error)
+
+    return build
+
+
+@pytest.fixture
+def unreachable_session_factory():
+    """A session factory whose every connection is refused, as when the database is stopped.
+
+    Its PostgreSQL engine connects through a ``creator`` that raises psycopg's own ``OperationalError``, so
+    SQLAlchemy wraps it exactly as it wraps a refused connection, and nothing reaches the network.
+    """
+    import psycopg
+
+    def refuse() -> None:
+        raise psycopg.OperationalError("connection refused")
+
+    engine = create_engine("postgresql+psycopg://", creator=refuse)
+    yield sessionmaker(bind=engine)
+    engine.dispose()
+
+
+@pytest.fixture
 def threaded_session_factory(mapped_base, database_url):
     """A session factory for sessions on several threads at once, empty at the start of the test.
 

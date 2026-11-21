@@ -449,6 +449,48 @@ alerts are built on them, so they are listed here.
 Loggers are named after their module (`jasil.publisher`, `jasil.jobs.runner`,
 `jasil._core.network`, …), so you can raise or lower verbosity per subsystem.
 
+### When the database is unreachable
+
+ERROR means a defect that someone has to fix. A database that is down, restarting
+or out of connection slots is a degraded dependency instead: once it is back,
+nothing is wrong. The job worker, its heartbeat, the lease renewal, the scheduled
+relay, reaper and dead-letter sweep, and the scheduled retention prune log it as
+a WARNING without a traceback, with the exception's class name in `error`:
+
+- The worker loop logs "Durable job worker cannot reach the database; retrying"
+  once per outage, and "Durable job worker reached the database again" at INFO
+  after the first iteration that succeeds.
+- The others end their message with "; the database is unavailable", once per
+  attempt.
+
+Any other failure keeps its ERROR and its traceback. The scheduled maintenance
+functions never raise into APScheduler, which would log the exception as an error
+on every interval. `prune_expired_records` still raises when you call it yourself.
+
+The test is `jasil.orm.is_database_unavailable(error)`. Use it in your own error
+handling to keep the two rules in step:
+
+```python
+import jasil.orm as jasil_orm
+
+try:
+    run_report()
+except Exception as error:
+    if not jasil_orm.is_database_unavailable(error):
+        raise
+```
+
+It returns True for:
+
+- an exhausted connection pool (`sqlalchemy.exc.TimeoutError`);
+- a connection SQLAlchemy invalidated as a disconnect;
+- with a PostgreSQL driver, SQLSTATE class `08`, `57P01`, `57P02`, `57P03` or
+  `53300`, or an `OperationalError` with no SQLSTATE at all (every server error has
+  one, so a missing one means the connection was lost or refused);
+- with a MySQL driver that reports only error numbers (PyMySQL, mysqlclient), an
+  `OperationalError` with a client error number (2000–2999). A deadlock or a lock-wait
+  timeout is a server error and stays False.
+
 One worth routing deliberately: `jasil._core.network` logs every time the SSRF
 allowlist permits a private destination, at INFO for a CIDR entry and at WARNING
 for a hostname entry. That is an audit trail — it tells you what the exception is

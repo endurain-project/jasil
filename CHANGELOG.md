@@ -8,6 +8,14 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`jasil.orm.is_database_unavailable(error)`** says whether a failure means the database could not be reached rather than that something is broken. It returns True for an exhausted pool, a connection SQLAlchemy invalidated as a disconnect, PostgreSQL SQLSTATE class `08`, `57P01`, `57P02`, `57P03` and `53300`, a PostgreSQL `OperationalError` with no SQLSTATE, and a MySQL client error (2000–2999). A host can use it to log its own failures by the same rule. Which errors it returns True for may change in a minor release.
+
+### Changed
+
+- **An unreachable database is logged as a warning, not an error.** While PostgreSQL was stopped, the job worker logged "Durable job worker iteration failed" with a traceback on every poll. APScheduler logged the relay, reaper and retention prune at ERROR with a traceback on every interval. The lease renewal, dead-letter sweep and heartbeat logged tracebacks on every beat. Now the worker logs one WARNING per outage and one INFO when the database is back. The others log a WARNING without a traceback that ends "; the database is unavailable". Any other failure keeps its ERROR and its traceback. `relay_outbox_scheduled`, `reap_expired_jobs_scheduled` and the scheduled retention prune no longer raise into APScheduler. `prune_expired_records` still raises when called directly. No change is needed in the host.
+
 ## [0.22.3] - 2026-11-20
 
 ### Fixed

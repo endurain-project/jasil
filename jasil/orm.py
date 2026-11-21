@@ -1,4 +1,4 @@
-"""JASIL's SQLAlchemy registry plumbing and session-factory helpers.
+"""JASIL's SQLAlchemy registry plumbing, session-factory helpers, and the test for an unreachable database.
 
 **Option B (the host owns the ``Base``).** JASIL's companion tables —
 ``jasil_event_log``, ``jasil_processing_jobs``, ``jasil_event_outbox``,
@@ -46,6 +46,9 @@ Host applications:
        jasil_orm.configure_sessionmaker(sessionmaker(bind=engine))
 
 JASIL never creates the engine; the host owns the connection.
+
+:func:`is_database_unavailable` is the test JASIL's worker and scheduled maintenance use to log an unreachable
+database as a warning rather than an error; a host can apply the same rule to its own failures.
 """
 
 import importlib
@@ -55,6 +58,7 @@ from sqlalchemy import Connection
 from sqlalchemy.exc import UnboundExecutionError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
+from jasil._core.db_outage import is_database_unavailable
 from jasil._core.registry import ConfigSlot
 
 __all__ = [
@@ -63,6 +67,7 @@ __all__ = [
     "get_active_base",
     "get_engine",
     "get_sessionmaker",
+    "is_database_unavailable",
     "is_models_mapped",
     "is_sessionmaker_configured",
     "jasil_table_names",

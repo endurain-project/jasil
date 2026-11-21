@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil._core.db_outage import log_failure
 from jasil.jobs._attempts import OUTCOME_ABANDONED
 from jasil.providers import ClockProvider
 
@@ -226,7 +227,7 @@ class LeaseKeeper:
                     db=db,
                 )
         except Exception as error:
-            logger.warning("Abandoned durable job attempt could not be recorded", exc_info=error)
+            log_failure(logger, "Abandoned durable job attempt could not be recorded", error, level=logging.WARNING)
 
     def _fence_if_silent(self, running: _Running | None) -> None:
         silent = self._clock.monotonic() - self._last_renewed
@@ -275,4 +276,6 @@ class LeaseKeeper:
         except Exception as error:
             # They stop being renewed either way; the reaper requeues them once
             # their leases expire, which costs an attempt but loses no work.
-            logger.warning("Durable jobs could not be released; leaving them to the reaper", exc_info=error)
+            log_failure(
+                logger, "Durable jobs could not be released; leaving them to the reaper", error, level=logging.WARNING
+            )

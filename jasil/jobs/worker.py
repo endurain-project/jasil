@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
+from jasil._core.db_outage import is_database_unavailable, log_failure
 from jasil._core.threads import STOP_JOIN_TIMEOUT_SECONDS, signal_and_join
 from jasil.jobs._worker_metadata import normalize_worker_metadata
 from jasil.jobs.heartbeat import LeaseKeeper
@@ -75,7 +76,7 @@ class WorkerTelemetry:
                     db=db,
                 )
         except Exception as error:
-            logger.warning("Durable worker start telemetry failed", exc_info=error)
+            log_failure(logger, "Durable worker start telemetry failed", error, level=logging.WARNING)
 
     def record_heartbeat(self) -> None:
         """Refresh this worker's last-heartbeat time."""
@@ -97,7 +98,7 @@ class WorkerTelemetry:
                     db=db,
                 )
         except Exception as error:
-            logger.warning("Durable worker heartbeat failed", exc_info=error)
+            log_failure(logger, "Durable worker heartbeat failed", error, level=logging.WARNING)
 
     def record_stop(self) -> None:
         """Record a graceful shutdown."""
@@ -107,7 +108,7 @@ class WorkerTelemetry:
             with self._session_factory() as db:
                 worker_registry.record_worker_stop(self._instance_id, now=self._clock.now(), db=db)
         except Exception as error:
-            logger.warning("Durable worker stop telemetry failed", exc_info=error)
+            log_failure(logger, "Durable worker stop telemetry failed", error, level=logging.WARNING)
 
 
 class WorkerHeartbeat:
@@ -141,7 +142,7 @@ class WorkerHeartbeat:
         try:
             self._leases.renew()
         except Exception as error:
-            logger.warning("Durable job lease renewal failed", exc_info=error)
+            log_failure(logger, "Durable job lease renewal failed", error, level=logging.WARNING)
         if self._telemetry is not None:
             self._telemetry.record_heartbeat()
 
@@ -196,7 +197,10 @@ def run_worker(
     Loops immediately while a batch found work (to drain a backlog) and waits
     ``poll_interval_seconds`` when the queue was empty. A failed iteration is
     logged and the loop continues; a ``BaseException`` (``SystemExit``,
-    ``KeyboardInterrupt``, a cancellation) is logged and ends it.
+    ``KeyboardInterrupt``, a cancellation) is logged and ends it. An unreachable
+    database (:func:`jasil.orm.is_database_unavailable`) is logged once per outage
+    as a warning, and its end once as info; any other failure is an error with its
+    traceback.
 
     Args:
         runner: The job runner to drive.
@@ -211,18 +215,30 @@ def run_worker(
     logger.info("Durable job worker started")
     if heartbeat is not None:
         heartbeat.start()
+    database_unreachable = False
     try:
         while not stop.is_set():
             try:
                 processed = runner.run_once(stop)
             except Exception as error:
-                logger.error("Durable job worker iteration failed", exc_info=error)
                 processed = 0
+                if not is_database_unavailable(error):
+                    logger.error("Durable job worker iteration failed", exc_info=error)
+                elif not database_unreachable:
+                    database_unreachable = True
+                    logger.warning(
+                        "Durable job worker cannot reach the database; retrying",
+                        extra={"error": type(error).__name__},
+                    )
             except BaseException as error:
                 # SystemExit, KeyboardInterrupt or a cancellation from a handler ends the worker, as it asks to;
                 # nothing restarts it, so it must not go quietly.
                 logger.error("Durable job worker stopped by %s", type(error).__name__, exc_info=error)
                 raise
+            else:
+                if database_unreachable:
+                    database_unreachable = False
+                    logger.info("Durable job worker reached the database again")
             if processed == 0:
                 stop.wait(poll_interval_seconds)
     finally:

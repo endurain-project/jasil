@@ -21,6 +21,7 @@ import jasil.jobs.registry as jobs_registry
 import jasil.jobs.relay as jobs_relay
 import jasil.jobs.service as jobs_service
 import jasil.jobs.worker as jobs_worker
+import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
 import jasil.settings as settings
 from jasil.events import new_event
@@ -430,6 +431,55 @@ class TestScheduledReaper:
             jobs_service.reap_expired_jobs_scheduled()
 
         assert "Reaped" not in caplog.text
+
+
+_SCHEDULED_MAINTENANCE = pytest.mark.parametrize(
+    "scheduled",
+    [
+        jobs_service.relay_outbox_scheduled,
+        jobs_service.reap_expired_jobs_scheduled,
+        jobs_service.deliver_dead_letters_scheduled,
+    ],
+    ids=["relay", "reaper", "dead-letters"],
+)
+
+
+class TestScheduledMaintenanceFailures:
+    """APScheduler logs whatever a job raises at ERROR with a traceback, every interval, so nothing reaches it."""
+
+    @_SCHEDULED_MAINTENANCE
+    def test_a_stopped_database_is_a_warning_without_a_traceback(
+        self, scheduled, platform, unreachable_session_factory, monkeypatch, caplog
+    ):
+        # A dead-letter callback to deliver, or the sweep never needs the database.
+        jobs_registry.registry.register(
+            "order.created", "invoice.render", lambda _e: None, on_dead_letter=lambda _e, _r: None
+        )
+        monkeypatch.setattr(jasil_orm, "get_sessionmaker", lambda: unreachable_session_factory)
+
+        with caplog.at_level("DEBUG", logger="jasil"):
+            scheduled()
+
+        [record] = caplog.records
+        assert record.levelname == "WARNING"
+        assert record.getMessage().endswith("; the database is unavailable")
+        assert record.exc_info is None
+
+    @_SCHEDULED_MAINTENANCE
+    def test_a_defect_is_an_error_with_a_traceback(self, scheduled, platform, monkeypatch, caplog):
+        defect = RuntimeError("session factory misconfigured")
+
+        def broken():
+            raise defect
+
+        monkeypatch.setattr(jasil_orm, "get_sessionmaker", broken)
+
+        with caplog.at_level("DEBUG", logger="jasil"):
+            scheduled()
+
+        [record] = caplog.records
+        assert record.levelname == "ERROR"
+        assert record.exc_info[1] is defect
 
 
 class TestScheduleJobMaintenance:
