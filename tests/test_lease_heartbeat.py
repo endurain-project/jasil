@@ -410,6 +410,25 @@ class TestWhenRenewalFails:
         skipped = "t" if ran == ["s"] else "s"
         assert _job(db, skipped).status == jobs_crud.STATUS_CLAIMED, "its lease is left to expire, not run blind"
 
+    def test_a_lease_lost_to_an_outage_is_a_warning_without_a_traceback(
+        self, runner, registry, db, caplog, monkeypatch, postgres_error
+    ):
+        _register_both(registry, lambda _name: lambda _event: None)
+        _enqueue(db, "s")
+        _enqueue(db, "t")
+
+        def fail():
+            raise postgres_error("57P01")
+
+        monkeypatch.setattr(runner.leases, "renew", fail)
+
+        with caplog.at_level(logging.DEBUG, logger="jasil.jobs.runner"):
+            runner.run_once()
+
+        [record] = [record for record in caplog.records if "could not be renewed" in record.getMessage()]
+        assert record.levelname == "WARNING"
+        assert record.exc_info is None
+
 
 class TestWorkerHeartbeat:
     class _Leases:

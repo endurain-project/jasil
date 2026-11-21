@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 import jasil.jobs.registry as jobs_registry
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil._core.db_outage import log_failure
 from jasil.capabilities import topology_of
 from jasil.profile import JobWorkerMode
 from jasil.settings import get_settings
@@ -263,23 +264,28 @@ def relay_outbox_scheduled() -> None:
     Runs on every replica; each pass claims its batch with ``FOR UPDATE SKIP
     LOCKED`` held across the fan-out, and the idempotent fan-out dedups any
     overlap where the dialect cannot lock, so no single-runner lock is needed.
+    Never raises: a failure is logged and the next pass retries.
     """
     import jasil.jobs.relay as jobs_relay
 
-    jobs = get_settings().jobs
-    platform = platform_runtime.get_active_platform()
-    total = 0
-    for _ in range(_MAX_RELAY_BATCHES):
-        relayed = jobs_relay.relay_outbox_once(
-            registry=jobs_registry.registry,
-            clock=platform.clock,
-            session_factory=jasil_orm.get_sessionmaker(),
-            max_attempts=jobs.max_attempts,
-            batch_size=jobs.batch_size,
-        )
-        total += relayed
-        if relayed == 0:
-            break
+    try:
+        jobs = get_settings().jobs
+        platform = platform_runtime.get_active_platform()
+        total = 0
+        for _ in range(_MAX_RELAY_BATCHES):
+            relayed = jobs_relay.relay_outbox_once(
+                registry=jobs_registry.registry,
+                clock=platform.clock,
+                session_factory=jasil_orm.get_sessionmaker(),
+                max_attempts=jobs.max_attempts,
+                batch_size=jobs.batch_size,
+            )
+            total += relayed
+            if relayed == 0:
+                break
+    except Exception as error:
+        log_failure(logger, "Durable job outbox relay failed", error)
+        return
     if total:
         # Debug, not info: this runs every few seconds, and "an event was
         # published but never processed" is the question it exists to answer.
@@ -291,23 +297,28 @@ def reap_expired_jobs_scheduled() -> None:
 
     Runs on every replica; ``reclaim_expired_leases`` combines ``FOR UPDATE SKIP
     LOCKED`` with a compare-and-set on ``status``, so concurrent reapers reclaim
-    disjoint rows and a loser never overwrites the winner's requeue.
+    disjoint rows and a loser never overwrites the winner's requeue. Never raises:
+    a failure is logged and the next pass retries.
     """
     import jasil.jobs.crud as jobs_crud
 
-    platform = platform_runtime.get_active_platform()
-    now = platform.clock.now()
-    session_factory = jasil_orm.get_sessionmaker()
-    reclaimed = 0
-    with session_factory() as db:
-        # Read before reclaiming, which clears the holder: a crash should name the
-        # worker, not just say that one happened.
-        holders = jobs_crud.expired_lease_holders(now=now, db=db)
-        for _ in range(_MAX_REAP_BATCHES):
-            batch = jobs_crud.reclaim_expired_leases(now=now, db=db, limit=_REAP_BATCH_SIZE)
-            reclaimed += batch
-            if batch < _REAP_BATCH_SIZE:
-                break
+    try:
+        platform = platform_runtime.get_active_platform()
+        now = platform.clock.now()
+        session_factory = jasil_orm.get_sessionmaker()
+        reclaimed = 0
+        with session_factory() as db:
+            # Read before reclaiming, which clears the holder: a crash should name the
+            # worker, not just say that one happened.
+            holders = jobs_crud.expired_lease_holders(now=now, db=db)
+            for _ in range(_MAX_REAP_BATCHES):
+                batch = jobs_crud.reclaim_expired_leases(now=now, db=db, limit=_REAP_BATCH_SIZE)
+                reclaimed += batch
+                if batch < _REAP_BATCH_SIZE:
+                    break
+    except Exception as error:
+        log_failure(logger, "Durable job lease reaper failed", error)
+        return
     if reclaimed:
         # A warning, not an info: a lease only expires because the worker holding
         # it died or went silent, so this is the symptom of something else going wrong.
@@ -328,15 +339,14 @@ def deliver_dead_letters_scheduled() -> None:
     """
     from jasil.jobs.dead_letter import deliver_dead_letters
 
-    platform = platform_runtime.get_active_platform()
     try:
         deliver_dead_letters(
             registry=jobs_registry.registry,
             session_factory=jasil_orm.get_sessionmaker(),
-            clock=platform.clock,
+            clock=platform_runtime.get_active_platform().clock,
         )
     except Exception as error:
-        logger.error("Dead-letter callbacks could not be delivered", exc_info=error)
+        log_failure(logger, "Dead-letter callbacks could not be delivered", error)
 
 
 def schedule_job_maintenance(scheduler: "AsyncIOScheduler") -> None:

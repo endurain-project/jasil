@@ -5,13 +5,15 @@ skipped on the SQLite developer default and the MySQL/MariaDB matrix jobs; no SQ
 or session is mocked here.
 """
 
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import create_engine, text
 from sqlalchemy import event as sqlalchemy_event
-from sqlalchemy import text
+from sqlalchemy.orm import sessionmaker
 
 import jasil.admin as jasil_admin
 import jasil.container as container
@@ -26,6 +28,7 @@ from jasil.events import new_event
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.jobs.runner import JobRunner
+from jasil.jobs.worker import run_worker
 from jasil.profile import JobWorkerMode
 
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -384,3 +387,54 @@ def test_a_held_advisory_lock_leaves_no_transaction_idle(db_engine):
         ).scalars()
 
         assert list(states) == ["idle"]
+
+
+class _Iterations:
+    """Run the real runner ``count`` times, then stop the worker loop."""
+
+    def __init__(self, runner: JobRunner, stop: threading.Event, count: int) -> None:
+        self._runner = runner
+        self._stop = stop
+        self._remaining = count
+
+    def run_once(self, stop: threading.Event | None = None) -> int:
+        self._remaining -= 1
+        try:
+            return self._runner.run_once(stop)
+        finally:
+            if self._remaining == 0:
+                self._stop.set()
+
+
+def test_a_terminated_connection_is_one_warning_until_the_worker_reconnects(db_engine, database_url, caplog):
+    """The worker's pooled connection is cut by the server, as when PostgreSQL restarts under it."""
+    application_name = "jasil-outage-test"
+    engine = create_engine(database_url, connect_args={"application_name": application_name})
+    try:
+        registry = JobHandlerRegistry()
+        registry.register("work.created", "handler", lambda _event: None)
+        runner = _runner(registry, sessionmaker(bind=engine), "outage-worker", queues=None)
+        assert runner.run_once() == 0  # leaves an idle connection in the worker's pool
+        with db_engine.connect() as admin:
+            terminated = admin.execute(
+                text("SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity WHERE application_name = :name"),
+                {"name": application_name},
+            ).scalars()
+            assert list(terminated) == [True]
+
+        stop = threading.Event()
+        with caplog.at_level(logging.DEBUG, logger="jasil"):
+            run_worker(_Iterations(runner, stop, 2), poll_interval_seconds=0, stop=stop)
+    finally:
+        engine.dispose()
+
+    assert [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "jasil.jobs.worker" and "database" in record.getMessage()
+    ] == [
+        ("WARNING", "Durable job worker cannot reach the database; retrying"),
+        ("INFO", "Durable job worker reached the database again"),
+    ]
+    assert max(record.levelno for record in caplog.records) == logging.WARNING
+    assert all(record.exc_info is None for record in caplog.records)

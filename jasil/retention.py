@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import jasil.orm as jasil_orm
 import jasil.runtime as platform_runtime
+from jasil._core.db_outage import is_database_unavailable, log_failure
 from jasil.settings import get_settings
 
 # Only for the annotation: apscheduler is the optional ``jobs`` extra, and a
@@ -105,7 +106,7 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
             with jasil_orm.get_sessionmaker()() as db:
                 events = event_log_crud.delete_events_before(cutoff, db=db)
         except Exception as error:
-            logger.error("Retention prune of the event_log failed: %s", type(error).__name__)
+            logger.log(_failure_level(error), "Retention prune of the event_log failed: %s", type(error).__name__)
             failures.append(error)
 
     if jobs_days > 0:
@@ -122,7 +123,9 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
             with jasil_orm.get_sessionmaker()() as db:
                 workers = worker_registry.prune_worker_records_before(cutoff, db=db)
         except Exception as error:
-            logger.error("Retention prune of the durable-job tables failed: %s", type(error).__name__)
+            logger.log(
+                _failure_level(error), "Retention prune of the durable-job tables failed: %s", type(error).__name__
+            )
             failures.append(error)
 
     if events or outbox or jobs or workers or attempts:
@@ -141,6 +144,19 @@ def _run_prune(now: datetime, event_log_days: int, jobs_days: int) -> None:
         raise failures[0]
 
 
+def _failure_level(error: Exception) -> int:
+    """WARNING for an unreachable database, which the next pass retries; ERROR for a defect."""
+    return logging.WARNING if is_database_unavailable(error) else logging.ERROR
+
+
+def _prune_scheduled() -> None:
+    """Run :func:`prune_expired_records` for the scheduler, which logs whatever a job raises as an error."""
+    try:
+        prune_expired_records()
+    except Exception as error:
+        log_failure(logger, "Scheduled retention prune failed", error)
+
+
 def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_startup: bool = True) -> None:
     """
     Register the recurring retention prune on the host's scheduler.
@@ -150,7 +166,9 @@ def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_star
     deployment that never enabled durable jobs.
 
     Register it on every replica. The prune takes the platform's coordination
-    lock, so only one of them does the work per pass.
+    lock, so only one of them does the work per pass. A scheduled pass never
+    raises into the scheduler: its failure is logged, as a warning when the
+    database is unavailable, and the next pass retries.
 
     Args:
         scheduler: The application scheduler to register the job on.
@@ -164,7 +182,7 @@ def schedule_retention_maintenance(scheduler: "AsyncIOScheduler", *, run_at_star
     # The system clock, not the platform's: APScheduler compares next_run_time with its own wall clock.
     starts_now = {"next_run_time": datetime.now(UTC)} if run_at_startup else {}
     scheduler.add_job(
-        prune_expired_records,
+        _prune_scheduled,
         "interval",
         hours=_PRUNE_INTERVAL_HOURS,
         id=_PRUNE_JOB_ID,

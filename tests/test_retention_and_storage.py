@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from sqlalchemy.exc import OperationalError
 
 import jasil.backends.storage_local as storage_local
 import jasil.jobs.outbox as jobs_outbox
@@ -194,6 +195,73 @@ class TestRetention:
 
         assert "1 event_log" in caplog.text
 
+    def test_a_stopped_database_is_warned_about_and_still_raised(
+        self, platform, unreachable_session_factory, monkeypatch, caplog
+    ):
+        """A direct caller still learns the prune failed; the log does not call the outage a defect."""
+        _configure_retention(event_log_days=30, jobs_days=30)
+        monkeypatch.setattr(retention.jasil_orm, "get_sessionmaker", lambda: unreachable_session_factory)
+
+        with caplog.at_level("INFO", logger="jasil"), pytest.raises(OperationalError):
+            retention.prune_expired_records()
+
+        assert [(record.levelname, record.getMessage()) for record in caplog.records] == [
+            ("WARNING", "Retention prune of the event_log failed: OperationalError"),
+            ("WARNING", "Retention prune of the durable-job tables failed: OperationalError"),
+        ]
+
+    def test_a_defect_is_still_an_error(self, platform, session_factory, monkeypatch, caplog):
+        import jasil.event_log.crud as event_log_crud
+
+        _configure_retention(event_log_days=30, jobs_days=0)
+
+        def failing(*_args, **_kwargs):
+            raise RuntimeError("bug")
+
+        monkeypatch.setattr(event_log_crud, "delete_events_before", failing)
+
+        with caplog.at_level("INFO", logger="jasil"), pytest.raises(RuntimeError):
+            retention.prune_expired_records()
+
+        [record] = caplog.records
+        assert record.levelname == "ERROR"
+        assert record.getMessage() == "Retention prune of the event_log failed: RuntimeError"
+
+
+class TestScheduledRetentionPrune:
+    """APScheduler logs whatever a job raises at ERROR with a traceback, so the scheduled prune never raises."""
+
+    def test_a_stopped_database_is_a_warning_without_a_traceback(
+        self, platform, unreachable_session_factory, monkeypatch, caplog
+    ):
+        _configure_retention(event_log_days=30, jobs_days=0)
+        monkeypatch.setattr(retention.jasil_orm, "get_sessionmaker", lambda: unreachable_session_factory)
+
+        with caplog.at_level("INFO", logger="jasil"):
+            retention._prune_scheduled()
+
+        assert [record.levelname for record in caplog.records] == ["WARNING", "WARNING"]
+        assert caplog.records[-1].getMessage() == "Scheduled retention prune failed; the database is unavailable"
+        assert all(record.exc_info is None for record in caplog.records)
+
+    def test_a_defect_is_an_error_with_a_traceback(self, platform, session_factory, monkeypatch, caplog):
+        import jasil.event_log.crud as event_log_crud
+
+        _configure_retention(event_log_days=30, jobs_days=0)
+        defect = RuntimeError("bug")
+
+        def failing(*_args, **_kwargs):
+            raise defect
+
+        monkeypatch.setattr(event_log_crud, "delete_events_before", failing)
+
+        with caplog.at_level("INFO", logger="jasil"):
+            retention._prune_scheduled()
+
+        assert caplog.records[-1].levelname == "ERROR"
+        assert caplog.records[-1].getMessage() == "Scheduled retention prune failed"
+        assert caplog.records[-1].exc_info[1] is defect
+
 
 class TestScheduleRetentionMaintenance:
     """Retention is scheduled separately from durable jobs, because it also
@@ -221,7 +289,7 @@ class TestScheduleRetentionMaintenance:
     async def test_the_registered_job_is_the_prune(self, scheduler):
         retention.schedule_retention_maintenance(scheduler)
 
-        assert scheduler.get_jobs()[0].func is retention.prune_expired_records
+        assert scheduler.get_jobs()[0].func is retention._prune_scheduled
 
     async def test_registering_twice_replaces_rather_than_duplicates(self, scheduler):
         """Otherwise a re-entrant startup would prune twice per interval."""

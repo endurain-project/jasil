@@ -22,6 +22,7 @@ from functools import partial
 from sqlalchemy.orm import Session
 
 import jasil.jobs.crud as jobs_crud
+from jasil._core.db_outage import log_failure
 from jasil.jobs.registry import JobHandlerRegistry
 from jasil.providers import ClockProvider
 
@@ -152,4 +153,4 @@ def _record(
         with session_factory() as db:
             write(db=db)
     except Exception as error:
-        logger.error("Dead-letter delivery could not be recorded; it will repeat", exc_info=error, extra=context)
+        log_failure(logger, "Dead-letter delivery could not be recorded; it will repeat", error, extra=context)

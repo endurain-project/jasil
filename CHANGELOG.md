@@ -8,6 +8,17 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-21
+
+### Added
+
+- **`jasil.orm.is_database_unavailable(error)`** says whether a failure means the database could not be reached rather than that something is broken. It returns True for an exhausted pool, a connection SQLAlchemy invalidated as a disconnect, PostgreSQL SQLSTATE class `08`, `57P01`, `57P02`, `57P03` and `53300`, a PostgreSQL `OperationalError` with no SQLSTATE, and a MySQL client error (2000–2999). A host can use it to log its own failures by the same rule. Which errors it returns True for may change in a minor release.
+
+### Changed
+
+- **An unreachable database is logged as a warning, not an error.** While PostgreSQL was stopped, the job worker logged "Durable job worker iteration failed" with a traceback on every poll. APScheduler logged the relay, reaper and retention prune at ERROR with a traceback on every interval. The lease renewal, dead-letter sweep and heartbeat logged tracebacks on every beat. Now the worker logs one WARNING per outage and one INFO when the database is back. The others log a WARNING without a traceback that ends "; the database is unavailable". Any other failure keeps its ERROR and its traceback. `relay_outbox_scheduled`, `reap_expired_jobs_scheduled` and the scheduled retention prune no longer raise into APScheduler. `prune_expired_records` still raises when called directly. No change is needed in the host.
+- Refreshed every dependency minimum, in all extras and groups, and the locked dependency graph to the newest releases allowed by the supply-chain cooldown. The runtime minimums are now `sqlalchemy>=2.1.8` and `pydantic>=2.14.3`. In the extras they are `boto3>=1.44.3`, `psycopg[binary]>=3.3.9`, `fastapi>=0.163.0`, `urllib3>=2.8.0`, `alembic>=1.20.1` and `cryptography>=50.0.2`. The release build uses uv 0.13.8. The pinned GitHub Actions were already on their newest releases outside the cooldown.
+
 ## [0.22.3] - 2026-11-20
 
 ### Fixed
