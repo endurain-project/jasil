@@ -8,6 +8,21 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+This release lets a lookup that would sleep for its geocoding turn book the turn and come back for it. **It is breaking for a host that implements `StateProvider` itself**: the protocol has a new method, `reserve_send`, and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` until it does). A host that implements `GeocodingProvider` should accept the new `reservation_key` keyword, which the built-in backends pass on. Hosts that use the built-in backends need no change. No migration is added.
+
+### Added
+
+- **`StateProvider.reserve_send(key, interval_seconds, *, max_wait_seconds, booking=None)`** clears one send through a rate gate, or books a slot for a caller that defers instead of waiting.
+  - It shares the slot pointer of `reserve_slot` and also records the gate's last send, so no two sends it clears are closer than the interval, however late a booked caller comes back.
+  - A caller back for its booking before the slot keeps it, and nothing new is booked. A due booking is used up, with a wait of at most one interval. An expired booking is a lost slot, and the next call books afresh.
+  - The last send and the bookings live under the reserved prefix `jasil:state:gate:`.
+  - See [Rate gates](docs/providers-and-backends.md#rate-gates).
+- **`GeocodingProvider.lookup(..., reservation_key=None)`.** With a key, a lookup that finds no turn free within `max_wait_seconds` books the next one and returns it as `retry_at`. Called again with the same key, it runs at that turn. A durable job passes its id with `max_wait_seconds=0`, so a backlog of lookups holds no worker asleep and does not wake together to defer again. See [Booking a turn instead of sleeping](docs/providers-and-backends.md#booking-a-turn-instead-of-sleeping).
+
+### Changed
+
+- **The HTTP geocoder gates every request through `reserve_send`**, so the last-send rule holds for booked and unbooked lookups alike. During a rolling deploy, processes of the previous release keep to the same slot order through `reserve_slot`. Their sends do not check the last send, so for that window a booked lookup sent late can come closer than one interval to one of theirs.
+
 ## [0.23.0] - 2026-11-21
 
 ### Added

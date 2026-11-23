@@ -231,13 +231,18 @@ class NullGeocoding:
         """Return ``None`` — no geocoding is configured."""
         return None
 
-    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+    def lookup(
+        self, latitude: float, longitude: float, *, max_wait_seconds: float, reservation_key: str | None = None
+    ) -> GeocodingOutcome:
         """Return a final answer of nothing — no geocoding is configured.
 
         Raises:
-            ValueError: When ``max_wait_seconds`` is negative or not finite.
+            ValueError: When ``max_wait_seconds`` is negative or not finite, or ``reservation_key`` is empty or too
+                long.
         """
         state_keys.check_max_wait(max_wait_seconds)
+        if reservation_key is not None:
+            state_keys.check_booking(reservation_key, name="reservation_key")
         return GeocodingOutcome()
 
 
@@ -327,11 +332,12 @@ class HttpGeocoding:
             )
         return place if any(vars(place).values()) else None
 
-    def _admit(self, max_wait_seconds: float) -> datetime | None:
+    def _admit(self, max_wait_seconds: float, reservation_key: str | None) -> datetime | None:
         """Wait for this request's turn, or return when to retry instead of sending it.
 
-        It is not sent while the upstream's back-off lasts, nor when no slot is free within ``max_wait_seconds``.
-        The back-off is read again after waiting for a slot, since a peer may have been told to back off meanwhile.
+        It is not sent while the upstream's back-off lasts, nor when no turn is free within ``max_wait_seconds``;
+        with a ``reservation_key`` the next turn is then booked under it, and taken when the caller comes back.
+        The back-off is read again after waiting for a turn, since a peer may have been told to back off meanwhile.
         Without the state the rate limit cannot be kept, so nothing is sent then either.
         """
         try:
@@ -339,7 +345,9 @@ class HttpGeocoding:
                 return until
             if self._min_interval <= 0:
                 return None
-            slot = self._state.reserve_slot(self._gate_key, self._min_interval, max_wait_seconds=max_wait_seconds)
+            slot = self._state.reserve_send(
+                self._gate_key, self._min_interval, max_wait_seconds=max_wait_seconds, booking=reservation_key
+            )
             if not slot.reserved:
                 logger.debug("Reverse-geocoding via %s deferred: no request slot within the wait bound", self._service)
                 return self._clock.now() + timedelta(seconds=slot.wait_seconds)
@@ -424,7 +432,9 @@ class HttpGeocoding:
         """
         return self.lookup(latitude, longitude, max_wait_seconds=_REVERSE_MAX_WAIT_SECONDS).place
 
-    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+    def lookup(
+        self, latitude: float, longitude: float, *, max_wait_seconds: float, reservation_key: str | None = None
+    ) -> GeocodingOutcome:
         """Reverse-geocode a coordinate, or say when to ask again.
 
         A 2xx answer is final, as is a request the upstream refused (another 4xx) or an answer that cannot be
@@ -435,14 +445,19 @@ class HttpGeocoding:
             latitude: WGS-84 latitude in decimal degrees.
             longitude: WGS-84 longitude in decimal degrees.
             max_wait_seconds: The longest this call sleeps for its turn under the rate limit.
+            reservation_key: Books the next turn under this name when none is free within ``max_wait_seconds``,
+                and runs at it when called again with the same name.
 
         Returns:
             The outcome. Never raises for an upstream or state failure.
 
         Raises:
-            ValueError: When ``max_wait_seconds`` is negative or not finite.
+            ValueError: When ``max_wait_seconds`` is negative or not finite, or ``reservation_key`` is empty or too
+                long.
         """
         state_keys.check_max_wait(max_wait_seconds)
+        if reservation_key is not None:
+            state_keys.check_booking(reservation_key, name="reservation_key")
         # The coordinates are deliberately not logged: they are a location fix
         # belonging to the host's user, and this is a library — it does not get to
         # decide that someone's whereabouts are acceptable to write to their log.
@@ -455,7 +470,7 @@ class HttpGeocoding:
         except ImportError as error:
             logger.error("Reverse-geocoding via %s failed - %s", self._service, _failure_detail(error))
             return GeocodingOutcome()
-        retry_at = self._admit(max_wait_seconds)
+        retry_at = self._admit(max_wait_seconds, reservation_key)
         if retry_at is not None:
             return GeocodingOutcome(retry_at=retry_at)
         deadline = time.monotonic() + _DEADLINE_SECONDS

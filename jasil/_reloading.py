@@ -229,7 +229,9 @@ class ReloadingGeocoding:
             return None
         return outcome.backend.reverse(latitude, longitude)
 
-    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+    def lookup(
+        self, latitude: float, longitude: float, *, max_wait_seconds: float, reservation_key: str | None = None
+    ) -> GeocodingOutcome:
         """Look up through the current backend.
 
         Settings that could not be loaded, or a host that could not be resolved to verify them, may work on a
@@ -237,9 +239,12 @@ class ReloadingGeocoding:
         a final answer of nothing, as ``NullGeocoding`` gives.
 
         Raises:
-            ValueError: When ``max_wait_seconds`` is negative or not finite.
+            ValueError: When ``max_wait_seconds`` is negative or not finite, or ``reservation_key`` is empty or too
+                long.
         """
         state_keys.check_max_wait(max_wait_seconds)
+        if reservation_key is not None:
+            state_keys.check_booking(reservation_key, name="reservation_key")
         try:
             outcome = self._backend.resolve()
         except SourceUnavailableError:
@@ -248,7 +253,9 @@ class ReloadingGeocoding:
             return self._retry_later()
         if outcome.backend is None:
             return GeocodingOutcome()
-        return outcome.backend.lookup(latitude, longitude, max_wait_seconds=max_wait_seconds)
+        return outcome.backend.lookup(
+            latitude, longitude, max_wait_seconds=max_wait_seconds, reservation_key=reservation_key
+        )
 
     def _retry_later(self) -> GeocodingOutcome:
         return GeocodingOutcome(retry_at=self._clock.now() + timedelta(seconds=TRANSIENT_RETRY_SECONDS))

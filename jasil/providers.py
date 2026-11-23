@@ -144,12 +144,12 @@ class TieredFailureOutcome:
 
 @dataclass(frozen=True)
 class SlotReservation:
-    """Result of :meth:`StateProvider.reserve_slot`.
+    """Result of :meth:`StateProvider.reserve_slot` and :meth:`StateProvider.reserve_send`.
 
     Attributes:
         reserved: True when this call reserved a slot.
         wait_seconds: When ``reserved``, the seconds the caller waits before acting (``0.0`` to act at once).
-            Otherwise the seconds until the gate's next free slot, which exceed the call's ``max_wait_seconds``.
+            Otherwise the seconds until the caller may try again: the gate's next free slot, or its booked one.
     """
 
     reserved: bool
@@ -168,7 +168,7 @@ class StateProvider(Protocol):
     (``set_if_absent``, ``get_and_delete``), changes only the current holder of a
     value may make (``delete_if_equals``, ``expire_if_equals``), an escalating gate
     over repeated events (``record_tiered_failure``), a rate gate that admits one
-    caller per interval (``reserve_slot``) and an ordered index whose members
+    caller per interval (``reserve_slot``, ``reserve_send``) and an ordered index whose members
     expire one by one (``index_add``, ``index_remove``, ``index_range``).
 
     ``ttl_seconds`` is a positive number of seconds, or ``None`` for no expiry; zero or a negative
@@ -385,6 +385,47 @@ class StateProvider(Protocol):
         Raises:
             ValueError: When ``interval_seconds`` or ``max_wait_seconds`` is out of range, ``key`` holds an index,
                 or ``key`` holds a plain value that is not a slot.
+            StateBackendUnavailableError: When the backing store is unreachable.
+        """
+
+    def reserve_send(
+        self, key: str, interval_seconds: float, *, max_wait_seconds: float, booking: str | None = None
+    ) -> SlotReservation:
+        """Clear one send through the rate gate ``key``, or book a slot for a caller that defers instead of waiting.
+
+        The gate is the one :meth:`reserve_slot` keeps, and it also records when it last cleared a send. A send
+        is cleared for the later of its slot and one interval after that last send, so no two cleared sends are
+        closer than ``interval_seconds``, however late a caller comes back to a booked slot. All of it is one
+        atomic step on one clock, as :meth:`reserve_slot`.
+
+        - No booking held under ``booking``: the call takes the next free slot. When its send is no more than
+          ``max_wait_seconds`` away it is cleared, and the call returns ``reserved`` with the wait. Otherwise,
+          with ``booking`` named, the call books that slot under it and returns not ``reserved`` with the wait
+          until then; without ``booking`` it writes nothing.
+        - A booking held: its slot more than ``max_wait_seconds`` away returns not ``reserved`` with the wait
+          until it, and books nothing more. A slot due sooner clears the send and uses the booking up, provided
+          the send waits at most one interval past the slot (or now, when the caller is late). A caller that
+          would wait longer, behind others back late at once, keeps its booking and is told when to try again.
+
+        A booking expires a tenth of its wait and 10 minutes after its slot; an expired one is a lost slot,
+        and the next call books afresh. The last send and the bookings sit under ``jasil:state:gate:``, so
+        ``iter_keys`` over the gate's own prefix sees the gate alone.
+
+        Args:
+            key: The gate key.
+            interval_seconds: Seconds between two sends: positive, finite and at most a day. Precise to the
+                microsecond.
+            max_wait_seconds: The longest wait the caller accepts before it sends: zero or more, and finite. A
+                caller using a due booking may wait up to one interval past it.
+            booking: Names the caller across retries (a durable job's id): a non-empty string of at most 200
+                characters. ``None`` books nothing.
+
+        Returns:
+            Whether the send was cleared, and the wait until it or, when it was not, until the caller tries again.
+
+        Raises:
+            ValueError: When ``interval_seconds``, ``max_wait_seconds`` or ``booking`` is out of range, ``key``
+                holds an index, or a gate value is not a slot.
             StateBackendUnavailableError: When the backing store is unreachable.
         """
 
@@ -1114,7 +1155,9 @@ class GeocodingProvider(Protocol):
             The resolved :class:`GeocodedPlace`, or ``None`` when nothing resolves or the upstream fails.
         """
 
-    def lookup(self, latitude: float, longitude: float, *, max_wait_seconds: float) -> GeocodingOutcome:
+    def lookup(
+        self, latitude: float, longitude: float, *, max_wait_seconds: float, reservation_key: str | None = None
+    ) -> GeocodingOutcome:
         """Resolve a coordinate to a place, or say when to ask again.
 
         Never raises for an upstream or state failure; one that may pass sets ``retry_at``.
@@ -1124,12 +1167,17 @@ class GeocodingProvider(Protocol):
             longitude: Longitude in decimal degrees.
             max_wait_seconds: The longest this call waits for its turn under the rate limit, zero or more and
                 finite. When the wait would be longer it sends nothing and returns when to retry.
+            reservation_key: Names the caller across retries (a durable job's id), a non-empty string of at most
+                200 characters. When no turn is free within ``max_wait_seconds`` the call books the next one under
+                it and returns that as ``retry_at``; called again with the same key it runs at that turn, waiting
+                at most one rate-limit interval. ``None`` books nothing.
 
         Returns:
             The :class:`GeocodingOutcome`: a place, a final "nothing here", or when to retry.
 
         Raises:
-            ValueError: When ``max_wait_seconds`` is negative or not finite.
+            ValueError: When ``max_wait_seconds`` is negative or not finite, or ``reservation_key`` is empty or too
+                long.
         """
 
 

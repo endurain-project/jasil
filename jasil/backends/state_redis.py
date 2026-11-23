@@ -107,6 +107,71 @@ redis.call("SET", KEYS[1], string.format("%.0f", slot), "PX", math.ceil((slot + 
 return {1, wait}
 """
 
+# Clears a send or books a slot (KEYS: gate, last send, and the booking when one is named; ARGV: interval,
+# max_wait, booking grace, all in microseconds), on the server's clock. Mirrors ``MemoryState.reserve_send``, and
+# the booking lifetime ``state_keys.booking_ttl_microseconds``: the wait, a tenth more, and the grace.
+_RESERVE_SEND_SCRIPT = """
+local time = redis.call("TIME")
+local now = tonumber(time[1]) * 1000000 + tonumber(time[2])
+local interval = tonumber(ARGV[1])
+local max_wait = tonumber(ARGV[2])
+local grace = tonumber(ARGV[3])
+local function integer(raw)
+    if not raw then
+        return nil
+    end
+    local value = tonumber(raw)
+    if value == nil or value ~= math.floor(value) then
+        return false
+    end
+    return value
+end
+local function store(key, value, expires_at)
+    redis.call("SET", key, string.format("%.0f", value), "PX", math.ceil((expires_at - now) / 1000))
+end
+local pointer = integer(redis.call("GET", KEYS[1]))
+local sent = integer(redis.call("GET", KEYS[2]))
+local booked = nil
+if #KEYS == 3 then
+    booked = integer(redis.call("GET", KEYS[3]))
+end
+if pointer == false or sent == false or booked == false then
+    return redis.error_reply("ERR value is not an integer or out of range")
+end
+local not_before = now
+if sent then
+    not_before = math.max(now, sent + interval)
+end
+if booked then
+    if booked - now > max_wait then
+        return {0, booked - now}
+    end
+    local start = math.max(booked, now)
+    local send_at = math.max(start, not_before)
+    if send_at - start > interval then
+        return {0, send_at - now}
+    end
+    redis.call("DEL", KEYS[3])
+    store(KEYS[2], send_at, send_at + interval)
+    return {1, send_at - now}
+end
+local slot = now
+if pointer then
+    slot = math.max(now, pointer + interval)
+end
+local send_at = math.max(slot, not_before)
+if send_at - now <= max_wait then
+    store(KEYS[1], slot, slot + interval)
+    store(KEYS[2], send_at, send_at + interval)
+    return {1, send_at - now}
+end
+if #KEYS == 3 then
+    store(KEYS[1], slot, slot + interval)
+    store(KEYS[3], slot, now + math.ceil((slot - now) * 11 / 10) + grace)
+end
+return {0, send_at - now}
+"""
+
 # Opens every index script (KEYS: index, deadlines; ARGV[1]: the caller's epoch time). It refuses a key of another
 # type, discards deadlines an index left behind (``delete`` and ``delete_prefix`` remove only the index), and drops
 # every member whose deadline has passed, so no script sees an expired member. ``rearm`` keeps both keys expiring
@@ -233,7 +298,7 @@ class RedisState:
 
     Correct for the ``distributed`` profile and multi-worker deployments.
     ``get`` / ``set`` store opaque ``bytes``; ``incr`` is an atomic server-side
-    ``INCRBY``; ``record_tiered_failure`` and ``reserve_slot`` run atomic Lua scripts; TTLs map to
+    ``INCRBY``; ``record_tiered_failure``, ``reserve_slot`` and ``reserve_send`` run atomic Lua scripts; TTLs map to
     Redis key expiry.
     """
 
@@ -247,6 +312,7 @@ class RedisState:
         self._index_remove_script = client.register_script(_INDEX_REMOVE_SCRIPT)
         self._index_range_script = client.register_script(_INDEX_RANGE_SCRIPT)
         self._reserve_slot_script = client.register_script(_RESERVE_SLOT_SCRIPT)
+        self._reserve_send_script = client.register_script(_RESERVE_SEND_SCRIPT)
 
     @classmethod
     def from_uri(cls, uri: str) -> "RedisState":
@@ -357,6 +423,20 @@ class RedisState:
         """Reserve the gate's next free slot in one Lua script, on the Redis server's clock."""
         interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
         reserved, wait = self._reserve_slot_script(keys=[key], args=[str(interval), str(max_wait)])
+        return SlotReservation(bool(int(reserved)), state_keys.to_seconds(int(wait)))
+
+    @_translate_state_errors
+    def reserve_send(
+        self, key: str, interval_seconds: float, *, max_wait_seconds: float, booking: str | None = None
+    ) -> SlotReservation:
+        """Clear a send or book a slot in one Lua script, on the Redis server's clock."""
+        interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
+        keys = [key, state_keys.last_send_key(key)]
+        if booking is not None:
+            state_keys.check_booking(booking)
+            keys.append(state_keys.booking_key(key, booking))
+        grace = state_keys.BOOKING_GRACE_SECONDS * 1_000_000
+        reserved, wait = self._reserve_send_script(keys=keys, args=[str(interval), str(max_wait), str(grace)])
         return SlotReservation(bool(int(reserved)), state_keys.to_seconds(int(wait)))
 
     @_translate_state_errors

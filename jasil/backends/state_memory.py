@@ -235,6 +235,57 @@ class MemoryState:
             self._data[key] = (str(slot).encode(), state_keys.to_seconds(slot + interval))
             return SlotReservation(True, state_keys.to_seconds(wait))
 
+    def reserve_send(
+        self, key: str, interval_seconds: float, *, max_wait_seconds: float, booking: str | None = None
+    ) -> SlotReservation:
+        """Clear a send or book a slot under the instance lock, on the monotonic clock in microseconds."""
+        interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
+        booked_key = None
+        if booking is not None:
+            state_keys.check_booking(booking)
+            booked_key = state_keys.booking_key(key, booking)
+        sent_key = state_keys.last_send_key(key)
+        with self._lock:
+            self._sweep_if_due()
+            now = math.floor(time.monotonic() * 1_000_000)
+            pointer = self._live_integer(key)
+            sent = self._live_integer(sent_key)
+            booked = None if booked_key is None else self._live_integer(booked_key)
+            not_before = now if sent is None else max(now, sent + interval)
+            if booked_key is not None and booked is not None:
+                if booked - now > max_wait:
+                    return SlotReservation(False, state_keys.to_seconds(booked - now))
+                start = max(booked, now)
+                send_at = max(start, not_before)
+                if send_at - start > interval:
+                    return SlotReservation(False, state_keys.to_seconds(send_at - now))
+                del self._data[booked_key]
+                self._store_integer(sent_key, send_at, expires_at=send_at + interval)
+                return SlotReservation(True, state_keys.to_seconds(send_at - now))
+            slot = now if pointer is None else max(now, pointer + interval)
+            send_at = max(slot, not_before)
+            if send_at - now <= max_wait:
+                self._store_integer(key, slot, expires_at=slot + interval)
+                self._store_integer(sent_key, send_at, expires_at=send_at + interval)
+                return SlotReservation(True, state_keys.to_seconds(send_at - now))
+            if booked_key is not None:
+                self._store_integer(key, slot, expires_at=slot + interval)
+                self._store_integer(booked_key, slot, expires_at=now + state_keys.booking_ttl_microseconds(slot - now))
+            return SlotReservation(False, state_keys.to_seconds(send_at - now))
+
+    def _live_integer(self, key: str) -> int | None:
+        """Return the gate value under ``key`` as an integer, or None when there is none; call under the lock.
+
+        Raises:
+            ValueError: When ``key`` holds an index or a value that is not an integer.
+        """
+        raw = self._live_value(key)
+        return None if raw is None else _parse_integer(raw)
+
+    def _store_integer(self, key: str, value: int, *, expires_at: int) -> None:
+        """Store a gate value expiring at ``expires_at`` on the monotonic clock in microseconds; under the lock."""
+        self._data[key] = (str(value).encode(), state_keys.to_seconds(expires_at))
+
     def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
         """Insert or replace ``member`` with ``score``, expiring ``ttl_seconds`` from now."""
         _check_ttl(ttl_seconds)
