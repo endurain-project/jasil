@@ -8,6 +8,17 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+### Added
+
+- **`jasil.providers.is_storage_unavailable(error)`** says whether a failure means storage could not be reached for now, rather than that the call was refused. It is the storage counterpart of `jasil.orm.is_database_unavailable` and reads the exception chain (`__cause__`, or `__context__` unless suppressed), so a host error raised `from` a storage one counts. The first storage error in the chain decides, so a refusal raised while handling an earlier outage is still a refusal. Which failures each built-in backend reports as transient may change in a minor release.
+- **`StorageBackendUnavailableError` has a `transient` attribute**, set by a keyword argument that defaults to `True`. The S3 backend sets it for a connection failure, a timeout, a 5xx, 408 or 429 answer, and a throttling or retry-later code. It clears it for any other refusal: `AccessDenied`, `NoSuchBucket`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`, missing credentials or region, and a malformed 2xx body. Local storage clears it for a tampered identity file, and disabled storage (`none://`) always clears it. The exception hierarchy is unchanged, so every `except StorageBackendUnavailableError` still catches both. A refusal from S3 now reads "S3 storage backend refused the request".
+- **`jobs.outage_defer_max_seconds`** (default 86400): how long a durable job whose handler cannot reach storage or the database is deferred instead of failed, counted from its first such deferral. `0` turns outage deferral off.
+- Migration `rev0013` adds two columns to `jasil_processing_jobs`. The nullable `outage_since` is the start of a job's outage window. `outage_deferrals` counts the deferrals made in an outage, so `max_deferrals` bounds only the handler's own `DeferJob`. Previous-release processes neither read nor write either column. It also rewords the comment on `deferrals`, which now counts outage deferrals too, except on SQLite, which keeps no column comments. On MySQL and MariaDB that is a `MODIFY COLUMN` restating the column.
+
+### Changed
+
+- **A storage or database outage defers durable jobs instead of spending their attempts.** Before, a handler that raised `StorageBackendUnavailableError` failed like any other exception, so with `max_attempts=5` and a 5-second backoff base a job dead-lettered after about a minute of S3 outage. Now an error whose nearest storage or database error, in the error or its chain, is an outage (`is_storage_unavailable` or `is_database_unavailable`) returns the job to `pending` without counting against `max_attempts` or `max_deferrals`. It never dead-letters or runs `on_dead_letter` while it defers. The wait is as long as the outage has lasted for that job, from 30 seconds to 15 minutes, with up to 10% jitter, and never more than `jobs.defer_max_seconds`. Past `jobs.outage_defer_max_seconds` each outage error is an ordinary failure again. Each worker logs one WARNING per outage, without a traceback, and an INFO when a deferred job completes. A job whose outcome cannot be written because the database is unreachable is logged as "Durable job could not be finalized; the database is unavailable" at WARNING, without a traceback, instead of ERROR. An outage deferral counts in `deferrals` and `Event.deferral_count`. No change is needed in the host, apart from running the migrations.
+
 ## [0.23.0] - 2026-11-21
 
 ### Added

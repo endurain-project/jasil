@@ -202,7 +202,7 @@ class LocalStorage:
     def _write_identity(self, path: Path, value: str) -> None:
         try:
             if path.is_symlink():
-                raise StorageBackendUnavailableError("Local storage object identity path is unsafe")
+                raise StorageBackendUnavailableError("Local storage object identity path is unsafe", transient=False)
             existing = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             temporary_path = path.with_name(f".{path.name}.{uuid4().hex}")
@@ -220,7 +220,9 @@ class LocalStorage:
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         if existing != value:
-            raise StorageBackendUnavailableError("Local storage object identity does not match its address")
+            raise StorageBackendUnavailableError(
+                "Local storage object identity does not match its address", transient=False
+            )
 
     def _prepare_object(self, area: str, key: str) -> Path:
         if area in self._plain_areas:
@@ -460,13 +462,20 @@ class LocalStorage:
         key_file = path.parent / _OBJECT_KEY_FILE
         try:
             if area_file.is_symlink() or key_file.is_symlink():
-                raise StorageBackendUnavailableError("Local storage object identity path is unsafe")
+                raise StorageBackendUnavailableError("Local storage object identity path is unsafe", transient=False)
             stored_area = area_file.read_text(encoding="utf-8")
             stored_key = key_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        except OSError as error:
             raise StorageBackendUnavailableError("Local storage object identity is unavailable") from error
+        except UnicodeError as error:
+            # Corrupt or tampered state, which waiting does not repair, unlike a file that cannot be read for now.
+            raise StorageBackendUnavailableError(
+                "Local storage object identity is not valid UTF-8", transient=False
+            ) from error
         if stored_area != area or stored_key != key:
-            raise StorageBackendUnavailableError("Local storage object identity does not match its address")
+            raise StorageBackendUnavailableError(
+                "Local storage object identity does not match its address", transient=False
+            )
 
     @staticmethod
     def _is_regular_file(path: Path) -> bool:
@@ -534,7 +543,7 @@ class LocalStorage:
         except OSError as error:
             raise StorageBackendUnavailableError("Local storage backend is unavailable") from error
         if resolved != requested or not resolved.is_relative_to(base):
-            raise StorageBackendUnavailableError("Local upload staging path is unsafe")
+            raise StorageBackendUnavailableError("Local upload staging path is unsafe", transient=False)
         return requested
 
     def _validate_upload_session(self, session: UploadSession) -> Path:
@@ -1101,10 +1110,12 @@ class LocalStorage:
                 return
             area_file = area_dir.parent / _OBJECT_AREA_FILE
             if area_file.is_symlink():
-                raise StorageBackendUnavailableError("Local storage area identity path is unsafe")
+                raise StorageBackendUnavailableError("Local storage area identity path is unsafe", transient=False)
             area_identity = area_file.read_text(encoding="utf-8")
             if area_identity != area:
-                raise StorageBackendUnavailableError("Local storage area identity does not match its address")
+                raise StorageBackendUnavailableError(
+                    "Local storage area identity does not match its address", transient=False
+                )
             for candidate in area_dir.rglob("*"):
                 if candidate.is_symlink():
                     continue  # never followed, and a loop would fail the resolve below

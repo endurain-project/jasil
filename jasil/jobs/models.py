@@ -56,9 +56,14 @@ class ProcessingJob(Base):
         job_metadata: Correlation context (request_id, plus any host-defined keys).
         status: Lifecycle state: pending, claimed, completed, or dead_letter.
         attempts: Claims so far, deferred ones included; incremented when the job is claimed.
-        deferrals: Claims the handler deferred with ``DeferJob``. ``attempts``
-            keeps counting every claim (it fences the claim); the budget spent
-            against ``max_attempts`` is ``attempts - deferrals - budget_offset``.
+        deferrals: Claims deferred by the handler with ``DeferJob`` or by the runner
+            in an outage. ``attempts`` keeps counting every claim (it fences the
+            claim); the budget spent against ``max_attempts`` is
+            ``attempts - deferrals - budget_offset``.
+        outage_deferrals: Of ``deferrals``, those the runner made in a storage or
+            database outage. ``max_deferrals`` bounds the rest, the handler's own.
+        outage_since: The first deferral in the job's current run of outages, or
+            NULL when it is not in one.
         continuations: Claims the handler ended with ``ContinueJob``.
         budget_offset: ``attempts - deferrals`` as of the last continuation, so
             the failure budget counts only claims made since then.
@@ -178,7 +183,7 @@ class ProcessingJob(Base):
         nullable=False,
         default=0,
         server_default="0",
-        comment="Claims the handler deferred with DeferJob; they do not count against max_attempts",
+        comment="Claims deferred by the handler (DeferJob) or by an outage; they do not count against max_attempts",
     )
     continuations: Mapped[int] = mapped_column(
         Integer,
@@ -193,6 +198,18 @@ class ProcessingJob(Base):
         default=0,
         server_default="0",
         comment="attempts - deferrals at the last ContinueJob; the failure budget counts claims after it",
+    )
+    outage_deferrals: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="Of deferrals, those made in a storage or database outage; max_deferrals does not count them",
+    )
+    outage_since: Mapped[datetime | None] = mapped_column(
+        MICROSECOND_DATETIME,
+        nullable=True,
+        comment="First deferral in the current run of storage or database outages; NULL when not in one",
     )
     max_attempts: Mapped[int] = mapped_column(
         Integer,

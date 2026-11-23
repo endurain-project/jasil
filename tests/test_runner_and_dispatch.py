@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import update
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 import jasil.audit as jasil_audit
 import jasil.correlation as correlation
@@ -414,6 +415,45 @@ class TestJobRunner:
         assert processed == 2
         assert len(finalized) == 2
         assert "Durable job could not be finalized" in caplog.text
+
+    def test_an_unreachable_database_while_finalizing_is_a_warning_without_a_traceback(
+        self, runner, registry, db, monkeypatch, caplog
+    ):
+        """A database that went down mid-batch is an outage the worker retries, not a defect."""
+        registry.register("activity.created", "s", lambda _event: None)
+        self._enqueue(db)
+
+        def finalize(_job):
+            raise PoolTimeoutError("QueuePool limit reached")
+
+        monkeypatch.setattr(runner, "_run_job", finalize)
+
+        with caplog.at_level("WARNING"):
+            runner.run_once()
+
+        (record,) = [r for r in caplog.records if r.getMessage().startswith("Durable job could not be finalized")]
+        assert record.levelname == "WARNING"
+        assert record.exc_info is None
+        assert record.getMessage().endswith("; the database is unavailable")
+        assert record.job_id
+
+    def test_any_other_finalization_error_keeps_its_error_and_traceback(
+        self, runner, registry, db, monkeypatch, caplog
+    ):
+        registry.register("activity.created", "s", lambda _event: None)
+        self._enqueue(db)
+
+        def finalize(_job):
+            raise RuntimeError("bug")
+
+        monkeypatch.setattr(runner, "_run_job", finalize)
+
+        with caplog.at_level("WARNING"):
+            runner.run_once()
+
+        (record,) = [r for r in caplog.records if r.getMessage() == "Durable job could not be finalized"]
+        assert record.levelname == "ERROR"
+        assert record.exc_info is not None
 
     def test_lost_ownership_skips_successful_finalization(self, runner, registry, db, monkeypatch, caplog):
         registry.register("activity.created", "s", lambda _event: None)

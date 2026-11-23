@@ -484,6 +484,36 @@ S3 client failures and local filesystem failures surface as
 `StorageBackendUnavailableError`, never as botocore or backend-specific
 exceptions. `StorageSizeLimitError` is reserved for `max_bytes` breaches.
 
+The error's `transient` attribute tells an outage from a refusal. It is True when
+the backend could not be reached, timed out, failed or was overloaded, so the same
+call should succeed once it recovers: on S3 a connection failure, a timeout, a 5xx,
+408 or 429 answer, or a throttling or retry-later code. It is False when the backend
+refused the call: on S3 any other 4xx (`AccessDenied`, `NoSuchBucket`,
+`InvalidAccessKeyId`, `SignatureDoesNotMatch`), missing credentials or region, or a
+malformed 2xx body; locally a tampered identity file; and always for disabled
+storage. A local filesystem error is transient. A backend you supply that raises
+the error without `transient=False` reports an outage.
+
+`jasil.providers.is_storage_unavailable(error)` reads it through the exception
+chain, so it also answers for an error of your own raised `from` a storage one. The
+first `StorageBackendUnavailableError` in the chain decides, so a refusal raised
+while handling an earlier outage is still a refusal:
+
+```python
+import jasil.providers as jasil_providers
+
+try:
+    delete_user_files(user_id)
+except Exception as error:
+    if not jasil_providers.is_storage_unavailable(error):
+        raise  # a refusal or a bug: fail loudly
+    respond_service_unavailable()
+```
+
+Durable jobs use it to [defer a job through a storage outage](durable-jobs.md#storage-and-database-outages)
+instead of spending its attempts. Which failures each built-in backend reports as
+transient may change in a minor release.
+
 !!! warning "Traversal and aliases are rejected"
     Area, key, source, destination, and deletion-prefix values are validated
     before backend I/O. Addresses must be canonical slash-delimited paths: an

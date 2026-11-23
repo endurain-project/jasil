@@ -799,7 +799,7 @@ class TestMicrosecondTimestamps:
         migrations.upgrade(engine, "rev0011")
         before = _schema(engine)
 
-        migrations.upgrade(engine)
+        migrations.upgrade(engine, "rev0012")
         after = _schema(engine)
         migrations.downgrade(engine, "rev0011")
 
@@ -812,6 +812,41 @@ class TestMicrosecondTimestamps:
             assert after == expected
         else:
             assert after == before
+
+
+class TestOutageSince:
+    """rev0013 adds ``outage_since`` and ``outage_deferrals`` to the jobs table, and its downgrade drops them."""
+
+    def test_it_adds_only_the_column_and_its_downgrade_drops_it(self, engine):
+        migrations.upgrade(engine, "rev0012")
+        before = _schema(engine)
+
+        migrations.upgrade(engine, "rev0013")
+        after = _schema(engine)
+        migrations.downgrade(engine, "rev0012")
+
+        assert _schema(engine) == before
+        jobs = "jasil_processing_jobs"
+        assert set(after[jobs]) - set(before[jobs]) == {"outage_since", "outage_deferrals"}
+        assert {table: columns for table, columns in after.items() if table != jobs} == {
+            table: columns for table, columns in before.items() if table != jobs
+        }
+
+    _OLD_COMMENT = "Claims the handler deferred with DeferJob; they do not count against max_attempts"
+    _NEW_COMMENT = "Claims deferred by the handler (DeferJob) or by an outage; they do not count against max_attempts"
+
+    def test_on_postgresql_it_rewords_the_deferrals_comment_and_the_downgrade_restores_it(self):
+        upgrade = TestMicrosecondTimestamps._render("postgresql://offline/none", "rev0012:rev0013")
+        downgrade = TestMicrosecondTimestamps._render("postgresql://offline/none", "rev0013:rev0012", downgrade=True)
+
+        assert f"COMMENT ON COLUMN jasil_processing_jobs.deferrals IS '{self._NEW_COMMENT}'" in upgrade
+        assert f"COMMENT ON COLUMN jasil_processing_jobs.deferrals IS '{self._OLD_COMMENT}'" in downgrade
+
+    def test_on_mysql_the_comment_change_restates_the_whole_column(self):
+        """``MODIFY COLUMN`` drops whatever it does not restate, so the type, nullability and default must be."""
+        sql = TestMicrosecondTimestamps._render("mysql+pymysql://offline/none", "rev0012:rev0013")
+
+        assert f"MODIFY deferrals INTEGER NOT NULL DEFAULT '0' COMMENT '{self._NEW_COMMENT}'" in sql
 
 
 class TestRevisionTransactions:
@@ -1259,7 +1294,7 @@ class TestAdoptExistingSchema:
         assert migrations.db_revision(engine) == migrations.head_revision()
 
     def test_a_mysql_create_all_schema_is_rejected(self, engine, mapped_base):
-        """``create_all`` builds rev0009's outbox index beside an audit log without rev0008's protections."""
+        """``create_all`` builds the head's tables without rev0008's protections, which the rejection names."""
         if engine.dialect.name not in ("mysql", "mariadb"):
             pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
         mapped_base.metadata.create_all(engine)
@@ -1268,8 +1303,15 @@ class TestAdoptExistingSchema:
             migrations.adopt_existing_schema(engine)
 
         message = str(caught.value)
-        assert "(closest revision rev0007)" in message
-        assert "jasil_event_outbox: unexpected index 'uq_jasil_event_outbox_event_id'" in message
+        assert f"(closest revision {migrations.head_revision()})" in message
+        for missing in (
+            "missing partitioning",
+            "missing trigger 'jasil_audit_log_no_update'",
+            "missing trigger 'jasil_audit_log_no_delete'",
+            "missing procedure 'jasil_audit_ensure_partitions'",
+            "missing procedure 'jasil_audit_drop_partitions'",
+        ):
+            assert f"jasil_audit_log: {missing}" in message
         assert migrations.db_revision(engine) is None
 
     def test_a_mysql_audit_log_with_part_of_its_protections_matches_no_revision(self, engine):
@@ -1505,8 +1547,27 @@ class TestRevisionSchemas:
     def test_an_unsupported_downgrade_operation_is_refused(self, mapped_base):
         ops = migrations._MetadataOps(_copied_jasil_metadata(mapped_base))
 
-        with pytest.raises(NotImplementedError, match=r"op\.alter_column"):
-            ops.alter_column("jasil_event_log", "status")
+        with pytest.raises(NotImplementedError, match=r"op\.add_column"):
+            ops.add_column("jasil_event_log", Column("extra", Integer))
+
+    def test_a_comment_change_is_applied_to_the_column(self, mapped_base):
+        metadata = _copied_jasil_metadata(mapped_base)
+        ops = migrations._MetadataOps(metadata)
+
+        ops.alter_column("jasil_processing_jobs", "deferrals", comment="older", existing_type=Integer())
+
+        assert metadata.tables["jasil_processing_jobs"].c.deferrals.comment == "older"
+
+    def test_an_alter_column_that_changes_more_than_the_comment_is_refused(self, mapped_base):
+        ops = migrations._MetadataOps(_copied_jasil_metadata(mapped_base))
+
+        with pytest.raises(NotImplementedError, match=r"op\.alter_column\(nullable\)"):
+            ops.alter_column("jasil_processing_jobs", "deferrals", nullable=True)
+
+    def test_the_schema_before_rev0013_has_the_previous_deferrals_comment(self):
+        deferrals = _revision_metadata("rev0012").tables["jasil_processing_jobs"].c.deferrals
+
+        assert deferrals.comment == TestOutageSince._OLD_COMMENT
 
     def test_the_metadata_ops_reject_an_unknown_index(self, mapped_base):
         ops = migrations._MetadataOps(_copied_jasil_metadata(mapped_base))

@@ -12,7 +12,9 @@ def _disabled() -> NoReturn:
     Raises:
         StorageBackendUnavailableError: Always.
     """
-    raise StorageBackendUnavailableError("Storage is disabled in this deployment (storage_uri=none://)")
+    raise StorageBackendUnavailableError(
+        "Storage is disabled in this deployment (storage_uri=none://)", transient=False
+    )
 
 
 class NullStorage:

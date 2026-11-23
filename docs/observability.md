@@ -453,9 +453,10 @@ Loggers are named after their module (`jasil.publisher`, `jasil.jobs.runner`,
 
 ERROR means a defect that someone has to fix. A database that is down, restarting
 or out of connection slots is a degraded dependency instead: once it is back,
-nothing is wrong. The job worker, its heartbeat, the lease renewal, the scheduled
-relay, reaper and dead-letter sweep, and the scheduled retention prune log it as
-a WARNING without a traceback, with the exception's class name in `error`:
+nothing is wrong. The job worker, its heartbeat, the lease renewal, the write of a
+job's outcome ("Durable job could not be finalized"), the scheduled relay, reaper
+and dead-letter sweep, and the scheduled retention prune log it as a WARNING
+without a traceback, with the exception's class name in `error`:
 
 - The worker loop logs "Durable job worker cannot reach the database; retrying"
   once per outage, and "Durable job worker reached the database again" at INFO
