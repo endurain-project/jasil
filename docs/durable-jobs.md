@@ -106,7 +106,7 @@ job row by the same comparison that dead-letters the job:
 | `event.attempt` | The 1-based attempt: `1` on the first run. Equal to `event.retry_count` inside a durable handler. `None` outside one. |
 | `event.max_attempts` | The ceiling stamped on the job when it was enqueued. A later change to the `max_attempts` setting does not alter jobs already queued. |
 | `event.is_last_attempt` | `True` when a failure now dead-letters the job (`attempt >= max_attempts`). |
-| `event.deferral_count` | How many earlier runs of this job the handler [deferred](#deferring-a-job). They are not attempts, so they are not in `attempt` or `retry_count`. `0` on a first run. |
+| `event.deferral_count` | How many earlier runs of this job were [deferred](#deferring-a-job), by the handler or by the runner during an [outage](#storage-and-database-outages). They are not attempts, so they are not in `attempt` or `retry_count`. `0` on a first run. |
 | `event.continuation_count` | How many earlier runs of this job the handler [continued](#continuing-a-job). Each restarts the attempt count, so `attempt` counts only the runs since the last one. `0` on a first run. |
 
 Use `event.is_last_attempt` rather than comparing `retry_count` with a setting.
@@ -156,6 +156,57 @@ Guard rails, so a bad value cannot park or spin a job:
 The handler's side effects before it raises are not rolled back, so the handler
 stays idempotent, as for any retry. Do not sleep in a handler to wait out a
 condition: that holds a lease and a worker slot. Defer instead.
+
+### Storage and database outages
+
+A handler that fails because storage or the database is unreachable is deferred
+by the runner, as if it had raised `DeferJob`, rather than failed. Without this an
+outage of a minute spends every attempt of every job that touches storage and
+dead-letters them all.
+
+The runner checks the exception and each one that led to it (`__cause__`, or
+`__context__` unless `raise ... from None` suppressed it), so a host error wrapping
+the outage counts too:
+
+- **Storage:** `jasil.providers.is_storage_unavailable(error)` is true, meaning a
+  `StorageBackendUnavailableError` whose `transient` is set. The S3 backend sets it
+  for a connection failure, a timeout, a 5xx, 408 or 429 answer, and a throttling
+  or retry-later code (`SlowDown`, `RequestTimeout`, `Throttling...`). It clears it
+  for a refusal that waiting does not change: `AccessDenied`, `NoSuchBucket`, bad
+  credentials, a missing region, a malformed 2xx body. Local storage clears it for
+  tampered identity files, and disabled storage (`none://`) always clears it. A
+  refusal fails as before, so a misconfiguration still fails fast.
+- **Database:** `jasil.orm.is_database_unavailable(error)` is true. Writing the
+  deferral needs the database, so this helps with a blip the database has
+  recovered from by the time the handler ends. While it is still down the write
+  fails, and the job waits for its lease to expire, as for any worker that cannot
+  record an outcome.
+
+An outage deferral:
+
+- Returns the job to `pending` and counts in `deferrals`, so it does not count
+  against `max_attempts`, never dead-letters and never runs `on_dead_letter`.
+- Is not bounded by `jobs.max_deferrals`. `jobs.outage_defer_max_seconds` (default
+  86400) bounds it instead, counted from the job's first outage deferral, which is
+  kept in `jasil_processing_jobs.outage_since`. Past that window each outage error
+  is an ordinary failure, with the usual backoff, and the job dead-letters once its
+  attempts run out. `0` turns outage deferral off.
+- Waits as long as the outage has lasted for that job: 30 seconds at first, then
+  about twice as long each time, up to 15 minutes, plus up to 10% jitter, and never
+  more than `jobs.defer_max_seconds`.
+- Is recorded as a `deferred` attempt. `last_error` starts with `storage
+  unavailable:` or `database unavailable:`. Each one is logged at `INFO` as
+  "Durable job deferred", with `outage` and `outage_since` in the log context.
+
+A claim that ends any other way (completed, failed with another error, deferred
+by the handler, continued) clears `outage_since`, so a later outage gets a window
+of its own. A replay clears it too.
+
+Each worker logs one `WARNING` per outage, without a traceback: "Durable job
+handlers cannot reach storage; deferring their jobs until it is back", with the
+exception's class in `error`. When a job the outage deferred completes, it logs
+"Durable job handlers reached storage again" at `INFO`, and the next outage warns
+again.
 
 ### Continuing a job
 

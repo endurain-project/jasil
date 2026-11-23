@@ -622,6 +622,17 @@ class _MetadataOps:
         table = self._metadata.tables[table_name]
         table._columns.remove(table.c[column_name])
 
+    def alter_column(self, table_name: str, column_name: str, **kwargs: Any) -> None:
+        """Apply a comment change; the ``existing_*`` arguments only describe the column as it is."""
+        changes = sorted(name for name in kwargs if not name.startswith("existing_") and name != "comment")
+        if changes:
+            raise NotImplementedError(
+                f"adoption cannot derive an older schema through op.alter_column({', '.join(changes)}); "
+                "teach jasil.migrations._MetadataOps"
+            )
+        if "comment" in kwargs:
+            self._metadata.tables[table_name].c[column_name].comment = kwargs["comment"]
+
     def __getattr__(self, name: str) -> Any:
         raise NotImplementedError(
             f"adoption cannot derive an older schema through op.{name}(); teach jasil.migrations._MetadataOps"

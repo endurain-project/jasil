@@ -10,6 +10,27 @@ import random
 
 _MAX_SHIFT = 30  # cap the exponent so ``base * 2**n`` cannot overflow
 
+#: The shortest and longest wait of a job deferred because a dependency it needs is unreachable.
+OUTAGE_MIN_SECONDS = 30.0
+OUTAGE_MAX_SECONDS = 900.0
+
+
+def outage_seconds(elapsed_seconds: float) -> float:
+    """
+    Compute how long a job deferred by an outage waits: as long as the outage has lasted, within bounds.
+
+    The wait is the time since the job's first outage deferral, between 30 seconds and 15 minutes, so successive
+    retries come about twice as far apart until the cap. It does not depend on a count of retries, so jobs caught by
+    the same outage at different times follow the same schedule.
+
+    Args:
+        elapsed_seconds: Seconds since the job's first deferral in this outage.
+
+    Returns:
+        The wait in seconds, before jitter and the ``defer_max_seconds`` clamp.
+    """
+    return min(max(elapsed_seconds, OUTAGE_MIN_SECONDS), OUTAGE_MAX_SECONDS)
+
 
 def defer_seconds(
     requested_seconds: float,

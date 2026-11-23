@@ -197,6 +197,16 @@ class TestJobSettingsValidation:
             pytest.param({"defer_max_seconds": -1}, r"defer_max_seconds must be at least 0", id="negative-defer"),
             pytest.param({"max_deferrals": -1}, r"max_deferrals must be at least 0", id="negative-deferrals"),
             pytest.param(
+                {"outage_defer_max_seconds": -1},
+                r"jobs\.outage_defer_max_seconds must be at least 0",
+                id="negative-outage-window",
+            ),
+            pytest.param(
+                {"outage_defer_max_seconds": 31_536_001},
+                r"jobs\.outage_defer_max_seconds must be at most 31536000",
+                id="huge-outage-window",
+            ),
+            pytest.param(
                 {"max_continuations": -1}, r"max_continuations must be at least 0", id="negative-continuations"
             ),
             pytest.param(
@@ -253,6 +263,7 @@ class TestJobSettingsValidation:
             defer_max_seconds=0,
             max_deferrals=0,
             max_continuations=0,
+            outage_defer_max_seconds=0,
             lease_seconds=45,
             heartbeat_interval_seconds=15,
             max_runtime_seconds=45,

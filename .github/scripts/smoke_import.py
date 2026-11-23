@@ -61,6 +61,7 @@ EXPECTED_REVISIONS = {
     "rev0010_audit_instance_row.py",
     "rev0011_audit_scope.py",
     "rev0012_mysql_microsecond_timestamps.py",
+    "rev0013_job_outage_since.py",
 }
 
 

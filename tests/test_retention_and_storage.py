@@ -417,6 +417,7 @@ class TestLocalStorage:
             storage.save("activity_files", "a/b", b"child")
 
         assert isinstance(excinfo.value.__cause__, PermissionError)
+        assert excinfo.value.transient is True
 
     def test_plain_stream_write_rejects_file_and_directory_key_conflicts(self, tmp_path):
         storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
@@ -772,8 +773,9 @@ class TestLocalStorage:
         outside.write_text("original.webp")
         key_file.symlink_to(outside)
 
-        with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
+        with pytest.raises(StorageBackendUnavailableError, match="unsafe") as excinfo:
             storage.get("thumbnails", "original.webp")
+        assert excinfo.value.transient is False  # tampering is no outage: retrying cannot repair it
         assert storage.list_keys("thumbnails") == []
 
     def test_listing_refuses_a_symlinked_area_identity(self, storage, tmp_path):
@@ -784,16 +786,18 @@ class TestLocalStorage:
         outside.write_text("thumbnails")
         area_file.symlink_to(outside)
 
-        with pytest.raises(StorageBackendUnavailableError, match="area identity path is unsafe"):
+        with pytest.raises(StorageBackendUnavailableError, match="area identity path is unsafe") as excinfo:
             storage.list_keys("thumbnails")
+        assert excinfo.value.transient is False
 
     def test_listing_refuses_an_area_identity_naming_another_area(self, storage):
         storage.save("thumbnails", "original.webp", b"original")
         area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
         area_file.write_text("avatars")
 
-        with pytest.raises(StorageBackendUnavailableError, match="area identity does not match"):
+        with pytest.raises(StorageBackendUnavailableError, match="area identity does not match") as excinfo:
             storage.list_keys("thumbnails")
+        assert excinfo.value.transient is False
 
     def test_a_plain_area_never_follows_a_symlink_out_of_the_base_directory(self, tmp_path):
         base = tmp_path / "data"

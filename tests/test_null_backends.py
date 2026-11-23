@@ -63,6 +63,13 @@ class TestNullStorage:
 
         assert "storage_uri=none://" in str(exc_info.value)
 
+    def test_disabled_storage_is_not_an_outage(self):
+        """A job must fail fast, not wait out a window for storage that was never configured."""
+        with pytest.raises(StorageBackendUnavailableError) as exc_info:
+            NullStorage().check_writable()
+
+        assert exc_info.value.transient is False
+
     def test_arguments_are_not_validated_first(self):
         """An invalid address still reports the disabled capability, not a ValueError."""
         with pytest.raises(StorageBackendUnavailableError):

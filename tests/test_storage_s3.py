@@ -24,7 +24,15 @@ import botocore.endpoint
 import pytest
 from botocore.awsrequest import AWSResponse
 from botocore.config import Config
-from botocore.exceptions import ClientError, EndpointConnectionError, ReadTimeoutError
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    NoCredentialsError,
+    NoRegionError,
+    ParamValidationError,
+    ReadTimeoutError,
+)
 from botocore.parsers import ResponseParserError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
@@ -260,6 +268,18 @@ class TestFromUri:
             S3Storage.from_uri("s3://my-bucket")
 
         assert isinstance(excinfo.value.__cause__, ReadTimeoutError)
+        assert excinfo.value.transient is True
+
+    def test_a_client_misconfiguration_is_a_refusal(self, monkeypatch):
+        def fail_to_create_client(*_args, **_kwargs):
+            raise NoRegionError()
+
+        monkeypatch.setattr(storage_s3.boto3, "client", fail_to_create_client)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            S3Storage.from_uri("s3://my-bucket")
+
+        assert excinfo.value.transient is False
 
 
 def _resolve_to(monkeypatch, address: str) -> None:
@@ -1294,6 +1314,15 @@ class TestMalformedResponse:
             stream.read()
 
         assert isinstance(excinfo.value.__cause__, ResponseParserError)
+        assert excinfo.value.transient is False
+
+    def test_a_timed_out_body_read_is_an_outage(self, storage, stub):
+        stub.add_response("get_object", {"Body": _FailingBody()}, {"Bucket": BUCKET, "Key": OBJECT_KEY})
+
+        with storage.open_stream(AREA, KEY) as stream, pytest.raises(StorageBackendUnavailableError) as excinfo:
+            stream.read()
+
+        assert excinfo.value.transient is True
 
 
 class TestGet:
@@ -1533,17 +1562,22 @@ class TestDeletePrefix:
 
         assert storage.delete_prefix(AREA, "pkg/1") == 1001
 
-    def test_a_delete_error_is_provider_neutral(self, storage, stub):
+    @pytest.mark.parametrize(
+        ("code", "transient"), [("AccessDenied", False), ("SlowDown", True), ("InternalError", True)]
+    )
+    def test_a_delete_error_is_provider_neutral(self, storage, stub, code, transient):
         root = f"{PREFIX}/{AREA}/pkg/1"
         stub.add_response("head_object", {}, {"Bucket": BUCKET, "Key": root})
         stub.add_response(
             "delete_objects",
-            {"Errors": [{"Key": root, "Code": "AccessDenied", "Message": "denied"}]},
+            {"Errors": [{"Key": root, "Code": code, "Message": "failed"}]},
             {"Bucket": BUCKET, "Delete": {"Objects": [{"Key": root}], "Quiet": True}},
         )
 
-        with pytest.raises(StorageBackendUnavailableError):
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
             storage.delete_prefix(AREA, "pkg/1")
+
+        assert excinfo.value.transient is transient
 
     def test_an_access_failure_is_provider_neutral(self, storage, stub):
         stub.add_client_error("head_object", service_error_code="AccessDenied", http_status_code=403)
@@ -1769,3 +1803,103 @@ class TestUrl:
     def test_response_headers_refuse_control_characters(self, storage, arguments, match):
         with pytest.raises(ValueError, match=match):
             storage.url(AREA, KEY, **arguments)
+
+
+class TestOutageClassification:
+    """A failure the same call survives once S3 recovers is an outage; a refusal it never survives is not."""
+
+    @pytest.mark.parametrize(
+        ("code", "status"),
+        [
+            ("SlowDown", 503),
+            ("ServiceUnavailable", 503),
+            ("InternalError", 500),
+            ("BadGateway", 502),
+            ("RequestTimeout", 400),
+            ("Throttling", 400),
+            ("ThrottlingException", 400),
+            ("RequestLimitExceeded", 400),
+            ("TooManyRequests", 429),
+            ("", 408),
+        ],
+    )
+    def test_an_overloaded_or_failing_service_is_an_outage(self, storage, stub, code, status):
+        stub.add_client_error("put_object", service_error_code=code, http_status_code=status)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save(AREA, KEY, b"bytes")
+
+        assert excinfo.value.transient is True
+        assert isinstance(excinfo.value.__cause__, ClientError)
+
+    @pytest.mark.parametrize(
+        ("code", "status"),
+        [
+            ("AccessDenied", 403),
+            ("NoSuchBucket", 404),
+            ("InvalidAccessKeyId", 403),
+            ("SignatureDoesNotMatch", 403),
+            ("InvalidBucketName", 400),
+            ("ConditionalRequestConflict", 409),
+        ],
+    )
+    def test_a_refused_request_is_not_an_outage(self, storage, stub, code, status):
+        stub.add_client_error("put_object", service_error_code=code, http_status_code=status)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save(AREA, KEY, b"bytes")
+
+        assert excinfo.value.transient is False
+
+    @pytest.mark.parametrize(("code", "transient"), [("503", True), ("500", True), ("403", False), ("", False)])
+    def test_a_numeric_code_stands_in_for_a_missing_status(self, storage, monkeypatch, code, transient):
+        """Some S3-compatible stores send the status only as the error code."""
+
+        def fail(**_request):
+            raise ClientError({"Error": {"Code": code}, "ResponseMetadata": {}}, "PutObject")
+
+        monkeypatch.setattr(storage._client, "put_object", fail)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save(AREA, KEY, b"bytes")
+
+        assert excinfo.value.transient is transient
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            EndpointConnectionError(endpoint_url="https://s3.test"),
+            ConnectTimeoutError(endpoint_url="https://s3.test"),
+            ReadTimeoutError(endpoint_url="https://s3.test"),
+        ],
+    )
+    def test_an_unreachable_endpoint_is_an_outage(self, storage, monkeypatch, error):
+        def fail(**_request):
+            raise error
+
+        monkeypatch.setattr(storage._client, "put_object", fail)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save(AREA, KEY, b"bytes")
+
+        assert excinfo.value.transient is True
+
+    @pytest.mark.parametrize("error", [NoCredentialsError(), ParamValidationError(report="Invalid bucket name")])
+    def test_a_client_side_misconfiguration_is_not_an_outage(self, storage, monkeypatch, error):
+        def fail(**_request):
+            raise error
+
+        monkeypatch.setattr(storage._client, "put_object", fail)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.save(AREA, KEY, b"bytes")
+
+        assert excinfo.value.transient is False
+
+    def test_a_cleanup_pass_reports_its_first_failure_as_it_is(self, storage, stub):
+        stub.add_client_error("list_objects_v2", service_error_code="AccessDenied", http_status_code=403)
+
+        with pytest.raises(StorageBackendUnavailableError) as excinfo:
+            storage.cleanup_uploads(older_than_epoch=0.0)
+
+        assert excinfo.value.transient is False

@@ -7,6 +7,9 @@ with backoff, or dead-letters it once the attempt ceiling is reached. A handler
 that raises :class:`~jasil.jobs.DeferJob` is rescheduled for the time it names
 without failing or using up an attempt; one that raises
 :class:`~jasil.jobs.ContinueJob` is requeued with its failure budget restarted.
+A handler that fails because storage or the database is unreachable is deferred
+too, with its own backoff, until the outage has lasted
+``jobs.outage_defer_max_seconds`` for that job.
 
 A handler runs as the system, in the worker, for the event that queued it: its
 audit context names the event and takes the scope the event carried, and its
@@ -18,13 +21,14 @@ import logging
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 import jasil.jobs.backoff as jobs_backoff
 import jasil.jobs.crud as jobs_crud
-from jasil._core.db_outage import log_failure
+from jasil._core.db_outage import is_database_unavailable, log_failure
+from jasil._core.exception_chain import exception_chain
 from jasil._core.job_context import job_lease
 from jasil._core.timestamps import as_utc
 from jasil.audit.context import event_handler_scope
@@ -33,7 +37,7 @@ from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
-from jasil.providers import ClockProvider
+from jasil.providers import ClockProvider, is_storage_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +56,7 @@ class ClaimedJob:
         metadata: Correlation context, if any.
         attempts: The claim number of this run; it fences the claim, and counts
             deferred and continued claims too.
-        deferrals: Earlier claims of this job the handler deferred.
+        deferrals: Earlier claims of this job deferred by the handler or by an outage.
         continuations: Earlier claims of this job the handler ended with ``ContinueJob``.
         budget_offset: ``attempts - deferrals`` as of the last continuation.
             ``attempts - deferrals - budget_offset`` is the attempt this run is
@@ -62,6 +66,7 @@ class ClaimedJob:
             the handler can upgrade or refuse a payload written by another build.
         queue: Named queue from which the job was claimed.
         max_attempts: The attempt ceiling stamped on the job row.
+        outage_since: The job's first deferral in its current run of outages, or None.
     """
 
     id: str
@@ -79,6 +84,16 @@ class ClaimedJob:
     schema_version: int
     queue: str
     max_attempts: int
+    outage_since: datetime | None
+
+
+def _outage(error: BaseException) -> str | None:
+    """Name the dependency whose outage ``error``, or an exception that led to it, reports; None for any other."""
+    if is_storage_unavailable(error):
+        return "storage"
+    if any(is_database_unavailable(link) for link in exception_chain(error)):
+        return "database"
+    return None
 
 
 class JobRunner:
@@ -102,6 +117,7 @@ class JobRunner:
         max_continuations: int = 10_000,
         queues: Iterable[str] | None = None,
         record_attempts: bool = True,
+        outage_defer_max_seconds: float = 86400,
     ) -> None:
         self._record_attempts = record_attempts
         self._registry = registry
@@ -115,6 +131,9 @@ class JobRunner:
         self._defer_max_seconds = defer_max_seconds
         self._max_deferrals = max_deferrals
         self._max_continuations = max_continuations
+        self._outage_defer_max_seconds = outage_defer_max_seconds
+        # The dependencies this worker has warned are down, so one outage logs one warning, not one per job.
+        self._outages: set[str] = set()
         self._queues = normalize_queue_selector(queues)
         self._legacy_queues_backfilled = False
         self._queue_cursor: str | None = None
@@ -350,7 +369,10 @@ class JobRunner:
             return self._continue(job, continuation, duration_ms=self._elapsed_ms(began))
         except Exception as error:
             self._leases.finalize(job.id)
-            return self._fail(job, error, duration_ms=self._elapsed_ms(began))
+            duration_ms = self._elapsed_ms(began)
+            if (dependency := _outage(error)) is not None:
+                return self._defer_outage(job, error, dependency, duration_ms=duration_ms)
+            return self._fail(job, error, duration_ms=duration_ms)
         except BaseException as error:
             # SystemExit, KeyboardInterrupt, a cancellation: the worker stops, but the attempt is recorded first,
             # rather than left claimed and unexplained until its lease expires.
@@ -380,6 +402,12 @@ class JobRunner:
                 "Durable job completion skipped because claim ownership was lost",
                 extra={**self._context(job), "duration_ms": duration_ms},
             )
+        elif job.outage_since is not None and self._outages:
+            # A job the outage had deferred ran to completion, so what it needed is reachable again.
+            logger.info(
+                "Durable job handlers reached %s again", " and ".join(sorted(self._outages)), extra=self._context(job)
+            )
+            self._outages.clear()
         return not completed
 
     def _elapsed_ms(self, began: float) -> int:
@@ -409,8 +437,63 @@ class JobRunner:
             problem = ValueError(f"DeferJob.retry_at is not a usable instant ({type(error).__name__})")
             return self._fail(job, problem, duration_ms=duration_ms)
         delay = jobs_backoff.defer_seconds(requested, max_seconds=self._defer_max_seconds)
-        retry_at = now + timedelta(seconds=delay)
-        reason = deferral.reason or str(deferral)
+        return self._reschedule(
+            job,
+            now=now,
+            retry_at=now + timedelta(seconds=delay),
+            reason=deferral.reason or str(deferral),
+            duration_ms=duration_ms,
+            extra={"requested_retry_at": as_utc(deferral.retry_at).isoformat()},
+        )
+
+    def _defer_outage(
+        self, job: ClaimedJob, error: Exception, dependency: str, *, duration_ms: int | None = None
+    ) -> bool:
+        """Reschedule a job whose handler could not reach ``dependency``; True when the claim was no longer owned.
+
+        Within ``outage_defer_max_seconds`` of the job's first outage deferral the claim is not a failure and is not
+        bounded by ``max_deferrals``; it waits as long as the outage has lasted, from 30 seconds to 15 minutes. Past
+        the window it is an ordinary failure that keeps the window's start, so every later outage error fails too
+        and the job dead-letters once its attempts run out.
+        """
+        now = self._clock.now()
+        since = now if job.outage_since is None else as_utc(job.outage_since)
+        elapsed = (now - since).total_seconds()
+        if elapsed >= self._outage_defer_max_seconds:
+            return self._fail(job, error, duration_ms=duration_ms, keep_outage_since=True)
+        if dependency not in self._outages:
+            self._outages.add(dependency)
+            logger.warning(
+                "Durable job handlers cannot reach %s; deferring their jobs until it is back",
+                dependency,
+                extra={"error": type(error).__name__, "worker_id": self._worker_id},
+            )
+        delay = jobs_backoff.defer_seconds(jobs_backoff.outage_seconds(elapsed), max_seconds=self._defer_max_seconds)
+        return self._reschedule(
+            job,
+            now=now,
+            retry_at=now + timedelta(seconds=delay),
+            reason=f"{dependency} unavailable: {type(error).__name__}: {error}",
+            duration_ms=duration_ms,
+            outage_since=since,
+            extra={"outage": dependency, "outage_since": since.isoformat()},
+        )
+
+    def _reschedule(
+        self,
+        job: ClaimedJob,
+        *,
+        now: datetime,
+        retry_at: datetime,
+        reason: str,
+        duration_ms: int | None,
+        extra: dict[str, object],
+        outage_since: datetime | None = None,
+    ) -> bool:
+        """Write a deferral and log it; True when the claim was no longer owned.
+
+        A handler's deferral past ``max_deferrals`` becomes an ordinary failure.
+        """
         with self._session_factory() as db:
             status = jobs_crud.mark_job_deferred(
                 job.id,
@@ -423,6 +506,7 @@ class JobRunner:
                 db=db,
                 duration_ms=duration_ms,
                 record_attempt=self._record_attempts,
+                outage_since=outage_since,
             )
         if status == jobs_crud.STATUS_DEFERRALS_EXHAUSTED:
             return self._fail(
@@ -443,10 +527,10 @@ class JobRunner:
                 "event_type": job.event_type,
                 "job_status": jobs_crud.STATUS_PENDING,
                 "retry_at": retry_at.isoformat(),
-                "requested_retry_at": as_utc(deferral.retry_at).isoformat(),
                 "reason": reason,
                 "deferrals": job.deferrals + 1,
                 "duration_ms": duration_ms,
+                **extra,
             },
         )
         return False
@@ -501,7 +585,14 @@ class JobRunner:
         )
         return False
 
-    def _fail(self, job: ClaimedJob, error: BaseException, *, duration_ms: int | None = None) -> bool:
+    def _fail(
+        self,
+        job: ClaimedJob,
+        error: BaseException,
+        *,
+        duration_ms: int | None = None,
+        keep_outage_since: bool = False,
+    ) -> bool:
         """Record a failure; True when the claim was no longer owned."""
         now = self._clock.now()
         with self._session_factory() as db:
@@ -516,6 +607,7 @@ class JobRunner:
                 db=db,
                 duration_ms=duration_ms,
                 record_attempt=self._record_attempts,
+                keep_outage_since=keep_outage_since,
             )
         if not status:
             logger.warning(
@@ -570,4 +662,5 @@ class JobRunner:
             schema_version=job.schema_version,
             queue=job.queue,
             max_attempts=job.max_attempts,
+            outage_since=job.outage_since,
         )

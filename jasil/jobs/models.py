@@ -178,7 +178,7 @@ class ProcessingJob(Base):
         nullable=False,
         default=0,
         server_default="0",
-        comment="Claims the handler deferred with DeferJob; they do not count against max_attempts",
+        comment="Claims deferred by the handler (DeferJob) or by an outage; they do not count against max_attempts",
     )
     continuations: Mapped[int] = mapped_column(
         Integer,
@@ -193,6 +193,11 @@ class ProcessingJob(Base):
         default=0,
         server_default="0",
         comment="attempts - deferrals at the last ContinueJob; the failure budget counts claims after it",
+    )
+    outage_since: Mapped[datetime | None] = mapped_column(
+        MICROSECOND_DATETIME,
+        nullable=True,
+        comment="First deferral in the current run of storage or database outages; NULL when not in one",
     )
     max_attempts: Mapped[int] = mapped_column(
         Integer,

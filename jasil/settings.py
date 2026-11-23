@@ -90,6 +90,10 @@ class JobSettings:
             is treated as an ordinary failure.
         max_continuations: Continuations a job may take before a further
             ``ContinueJob`` is treated as an ordinary failure. At least 0.
+        outage_defer_max_seconds: How long a job whose handler cannot reach
+            storage or the database is deferred instead of failed, counted from
+            its first such deferral. Past it each outage error is an ordinary
+            failure. ``0`` fails every outage error as before.
         poll_interval_seconds: Idle wait between empty polls; greater than zero.
         max_runtime_seconds: The longest a single handler is kept leased. Past it
             the job is abandoned to the reaper, the handler is told to stop
@@ -119,6 +123,7 @@ class JobSettings:
     defer_max_seconds: int = 86400
     max_deferrals: int = 100
     max_continuations: int = 10_000
+    outage_defer_max_seconds: int = 86400
     poll_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
@@ -149,6 +154,7 @@ class JobSettings:
             "defer_max_seconds": 0,
             "max_deferrals": 0,
             "max_continuations": 0,
+            "outage_defer_max_seconds": 0,
         }
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
@@ -160,6 +166,7 @@ class JobSettings:
             "backoff_base_seconds": MAX_JOB_SECONDS,
             "backoff_max_seconds": MAX_JOB_SECONDS,
             "defer_max_seconds": MAX_JOB_SECONDS,
+            "outage_defer_max_seconds": MAX_JOB_SECONDS,
             "retention_days": MAX_RETENTION_DAYS,
         }
         for name, maximum in maximums.items():
