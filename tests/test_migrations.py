@@ -1294,7 +1294,7 @@ class TestAdoptExistingSchema:
         assert migrations.db_revision(engine) == migrations.head_revision()
 
     def test_a_mysql_create_all_schema_is_rejected(self, engine, mapped_base):
-        """``create_all`` builds rev0009's outbox index beside an audit log without rev0008's protections."""
+        """``create_all`` builds the head's tables without rev0008's protections, which the rejection names."""
         if engine.dialect.name not in ("mysql", "mariadb"):
             pytest.skip("only MySQL and MariaDB gain the protections in rev0008")
         mapped_base.metadata.create_all(engine)
@@ -1303,8 +1303,15 @@ class TestAdoptExistingSchema:
             migrations.adopt_existing_schema(engine)
 
         message = str(caught.value)
-        assert "(closest revision rev0007)" in message
-        assert "jasil_event_outbox: unexpected index 'uq_jasil_event_outbox_event_id'" in message
+        assert f"(closest revision {migrations.head_revision()})" in message
+        for missing in (
+            "missing partitioning",
+            "missing trigger 'jasil_audit_log_no_update'",
+            "missing trigger 'jasil_audit_log_no_delete'",
+            "missing procedure 'jasil_audit_ensure_partitions'",
+            "missing procedure 'jasil_audit_drop_partitions'",
+        ):
+            assert f"jasil_audit_log: {missing}" in message
         assert migrations.db_revision(engine) is None
 
     def test_a_mysql_audit_log_with_part_of_its_protections_matches_no_revision(self, engine):
