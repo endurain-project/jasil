@@ -1,4 +1,4 @@
-"""Add ``processing_jobs.outage_since``, the start of a job's run of storage or database outages.
+"""Add ``processing_jobs.outage_since`` and ``outage_deferrals``, for jobs deferred through an outage.
 
 A handler that fails because storage or the database is unreachable is deferred rather than failed, for as long
 as ``jobs.outage_defer_max_seconds`` from its first such deferral; this column holds that instant, and is NULL
@@ -6,6 +6,10 @@ while the job is not in an outage. Existing rows start NULL, which is what they 
 neither read nor write the column: they fail an outage error as before, and a job they complete or fail keeps
 the instant a new-release process stored, so a later outage of that job starts from the earlier one's window.
 The column is ``DATETIME(6)`` on MySQL and MariaDB, as every JASIL timestamp column has been since rev0012.
+
+``outage_deferrals`` counts the deferrals made in an outage, so ``jobs.max_deferrals`` bounds only the handler's
+own ``DeferJob``. Existing rows start at 0, which is what they mean; a previous-release process leaves it alone,
+and counts every deferral against ``max_deferrals``, as it always has.
 
 Outage deferrals count in ``deferrals``, so its comment is reworded where the database keeps comments (not on
 SQLite). On MySQL and MariaDB that is a ``MODIFY COLUMN`` restating the column's type, nullability and default.
@@ -44,11 +48,22 @@ def upgrade() -> None:
             comment="First deferral in the current run of storage or database outages; NULL when not in one",
         ),
     )
+    op.add_column(
+        _JOBS,
+        sa.Column(
+            "outage_deferrals",
+            sa.Integer,
+            nullable=False,
+            server_default="0",
+            comment="Of deferrals, those made in a storage or database outage; max_deferrals does not count them",
+        ),
+    )
     _comment_deferrals(_DEFERRALS_COMMENT, previous=_PREVIOUS_DEFERRALS_COMMENT)
 
 
 def downgrade() -> None:
     _comment_deferrals(_PREVIOUS_DEFERRALS_COMMENT, previous=_DEFERRALS_COMMENT)
+    op.drop_column(_JOBS, "outage_deferrals")
     op.drop_column(_JOBS, "outage_since")
 
 

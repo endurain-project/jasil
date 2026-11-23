@@ -843,9 +843,11 @@ def mark_job_deferred(
     any other exception, so a job cannot defer forever.
 
     An outage deferral (``outage_since`` given) is the runner's, not the
-    handler's: ``max_deferrals`` does not bound it, since the outage window does,
-    and ``outage_since`` is stored as the window's start. A handler's deferral
-    clears ``outage_since``, as its claim did not end in an outage.
+    handler's: the outage window bounds it, so it is counted in
+    ``outage_deferrals`` as well, which ``max_deferrals`` leaves out, and
+    ``outage_since`` is stored as the window's start. A handler's deferral is
+    bounded by ``deferrals - outage_deferrals``, and clears ``outage_since``, as
+    its claim did not end in an outage.
 
     ``retry_at`` is used as given: clamping and jitter are the caller's, which
     knows the configured ceiling.
@@ -871,9 +873,10 @@ def mark_job_deferred(
     ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
     truncated = fit_length(reason, MAX_STORED_ERROR_LENGTH)
     status = ""
-    deferrals = db.execute(select(ProcessingJob.deferrals).where(*ownership)).scalar_one_or_none()
-    if deferrals is not None:
-        if outage_since is None and deferrals >= max_deferrals:
+    counts = db.execute(select(ProcessingJob.deferrals, ProcessingJob.outage_deferrals).where(*ownership)).one_or_none()
+    if counts is not None:
+        deferrals, outage_deferrals = counts
+        if outage_since is None and deferrals - outage_deferrals >= max_deferrals:
             db.rollback()  # nothing was written; end the read transaction
             return STATUS_DEFERRALS_EXHAUSTED
         deferred = cast(
@@ -884,6 +887,7 @@ def mark_job_deferred(
                 .values(
                     status=STATUS_PENDING,
                     deferrals=ProcessingJob.deferrals + 1,
+                    outage_deferrals=ProcessingJob.outage_deferrals + (0 if outage_since is None else 1),
                     available_at=retry_at,
                     outage_since=outage_since,
                     last_error=truncated,
@@ -1297,6 +1301,7 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
                 deferrals=0,
                 continuations=0,
                 budget_offset=0,
+                outage_deferrals=0,
                 outage_since=None,
                 available_at=now,
                 updated_at=now,

@@ -86,8 +86,9 @@ class JobSettings:
         defer_max_seconds: Furthest ahead a handler may defer itself with
             ``DeferJob``, or wait between passes with ``ContinueJob``; a later
             instant is clamped to it.
-        max_deferrals: Deferrals a job may take before a further ``DeferJob``
-            is treated as an ordinary failure.
+        max_deferrals: Deferrals a job's handler may take before a further
+            ``DeferJob`` is treated as an ordinary failure. Deferrals through a
+            storage or database outage do not count.
         max_continuations: Continuations a job may take before a further
             ``ContinueJob`` is treated as an ordinary failure. At least 0.
         outage_defer_max_seconds: How long a job whose handler cannot reach

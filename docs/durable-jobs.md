@@ -187,9 +187,11 @@ An outage deferral:
 
 - Returns the job to `pending` and counts in `deferrals`, so it does not count
   against `max_attempts`, never dead-letters and never runs `on_dead_letter`.
-- Is not bounded by `jobs.max_deferrals`. `jobs.outage_defer_max_seconds` (default
-  86400) bounds it instead, counted from the job's first outage deferral, which is
-  kept in `jasil_processing_jobs.outage_since`. Past that window each outage error
+- Neither is bounded by `jobs.max_deferrals` nor counts against it: it is also
+  counted in `jasil_processing_jobs.outage_deferrals`, and `max_deferrals` bounds
+  `deferrals - outage_deferrals`, the handler's own. `jobs.outage_defer_max_seconds`
+  (default 86400) bounds it instead, counted from the job's first outage deferral,
+  which is kept in `jasil_processing_jobs.outage_since`. Past that window each outage error
   is an ordinary failure, with the usual backoff, and the job dead-letters once its
   attempts run out. `0` turns outage deferral off.
 - Waits as long as the outage has lasted for that job: 30 seconds at first, then

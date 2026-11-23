@@ -815,7 +815,7 @@ class TestMicrosecondTimestamps:
 
 
 class TestOutageSince:
-    """rev0013 adds the nullable ``outage_since`` to the jobs table, and its downgrade drops it again."""
+    """rev0013 adds ``outage_since`` and ``outage_deferrals`` to the jobs table, and its downgrade drops them."""
 
     def test_it_adds_only_the_column_and_its_downgrade_drops_it(self, engine):
         migrations.upgrade(engine, "rev0012")
@@ -827,7 +827,7 @@ class TestOutageSince:
 
         assert _schema(engine) == before
         jobs = "jasil_processing_jobs"
-        assert set(after[jobs]) - set(before[jobs]) == {"outage_since"}
+        assert set(after[jobs]) - set(before[jobs]) == {"outage_since", "outage_deferrals"}
         assert {table: columns for table, columns in after.items() if table != jobs} == {
             table: columns for table, columns in before.items() if table != jobs
         }

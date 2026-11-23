@@ -141,7 +141,39 @@ class TestStorageOutage:
         _runner(registry, clock, session_factory, max_deferrals=0).run_once()
 
         job = _job(db)
-        assert (job.status, job.deferrals, job.attempts) == ("pending", 1, 1)
+        assert (job.status, job.deferrals, job.outage_deferrals, job.attempts) == ("pending", 1, 1, 1)
+
+    def test_outage_deferrals_leave_the_handler_its_own_deferrals(self, registry, clock, session_factory, db):
+        """``max_deferrals`` bounds the handler's ``DeferJob`` alone, so an outage cannot use it up."""
+        raised = [StorageBackendUnavailableError("down"), StorageBackendUnavailableError("down")]
+
+        def handler(_event):
+            raise raised.pop(0) if raised else DeferJob(clock.now(), "rate limited")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db, max_attempts=1)
+        runner = _runner(registry, clock, session_factory, max_deferrals=1)
+
+        for _ in range(4):
+            runner.run_once()
+            clock.advance(1000)
+
+        job = _job(db)
+        assert _outcomes(db) == ["deferred", "deferred", "deferred", "dead_letter"]
+        assert (job.deferrals, job.outage_deferrals) == (3, 2)
+        assert "deferred more than 1 times" in job.last_error
+
+    def test_a_replay_restarts_the_outage_deferral_count(self, registry, clock, session_factory, db):
+        registry.register("activity.created", "s", _storage_down())
+        job_id = _enqueue(db, max_attempts=1)
+        runner = _runner(registry, clock, session_factory, outage_defer_max_seconds=60)
+        runner.run_once()
+        clock.advance(61)
+        runner.run_once()
+
+        assert jobs_crud.replay_dead_letter_job(job_id, now=clock.now(), db=db)
+
+        assert _job(db).outage_deferrals == 0
 
     def test_a_wrapped_storage_error_is_recognised(self, runner, registry, db):
         def handler(_event):

@@ -68,7 +68,7 @@ fields.
 | `backoff_base_seconds` | `60` | First retry delay; doubles per attempt. At least 0. |
 | `backoff_max_seconds` | `3600` | Ceiling for the exponential backoff. Not below `backoff_base_seconds`. |
 | `defer_max_seconds` | `86400` | Furthest ahead a handler may [defer itself](durable-jobs.md#deferring-a-job) with `DeferJob`, or wait between passes with [`ContinueJob`](durable-jobs.md#continuing-a-job); a later instant is clamped to it (jitter included). |
-| `max_deferrals` | `100` | Deferrals a job may take, at least 0. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. |
+| `max_deferrals` | `100` | Deferrals a job's handler may take, at least 0. The next `DeferJob` is then an ordinary failure, so a job cannot defer forever. Deferrals through a [storage or database outage](durable-jobs.md#storage-and-database-outages) do not count. |
 | `max_continuations` | `10000` | Continuations a job may take, at least 0. The next `ContinueJob` is then an ordinary failure, so a job cannot continue forever. |
 | `outage_defer_max_seconds` | `86400` | How long a job whose handler cannot reach storage or the database is [deferred instead of failed](durable-jobs.md#storage-and-database-outages), counted from its first such deferral. Past it each outage error is an ordinary failure. `0` fails every outage error as before. |
 | `poll_interval_seconds` | `5.0` | Idle wait between empty polls; greater than zero. |
