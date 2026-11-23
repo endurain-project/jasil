@@ -8,31 +8,48 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
-This release lets a lookup that would sleep for its geocoding turn book the turn and come back for it. **It is breaking for a host that implements `StateProvider` itself**: the protocol has a new method, `reserve_send`, and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` until it does). A host that implements `GeocodingProvider` should accept the new `reservation_key` keyword, which the built-in backends pass on. Hosts that use the built-in backends need no change. No migration is added.
+## [0.24.0] - 2026-11-23
+
+This release lets durable jobs and geocoding ride out a dependency that is down or rate-limited, rather than spend their retries on it. A storage or database outage defers a durable job instead of using up its attempts, and a geocoding lookup can book its rate-limit turn instead of sleeping for it. **It is breaking for a host that implements `StateProvider` itself**: the protocol has a new method, `reserve_send`, and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in backends need no change apart from running migration `rev0013`; see **Upgrading**.
 
 ### Added
 
+- **`jasil.providers.is_storage_unavailable(error)`** says whether a failure means storage could not be reached for now, rather than that the call was refused. It is the storage counterpart of `jasil.orm.is_database_unavailable`. It reads the exception chain (`__cause__`, or `__context__` unless suppressed), so a host error raised `from` a storage one counts. The first storage error in the chain decides, so a refusal raised while handling an earlier outage is still a refusal. Which failures each built-in backend reports as transient may change in a minor release.
+- **`StorageBackendUnavailableError` has a `transient` attribute**, set by a keyword argument that defaults to `True`.
+  - The S3 backend sets it for a connection failure, a timeout, a 5xx, 408 or 429 answer, and a throttling or retry-later code.
+  - It clears it for any other refusal: `AccessDenied`, `NoSuchBucket`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`, missing credentials or region, and a malformed 2xx body. A refusal from S3 now reads "S3 storage backend refused the request".
+  - Local storage clears it for a tampered or undecodable identity file, and disabled storage (`none://`) always clears it.
+  - The exception hierarchy is unchanged, so every `except StorageBackendUnavailableError` still catches both.
+- **`jobs.outage_defer_max_seconds`** (default 86400): how long a durable job whose handler cannot reach storage or the database is deferred instead of failed, counted from its first such deferral. `0` turns outage deferral off.
 - **`StateProvider.reserve_send(key, interval_seconds, *, max_wait_seconds, booking=None)`** clears one send through a rate gate, or books a slot for a caller that defers instead of waiting.
   - It shares the slot pointer of `reserve_slot` and also records the gate's last send, so no two sends it clears are closer than the interval, however late a booked caller comes back.
   - A caller back for its booking before the slot keeps it, and nothing new is booked. A due booking is used up, with a wait of at most one interval. An expired booking is a lost slot, and the next call books afresh.
   - The last send and the bookings live under the reserved prefix `jasil:state:gate:`.
   - See [Rate gates](docs/providers-and-backends.md#rate-gates).
 - **`GeocodingProvider.lookup(..., reservation_key=None)`.** With a key, a lookup that finds no turn free within `max_wait_seconds` books the next one and returns it as `retry_at`. Called again with the same key, it runs at that turn. A durable job passes its id with `max_wait_seconds=0`, so a backlog of lookups holds no worker asleep and does not wake together to defer again. See [Booking a turn instead of sleeping](docs/providers-and-backends.md#booking-a-turn-instead-of-sleeping).
+- Migration `rev0013` adds two columns to `jasil_processing_jobs`. The nullable `outage_since` is the start of a job's outage window. `outage_deferrals` counts the deferrals made in an outage, so `max_deferrals` bounds only the handler's own `DeferJob`.
 
 ### Changed
 
-- **The HTTP geocoder gates every request through `reserve_send`**, so the last-send rule holds for booked and unbooked lookups alike. During a rolling deploy, processes of the previous release keep to the same slot order through `reserve_slot`. Their sends do not check the last send, so for that window a booked lookup sent late can come closer than one interval to one of theirs.
+- **A storage or database outage defers durable jobs instead of spending their attempts.** Before, a handler that raised `StorageBackendUnavailableError` failed like any other exception. With `max_attempts=5` and a 5-second backoff base, a job dead-lettered after about a minute of S3 outage.
+  - Now an error whose nearest storage or database error, in the error or its chain, is an outage (`is_storage_unavailable` or `is_database_unavailable`) returns the job to `pending`. It counts against neither `max_attempts` nor `max_deferrals`, and the job never dead-letters or runs `on_dead_letter` while it defers.
+  - The wait is as long as the outage has lasted for that job, from 30 seconds to 15 minutes, with up to 10% jitter, and never more than `jobs.defer_max_seconds`.
+  - Past `jobs.outage_defer_max_seconds` each outage error is an ordinary failure again.
+  - An outage deferral counts in `deferrals` and `Event.deferral_count`.
+- **An outage is logged once, not once per job.** Each worker logs one WARNING per outage, without a traceback, and an INFO when a deferred job completes. A job whose outcome cannot be written because the database is unreachable is logged as "Durable job could not be finalized; the database is unavailable" at WARNING, without a traceback, instead of ERROR.
+- **The HTTP geocoder gates every request through `reserve_send`**, so the last-send rule holds for booked and unbooked lookups alike.
+- Refreshed the locked dependency graph, in all extras and groups, to the newest releases allowed by the supply-chain cooldown, and raised the `fastapi` minimum to `0.163.1` to match. Every other minimum already named its locked version, and every pinned GitHub Action was already on its newest release outside the cooldown.
 
-### Added
+### Upgrading
 
-- **`jasil.providers.is_storage_unavailable(error)`** says whether a failure means storage could not be reached for now, rather than that the call was refused. It is the storage counterpart of `jasil.orm.is_database_unavailable` and reads the exception chain (`__cause__`, or `__context__` unless suppressed), so a host error raised `from` a storage one counts. The first storage error in the chain decides, so a refusal raised while handling an earlier outage is still a refusal. Which failures each built-in backend reports as transient may change in a minor release.
-- **`StorageBackendUnavailableError` has a `transient` attribute**, set by a keyword argument that defaults to `True`. The S3 backend sets it for a connection failure, a timeout, a 5xx, 408 or 429 answer, and a throttling or retry-later code. It clears it for any other refusal: `AccessDenied`, `NoSuchBucket`, `InvalidAccessKeyId`, `SignatureDoesNotMatch`, missing credentials or region, and a malformed 2xx body. Local storage clears it for a tampered identity file, and disabled storage (`none://`) always clears it. The exception hierarchy is unchanged, so every `except StorageBackendUnavailableError` still catches both. A refusal from S3 now reads "S3 storage backend refused the request".
-- **`jobs.outage_defer_max_seconds`** (default 86400): how long a durable job whose handler cannot reach storage or the database is deferred instead of failed, counted from its first such deferral. `0` turns outage deferral off.
-- Migration `rev0013` adds two columns to `jasil_processing_jobs`. The nullable `outage_since` is the start of a job's outage window. `outage_deferrals` counts the deferrals made in an outage, so `max_deferrals` bounds only the handler's own `DeferJob`. Previous-release processes neither read nor write either column. It also rewords the comment on `deferrals`, which now counts outage deferrals too, except on SQLite, which keeps no column comments. On MySQL and MariaDB that is a `MODIFY COLUMN` restating the column.
-
-### Changed
-
-- **A storage or database outage defers durable jobs instead of spending their attempts.** Before, a handler that raised `StorageBackendUnavailableError` failed like any other exception, so with `max_attempts=5` and a 5-second backoff base a job dead-lettered after about a minute of S3 outage. Now an error whose nearest storage or database error, in the error or its chain, is an outage (`is_storage_unavailable` or `is_database_unavailable`) returns the job to `pending` without counting against `max_attempts` or `max_deferrals`. It never dead-letters or runs `on_dead_letter` while it defers. The wait is as long as the outage has lasted for that job, from 30 seconds to 15 minutes, with up to 10% jitter, and never more than `jobs.defer_max_seconds`. Past `jobs.outage_defer_max_seconds` each outage error is an ordinary failure again. Each worker logs one WARNING per outage, without a traceback, and an INFO when a deferred job completes. A job whose outcome cannot be written because the database is unreachable is logged as "Durable job could not be finalized; the database is unavailable" at WARNING, without a traceback, instead of ERROR. An outage deferral counts in `deferrals` and `Event.deferral_count`. No change is needed in the host, apart from running the migrations.
+- **Run migration `rev0013`.**
+  - It adds two columns to `jasil_processing_jobs`: the nullable `outage_since`, and `outage_deferrals`, which existing rows start at 0.
+  - It also rewords the comment on `deferrals`, except on SQLite, which keeps no column comments. On MySQL and MariaDB that is a `MODIFY COLUMN` restating the column.
+- **A host that implements `StateProvider` must add `reserve_send`.** A host that implements `GeocodingProvider` should accept the `reservation_key` keyword, which the built-in backends pass on.
+- **During a rolling deploy, processes of the previous release:**
+  - fail an outage error as before, and count every deferral against `max_deferrals`;
+  - keep to the same geocoding slot order through `reserve_slot`, but their sends do not check the last send, so for that window a booked lookup sent late can come closer than one interval to one of theirs.
+- Code that catches `StorageBackendUnavailableError` still catches refusals too. To answer a refusal differently from an outage (a 500 rather than a 503), check `is_storage_unavailable(error)`.
 
 ## [0.23.0] - 2026-11-21
 
