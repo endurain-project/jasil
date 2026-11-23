@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 import jasil.jobs.backoff as jobs_backoff
@@ -208,6 +209,46 @@ class TestDatabaseOutage:
         runner.run_once()
 
         assert _job(db).deferrals == 1
+
+
+class TestNearestErrorDecides:
+    """The error nearest the handler's says whether this is an outage, not one further down its chain."""
+
+    def test_a_storage_refusal_raised_while_handling_an_outage_fails(self, runner, registry, db):
+        def handler(_event):
+            try:
+                raise StorageBackendUnavailableError("down")
+            except StorageBackendUnavailableError as outage:
+                raise StorageBackendUnavailableError("denied", transient=False) from outage
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db)
+
+        runner.run_once()
+
+        assert _outcomes(db) == ["failed"]
+
+    def test_a_storage_refusal_raised_while_handling_a_database_outage_fails(self, runner, registry, db):
+        def handler(_event):
+            raise StorageBackendUnavailableError("denied", transient=False) from PoolTimeoutError("pool")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db)
+
+        runner.run_once()
+
+        assert _outcomes(db) == ["failed"]
+
+    def test_a_database_defect_raised_while_handling_a_storage_outage_fails(self, runner, registry, db):
+        def handler(_event):
+            raise IntegrityError("INSERT", {}, Exception("duplicate key")) from StorageBackendUnavailableError("down")
+
+        registry.register("activity.created", "s", handler)
+        _enqueue(db)
+
+        runner.run_once()
+
+        assert _outcomes(db) == ["failed"]
 
 
 class TestOutageWindow:

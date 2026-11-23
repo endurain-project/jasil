@@ -166,7 +166,8 @@ dead-letters them all.
 
 The runner checks the exception and each one that led to it (`__cause__`, or
 `__context__` unless `raise ... from None` suppressed it), so a host error wrapping
-the outage counts too:
+the outage counts too. The first storage or database error in that chain decides,
+so a refusal or a defect raised while handling an earlier outage fails as usual:
 
 - **Storage:** `jasil.providers.is_storage_unavailable(error)` is true, meaning a
   `StorageBackendUnavailableError` whose `transient` is set. The S3 backend sets it

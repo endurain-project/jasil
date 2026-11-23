@@ -76,6 +76,20 @@ class TestIsStorageUnavailable:
 
         assert not is_storage_unavailable(_raised(build))
 
+    def test_a_refusal_raised_while_handling_an_outage_is_not_an_outage(self):
+        """The nearest storage error decides: the refusal is what stopped this call."""
+
+        def build():
+            raise StorageBackendUnavailableError("denied", transient=False) from StorageBackendUnavailableError("down")
+
+        assert not is_storage_unavailable(_raised(build))
+
+    def test_an_outage_raised_while_handling_a_refusal_is_an_outage(self):
+        def build():
+            raise StorageBackendUnavailableError("down") from StorageBackendUnavailableError("denied", transient=False)
+
+        assert is_storage_unavailable(_raised(build))
+
     def test_a_cyclic_chain_ends(self):
         first, second = DomainError("first"), DomainError("second")
         first.__cause__, second.__cause__ = second, first

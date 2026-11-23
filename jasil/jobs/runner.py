@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import jasil.jobs.backoff as jobs_backoff
@@ -37,7 +38,7 @@ from jasil.jobs.defer import ContinueJob, DeferJob
 from jasil.jobs.heartbeat import LeaseKeeper
 from jasil.jobs.models import ProcessingJob
 from jasil.jobs.registry import JobHandlerRegistry, normalize_queue_selector, validate_queue_name
-from jasil.providers import ClockProvider, is_storage_unavailable
+from jasil.providers import ClockProvider, StorageBackendUnavailableError, is_storage_unavailable
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +89,16 @@ class ClaimedJob:
 
 
 def _outage(error: BaseException) -> str | None:
-    """Name the dependency whose outage ``error``, or an exception that led to it, reports; None for any other."""
-    if is_storage_unavailable(error):
-        return "storage"
-    if any(is_database_unavailable(link) for link in exception_chain(error)):
-        return "database"
+    """Name the dependency whose outage ``error`` reports, or None when it reports none.
+
+    The first storage or database error in ``error``'s chain decides, so a refusal or a defect raised while
+    handling an earlier outage fails like any other error.
+    """
+    for link in exception_chain(error):
+        if isinstance(link, StorageBackendUnavailableError):
+            return "storage" if is_storage_unavailable(link) else None
+        if isinstance(link, SQLAlchemyError):
+            return "database" if is_database_unavailable(link) else None
     return None
 
 

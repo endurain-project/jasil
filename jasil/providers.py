@@ -56,9 +56,10 @@ class StorageBackendUnavailableError(RuntimeError):
 def is_storage_unavailable(error: BaseException) -> bool:
     """Return whether ``error`` means storage could not be reached for now, rather than that the call is refused.
 
-    True when ``error``, or an exception that led to it (its ``__cause__`` or ``__context__``), is a
-    :class:`StorageBackendUnavailableError` whose ``transient`` is set, so a host's error that wraps a storage
-    outage is one too. Which failures each built-in backend reports as transient may change in a minor release.
+    Reads ``error`` and then each exception that led to it (its ``__cause__``, or its ``__context__``), and the
+    first :class:`StorageBackendUnavailableError` among them decides by its ``transient``. So a host's error that
+    wraps a storage outage is one too, and a refusal raised while handling an earlier outage is still a refusal.
+    Which failures each built-in backend reports as transient may change in a minor release.
 
     Args:
         error: The exception a storage call, or code that made one, raised.
@@ -66,7 +67,8 @@ def is_storage_unavailable(error: BaseException) -> bool:
     Returns:
         True when storage is unreachable, failing or overloaded; False for a refusal or anything else.
     """
-    return any(isinstance(link, StorageBackendUnavailableError) and link.transient for link in exception_chain(error))
+    nearest = next((link for link in exception_chain(error) if isinstance(link, StorageBackendUnavailableError)), None)
+    return nearest is not None and nearest.transient
 
 
 class StorageKeyConflictError(ValueError):

@@ -495,7 +495,9 @@ storage. A local filesystem error is transient. A backend you supply that raises
 the error without `transient=False` reports an outage.
 
 `jasil.providers.is_storage_unavailable(error)` reads it through the exception
-chain, so it also answers for an error of your own raised `from` a storage one:
+chain, so it also answers for an error of your own raised `from` a storage one. The
+first `StorageBackendUnavailableError` in the chain decides, so a refusal raised
+while handling an earlier outage is still a refusal:
 
 ```python
 import jasil.providers as jasil_providers
