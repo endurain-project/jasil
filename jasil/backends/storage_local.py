@@ -465,8 +465,13 @@ class LocalStorage:
                 raise StorageBackendUnavailableError("Local storage object identity path is unsafe", transient=False)
             stored_area = area_file.read_text(encoding="utf-8")
             stored_key = key_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        except OSError as error:
             raise StorageBackendUnavailableError("Local storage object identity is unavailable") from error
+        except UnicodeError as error:
+            # Corrupt or tampered state, which waiting does not repair, unlike a file that cannot be read for now.
+            raise StorageBackendUnavailableError(
+                "Local storage object identity is not valid UTF-8", transient=False
+            ) from error
         if stored_area != area or stored_key != key:
             raise StorageBackendUnavailableError(
                 "Local storage object identity does not match its address", transient=False

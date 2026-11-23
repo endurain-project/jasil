@@ -778,6 +778,16 @@ class TestLocalStorage:
         assert excinfo.value.transient is False  # tampering is no outage: retrying cannot repair it
         assert storage.list_keys("thumbnails") == []
 
+    def test_an_identity_file_that_is_not_utf8_is_a_refusal(self, storage):
+        storage.save("thumbnails", "original.webp", b"original")
+        payload = storage._resolve("thumbnails", "original.webp")
+        (payload.parent / storage_local._OBJECT_KEY_FILE).write_bytes(b"\xff\xfe")
+
+        with pytest.raises(StorageBackendUnavailableError, match="identity is not valid") as excinfo:
+            storage.get("thumbnails", "original.webp")
+
+        assert excinfo.value.transient is False  # corrupt state is no outage: retrying cannot repair it
+
     def test_listing_refuses_a_symlinked_area_identity(self, storage, tmp_path):
         storage.save("thumbnails", "original.webp", b"original")
         area_file = storage._resolve_area("thumbnails").parent / storage_local._OBJECT_AREA_FILE
