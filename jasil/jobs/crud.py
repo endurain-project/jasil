@@ -772,15 +772,14 @@ def mark_job_failed(
         # the backoff.
         claims, deferrals, budget_offset, max_attempts = attempt_state
         attempts = claims - deferrals - budget_offset
+        values: dict[str, Any] = {} if keep_outage_since else {"outage_since": None}
         if attempts >= max_attempts:
             new_status = STATUS_DEAD_LETTER
-            values: dict[str, Any] = {"completed_at": now}
+            values["completed_at"] = now
         else:
             delay = jobs_backoff.backoff_seconds(attempts, base_seconds=base_seconds, max_seconds=max_seconds)
             new_status = STATUS_PENDING
-            values = {"available_at": now + timedelta(seconds=delay)}
-        if not keep_outage_since:
-            values["outage_since"] = None
+            values["available_at"] = now + timedelta(seconds=delay)
         failed = cast(
             CursorResult[Any],
             db.execute(
