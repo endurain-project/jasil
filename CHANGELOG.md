@@ -45,7 +45,7 @@ This release lets durable jobs and geocoding ride out a dependency that is down 
 - **Run migration `rev0013`.**
   - It adds two columns to `jasil_processing_jobs`: the nullable `outage_since`, and `outage_deferrals`, which existing rows start at 0.
   - It also rewords the comment on `deferrals`, except on SQLite, which keeps no column comments. On MySQL and MariaDB that is a `MODIFY COLUMN` restating the column.
-- **A host that implements `StateProvider` must add `reserve_send`.** A host that implements `GeocodingProvider` should accept the `reservation_key` keyword, which the built-in backends pass on.
+- **A host that implements `StateProvider` must add `reserve_send`.** A host that implements `GeocodingProvider` needs the new `reservation_key` keyword only once code calls its `lookup` with one. JASIL never does: the reloading provider passes the keyword on only to the built-in backends it builds. As with any new optional keyword, add it before your own code starts passing a key.
 - **During a rolling deploy, processes of the previous release:**
   - fail an outage error as before, and count every deferral against `max_deferrals`;
   - keep to the same geocoding slot order through `reserve_slot`, but their sends do not check the last send, so for that window a booked lookup sent late can come closer than one interval to one of theirs.
