@@ -106,7 +106,9 @@ def _geo(source, base: JasilSettings | None = None, state=None, clock=None):
 def no_network(monkeypatch):
     """Geocoding backends built here must never reach the real upstream."""
     monkeypatch.setattr(HttpGeocoding, "reverse", lambda self, latitude, longitude: None)
-    monkeypatch.setattr(HttpGeocoding, "lookup", lambda self, latitude, longitude, *, max_wait_seconds: None)
+    monkeypatch.setattr(
+        HttpGeocoding, "lookup", lambda self, latitude, longitude, *, max_wait_seconds, reservation_key=None: None
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -409,14 +411,25 @@ class TestSourceFailure:
 
     def test_a_lookup_goes_through_the_last_good_backend(self, monkeypatch):
         answer = GeocodingOutcome(GeocodedPlace(locality="Porto"))
-        monkeypatch.setattr(HttpGeocoding, "lookup", lambda self, lat, lon, *, max_wait_seconds: answer)
+        keys = []
+
+        def lookup(self, lat, lon, *, max_wait_seconds, reservation_key=None):
+            keys.append(reservation_key)
+            return answer
+
+        monkeypatch.setattr(HttpGeocoding, "lookup", lookup)
         source = Source(GOOD_GEO)
         provider = _geo(source)
         provider.lookup(1.0, 2.0, max_wait_seconds=0)
 
         source.error = RuntimeError("db down")
 
-        assert provider.lookup(1.0, 2.0, max_wait_seconds=0) is answer
+        assert provider.lookup(1.0, 2.0, max_wait_seconds=0, reservation_key="job-1") is answer
+        assert keys == [None, "job-1"]
+
+    def test_a_lookup_refuses_an_empty_reservation_key(self):
+        with pytest.raises(ValueError, match="reservation_key"):
+            _geo(Source(GOOD_GEO)).lookup(1.0, 2.0, max_wait_seconds=0, reservation_key="")
 
     def test_a_lookup_after_a_rejection_is_a_final_answer_of_nothing(self):
         provider = _geo(Source(GeocodingSettings(uri="mapquest://x")))

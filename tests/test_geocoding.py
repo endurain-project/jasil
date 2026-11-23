@@ -89,6 +89,13 @@ class TestNullGeocoding:
         with pytest.raises(ValueError, match="max_wait_seconds"):
             NullGeocoding().lookup(38.7, -9.1, max_wait_seconds=max_wait)
 
+    def test_a_lookup_takes_a_reservation_key(self):
+        assert NullGeocoding().lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1") == GeocodingOutcome()
+
+    def test_a_lookup_refuses_an_empty_reservation_key(self):
+        with pytest.raises(ValueError, match="reservation_key"):
+            NullGeocoding().lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="")
+
 
 class TestEndpointConstruction:
     def test_a_public_host_yields_its_reverse_endpoint(self, resolves_to):
@@ -764,7 +771,7 @@ class TestTheRateGate:
     @responses.activate
     def test_an_unreachable_state_defers_without_sending(self, caplog):
         class _Down(MemoryState):
-            def reserve_slot(self, key, interval_seconds, *, max_wait_seconds):
+            def reserve_send(self, key, interval_seconds, *, max_wait_seconds, booking=None):
                 raise StateBackendUnavailableError("down")
 
         clock = FixedClock()
@@ -781,6 +788,97 @@ class TestTheRateGate:
     def test_a_max_wait_out_of_range_is_refused(self, max_wait):
         with pytest.raises(ValueError, match="max_wait_seconds"):
             _geocoder().lookup(38.7, -9.1, max_wait_seconds=max_wait)
+
+
+@pytest.fixture
+def gate_clock(monkeypatch):
+    """One instant for the geocoder's clock and the memory gate's monotonic clock, advanced together.
+
+    Each wait is recorded instead of slept.
+    """
+    clock = FixedClock()
+    start = clock.now()
+    clock.waits = []
+    monkeypatch.setattr(geocoding_http.time, "sleep", clock.waits.append)
+    monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0 + (clock.now() - start).total_seconds())
+    return clock
+
+
+def _advance_to(clock, moment):
+    clock.advance((moment - clock.now()).total_seconds())
+
+
+class TestBookedLookups:
+    """A lookup that names its caller books the next slot instead of sleeping for it, and runs at that slot when it
+    comes back, so a backlog of deferred lookups neither holds workers asleep nor wakes together."""
+
+    @responses.activate
+    def test_deferred_lookups_each_get_a_slot_of_their_own_and_run_once_there(self, gate_clock):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=1.0)
+        start = gate_clock.now()
+
+        outcomes = [backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key=f"job-{n}") for n in range(100)]
+
+        assert outcomes[0].place == GeocodedPlace(country="Portugal")
+        assert [outcome.retry_at for outcome in outcomes[1:]] == [start + timedelta(seconds=n) for n in range(1, 100)]
+        for n, outcome in enumerate(outcomes[1:], start=1):
+            _advance_to(gate_clock, outcome.retry_at)
+            again = backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key=f"job-{n}")
+            assert again.place == GeocodedPlace(country="Portugal"), n
+        assert len(responses.calls) == 100
+        assert gate_clock.waits == []
+
+    @responses.activate
+    def test_a_lookup_back_before_its_slot_keeps_it_and_sends_nothing(self, gate_clock):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=1.0)
+        backend.lookup(38.7, -9.1, max_wait_seconds=0)
+        booked = backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1")
+        gate_clock.advance(0.5)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1") == booked
+        assert len(responses.calls) == 1
+
+    @responses.activate
+    def test_lookups_back_late_together_send_an_interval_apart(self, gate_clock):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=1.0)
+        backend.lookup(38.7, -9.1, max_wait_seconds=0)
+        for name in ("a", "b"):
+            backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key=name)
+        gate_clock.advance(30)
+
+        backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="a")
+        backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="b")
+
+        assert len(responses.calls) == 3
+        assert gate_clock.waits == [pytest.approx(1.0)]  # never more than one interval
+
+    @responses.activate
+    def test_an_upstream_back_off_holds_a_booked_lookup_until_it_ends(self, gate_clock):
+        responses.add(responses.GET, URL, json=PORTUGAL)
+        state = MemoryState()
+        backend = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
+        peer = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
+        backend.lookup(38.7, -9.1, max_wait_seconds=0)
+        booked = backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1")
+        peer._back_off("120")
+        backed_off_until = gate_clock.now() + timedelta(seconds=120)
+        _advance_to(gate_clock, booked.retry_at)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1") == GeocodingOutcome(
+            None, backed_off_until
+        )
+        assert len(responses.calls) == 1
+
+        _advance_to(gate_clock, backed_off_until)
+
+        assert backend.lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="job-1").place is not None
+
+    def test_a_reservation_key_out_of_range_is_refused(self):
+        with pytest.raises(ValueError, match="reservation_key"):
+            _geocoder().lookup(38.7, -9.1, max_wait_seconds=0, reservation_key="x" * 201)
 
 
 class TestLookupOutcomes:

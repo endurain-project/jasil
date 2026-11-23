@@ -86,6 +86,52 @@ if slot.reserved:
   raises `ValueError` on an index key, or a plain value that is not an integer.
 - Each call is O(1): under the lock in memory, one Lua script on Redis.
 
+`reserve_send(key, interval_seconds, *, max_wait_seconds, booking=None)` is the
+same gate for a caller that sends once it is through, and may defer rather than
+wait. It shares the slot pointer `reserve_slot` keeps, and also records the
+instant it last cleared a send, so no two sends it clears are closer than the
+interval.
+
+- **No booking held.** The call takes the next free slot. The send goes at the
+  later of that slot and one interval after the last send. When that is within
+  `max_wait_seconds` the call returns `reserved=True` with the wait.
+  - Otherwise, with `booking` named, it books that slot under the name and
+    returns `reserved=False` with the wait until then.
+  - Without `booking` it writes nothing.
+- **A booking held** under that name, from an earlier call:
+  - A slot more than `max_wait_seconds` away returns `reserved=False` with the
+    wait until it, and books nothing more.
+  - A slot due within the wait clears the send and uses the booking up. The send
+    waits at most one interval past the slot, or past now when the caller is
+    late.
+  - A caller back late at the same moment as others, which would wait longer,
+    keeps its booking and gets `reserved=False` with when to try again.
+- **Booking lifetime.** A booking lasts until a tenth of its wait plus 10 minutes
+  after its slot. Once it expires the slot is lost, and the next call with that
+  name books afresh.
+- **Naming.** `booking` is a non-empty string of at most 200 characters, such as
+  a durable job's id. Use one name per caller that will come back.
+- **Order.** Bookings and immediate sends share one queue, first come first served.
+  A backlog that books far ahead also delays a caller that cannot defer.
+
+```python
+import time
+from datetime import timedelta
+
+from jasil.jobs import DeferJob
+
+slot = platform.state.reserve_send("upstream:gate", 1.0, max_wait_seconds=0, booking=event.event_id)
+if not slot.reserved:
+    raise DeferJob(platform.clock.now() + timedelta(seconds=slot.wait_seconds))
+time.sleep(slot.wait_seconds)  # at most one interval
+call_the_upstream()
+```
+
+The last send and the bookings sit under the reserved prefix `jasil:state:gate:`, so
+`iter_keys` over the gate's own prefix sees only the gate. Each call is O(1): under
+the lock in memory, one Lua script on Redis, on the same single clock as
+`reserve_slot`.
+
 The geocoding rate limit is one of these gates; see
 [GeocodingProvider](#geocodingprovider).
 
@@ -664,13 +710,14 @@ save_place(outcome.place)  # None: nothing to resolve here
 | A 2xx answer with a place | `place` |
 | A 2xx answer with nothing usable, or one that cannot be read | final: both `None` |
 | Another 4xx (400, 401, 403, 404, ...) or a 3xx (redirects are refused) | final: both `None`, logged |
-| No request slot free within `max_wait_seconds` | `retry_at` = when the next slot frees; nothing is sent |
+| No request slot free within `max_wait_seconds` | `retry_at` = when the next slot frees, or the slot booked under `reservation_key`; nothing is sent |
 | 429 or 503 | `retry_at` from `Retry-After` (seconds or an HTTP-date), clamped to 1 hour; 60 seconds when absent or unreadable |
 | Another 5xx, a timeout, a refused or dropped connection, the 30-second deadline | `retry_at` 60 seconds ahead |
 | The state is unreachable | `retry_at` 60 seconds ahead; nothing is sent |
 
-`lookup` never raises for an upstream or state failure; a `max_wait_seconds` that
-is negative or not finite raises `ValueError`. `reverse` is `lookup` with a
+`lookup` never raises for an upstream or state failure. A `max_wait_seconds` that
+is negative or not finite raises `ValueError`, and so does a `reservation_key`
+that is empty or longer than 200 characters. `reverse` is `lookup` with a
 60-second wait bound, returning its `place`. `NullGeocoding.lookup` always returns
 a final `GeocodingOutcome(None, None)`.
 
@@ -688,8 +735,34 @@ shares one budget:
 - A settings reload builds a new backend on the same gate, so it keeps the budget.
 
 Each lookup costs one `index_range` of the back-off and, with a rate limit, one
-`reserve_slot` before it sends. A request that waits for its slot sleeps in the
-calling thread.
+[`reserve_send`](#rate-gates) before it sends. A request that waits for its slot
+sleeps in the calling thread.
+
+### Booking a turn instead of sleeping
+
+A durable job that would otherwise sleep for its turn can pass
+`reservation_key`, a name it keeps across retries such as its job's id, and
+`max_wait_seconds=0`:
+
+```python
+from jasil.jobs import DeferJob
+
+outcome = platform.geocoding.lookup(latitude, longitude, max_wait_seconds=0, reservation_key=event.event_id)
+if outcome.retry_at is not None:
+    raise DeferJob(outcome.retry_at, reason="geocoding turn booked")
+save_place(outcome.place)
+```
+
+When no turn is free, the lookup books the next one under that key and returns it
+as `retry_at`. Called again with the same key, it runs at that turn, or waits at
+most one rate-limit interval for it if others came back at the same moment.
+A backlog of deferred lookups therefore holds no worker asleep, and each runs once
+at a turn of its own, instead of every deferred lookup waking at the same instant
+and deferring again. An upstream back-off still holds a booked lookup until it
+ends.
+
+Bookings and other lookups share one queue, first come first served. A large
+booked backlog also delays a `reverse()` call, which gives up after 60 seconds.
 
 A 429 or 503 holds back every backend on that gate, not only the one that got it.
 Each back-off is a member of an [ordered index](#ordered-indexes) under

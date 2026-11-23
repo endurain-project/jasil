@@ -17,6 +17,7 @@ import time
 import fakeredis
 import pytest
 
+import jasil._core.state_keys as state_keys
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.providers import SlotReservation, StateBackendUnavailableError, StateProvider, TieredFailureOutcome
@@ -731,6 +732,170 @@ class TestSlotConcurrency:
         assert waits == pytest.approx([0.1 * n for n in range(self.CALLERS)])
 
 
+class TestSendConformance:
+    """``reserve_send`` books the slot a deferred caller will come back for, and never lets two sends out closer
+    together than the interval, however late a booked caller comes back."""
+
+    def test_without_a_booking_it_spaces_sends_as_reserve_slot_does(self, clock, state):
+        waits = [state.reserve_send("gate", 0.5, max_wait_seconds=10) for _ in range(3)]
+
+        assert waits == [SlotReservation(True, 0.0), SlotReservation(True, 0.5), SlotReservation(True, 1.0)]
+
+    def test_without_a_booking_a_wait_past_the_bound_writes_nothing(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        written = state.get("gate")
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0.5) == SlotReservation(False, pytest.approx(1.0))
+        assert state.get("gate") == written
+
+    def test_it_shares_the_slot_pointer_of_reserve_slot(self, clock, state):
+        """A process of the previous release reserves on the same key, so the two keep one order of slots."""
+        state.reserve_slot("gate", 1.0, max_wait_seconds=0)
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0) == SlotReservation(False, pytest.approx(1.0))
+
+    def test_deferred_callers_each_book_a_slot_of_their_own(self, clock, state):
+        results = [state.reserve_send("gate", 1.0, max_wait_seconds=0, booking=f"job-{n}") for n in range(100)]
+
+        assert results[0] == SlotReservation(True, 0.0)  # the gate was idle, so the first one sends at once
+        assert results[1:] == [SlotReservation(False, pytest.approx(float(n))) for n in range(1, 100)]
+
+    def test_each_booked_caller_sends_once_when_it_comes_back_on_time(self, clock, state):
+        for n in range(10):
+            state.reserve_send("gate", 1.0, max_wait_seconds=0, booking=f"job-{n}")
+
+        for n in range(1, 10):
+            clock["seconds"] = float(n)
+            assert state.reserve_send("gate", 1.0, max_wait_seconds=0, booking=f"job-{n}") == SlotReservation(True, 0.0)
+
+    def test_a_booked_caller_back_before_its_slot_keeps_it_and_books_nothing(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="early")
+        clock["seconds"] += 0.25
+
+        again = state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="early")
+
+        assert again == SlotReservation(False, pytest.approx(0.75))
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="next") == SlotReservation(
+            False, pytest.approx(1.75)
+        )
+
+    def test_a_booked_slot_within_the_wait_bound_is_waited_for(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=5, booking="b") == SlotReservation(True, 1.0)
+
+    def test_a_used_booking_is_gone(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+        clock["seconds"] = 1.0
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b") == SlotReservation(
+            False, pytest.approx(1.0)
+        )
+
+    def test_an_expired_booking_books_a_fresh_slot(self, clock, state):
+        state.reserve_send("gate", 3600, max_wait_seconds=0)
+        state.reserve_send("gate", 3600, max_wait_seconds=0, booking="lost")  # slot at 3600 s
+        state.reserve_send("gate", 3600, max_wait_seconds=0, booking="kept")  # slot at 7200 s
+        clock["seconds"] = 3600 + state_keys.to_seconds(state_keys.booking_ttl_microseconds(3600 * 1_000_000)) + 1
+
+        assert state.reserve_send("gate", 3600, max_wait_seconds=0, booking="lost") == SlotReservation(
+            False, pytest.approx(10_800 - clock["seconds"])
+        )
+
+    def test_booked_callers_back_late_together_still_send_an_interval_apart(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        for name in ("a", "b", "c"):
+            state.reserve_send("gate", 1.0, max_wait_seconds=0, booking=name)
+        clock["seconds"] = 10.0
+
+        first = state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="a")
+        second = state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+        third = state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="c")
+
+        assert first == SlotReservation(True, 0.0)
+        assert second == SlotReservation(True, pytest.approx(1.0))  # waits at most one interval
+        assert third == SlotReservation(False, pytest.approx(2.0))  # would wait longer: comes back, keeps its slot
+        clock["seconds"] = 12.0
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="c") == SlotReservation(True, 0.0)
+
+    def test_a_late_booked_send_holds_back_the_next_unbooked_one(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="late")
+        clock["seconds"] = 10.0
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="late")
+        clock["seconds"] = 10.25
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0) == SlotReservation(False, pytest.approx(0.75))
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=5) == SlotReservation(True, pytest.approx(0.75))
+
+    def test_bookings_and_the_last_send_stay_out_of_the_callers_keys(self, clock, state):
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+
+        assert list(state.iter_keys("gate")) == ["gate"]
+
+    def test_an_index_key_is_refused(self, state):
+        state.index_add("gate", "a", 1.0, ttl_seconds=60)
+
+        with pytest.raises(ValueError):
+            state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b")
+
+    @pytest.mark.parametrize("booking", ["", "x" * (state_keys.MAX_BOOKING_LENGTH + 1)])
+    def test_a_booking_that_is_empty_or_too_long_is_refused(self, state, booking):
+        with pytest.raises(ValueError, match="booking"):
+            state.reserve_send("gate", 1.0, max_wait_seconds=0, booking=booking)
+
+        assert state.get("gate") is None
+
+    @pytest.mark.parametrize("interval", [0, -1.0, math.inf, math.nan, 86_400.5])
+    def test_an_interval_out_of_range_is_refused(self, state, interval):
+        with pytest.raises(ValueError, match="interval_seconds"):
+            state.reserve_send("gate", interval, max_wait_seconds=0)
+
+    @pytest.mark.parametrize("max_wait", [-0.1, math.inf, math.nan])
+    def test_a_max_wait_out_of_range_is_refused(self, state, max_wait):
+        with pytest.raises(ValueError, match="max_wait_seconds"):
+            state.reserve_send("gate", 1.0, max_wait_seconds=max_wait)
+
+
+class TestSendConcurrency:
+    """Concurrent deferred callers each book a distinct slot, and exactly one of them sends at once."""
+
+    CALLERS = 8
+
+    def _book_concurrently(self, states):
+        results = []
+        barrier = threading.Barrier(self.CALLERS)
+
+        def book(state, name):
+            barrier.wait()
+            results.append(state.reserve_send("gate", 0.1, max_wait_seconds=0, booking=name))
+
+        threads = [threading.Thread(target=book, args=(state, f"job-{n}")) for n, state in enumerate(states)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return sorted(results, key=lambda result: result.wait_seconds)
+
+    def _assert_distinct(self, results):
+        assert [result.reserved for result in results] == [True] + [False] * (self.CALLERS - 1)
+        assert [result.wait_seconds for result in results] == pytest.approx([0.1 * n for n in range(self.CALLERS)])
+
+    def test_threads_sharing_a_memory_backend(self, clock):
+        self._assert_distinct(self._book_concurrently([MemoryState()] * self.CALLERS))
+
+    def test_connections_sharing_a_redis_server(self, clock):
+        server = fakeredis.FakeServer()
+        states = [RedisState(fakeredis.FakeStrictRedis(server=server)) for _ in range(self.CALLERS)]
+
+        self._assert_distinct(self._book_concurrently(states))
+
+
 class TestRedisSlotLayout:
     @pytest.fixture
     def client(self):
@@ -749,6 +914,35 @@ class TestRedisSlotLayout:
 
         assert RedisState(client).reserve_slot("gate", 1.0, max_wait_seconds=0) == SlotReservation(True, 0.0)
         assert client.get("gate") == b"1800000000000000"
+
+
+class TestRedisSendLayout:
+    @pytest.fixture
+    def client(self):
+        return fakeredis.FakeStrictRedis(decode_responses=False)
+
+    def test_a_booking_is_kept_under_the_reserved_namespace_for_its_wait_and_a_margin(self, clock, client):
+        state = RedisState(client)
+        state.reserve_send("gate", 100.0, max_wait_seconds=0)
+        state.reserve_send("gate", 100.0, max_wait_seconds=0, booking="job-1")
+
+        key = state_keys.booking_key("gate", "job-1")
+        assert key.startswith(state_keys.GATE_PREFIX)
+        assert client.get(key) == b"1800000100000000"
+        assert client.pttl(key) == math.ceil(state_keys.booking_ttl_microseconds(100 * 1_000_000) / 1000)
+
+    def test_the_last_send_expires_one_interval_after_it(self, clock, client):
+        state = RedisState(client)
+        state.reserve_send("gate", 2.0, max_wait_seconds=0)
+
+        assert client.pttl(state_keys.last_send_key("gate")) == 2_000
+
+    def test_the_booked_slot_is_read_from_the_server_clock(self, clock, client, monkeypatch):
+        monkeypatch.setattr("jasil.backends.state_redis.time", None)  # the backend module must not read its clock
+        state = RedisState(client)
+        state.reserve_send("gate", 1.0, max_wait_seconds=0)
+
+        assert state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="b") == SlotReservation(False, 1.0)
 
 
 class TestRedisIndexLayout:

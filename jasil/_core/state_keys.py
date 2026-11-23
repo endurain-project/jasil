@@ -13,14 +13,33 @@ INDEX_EXPIRY_PREFIX = "jasil:state:index-expiry:"
 #: accepts as a key expiry.
 MAX_SLOT_INTERVAL_SECONDS = 86_400
 
+#: Where a rate gate keeps what ``reserve_send`` adds to its slot pointer: the instant of its last send, and each
+#: caller's booked slot. Outside the caller's own prefix, so ``iter_keys`` and ``delete_prefix`` over it see the gate
+#: alone. Deleting these keys only loses slots, so ``delete_prefix`` need not refuse them.
+GATE_PREFIX = "jasil:state:gate:"
+
+#: The longest booking name ``reserve_send`` takes, in characters.
+MAX_BOOKING_LENGTH = 200
+
+#: How long a booking outlives its slot beyond a tenth of the wait: the time a deferred caller may take to be run
+#: again (a job queued behind others), so a booking does not expire just before its caller comes back for it.
+BOOKING_GRACE_SECONDS = 600
+
 #: Rate-gate slots are counted in whole microseconds, so both backends do exact integer arithmetic.
 _MICROSECONDS = 1_000_000
 
 __all__ = [
+    "BOOKING_GRACE_SECONDS",
+    "GATE_PREFIX",
     "INDEX_EXPIRY_PREFIX",
+    "MAX_BOOKING_LENGTH",
     "MAX_SLOT_INTERVAL_SECONDS",
+    "booking_key",
+    "booking_ttl_microseconds",
+    "check_booking",
     "check_delete_prefix",
     "check_max_wait",
+    "last_send_key",
     "slot_microseconds",
     "to_seconds",
 ]
@@ -78,3 +97,38 @@ def slot_microseconds(interval_seconds: float, max_wait_seconds: float) -> tuple
 def to_seconds(microseconds: int) -> float:
     """Convert a slot wait in microseconds back to seconds."""
     return microseconds / _MICROSECONDS
+
+
+def check_booking(booking: str, *, name: str = "booking") -> None:
+    """Refuse a ``reserve_send`` booking name that is not a non-empty string of at most :data:`MAX_BOOKING_LENGTH`.
+
+    Args:
+        booking: The booking name.
+        name: The argument the caller took it as, for the error message.
+
+    Raises:
+        ValueError: When ``booking`` is not a string, is empty, or is longer than :data:`MAX_BOOKING_LENGTH`.
+    """
+    if not isinstance(booking, str) or not 0 < len(booking) <= MAX_BOOKING_LENGTH:
+        raise ValueError(f"{name} must be a non-empty string of at most {MAX_BOOKING_LENGTH} characters")
+
+
+def last_send_key(key: str) -> str:
+    """Return the key holding the instant the gate ``key`` last let a caller send, in microseconds."""
+    return f"{GATE_PREFIX}sent:{key}"
+
+
+def booking_key(key: str, booking: str) -> str:
+    """Return the key holding the slot ``booking`` booked on the gate ``key``.
+
+    The gate key's length leads, so no gate key and booking name pair can spell another pair's key.
+    """
+    return f"{GATE_PREFIX}booking:{len(key)}:{key}{booking}"
+
+
+def booking_ttl_microseconds(wait: int) -> int:
+    """Return how long a booking whose slot is ``wait`` microseconds away is kept: the wait, a tenth more, a grace.
+
+    The tenth covers the jitter ``DeferJob`` adds to the retry, and the grace a caller run late.
+    """
+    return -(-wait * 11 // 10) + BOOKING_GRACE_SECONDS * _MICROSECONDS

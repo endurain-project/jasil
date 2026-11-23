@@ -1,6 +1,6 @@
 [project]
 name = "jasil"
-version = "0.23.0"
+version = "0.24.0"
 description = "Just Another Substrate & Infrastructure Library"
 authors = [{name = "João Vitória Silva", email = "joao@endurain.com"}]
 license = {text = "MIT"}
@@ -60,7 +60,7 @@ jobs = [
 ]
 # FastAPI `Depends` helpers exposing the platform providers to routes.
 fastapi = [
-    "fastapi>=0.163.0",
+    "fastapi>=0.163.1",
 ]
 # HTTP reverse-geocoding backend (nominatim / photon / geocode.maps.co).
 # urllib3 >= 2.6.0 decompresses a streamed body chunk by chunk (CVE-2025-66471), which the 1 MiB
@@ -84,7 +84,7 @@ all = [
     "boto3>=1.44.3",
     "psycopg[binary]>=3.3.9",
     "apscheduler>=3.11.3",
-    "fastapi>=0.163.0",
+    "fastapi>=0.163.1",
     "requests>=2.34.2",
     "urllib3>=2.8.0",
     "alembic>=1.20.1",
@@ -117,7 +117,7 @@ test = [
     # The remaining backends and integrations are all exercised by the suite.
     "boto3>=1.44.3",
     "apscheduler>=3.11.3",
-    "fastapi>=0.163.0",
+    "fastapi>=0.163.1",
     "requests>=2.34.2",
     "responses>=0.26.3",
     # The database-outage tests wrap real psycopg errors, and refuse connections through its dialect.
