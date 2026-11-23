@@ -235,9 +235,11 @@ class JobRunner:
                         self._leases.release_waiting()
                         break
                 except Exception as error:
-                    logger.error(
+                    # An unreachable database is an outage the worker loop retries, not a defect.
+                    log_failure(
+                        logger,
                         "Durable job could not be finalized",
-                        exc_info=error,
+                        error,
                         extra={"job_id": snapshot.id, "subscriber": snapshot.subscriber_id},
                     )
         except BaseException:
