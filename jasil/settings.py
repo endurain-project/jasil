@@ -91,10 +91,6 @@ class JobSettings:
             storage or database outage do not count.
         max_continuations: Continuations a job may take before a further
             ``ContinueJob`` is treated as an ordinary failure. At least 0.
-        outage_defer_max_seconds: How long a job whose handler cannot reach
-            storage or the database is deferred instead of failed, counted from
-            its first such deferral. Past it each outage error is an ordinary
-            failure. ``0`` fails every outage error as before.
         poll_interval_seconds: Idle wait between empty polls; greater than zero.
         max_runtime_seconds: The longest a single handler is kept leased. Past it
             the job is abandoned to the reaper, the handler is told to stop
@@ -112,6 +108,10 @@ class JobSettings:
             attempt history, and stopped and stale worker rows are pruned. A job
             that is pending, claimed or dead-lettered keeps its whole history.
             ``<= 0`` disables pruning.
+        outage_defer_max_seconds: How long a job whose handler cannot reach
+            storage or the database is deferred instead of failed, counted from
+            its first such deferral. Past it each outage error is an ordinary
+            failure. ``0`` fails every outage error as before.
     """
 
     enabled: bool = False
@@ -124,11 +124,12 @@ class JobSettings:
     defer_max_seconds: int = 86400
     max_deferrals: int = 100
     max_continuations: int = 10_000
-    outage_defer_max_seconds: int = 86400
     poll_interval_seconds: float = 5.0
     heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
     retention_days: int = 30
+    # Last, after every field of earlier releases, so a host passing them by position keeps their meaning.
+    outage_defer_max_seconds: int = 86400
 
     def __post_init__(self) -> None:
         """Reject values the job pipeline cannot honour, where the host configures JASIL.

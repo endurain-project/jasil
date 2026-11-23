@@ -254,6 +254,13 @@ class TestJobSettingsValidation:
         with pytest.raises(ValueError, match=message):
             settings.JobSettings(**values)
 
+    def test_positional_arguments_keep_the_fields_they_had(self):
+        """A field added later goes last, so a host passing the earlier fields by position is not shifted."""
+        jobs = settings.JobSettings(False, 300, 1800, True, 20, 60, 3600, 86400, 100, 10000, 2.0)
+
+        assert (jobs.max_continuations, jobs.poll_interval_seconds) == (10000, 2.0)
+        assert jobs.outage_defer_max_seconds == 86400
+
     def test_the_bounds_themselves_are_accepted(self):
         settings.JobSettings(
             batch_size=1000,
