@@ -86,8 +86,9 @@ class JobSettings:
         defer_max_seconds: Furthest ahead a handler may defer itself with
             ``DeferJob``, or wait between passes with ``ContinueJob``; a later
             instant is clamped to it.
-        max_deferrals: Deferrals a job may take before a further ``DeferJob``
-            is treated as an ordinary failure.
+        max_deferrals: Deferrals a job's handler may take before a further
+            ``DeferJob`` is treated as an ordinary failure. Deferrals through a
+            storage or database outage do not count.
         max_continuations: Continuations a job may take before a further
             ``ContinueJob`` is treated as an ordinary failure. At least 0.
         poll_interval_seconds: Idle wait between empty polls; greater than zero.
@@ -107,6 +108,10 @@ class JobSettings:
             attempt history, and stopped and stale worker rows are pruned. A job
             that is pending, claimed or dead-lettered keeps its whole history.
             ``<= 0`` disables pruning.
+        outage_defer_max_seconds: How long a job whose handler cannot reach
+            storage or the database is deferred instead of failed, counted from
+            its first such deferral. Past it each outage error is an ordinary
+            failure. ``0`` fails every outage error as before.
     """
 
     enabled: bool = False
@@ -123,6 +128,8 @@ class JobSettings:
     heartbeat_interval_seconds: float = 15.0
     max_attempts: int = 5
     retention_days: int = 30
+    # Last, after every field of earlier releases, so a host passing them by position keeps their meaning.
+    outage_defer_max_seconds: int = 86400
 
     def __post_init__(self) -> None:
         """Reject values the job pipeline cannot honour, where the host configures JASIL.
@@ -149,6 +156,7 @@ class JobSettings:
             "defer_max_seconds": 0,
             "max_deferrals": 0,
             "max_continuations": 0,
+            "outage_defer_max_seconds": 0,
         }
         for name, minimum in minimums.items():
             if getattr(self, name) < minimum:
@@ -160,6 +168,7 @@ class JobSettings:
             "backoff_base_seconds": MAX_JOB_SECONDS,
             "backoff_max_seconds": MAX_JOB_SECONDS,
             "defer_max_seconds": MAX_JOB_SECONDS,
+            "outage_defer_max_seconds": MAX_JOB_SECONDS,
             "retention_days": MAX_RETENTION_DAYS,
         }
         for name, maximum in maximums.items():

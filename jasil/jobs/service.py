@@ -91,6 +91,7 @@ def build_runner(*, queues: Iterable[str] | None = None) -> "JobRunner":
         defer_max_seconds=jobs.defer_max_seconds,
         max_deferrals=jobs.max_deferrals,
         max_continuations=jobs.max_continuations,
+        outage_defer_max_seconds=jobs.outage_defer_max_seconds,
         queues=queues,
         record_attempts=jobs.record_attempts,
     )

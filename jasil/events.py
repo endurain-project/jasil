@@ -103,9 +103,10 @@ class Event:
             delivered for; ``None`` for an event that is not a durable delivery.
             Set by the job runner from the job row, the same value it uses to
             decide dead-lettering.
-        deferral_count: How many earlier runs of this durable job the handler
-            deferred with ``DeferJob``; 0 otherwise. Deferred runs are not
-            counted in ``retry_count``.
+        deferral_count: How many earlier runs of this durable job were deferred,
+            by the handler with ``DeferJob`` or by the runner during a storage or
+            database outage; 0 otherwise. Deferred runs are not counted in
+            ``retry_count``.
         continuation_count: How many earlier runs of this durable job the
             handler ended with ``ContinueJob``; 0 otherwise. ``retry_count``
             counts only the runs since the last of them.

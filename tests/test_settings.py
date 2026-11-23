@@ -197,6 +197,16 @@ class TestJobSettingsValidation:
             pytest.param({"defer_max_seconds": -1}, r"defer_max_seconds must be at least 0", id="negative-defer"),
             pytest.param({"max_deferrals": -1}, r"max_deferrals must be at least 0", id="negative-deferrals"),
             pytest.param(
+                {"outage_defer_max_seconds": -1},
+                r"jobs\.outage_defer_max_seconds must be at least 0",
+                id="negative-outage-window",
+            ),
+            pytest.param(
+                {"outage_defer_max_seconds": 31_536_001},
+                r"jobs\.outage_defer_max_seconds must be at most 31536000",
+                id="huge-outage-window",
+            ),
+            pytest.param(
                 {"max_continuations": -1}, r"max_continuations must be at least 0", id="negative-continuations"
             ),
             pytest.param(
@@ -244,6 +254,13 @@ class TestJobSettingsValidation:
         with pytest.raises(ValueError, match=message):
             settings.JobSettings(**values)
 
+    def test_positional_arguments_keep_the_fields_they_had(self):
+        """A field added later goes last, so a host passing the earlier fields by position is not shifted."""
+        jobs = settings.JobSettings(False, 300, 1800, True, 20, 60, 3600, 86400, 100, 10000, 2.0)
+
+        assert (jobs.max_continuations, jobs.poll_interval_seconds) == (10000, 2.0)
+        assert jobs.outage_defer_max_seconds == 86400
+
     def test_the_bounds_themselves_are_accepted(self):
         settings.JobSettings(
             batch_size=1000,
@@ -253,6 +270,7 @@ class TestJobSettingsValidation:
             defer_max_seconds=0,
             max_deferrals=0,
             max_continuations=0,
+            outage_defer_max_seconds=0,
             lease_seconds=45,
             heartbeat_interval_seconds=15,
             max_runtime_seconds=45,

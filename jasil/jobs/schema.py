@@ -94,7 +94,7 @@ class DeadLetterJob(BaseModel):
         subscriber_id: The subscriber that failed.
         source: Where the originating event came from.
         attempts: Claims made before dead-lettering, deferred ones included.
-        deferrals: Of those, the claims the handler deferred with ``DeferJob``; they
+        deferrals: Of those, the claims deferred by the handler with ``DeferJob`` or in an outage; they
             do not count against ``max_attempts``.
         continuations: Of those, the claims the handler ended with ``ContinueJob``;
             each restarts the count against ``max_attempts``.
@@ -222,7 +222,7 @@ class JobDetail(BaseModel):
         source: Where the event came from.
         status: ``pending``, ``claimed``, ``completed`` or ``dead_letter``.
         attempts: Claims made so far, deferred ones included.
-        deferrals: Of those, the claims the handler deferred with ``DeferJob``;
+        deferrals: Of those, the claims deferred by the handler with ``DeferJob`` or in an outage;
             they do not count against ``max_attempts``.
         continuations: Of those, the claims the handler ended with ``ContinueJob``;
             each restarts the count against ``max_attempts``.

@@ -28,7 +28,8 @@ except ModuleNotFoundError as error:
     raise optional_deps.not_installed("boto3", extra="s3", feature="S3 storage") from error
 from boto3.exceptions import Boto3Error
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, HTTPClientError, IncompleteReadError
+from botocore.exceptions import ConnectionError as BotoConnectionError
 from botocore.parsers import ResponseParserError
 
 import jasil._core.network as network
@@ -93,13 +94,56 @@ class _S3UploadState:
 _S3_ERRORS = (Boto3Error, BotoCoreError, ClientError, ResponseParserError)
 
 
+#: Error codes asking the caller to slow down or try again, whatever HTTP status the store sent them with.
+_RETRY_LATER_CODES = frozenset(
+    {
+        "InternalError",
+        "RequestLimitExceeded",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "SlowDown",
+        "TooManyRequests",
+        "TooManyRequestsException",
+    }
+)
+
+#: HTTP statuses below 500 that mean "try again later" rather than a refusal.
+_RETRY_LATER_STATUSES = frozenset({408, 429})
+
+
 def _error_code(error: ClientError) -> str:
     return str(error.response.get("Error", {}).get("Code", ""))
 
 
+def _is_transient(error: BaseException) -> bool:
+    """Whether S3 failed in a way the same call survives once it recovers, rather than refusing the call.
+
+    Transient: no connection, a timeout or a broken response stream, an answer of 5xx, 408 or 429, a throttling or
+    retry-later code, and a local ``OSError`` while staging a part. Everything else is a refusal: a 4xx such as
+    ``AccessDenied`` or ``NoSuchBucket``, missing credentials or region, a request botocore would not send, a
+    malformed 2xx body (not S3 answering) and an invalid upload manifest.
+    """
+    if isinstance(error, ClientError):
+        return _retry_later(_error_code(error), error.response.get("ResponseMetadata", {}).get("HTTPStatusCode"))
+    return isinstance(error, BotoConnectionError | HTTPClientError | IncompleteReadError | OSError)
+
+
+def _retry_later(code: str, status: int | None) -> bool:
+    """Whether an S3 error code and HTTP status ask to try again later; a numeric code stands in for no status."""
+    status = status or (int(code) if code.isdigit() else 0)
+    return status >= 500 or status in _RETRY_LATER_STATUSES or code in _RETRY_LATER_CODES or code.startswith("Throttl")
+
+
+def _unavailable(error: BaseException) -> StorageBackendUnavailableError:
+    """The provider-neutral error for a failed S3 call, telling an outage from a refusal."""
+    if _is_transient(error):
+        return StorageBackendUnavailableError("S3 storage backend is unavailable")
+    return StorageBackendUnavailableError("S3 storage backend refused the request", transient=False)
+
+
 def _translate_s3_stream_error(error: Exception) -> None:
     if isinstance(error, _S3_ERRORS):
-        raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+        raise _unavailable(error) from error
 
 
 def _translate_s3_errors[**P, R](
@@ -110,7 +154,7 @@ def _translate_s3_errors[**P, R](
         try:
             return method(self, *args, **kwargs)
         except _S3_ERRORS as error:
-            raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+            raise _unavailable(error) from error
 
     return wrapper
 
@@ -224,7 +268,7 @@ class S3Storage:
                 ),
             )
         except BotoCoreError as error:
-            raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+            raise _unavailable(error) from error
         if endpoint_url is None:
             # botocore takes an endpoint the URI does not give from the environment (``AWS_ENDPOINT_URL``,
             # ``AWS_ENDPOINT_URL_S3``) or the AWS config file, and the same rule holds for it.
@@ -637,7 +681,7 @@ class S3Storage:
                 try:
                     body.write(chunk)
                 except OSError as error:
-                    raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+                    raise _unavailable(error) from error
             reader.verify_complete()
             body.seek(0)
             try:
@@ -784,7 +828,7 @@ class S3Storage:
                 break
             start_after = contents[-1]["Key"]
         if first_error is not None:
-            raise StorageBackendUnavailableError("S3 storage backend is unavailable") from first_error
+            raise _unavailable(first_error) from first_error
         return removed
 
     def get(self, area: str, key: str) -> bytes | None:
@@ -929,7 +973,11 @@ class S3Storage:
             Delete={"Objects": [{"Key": key} for key in keys], "Quiet": True},
         )
         if errors := response.get("Errors"):
-            raise StorageBackendUnavailableError(f"S3 failed to delete {len(errors)} storage objects")
+            # Each key reports its own code; a batch that failed for any key in a retry-later way is an outage.
+            transient = any(_retry_later(str(error.get("Code", "")), None) for error in errors)
+            raise StorageBackendUnavailableError(
+                f"S3 failed to delete {len(errors)} storage objects", transient=transient
+            )
 
     @_translate_s3_errors
     def copy(self, src_area: str, src_key: str, dst_area: str, dst_key: str) -> None:
@@ -975,7 +1023,7 @@ class S3Storage:
                     for entry in page.get("Contents", []):
                         yield entry["Key"][strip_from:], entry["LastModified"].timestamp()
             except _S3_ERRORS as error:
-                raise StorageBackendUnavailableError("S3 storage backend is unavailable") from error
+                raise _unavailable(error) from error
 
         return objects()
 

@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import BinaryIO, Protocol, runtime_checkable
 
+from jasil._core.exception_chain import exception_chain
 from jasil._core.realtime_envelope import MAX_KEY_LENGTH
 from jasil.events import Event
 
@@ -38,7 +39,36 @@ class StateBackendUnavailableError(RuntimeError):
 
 
 class StorageBackendUnavailableError(RuntimeError):
-    """Raised when a storage backend cannot complete an operation."""
+    """Raised when a storage backend cannot complete an operation.
+
+    Attributes:
+        transient: True when the backend could not be reached, timed out, failed or was overloaded, so the same
+            call should succeed once it recovers. False when it refused the call (denied access, a missing bucket,
+            bad credentials, tampered local state, storage disabled), which waiting does not change.
+            :func:`is_storage_unavailable` reads it.
+    """
+
+    def __init__(self, *args: object, transient: bool = True) -> None:
+        super().__init__(*args)
+        self.transient = transient
+
+
+def is_storage_unavailable(error: BaseException) -> bool:
+    """Return whether ``error`` means storage could not be reached for now, rather than that the call is refused.
+
+    Reads ``error`` and then each exception that led to it (its ``__cause__``, or its ``__context__``), and the
+    first :class:`StorageBackendUnavailableError` among them decides by its ``transient``. So a host's error that
+    wraps a storage outage is one too, and a refusal raised while handling an earlier outage is still a refusal.
+    Which failures each built-in backend reports as transient may change in a minor release.
+
+    Args:
+        error: The exception a storage call, or code that made one, raised.
+
+    Returns:
+        True when storage is unreachable, failing or overloaded; False for a refusal or anything else.
+    """
+    nearest = next((link for link in exception_chain(error) if isinstance(link, StorageBackendUnavailableError)), None)
+    return nearest is not None and nearest.transient
 
 
 class StorageKeyConflictError(ValueError):

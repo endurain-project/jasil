@@ -680,6 +680,7 @@ def mark_job_completed(
             .where(*_owned_claim(job_id, worker_id=worker_id, attempt=attempt))
             .values(
                 status=STATUS_COMPLETED,
+                outage_since=None,
                 completed_at=now,
                 updated_at=now,
                 last_error=None,
@@ -727,13 +728,16 @@ def mark_job_failed(
     db: Session,
     duration_ms: int | None = None,
     record_attempt: bool = True,
+    keep_outage_since: bool = False,
 ) -> str:
     """
     Record a failed attempt if the caller still owns that exact claim.
 
     The attempt row is closed in the same transaction: ``failed`` or
     ``dead_letter`` for the job's new state, or ``superseded`` when the handler
-    failed after its job had been taken from it.
+    failed after its job had been taken from it. ``outage_since`` is cleared,
+    since the claim did not end in an outage, unless ``keep_outage_since`` says
+    it did and the outage has outlasted its window.
 
     Args:
         job_id: The job that failed.
@@ -746,6 +750,8 @@ def mark_job_failed(
         db: Active database session.
         duration_ms: Handler wall time, recorded on the attempt.
         record_attempt: Close the claim's ``job_attempts`` row.
+        keep_outage_since: Leave ``outage_since`` as it is: the claim failed in an
+            outage past its window, which stays past it.
 
     Returns:
         The job's new status (``pending`` when rescheduled, ``dead_letter`` when
@@ -766,13 +772,14 @@ def mark_job_failed(
         # the backoff.
         claims, deferrals, budget_offset, max_attempts = attempt_state
         attempts = claims - deferrals - budget_offset
+        values: dict[str, Any] = {} if keep_outage_since else {"outage_since": None}
         if attempts >= max_attempts:
             new_status = STATUS_DEAD_LETTER
-            values: dict[str, Any] = {"completed_at": now}
+            values["completed_at"] = now
         else:
             delay = jobs_backoff.backoff_seconds(attempts, base_seconds=base_seconds, max_seconds=max_seconds)
             new_status = STATUS_PENDING
-            values = {"available_at": now + timedelta(seconds=delay)}
+            values["available_at"] = now + timedelta(seconds=delay)
         failed = cast(
             CursorResult[Any],
             db.execute(
@@ -819,6 +826,7 @@ def mark_job_deferred(
     db: Session,
     duration_ms: int | None = None,
     record_attempt: bool = True,
+    outage_since: datetime | None = None,
 ) -> str:
     """
     Return a claimed job to ``pending`` for ``retry_at`` without spending an attempt.
@@ -834,6 +842,13 @@ def mark_job_deferred(
     :data:`STATUS_DEFERRALS_EXHAUSTED` is returned: the caller then fails it like
     any other exception, so a job cannot defer forever.
 
+    An outage deferral (``outage_since`` given) is the runner's, not the
+    handler's: the outage window bounds it, so it is counted in
+    ``outage_deferrals`` as well, which ``max_deferrals`` leaves out, and
+    ``outage_since`` is stored as the window's start. A handler's deferral is
+    bounded by ``deferrals - outage_deferrals``, and clears ``outage_since``, as
+    its claim did not end in an outage.
+
     ``retry_at`` is used as given: clamping and jitter are the caller's, which
     knows the configured ceiling.
 
@@ -848,6 +863,7 @@ def mark_job_deferred(
         db: Active database session.
         duration_ms: Handler wall time, recorded on the attempt.
         record_attempt: Close the claim's ``job_attempts`` row.
+        outage_since: For an outage deferral, the first deferral of the job in this outage.
 
     Returns:
         :data:`STATUS_DEFERRED` when rescheduled, :data:`STATUS_DEFERRALS_EXHAUSTED`
@@ -857,9 +873,10 @@ def mark_job_deferred(
     ownership = _owned_claim(job_id, worker_id=worker_id, attempt=attempt)
     truncated = fit_length(reason, MAX_STORED_ERROR_LENGTH)
     status = ""
-    deferrals = db.execute(select(ProcessingJob.deferrals).where(*ownership)).scalar_one_or_none()
-    if deferrals is not None:
-        if deferrals >= max_deferrals:
+    counts = db.execute(select(ProcessingJob.deferrals, ProcessingJob.outage_deferrals).where(*ownership)).one_or_none()
+    if counts is not None:
+        deferrals, outage_deferrals = counts
+        if outage_since is None and deferrals - outage_deferrals >= max_deferrals:
             db.rollback()  # nothing was written; end the read transaction
             return STATUS_DEFERRALS_EXHAUSTED
         deferred = cast(
@@ -870,7 +887,9 @@ def mark_job_deferred(
                 .values(
                     status=STATUS_PENDING,
                     deferrals=ProcessingJob.deferrals + 1,
+                    outage_deferrals=ProcessingJob.outage_deferrals + (0 if outage_since is None else 1),
                     available_at=retry_at,
+                    outage_since=outage_since,
                     last_error=truncated,
                     updated_at=now,
                     locked_by=None,
@@ -963,6 +982,7 @@ def mark_job_continued(
                     continuations=ProcessingJob.continuations + 1,
                     budget_offset=ProcessingJob.attempts - ProcessingJob.deferrals,
                     available_at=available_at,
+                    outage_since=None,
                     last_error=truncated,
                     updated_at=now,
                     locked_by=None,
@@ -1281,6 +1301,8 @@ def replay_dead_letter_job(job_id: str, *, now: datetime, db: Session) -> bool:
                 deferrals=0,
                 continuations=0,
                 budget_offset=0,
+                outage_deferrals=0,
+                outage_since=None,
                 available_at=now,
                 updated_at=now,
                 last_error=None,
