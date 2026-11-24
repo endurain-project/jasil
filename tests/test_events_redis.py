@@ -482,6 +482,28 @@ class TestFailureIsolation:
         assert [record.levelname for record in caplog.records] == ["WARNING", "ERROR"]
         assert caplog.records[1].exc_info is not None
 
+    def test_an_outage_after_another_failure_is_still_a_warning(self, bus, monkeypatch, caplog):
+        """A streak opened by a refused command must not hide the outage that follows it."""
+        failures = [
+            redis.exceptions.ResponseError("OOM command not allowed when used memory > 'maxmemory'"),
+            redis.exceptions.ConnectionError("Connection closed by server."),
+            redis.exceptions.ConnectionError("Error 111 connecting to redis:6379. Connection refused."),
+        ]
+
+        def _poll():
+            if failures:
+                raise failures.pop(0)
+            bus._stop.set()
+
+        monkeypatch.setattr(bus, "_poll_once", _poll)
+        monkeypatch.setattr(bus._stop, "wait", lambda timeout=None: None)
+
+        with caplog.at_level("WARNING"):
+            bus._run(bus._stop)
+
+        assert [record.levelname for record in caplog.records] == ["ERROR", "WARNING"]
+        assert "cannot reach Redis" in caplog.records[1].getMessage()
+
     def test_repeated_failures_back_off_and_log_a_traceback_once(self, bus, monkeypatch, caplog):
         waits: list[float] = []
         polls = []

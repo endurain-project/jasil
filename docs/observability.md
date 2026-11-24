@@ -511,9 +511,12 @@ server still loading its dataset, is logged as a WARNING without a traceback:
 - The HTTP geocoder logs a rate gate it cannot read, or an upstream back-off it
   cannot share, because the state backend is unavailable, and defers the lookup.
 
-A refused login, a lost consumer group (`NOGROUP`, which means Redis came back
-without its data), any other Redis error, and a rate-gate value the state cannot
-read keep their ERROR.
+In the event bus, a refused login, a lost consumer group (`NOGROUP`, which means
+Redis came back without its data) and any other Redis error keep their ERROR and
+traceback. The geocoder sees Redis only through the state backend, which reports
+every Redis failure but a refused value as unavailable, so a refused command
+(`NOPERM`, `READONLY`, out of memory) is a WARNING there too. Only a rate-gate
+value the state cannot read keeps its ERROR.
 
 One worth routing deliberately: `jasil._core.network` logs every time the SSRF
 allowlist permits a private destination, at INFO for a CIDR entry and at WARNING

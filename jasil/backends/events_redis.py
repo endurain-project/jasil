@@ -171,7 +171,7 @@ class RedisStreamEventBus:
     def _run(self, stop: threading.Event) -> None:
         group_missing = False
         failures = 0
-        error_logged = False
+        error_logged = outage_logged = False
         while not stop.is_set():
             try:
                 if group_missing:
@@ -181,22 +181,24 @@ class RedisStreamEventBus:
                 if failures:
                     logger.info("Event bus consumer recovered after %d failed poll(s)", failures)
                     failures = 0
-                    error_logged = False
+                    error_logged = outage_logged = False
             except redis_clients.RedisError as error:
                 # A Redis restarted without persistence, or flushed, loses the group; XADD recreates only the
                 # stream, so every read fails until the group is created again.
                 group_missing = isinstance(error, redis_clients.ResponseError) and str(error).startswith("NOGROUP")
-                # An unreachable Redis is an outage, worth one warning per streak. The first other failure of a
-                # streak is a defect worth a traceback, even after an outage (a Redis back without its data lost
-                # the group); the repeats only say it goes on.
+                # An unreachable Redis is an outage, worth one warning per streak, and any other failure is a
+                # defect worth one traceback per streak, whichever comes first: a Redis back without its data
+                # lost the group after the outage, and an outage can follow a refused command. The repeats only
+                # say it goes on.
                 unreachable = redis_clients.is_unreachable(error)
                 if not unreachable and not error_logged:
                     logger.error("Event bus consumer poll failed", exc_info=error)
                     error_logged = True
-                elif unreachable and failures == 0:
+                elif unreachable and not outage_logged:
                     logger.warning(
                         "Event bus consumer cannot reach Redis; retrying", extra={"error": type(error).__name__}
                     )
+                    outage_logged = True
                 else:
                     logger.debug("Event bus consumer poll failed again (%d in a row): %r", failures + 1, error)
                 stop.wait(timeout=backoff_delay(failures, base=_RETRY_BASE_SECONDS, maximum=_RETRY_MAX_SECONDS))
