@@ -13,7 +13,6 @@ Private to JASIL: hosts reach it only through
 import itertools
 import logging
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
@@ -55,8 +54,8 @@ TRANSIENT_RETRY_SECONDS = 30.0
 class Outcome[S, B]:
     """What building from ``settings`` produced: a ``backend``, or the ``rejection`` reason.
 
-    ``retry_at`` (a ``time.monotonic`` instant) is set only for a transient
-    failure: until then the outcome is reused, after it the build runs again.
+    ``retry_at`` (an instant on the clock's monotonic reading) is set only for a
+    transient failure: until then the outcome is reused, after it the build runs again.
     """
 
     settings: S
@@ -79,12 +78,14 @@ class ReloadingBackend[S, B]:
             outside the lock, and may raise.
         build: Builds a backend from settings, raising ``ValueError`` (with a
             message that carries no setting's value) when they are unusable.
+        clock: Times the retry of a transient build failure.
     """
 
-    def __init__(self, label: str, source: Callable[[], S], build: Callable[[S], B]) -> None:
+    def __init__(self, label: str, source: Callable[[], S], build: Callable[[S], B], clock: ClockProvider) -> None:
         self._label = label
         self._source = source
         self._build = build
+        self._clock = clock
         self._lock = threading.Lock()
         self._current: Outcome[S, B] | None = None
         self._source_failing = False
@@ -143,16 +144,15 @@ class ReloadingBackend[S, B]:
             type(error).__name__,
         )
 
-    @staticmethod
-    def _retry_due(current: Outcome[S, B]) -> bool:
-        return current.retry_at is not None and time.monotonic() >= current.retry_at
+    def _retry_due(self, current: Outcome[S, B]) -> bool:
+        return current.retry_at is not None and self._clock.monotonic() >= current.retry_at
 
     def _rebuild(self, fresh: S) -> Outcome[S, B]:
         try:
             return Outcome(fresh, self._build(fresh))
         except TransientBuildError as error:
             logger.warning("%s settings could not be verified, will retry: %s", self._label, error)
-            return Outcome(fresh, None, str(error), retry_at=time.monotonic() + TRANSIENT_RETRY_SECONDS)
+            return Outcome(fresh, None, str(error), retry_at=self._clock.monotonic() + TRANSIENT_RETRY_SECONDS)
         except ValueError as error:
             logger.error("%s settings rejected: %s", self._label, error)
             return Outcome(fresh, None, str(error))
@@ -164,10 +164,21 @@ class ReloadingBackend[S, B]:
 
 
 class ReloadingMail:
-    """``MailProvider`` that sends through the backend the latest mail settings describe."""
+    """``MailProvider`` that sends through the backend the latest mail settings describe.
 
-    def __init__(self, source: Callable[[], MailSettings], build: Callable[[MailSettings], MailProvider]) -> None:
-        self._backend: ReloadingBackend[MailSettings, MailProvider] = ReloadingBackend("Mail", source, build)
+    Args:
+        source: Returns the current mail settings; may raise.
+        build: Builds a backend from settings.
+        clock: Times the retry of settings that could not be verified.
+    """
+
+    def __init__(
+        self,
+        source: Callable[[], MailSettings],
+        build: Callable[[MailSettings], MailProvider],
+        clock: ClockProvider,
+    ) -> None:
+        self._backend: ReloadingBackend[MailSettings, MailProvider] = ReloadingBackend("Mail", source, build, clock)
 
     def current_backend(self) -> MailProvider | None:
         """The backend built from the latest settings, without consulting the source."""
@@ -201,7 +212,8 @@ class ReloadingGeocoding:
     Args:
         source: Returns the current geocoding settings; may raise.
         build: Builds a backend from settings.
-        clock: Sets ``retry_at`` when the settings cannot be loaded or verified.
+        clock: Sets ``retry_at`` when the settings cannot be loaded or verified, and times the retry of a
+            verification.
     """
 
     def __init__(
@@ -211,7 +223,7 @@ class ReloadingGeocoding:
         clock: ClockProvider,
     ) -> None:
         self._backend: ReloadingBackend[GeocodingSettings, GeocodingProvider] = ReloadingBackend(
-            "Geocoding", source, build
+            "Geocoding", source, build, clock
         )
         self._clock = clock
 

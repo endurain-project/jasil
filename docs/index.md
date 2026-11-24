@@ -174,9 +174,10 @@ def jasil(tmp_path):
 ```
 
 `install_test_platform` roots local storage inside `tmp_path`, installs a
-`FixedClock` so lease expiry, retry backoff and retention windows can be
-exercised without sleeping, and — the part that is easy to forget — *publishes*
-the platform, without which every `publish` raises.
+`FixedClock` so lease expiry, retry backoff, retention windows, `memory://`
+state expiry and rate-gate turns can be exercised without sleeping, and — the
+part that is easy to forget — *publishes* the platform, without which every
+`publish` raises.
 
 Map the models once for the whole session, though. `reset_all` deliberately
 leaves the declarative base alone: JASIL's model modules capture it at import

@@ -8,6 +8,26 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+**Breaking for a host that implements `ClockProvider` itself**: the protocol has a new method, `sleep`. Under `jasil.testing.install_test_platform`, `memory://` state now stands still until the test advances the clock; see **Upgrading**.
+
+### Added
+
+- **`ClockProvider.sleep(seconds)`** waits on the clock. `SystemClock` blocks in `time.sleep`. `jasil.testing.FixedClock.sleep` advances the clock instead, and refuses a negative length as `time.sleep` does.
+
+### Changed
+
+- **Every in-process backend reads the platform clock**, so a test that installs a `FixedClock` drives it with `advance` instead of sleeping. In production `SystemClock` reads the same clocks as before.
+  - `memory://` state uses it for key and index expiry, for the `reserve_slot` and `reserve_send` gates (a booked turn is taken once the clock reaches it), and for the lockout deadline of `record_tiered_failure`.
+  - Local storage stamps the initiation time of a resumable upload session, which `cleanup_uploads` compares with its cutoff, from the clock's wall time.
+  - The HTTP geocoder waits for a turn within `max_wait_seconds` with the clock's `sleep`.
+  - A mail or geocoding source whose settings could not be verified is retried on the clock.
+- The backend constructors `MemoryState(clock)` and `LocalStorage(base_dir, ..., clock=...)` take the clock as a required argument. Backend classes are not covered by SemVer; `build_platform` passes the platform clock.
+
+### Upgrading
+
+- **A host that implements `ClockProvider` must add `sleep(seconds)`.** Its clock stops passing `isinstance(clock, ClockProvider)` until it does.
+- **A host test on `install_test_platform` advances the `FixedClock` instead of waiting.** A `memory://` key, a rate-gate turn or a `record_tiered_failure` lockout no longer lapses in real time, and a lockout's `locked_until_epoch` is measured from the `FixedClock`, not from `time.time()`.
+
 ## [0.24.2] - 2026-11-24
 
 ### Changed

@@ -261,7 +261,7 @@ class HttpGeocoding:
             ``"https://nominatim.openstreetmap.org/reverse"``. Built by the
             composition root, which is also where the host was validated.
         state: Holds the rate gate and the upstream's back-off.
-        clock: Sets ``retry_at`` and reads the back-off against it.
+        clock: Sets ``retry_at``, reads the back-off against it, and waits out a turn within the wait bound.
         api_key: API key, for the services that require one (geocode.maps.co).
         min_interval_seconds: Minimum gap between two requests to this upstream, at most a day. ``0`` disables
             throttling.
@@ -352,7 +352,7 @@ class HttpGeocoding:
                 logger.debug("Reverse-geocoding via %s deferred: no request slot within the wait bound", self._service)
                 return self._clock.now() + timedelta(seconds=slot.wait_seconds)
             if slot.wait_seconds > 0:
-                time.sleep(slot.wait_seconds)
+                self._clock.sleep(slot.wait_seconds)
                 return self._backed_off_until()
             return None
         except StateBackendUnavailableError as error:

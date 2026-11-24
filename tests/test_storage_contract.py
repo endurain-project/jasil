@@ -19,6 +19,7 @@ from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 
 from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader
+from jasil.backends.clock_system import SystemClock
 from jasil.backends.storage_local import LocalStorage
 from jasil.backends.storage_s3 import S3Storage
 from jasil.providers import (
@@ -358,7 +359,7 @@ class TestExactSizeReader:
 @pytest.fixture(params=["local", "s3"])
 def storage(request, tmp_path):
     if request.param == "local":
-        return LocalStorage(str(tmp_path))
+        return LocalStorage(str(tmp_path), clock=SystemClock())
     return S3Storage(_MemoryS3Client(), "blobs", "jasil")
 
 
@@ -375,7 +376,7 @@ class TestStorageProtocolConformance:
 
 
 def test_plain_local_and_s3_areas_match_for_non_conflicting_keys(tmp_path):
-    local = LocalStorage(str(tmp_path), plain_areas=frozenset({AREA}))
+    local = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({AREA}))
     s3 = S3Storage(_MemoryS3Client(), "blobs", "jasil")
     objects = {"manifest.json": b"manifest", "processed/42.fit": b"activity"}
 

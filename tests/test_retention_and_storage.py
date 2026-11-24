@@ -24,6 +24,8 @@ import jasil.jobs.outbox as jobs_outbox
 import jasil.retention as retention
 import jasil.runtime as runtime
 import jasil.settings as settings
+import jasil.testing as jasil_testing
+from jasil.backends.clock_system import SystemClock
 from jasil.backends.lock_noop import NoopLock
 from jasil.backends.storage_local import LocalStorage
 from jasil.event_log.models import EventLog
@@ -314,11 +316,11 @@ class TestScheduleRetentionMaintenance:
 class TestLocalStorage:
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), url_prefix="/media")
+        return LocalStorage(str(tmp_path), clock=SystemClock(), url_prefix="/media")
 
     @pytest.fixture
     def legacy_storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), url_prefix="/media", legacy_layout=True)
+        return LocalStorage(str(tmp_path), clock=SystemClock(), url_prefix="/media", legacy_layout=True)
 
     def test_a_key_component_too_long_for_the_filesystem_is_simply_absent_from_the_legacy_layout(
         self, legacy_storage, tmp_path, caplog
@@ -347,7 +349,7 @@ class TestLocalStorage:
         assert storage.save("thumbnails", "1.webp", b"x") == "1.webp"
 
     def test_plain_area_round_trips_through_visible_paths_without_identity_files(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         area = tmp_path / "activity_files"
         path = area / "processed" / "42.fit"
 
@@ -366,7 +368,7 @@ class TestLocalStorage:
         assert storage.url("activity_files", "processed/42.fit") == "/activity_files/processed/42.fit"
 
     def test_plain_area_supports_streams_copy_and_prefix_deletion(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files", "archive"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files", "archive"}))
         storage.save_stream("activity_files", "processed/42.fit", io.BytesIO(b"activity"))
 
         storage.copy("activity_files", "processed/42.fit", "archive", "42.fit")
@@ -376,7 +378,7 @@ class TestLocalStorage:
         assert storage.list_keys("activity_files") == []
 
     def test_plain_area_uploads_commit_to_the_plain_layout(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         session = storage.begin_upload("activity_files", "processed/42.fit")
         part = _upload_part(storage, session, 1, b"activity")
 
@@ -390,7 +392,7 @@ class TestLocalStorage:
         [("a", "a/b"), ("a/b", "a")],
     )
     def test_plain_area_rejects_file_and_directory_key_conflicts(self, tmp_path, first_key, second_key):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", first_key, b"first")
 
         with pytest.raises(StorageKeyConflictError, match="file/directory conflict"):
@@ -401,7 +403,7 @@ class TestLocalStorage:
 
     @pytest.mark.parametrize("probe", ["exists", "is_dir"])
     def test_plain_conflict_checks_translate_filesystem_errors(self, tmp_path, monkeypatch, probe):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         conflict_parent = tmp_path / "activity_files" / "a"
         conflict_parent.mkdir(parents=True)
         original_probe = getattr(Path, probe)
@@ -420,7 +422,7 @@ class TestLocalStorage:
         assert excinfo.value.transient is True
 
     def test_plain_stream_write_rejects_file_and_directory_key_conflicts(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "a", b"parent")
 
         with pytest.raises(StorageKeyConflictError, match="file/directory conflict"):
@@ -429,7 +431,7 @@ class TestLocalStorage:
         assert storage.get("activity_files", "a") == b"parent"
 
     def test_failed_plain_stream_write_does_not_leave_conflicting_directories(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         with pytest.raises(StorageSizeLimitError):
             storage.save_stream("activity_files", "a/b", io.BytesIO(b"too large"), max_bytes=1)
@@ -438,7 +440,7 @@ class TestLocalStorage:
         assert storage.save("activity_files", "a", b"parent") == "a"
 
     def test_plain_upload_completion_rechecks_key_conflicts(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         session = storage.begin_upload("activity_files", "a/b")
         part = _upload_part(storage, session, 1, b"child")
         storage.save("activity_files", "a", b"parent")
@@ -450,7 +452,7 @@ class TestLocalStorage:
         storage.abort_upload(session)
 
     def test_failed_plain_upload_completion_does_not_leave_conflicting_directories(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         session = storage.begin_upload("activity_files", "a/b")
         part = _upload_part(storage, session, 1, b"child")
         invalid_part = PartRef(part_number=part.part_number, size=part.size, validator="wrong")
@@ -463,9 +465,9 @@ class TestLocalStorage:
         storage.abort_upload(session)
 
     def test_plain_area_refuses_to_create_a_conflict_with_an_opaque_fallback(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "a/b", b"child")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         with pytest.raises(StorageKeyConflictError, match="file/directory conflict"):
             storage.save("activity_files", "a", b"parent")
@@ -473,17 +475,17 @@ class TestLocalStorage:
         assert storage.get("activity_files", "a/b") == b"child"
 
     def test_plain_area_refuses_a_nested_opaque_ancestor(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "a/b", b"parent")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         with pytest.raises(StorageKeyConflictError, match="file/directory conflict"):
             storage.save("activity_files", "a/b/c", b"child")
 
     def test_plain_area_reads_lists_and_migrates_opaque_objects_on_overwrite(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"old")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
 
         assert storage.get("activity_files", "processed/42.fit") == b"old"
@@ -503,9 +505,9 @@ class TestLocalStorage:
         assert opaque_path.exists() is False
 
     def test_plain_stream_overwrite_migrates_an_opaque_object(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"old")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
 
         storage.save_stream("activity_files", "processed/42.fit", io.BytesIO(b"new"))
@@ -514,9 +516,9 @@ class TestLocalStorage:
         assert opaque_path.exists() is False
 
     def test_plain_upload_overwrite_migrates_an_opaque_object(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"old")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
         session = storage.begin_upload("activity_files", "processed/42.fit")
         part = _upload_part(storage, session, 1, b"new")
@@ -527,9 +529,9 @@ class TestLocalStorage:
         assert opaque_path.exists() is False
 
     def test_plain_area_delete_removes_an_opaque_only_copy(self, tmp_path):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"old")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
 
         storage.delete("activity_files", "processed/42.fit")
@@ -538,9 +540,9 @@ class TestLocalStorage:
         assert storage.exists("activity_files", "processed/42.fit") is False
 
     def test_plain_area_delete_reports_opaque_unlink_failures(self, tmp_path, monkeypatch):
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"old")
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
         original_unlink = Path.unlink
 
@@ -557,7 +559,7 @@ class TestLocalStorage:
         assert storage.exists("activity_files", "processed/42.fit") is True
 
     def test_plain_stream_temporary_file_is_not_listed(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         original_replace = os.replace
 
         def inspect_before_replace(source, destination):
@@ -572,14 +574,14 @@ class TestLocalStorage:
         assert storage.list_keys("activity_files") == ["42.fit"]
 
     def test_plain_temporary_names_cannot_be_addressed_as_objects(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         temporary_key = f"{storage_local._PLAIN_TEMP_PREFIX}{'a' * 32}.tmp"
 
         with pytest.raises(ValueError, match="reserved local staging name"):
             storage.save("activity_files", temporary_key, b"not an object")
 
     def test_plain_upload_temporary_file_is_not_listed(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         session = storage.begin_upload("activity_files", "42.fit")
         part = _upload_part(storage, session, 1, b"activity")
         original_replace = os.replace
@@ -596,7 +598,7 @@ class TestLocalStorage:
         assert storage.list_keys("activity_files") == ["42.fit"]
 
     def test_cleanup_removes_abandoned_plain_write_temporary_files(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         staging_root = storage._upload_root()
         staging_root.mkdir()
         temporary_file = staging_root / f"{storage_local._PLAIN_TEMP_PREFIX}{'a' * 32}.tmp"
@@ -607,7 +609,7 @@ class TestLocalStorage:
         assert temporary_file.exists() is False
 
     def test_plain_save_is_atomic_when_replacement_fails(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "42.fit", b"old")
         original_replace = os.replace
 
@@ -628,7 +630,7 @@ class TestLocalStorage:
 
     def test_opaque_save_is_atomic_when_replacement_fails(self, tmp_path, monkeypatch):
         """An overwrite that fails part-way must leave the previous object, never a torn new one."""
-        storage = LocalStorage(str(tmp_path))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock())
         storage.save("avatars", "42.webp", b"old")
         payload = storage._resolve("avatars", "42.webp")
         original_replace = os.replace
@@ -647,9 +649,9 @@ class TestLocalStorage:
         assert sorted(path.name for path in payload.parent.iterdir()) == sorted(["key", payload.name])
 
     def test_plain_area_delete_removes_plain_and_opaque_copies(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         storage.save("activity_files", "processed/42.fit", b"plain")
-        opaque = LocalStorage(str(tmp_path))
+        opaque = LocalStorage(str(tmp_path), clock=SystemClock())
         opaque.save("activity_files", "processed/42.fit", b"opaque")
         opaque_path = opaque._resolve("activity_files", "processed/42.fit")
 
@@ -660,7 +662,7 @@ class TestLocalStorage:
         assert storage.exists("activity_files", "processed/42.fit") is False
 
     def test_plain_area_rejects_symlinked_paths_and_omits_symlinks_from_lists(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         outside = tmp_path / "outside.fit"
         outside.write_bytes(b"outside")
         area = tmp_path / "activity_files"
@@ -672,7 +674,7 @@ class TestLocalStorage:
         assert storage.list_keys("activity_files") == []
 
     def test_plain_area_rejects_a_symlinked_directory_component(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         outside = tmp_path / "outside"
         outside.mkdir()
         (tmp_path / "activity_files").mkdir()
@@ -682,7 +684,7 @@ class TestLocalStorage:
             storage.save("activity_files", "processed/42.fit", b"unsafe")
 
     def test_plain_delete_prefix_rejects_a_symlinked_prefix(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         outside = tmp_path / "outside"
         outside.mkdir()
         area = tmp_path / "activity_files"
@@ -694,7 +696,7 @@ class TestLocalStorage:
 
     @pytest.mark.parametrize("operation", ["save", "save_stream", "complete_upload"])
     def test_plain_writes_support_long_filename_components(self, tmp_path, operation):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         key = "x" * 240
 
         if operation == "save":
@@ -710,7 +712,7 @@ class TestLocalStorage:
 
     @pytest.mark.parametrize("operation", ["save", "save_stream", "complete_upload"])
     def test_plain_writes_recreate_a_parent_removed_before_atomic_replace(self, tmp_path, monkeypatch, operation):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         key = "processed/42.fit"
         destination = tmp_path / "activity_files" / key
         payload = b"activity"
@@ -743,7 +745,7 @@ class TestLocalStorage:
         assert storage.get("activity_files", key) == payload
 
     def test_plain_area_rejects_traversal(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         with pytest.raises(ValueError, match="escapes base directory"):
             storage.save("activity_files", "../outside.fit", b"unsafe")
@@ -815,7 +817,7 @@ class TestLocalStorage:
         base.mkdir()
         outside.mkdir()
         (base / "activity_files").symlink_to(outside, target_is_directory=True)
-        storage = LocalStorage(str(base), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(base), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         with pytest.raises(ValueError, match="escapes base directory"):
             storage.save("activity_files", "a.fit", b"x")
@@ -1028,7 +1030,7 @@ class TestLocalStorage:
             content_type="application/octet-stream",
         )
         tail = _upload_part(storage, session, 2, b"tail")
-        other_instance = LocalStorage(str(tmp_path), url_prefix="/media")
+        other_instance = LocalStorage(str(tmp_path), clock=SystemClock(), url_prefix="/media")
         first = _upload_part(other_instance, session, 1, b"a" * session.min_part_size)
 
         assert storage.get("packages", "release.bin") == b"previous"
@@ -1091,13 +1093,15 @@ class TestLocalStorage:
             storage.complete_upload(session, [part])
         assert storage.exists("packages", "release.bin") is False
 
-    def test_cleanup_removes_only_sessions_older_than_the_cutoff(self, storage, monkeypatch):
-        monkeypatch.setattr(storage_local.time, "time", lambda: 10.0)
+    def test_cleanup_removes_only_sessions_older_than_the_cutoff(self, tmp_path):
+        """A session is aged by the clock the storage is given, so a test ages it by advancing that clock."""
+        clock = jasil_testing.FixedClock()
+        storage = LocalStorage(str(tmp_path), url_prefix="/media", clock=clock)
         old_session = storage.begin_upload("packages", "old.bin")
-        monkeypatch.setattr(storage_local.time, "time", lambda: 20.0)
+        clock.advance(10)
         current_session = storage.begin_upload("packages", "current.bin")
 
-        assert storage.cleanup_uploads(older_than_epoch=15.0) == 1
+        assert storage.cleanup_uploads(older_than_epoch=clock.now().timestamp() - 5) == 1
 
         with pytest.raises(StorageUploadSessionError, match="not active"):
             _upload_part(storage, old_session, 1, b"old")
@@ -1146,7 +1150,7 @@ class TestLocalStorage:
         outside = tmp_path / "outside"
         outside.mkdir()
         (base / storage_local._UPLOADS_DIRECTORY).symlink_to(outside, target_is_directory=True)
-        storage = LocalStorage(str(base))
+        storage = LocalStorage(str(base), clock=SystemClock())
 
         with pytest.raises(StorageBackendUnavailableError, match="unsafe"):
             storage.begin_upload("packages", "release.bin")
@@ -1363,8 +1367,9 @@ class TestLocalStorage:
 
         assert storage.cleanup_uploads(older_than_epoch=20.0) == 1
 
-    def test_manifest_timestamp_tampering_cannot_postpone_cleanup(self, storage, tmp_path, monkeypatch):
-        monkeypatch.setattr(storage_local.time, "time", lambda: 10.0)
+    def test_manifest_timestamp_tampering_cannot_postpone_cleanup(self, tmp_path):
+        clock = jasil_testing.FixedClock()
+        storage = LocalStorage(str(tmp_path), url_prefix="/media", clock=clock)
         session = storage.begin_upload("packages", "release.bin")
         manifest_path = (
             tmp_path / storage_local._UPLOADS_DIRECTORY / session.session_id / storage_local._UPLOAD_MANIFEST
@@ -1373,7 +1378,7 @@ class TestLocalStorage:
         manifest["created_epoch"] = 1_000_000_000_000.0
         manifest_path.write_text(json.dumps(manifest))
 
-        assert storage.cleanup_uploads(older_than_epoch=20.0) == 1
+        assert storage.cleanup_uploads(older_than_epoch=clock.now().timestamp() + 10) == 1
 
     @pytest.mark.parametrize("failure", [FileNotFoundError(), OSError("storage unavailable")])
     def test_cleanup_handles_removal_races_and_failures(self, storage, monkeypatch, failure):
@@ -1622,7 +1627,7 @@ class TestLocalStorage:
         assert isinstance(excinfo.value.__cause__, OSError)
 
     def test_a_missing_storage_root_is_not_reported_writable(self, tmp_path):
-        storage = LocalStorage(str(tmp_path / "detached-volume"))
+        storage = LocalStorage(str(tmp_path / "detached-volume"), clock=SystemClock())
 
         with pytest.raises(StorageBackendUnavailableError):
             storage.check_writable()
@@ -1729,7 +1734,7 @@ class TestLocalStorageDurability:
 
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        return LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"plain"}))
 
     @staticmethod
     def _record(monkeypatch, published):
@@ -1801,7 +1806,7 @@ class TestLocalStorageDurability:
 class TestLocalStorageFailedWrites:
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        return LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"plain"}))
 
     @staticmethod
     def _identity_files(root):
@@ -1826,7 +1831,7 @@ class TestLocalStorageFailedWrites:
 
 class TestLocalStorageListingGuards:
     def test_a_symlink_loop_in_a_legacy_area_does_not_break_listing(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), legacy_layout=True)
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), legacy_layout=True)
         area = tmp_path / "leg"
         area.mkdir()
         (area / "ok.txt").write_bytes(b"x")
@@ -1835,7 +1840,7 @@ class TestLocalStorageListingGuards:
         assert storage.list_keys("leg") == ["ok.txt"]
 
     def test_a_symlink_loop_in_a_plain_area_does_not_break_listing(self, tmp_path):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"plain"}))
         area = tmp_path / "plain"
         area.mkdir()
         (area / "ok.txt").write_bytes(b"x")
@@ -1867,7 +1872,7 @@ class TestLocalStorageNameAliases:
     def storage(self, tmp_path):
         if not _folds(tmp_path, "probe", "PROBE"):
             pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
-        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+        storage = LocalStorage(str(tmp_path / "data"), clock=SystemClock(), plain_areas=frozenset({self.AREA}))
         storage.save(self.AREA, "alice/Report.pdf", b"alice")
         return storage
 
@@ -1908,7 +1913,7 @@ class TestLocalStorageNameAliases:
     def test_a_legacy_object_is_not_reached_through_another_spelling(self, tmp_path):
         if not _folds(tmp_path, "probe", "PROBE"):
             pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
-        storage = LocalStorage(str(tmp_path / "data"), legacy_layout=True)
+        storage = LocalStorage(str(tmp_path / "data"), clock=SystemClock(), legacy_layout=True)
         legacy = tmp_path / "data" / "avatars" / "alice"
         legacy.mkdir(parents=True)
         (legacy / "me.png").write_bytes(b"alice")
@@ -1924,7 +1929,7 @@ class TestLocalStorageNameAliases:
         composed, decomposed = "café.txt", "café.txt"
         if not _folds(tmp_path, composed, decomposed):
             pytest.skip("the filesystem keeps Unicode normalization forms apart, so they cannot alias")
-        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+        storage = LocalStorage(str(tmp_path / "data"), clock=SystemClock(), plain_areas=frozenset({self.AREA}))
         storage.save(self.AREA, composed, b"composed")
 
         assert storage.get(self.AREA, decomposed) is None
@@ -1944,7 +1949,7 @@ class TestLocalStorageSpellingCheckFailures:
         monkeypatch.setattr(storage_local.os, "listdir", listdir)
 
     def test_a_directory_that_cannot_be_listed_makes_the_backend_unavailable(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"plain"}))
         storage.save("plain", "a/b.txt", b"x")
         self._failing_listdir(monkeypatch, PermissionError("denied"))
 
@@ -1954,7 +1959,7 @@ class TestLocalStorageSpellingCheckFailures:
             storage.save("plain", "a/b.txt", b"y")
 
     def test_a_directory_removed_while_it_is_checked_holds_nothing(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path), plain_areas=frozenset({"plain"}))
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), plain_areas=frozenset({"plain"}))
         storage.save("plain", "a/b.txt", b"x")
         self._failing_listdir(monkeypatch, FileNotFoundError("gone"))
 
@@ -1963,7 +1968,7 @@ class TestLocalStorageSpellingCheckFailures:
     def test_a_legacy_copy_that_cannot_be_checked_does_not_fail_the_committed_write(
         self, tmp_path, monkeypatch, caplog
     ):
-        storage = LocalStorage(str(tmp_path), legacy_layout=True)
+        storage = LocalStorage(str(tmp_path), clock=SystemClock(), legacy_layout=True)
         (tmp_path / "avatars").mkdir()
         (tmp_path / "avatars" / "me.png").write_bytes(b"old")
         self._failing_listdir(monkeypatch, PermissionError("denied"))
@@ -1979,7 +1984,7 @@ class TestLocalStorageConcurrentDelete:
 
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), url_prefix="/media")
+        return LocalStorage(str(tmp_path), clock=SystemClock(), url_prefix="/media")
 
     @pytest.mark.parametrize(
         "write",
@@ -2028,7 +2033,7 @@ class TestLocalStoragePlainFirstWriteRace:
     def storage(self, tmp_path):
         if not _folds(tmp_path, "probe", "PROBE"):
             pytest.skip("the filesystem keeps names that differ in case apart, so they cannot alias")
-        return LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({self.AREA}))
+        return LocalStorage(str(tmp_path / "data"), clock=SystemClock(), plain_areas=frozenset({self.AREA}))
 
     @staticmethod
     def _after_first_call(monkeypatch, owner, name, action):
@@ -2128,7 +2133,7 @@ class TestLocalStoragePlainFirstWriteRace:
 
 class TestLocalStoragePlainRequiresHardLinks:
     def test_a_filesystem_without_hard_links_cannot_write_a_plain_area(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path / "data"), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
 
         def refuse(*args, **kwargs):
             raise OSError(errno.EPERM, "hard links are not supported")
@@ -2145,7 +2150,7 @@ class TestLocalStoragePlainRequiresHardLinks:
 
 class TestLocalStoragePlainPublishFailures:
     def test_a_directory_that_cannot_be_listed_when_publishing_leaves_no_temporary_file(self, tmp_path, monkeypatch):
-        storage = LocalStorage(str(tmp_path / "data"), plain_areas=frozenset({"activity_files"}))
+        storage = LocalStorage(str(tmp_path / "data"), clock=SystemClock(), plain_areas=frozenset({"activity_files"}))
         original = storage._prepare_object
 
         def prepare_then_fail_listing(area, key):
@@ -2167,7 +2172,7 @@ class TestLocalStorageIdentityRemovalRace:
 
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path))
+        return LocalStorage(str(tmp_path), clock=SystemClock())
 
     @staticmethod
     def _save_before_identity_unlink(monkeypatch, storage, key):
@@ -2213,7 +2218,7 @@ class TestLocalStorageFilesystemFailures:
 
     @pytest.fixture
     def storage(self, tmp_path):
-        return LocalStorage(str(tmp_path), url_prefix="/media")
+        return LocalStorage(str(tmp_path), clock=SystemClock(), url_prefix="/media")
 
     @pytest.fixture
     def read_only(self):

@@ -64,54 +64,57 @@ def _settings(**kwargs) -> settings.JasilSettings:
 
 
 def _geocoding(jasil_settings: settings.JasilSettings, state=None):
-    return container._build_geocoding(jasil_settings, state or MemoryState(), SystemClock())
+    return container._build_geocoding(jasil_settings, state or MemoryState(SystemClock()), SystemClock())
 
 
 class TestStateResolution:
     def test_memory_uri_selects_the_in_process_backend(self):
-        assert isinstance(container._build_state(_settings(state_uri="memory://")), MemoryState)
+        assert isinstance(container._build_state(_settings(state_uri="memory://"), SystemClock()), MemoryState)
 
     @pytest.mark.parametrize("uri", ["redis://c:6379/0", "rediss://c:6379/0", "unix:///run/redis.sock"])
     def test_every_redis_scheme_selects_the_redis_backend(self, uri):
-        assert isinstance(container._build_state(_settings(state_uri=uri)), RedisState)
+        assert isinstance(container._build_state(_settings(state_uri=uri), SystemClock()), RedisState)
 
     def test_an_unknown_scheme_is_refused(self):
         """Failing to start beats silently running on the wrong backend."""
         with pytest.raises(ValueError, match="Unsupported state_uri scheme"):
-            container._build_state(_settings(state_uri="mysql://db"))
+            container._build_state(_settings(state_uri="mysql://db"), SystemClock())
 
     def test_none_is_not_accepted_because_state_is_not_optional(self):
         with pytest.raises(ValueError, match="Unsupported state_uri scheme"):
-            container._build_state(_settings(state_uri="none://"))
+            container._build_state(_settings(state_uri="none://"), SystemClock())
 
 
 class TestStorageResolution:
     def test_local_uri_selects_the_filesystem_backend(self):
-        assert isinstance(container._build_storage(_settings(storage_uri="local://")), LocalStorage)
+        assert isinstance(container._build_storage(_settings(storage_uri="local://"), SystemClock()), LocalStorage)
 
     def test_the_data_dir_roots_the_local_backend(self, tmp_path):
-        storage = container._build_storage(_settings(storage_uri="local://", data_dir=str(tmp_path)))
+        storage = container._build_storage(_settings(storage_uri="local://", data_dir=str(tmp_path)), SystemClock())
 
         assert str(tmp_path) in str(storage._base)
 
     def test_a_path_in_the_uri_overrides_the_data_dir(self, tmp_path):
-        storage = container._build_storage(_settings(storage_uri=f"local://{tmp_path}", data_dir="/unused"))
+        storage = container._build_storage(
+            _settings(storage_uri=f"local://{tmp_path}", data_dir="/unused"), SystemClock()
+        )
 
         assert "/unused" not in str(storage._base)
 
     def test_an_unknown_scheme_is_refused(self):
         with pytest.raises(ValueError, match="Unsupported storage_uri scheme"):
-            container._build_storage(_settings(storage_uri="ftp://files"))
+            container._build_storage(_settings(storage_uri="ftp://files"), SystemClock())
 
     def test_none_uri_disables_storage(self):
-        assert isinstance(container._build_storage(_settings(storage_uri="none://")), NullStorage)
+        assert isinstance(container._build_storage(_settings(storage_uri="none://"), SystemClock()), NullStorage)
 
     def test_s3_ignores_local_plain_area_settings(self):
         storage = container._build_storage(
             _settings(
                 storage_uri="s3://bucket",
                 storage=settings.StorageSettings(local_plain_areas=frozenset({"activity_files"})),
-            )
+            ),
+            SystemClock(),
         )
 
         assert isinstance(storage, S3Storage)
@@ -119,7 +122,7 @@ class TestStorageResolution:
 
 class TestLocalStorageSettings:
     def test_the_defaults_serve_from_the_root_with_no_flat_layout(self, tmp_path):
-        storage = container._build_storage(_settings(data_dir=str(tmp_path)))
+        storage = container._build_storage(_settings(data_dir=str(tmp_path)), SystemClock())
 
         assert storage._url_prefix == ""
         assert storage._legacy_layout is False
@@ -134,7 +137,8 @@ class TestLocalStorageSettings:
                     local_legacy_layout=True,
                     local_plain_areas=frozenset({"activity_files"}),
                 ),
-            )
+            ),
+            SystemClock(),
         )
 
         assert storage._url_prefix == "/media"
@@ -445,7 +449,12 @@ class TestAUriIsNeverEchoed:
     )
     @pytest.mark.parametrize("uri", ["redis:/:S3CRETPW@cache:6379/0", "mysql://:S3CRETPW@db/x"])
     def test_an_unsupported_uri_is_refused_without_its_secret(self, build, setting, uri):
-        arguments = (_settings(**{setting: uri}),) + ((None,) if build is container._build_events else ())
+        extra = {
+            container._build_events: (None,),
+            container._build_state: (SystemClock(),),
+            container._build_storage: (SystemClock(),),
+        }
+        arguments = (_settings(**{setting: uri}), *extra.get(build, ()))
 
         with pytest.raises(ValueError, match=setting) as excinfo:
             build(*arguments)
@@ -536,7 +545,7 @@ class TestBuildPlatform:
         platform = container.build_platform(_settings(data_dir=str(tmp_path)))
 
         with pytest.raises(dataclasses.FrozenInstanceError):
-            platform.state = MemoryState()  # type: ignore[misc]
+            platform.state = MemoryState(SystemClock())  # type: ignore[misc]
 
     def test_a_distributed_profile_without_uris_fails_fast(self):
         with pytest.raises(ValueError, match="must be set explicitly"):

@@ -59,12 +59,13 @@ DEFAULT_NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
 class FixedClock:
     """A ``ClockProvider`` whose time only moves when a test moves it.
 
-    Lease expiry, retry backoff, and retention windows are all measured against
-    the platform clock, so injecting this is what lets a suite exercise them
-    without sleeping.
+    Lease expiry, retry backoff, retention windows, in-memory state expiry and
+    rate gates are all measured against the platform clock, so injecting this is
+    what lets a suite exercise them without sleeping.
 
     ``monotonic`` advances in lockstep with ``now`` rather than tracking the real
-    clock, so code measuring an elapsed duration sees the time the test moved.
+    clock, so code measuring an elapsed duration sees the time the test moved,
+    and :meth:`sleep` advances both instead of blocking.
 
     Attributes:
         moment: The instant :meth:`now` returns.
@@ -88,6 +89,19 @@ class FixedClock:
                 which is occasionally what a clock-skew test wants.
         """
         self.moment += timedelta(seconds=seconds)
+
+    def sleep(self, seconds: float) -> None:
+        """Advance by ``seconds`` at once, where the system clock would block for them.
+
+        Args:
+            seconds: How long the caller waits.
+
+        Raises:
+            ValueError: When ``seconds`` is negative, as ``time.sleep`` refuses it.
+        """
+        if seconds < 0:
+            raise ValueError("sleep length must be non-negative")
+        self.advance(seconds)
 
 
 def _prefer_memory(

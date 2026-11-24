@@ -1110,6 +1110,13 @@ class ClockProvider(Protocol):
     def monotonic(self) -> float:
         """Return a monotonic clock reading in seconds, for measuring elapsed time."""
 
+    def sleep(self, seconds: float) -> None:
+        """Wait ``seconds`` on this clock, so :meth:`now` and :meth:`monotonic` read that much later afterwards.
+
+        Raises:
+            ValueError: When ``seconds`` is negative.
+        """
+
 
 @dataclass(frozen=True)
 class GeocodedPlace:

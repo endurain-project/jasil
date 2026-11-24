@@ -76,7 +76,7 @@ class TestAStaleRead:
             builds.append(value)
             return f"backend-{value}"
 
-        backend = ReloadingBackend("Test", source, build)
+        backend = ReloadingBackend("Test", source, build, FixedClock())
         outcomes = []
         slow = threading.Thread(target=lambda: outcomes.append(backend.resolve()))
         slow.start()
@@ -92,14 +92,13 @@ class TestAStaleRead:
         assert outcomes[0].backend == "backend-B"
 
 
-def _mail(source, base: JasilSettings | None = None):
-    return container._build_runtime_mail(base or JasilSettings(), container.SystemClock(), source)
+def _mail(source, base: JasilSettings | None = None, clock=None):
+    return container._build_runtime_mail(base or JasilSettings(), clock or container.SystemClock(), source)
 
 
 def _geo(source, base: JasilSettings | None = None, state=None, clock=None):
-    return container._build_runtime_geocoding(
-        base or JasilSettings(), state or MemoryState(), clock or FixedClock(), source
-    )
+    clock = clock or FixedClock()
+    return container._build_runtime_geocoding(base or JasilSettings(), state or MemoryState(clock), clock, source)
 
 
 @pytest.fixture(autouse=True)
@@ -227,12 +226,12 @@ class TestRebuild:
         assert builds["geocoding"] == 2
         assert provider.current_backend()._api_key == "key-two"
 
-    def test_rebuilding_geocoding_keeps_the_rate_budget(self, monkeypatch):
+    def test_rebuilding_geocoding_keeps_the_rate_budget(self):
         """The gate lives in the platform state under the upstream's key, so a rebuilt backend finds its slots."""
-        monkeypatch.setattr("jasil.backends.state_memory.time.monotonic", lambda: 1000.0)
-        state = MemoryState()
+        clock = FixedClock()
+        state = MemoryState(clock)
         source = Source(GOOD_GEO)
-        provider = _geo(source, state=state)
+        provider = _geo(source, state=state, clock=clock)
         provider.reverse(1.0, 2.0)
         first = provider.current_backend()
         assert state.reserve_slot(first._gate_key, 1.0, max_wait_seconds=0).reserved
@@ -631,10 +630,9 @@ class TestTransientAndUnexpectedFailures:
 
     def test_an_unresolved_mail_relay_is_retried_after_the_delay(self, monkeypatch):
         calls = self._resolver(monkeypatch, fail_first=1)
-        now = [1000.0]
-        monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
+        clock = FixedClock()
         relay = MailSettings(uri="smtp://relay.internal", secure=False, from_address="a@example.org")
-        provider = _mail(Source(relay))
+        provider = _mail(Source(relay), clock=clock)
 
         with pytest.raises(MailError) as first:
             provider.send(MESSAGE)
@@ -644,22 +642,21 @@ class TestTransientAndUnexpectedFailures:
             provider.send(MESSAGE)
         assert calls["n"] == 1  # remembered until the delay passes
 
-        now[0] += reloading.TRANSIENT_RETRY_SECONDS
+        clock.advance(reloading.TRANSIENT_RETRY_SECONDS)
         assert provider._backend.resolve().backend is not None
         assert calls["n"] == 2
 
     def test_an_unresolved_geocoding_host_is_retried(self, monkeypatch):
         self._resolver(monkeypatch, fail_first=1)
-        now = [1000.0]
-        monkeypatch.setattr(reloading.time, "monotonic", lambda: now[0])
+        clock = FixedClock()
         # 10.0.0.5 is private, so the SSRF guard needs the allowlist to accept it.
         base = JasilSettings(network=NetworkSettings(ssrf_allowed_hosts=("geo.internal",)))
-        provider = _geo(Source(GeocodingSettings(uri="nominatim://geo.internal")), base)
+        provider = _geo(Source(GeocodingSettings(uri="nominatim://geo.internal")), base, clock=clock)
 
         assert provider.reverse(1.0, 2.0) is None
         assert provider.current_backend() is None
         assert provider.lookup(1.0, 2.0, max_wait_seconds=0).retry_at is not None
-        now[0] += reloading.TRANSIENT_RETRY_SECONDS
+        clock.advance(reloading.TRANSIENT_RETRY_SECONDS)
         provider.reverse(1.0, 2.0)
         assert isinstance(provider.current_backend(), HttpGeocoding)
 

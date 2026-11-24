@@ -52,9 +52,10 @@ URL = "https://geo.test/reverse"
 
 
 def _geocoder(service="nominatim", base_url=URL, *, state=None, clock=None, **kwargs) -> HttpGeocoding:
-    """An ``HttpGeocoding`` on a gate of its own, unless the test shares one."""
+    """An ``HttpGeocoding`` on a gate of its own, on the same clock, unless the test shares one."""
+    clock = clock or FixedClock()
     return HttpGeocoding(
-        service, base_url, state=state if state is not None else MemoryState(), clock=clock or FixedClock(), **kwargs
+        service, base_url, state=state if state is not None else MemoryState(clock), clock=clock, **kwargs
     )
 
 
@@ -538,7 +539,6 @@ class TestTheTransferHasADeadline:
     def test_a_transfer_past_the_deadline_resolves_to_none(self, monkeypatch, caplog):
         clock = itertools.count(1000, 10)  # every read of the clock is ten seconds after the last
         monkeypatch.setattr("jasil.backends.geocoding_http.time.monotonic", lambda: next(clock))
-        monkeypatch.setattr("jasil.backends.geocoding_http.time.sleep", lambda _seconds: None)
         responses.add(
             responses.GET,
             "https://geo.test/reverse",
@@ -664,12 +664,18 @@ PORTUGAL = {"address": {"country": "Portugal"}}
 
 
 @pytest.fixture
-def slept(monkeypatch):
-    """Record each wait instead of sleeping, on a monotonic clock that stands still."""
-    waits = []
-    monkeypatch.setattr(geocoding_http.time, "sleep", waits.append)
-    monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0)
-    return waits
+def gate_clock():
+    """One clock for the geocoder and its memory gate, recording each wait it is asked to sleep."""
+    clock = FixedClock()
+    clock.waits = []
+    advance = clock.sleep
+
+    def sleep(seconds):
+        clock.waits.append(seconds)
+        advance(seconds)
+
+    clock.sleep = sleep
+    return clock
 
 
 class TestTheRateGate:
@@ -677,39 +683,39 @@ class TestTheRateGate:
     rate and a settings reload does not reset it."""
 
     @responses.activate
-    def test_no_rate_limit_means_no_wait(self, slept):
+    def test_no_rate_limit_means_no_wait(self, gate_clock):
         responses.add(responses.GET, URL, json=PORTUGAL)
-        backend = _geocoder(min_interval_seconds=0)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=0)
 
         backend.reverse(38.7, -9.1)
         backend.reverse(38.7, -9.1)
 
-        assert slept == []
+        assert gate_clock.waits == []
         assert len(responses.calls) == 2
 
     @responses.activate
-    def test_a_second_call_waits_out_the_interval(self, slept):
+    def test_a_second_call_waits_out_the_interval(self, gate_clock):
         """Nominatim's policy is one request per second; exceeding it gets you banned."""
         responses.add(responses.GET, URL, json=PORTUGAL)
-        backend = _geocoder(min_interval_seconds=1.0)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=1.0)
 
         backend.reverse(38.7, -9.1)
         backend.reverse(38.7, -9.1)
 
-        assert slept == [pytest.approx(1.0)]
+        assert gate_clock.waits == [pytest.approx(1.0)]
 
     @responses.activate
-    def test_two_backends_on_one_state_share_the_budget(self, slept):
+    def test_two_backends_on_one_state_share_the_budget(self, gate_clock):
         """What two processes on one Redis, or a backend and its rebuild after a reload, look like."""
         responses.add(responses.GET, URL, json=PORTUGAL)
-        state = MemoryState()
-        first = _geocoder(state=state, min_interval_seconds=1.0)
-        second = _geocoder(state=state, min_interval_seconds=1.0)
+        state = MemoryState(gate_clock)
+        first = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
+        second = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
 
         first.reverse(38.7, -9.1)
         second.reverse(38.7, -9.1)
 
-        assert slept == [pytest.approx(1.0)]
+        assert gate_clock.waits == [pytest.approx(1.0)]
         assert state.get("jasil:geocoding:gate:nominatim:geo.test") is not None
 
     def test_the_host_is_matched_without_regard_to_case(self):
@@ -721,13 +727,13 @@ class TestTheRateGate:
     @responses.activate
     def test_a_back_off_recorded_while_waiting_for_a_slot_stops_the_request(self, monkeypatch):
         """A peer's 429 can arrive while this request sleeps for its slot; it must not then send anyway."""
-        monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0)
         responses.add(responses.GET, URL, json=PORTUGAL)
-        clock, state = FixedClock(), MemoryState()
+        clock = FixedClock()
+        state = MemoryState(clock)
         backend = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
         peer = _geocoder(clock=clock, state=state, min_interval_seconds=1.0)
         state.reserve_slot(backend._gate_key, 1.0, max_wait_seconds=0)  # the next slot is a second away
-        monkeypatch.setattr(geocoding_http.time, "sleep", lambda _seconds: peer._back_off("120"))
+        monkeypatch.setattr(clock, "sleep", lambda _seconds: peer._back_off("120"))
 
         outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
 
@@ -735,38 +741,41 @@ class TestTheRateGate:
         assert len(responses.calls) == 0
 
     @responses.activate
-    def test_backends_for_different_hosts_do_not_share_a_budget(self, slept):
+    def test_backends_for_different_hosts_do_not_share_a_budget(self, gate_clock):
         responses.add(responses.GET, "https://a.test/reverse", json=PORTUGAL)
         responses.add(responses.GET, "https://b.test/reverse", json=PORTUGAL)
-        state = MemoryState()
+        state = MemoryState(gate_clock)
 
-        _geocoder(base_url="https://a.test/reverse", state=state, min_interval_seconds=1.0).reverse(38.7, -9.1)
-        _geocoder(base_url="https://b.test/reverse", state=state, min_interval_seconds=1.0).reverse(38.7, -9.1)
+        _geocoder(base_url="https://a.test/reverse", clock=gate_clock, state=state, min_interval_seconds=1.0).reverse(
+            38.7, -9.1
+        )
+        _geocoder(base_url="https://b.test/reverse", clock=gate_clock, state=state, min_interval_seconds=1.0).reverse(
+            38.7, -9.1
+        )
 
-        assert slept == []
+        assert gate_clock.waits == []
 
     @responses.activate
-    def test_a_wait_past_the_bound_says_when_to_retry_without_sending(self, slept):
+    def test_a_wait_past_the_bound_says_when_to_retry_without_sending(self, gate_clock):
         responses.add(responses.GET, URL, json=PORTUGAL)
-        clock = FixedClock()
-        backend = _geocoder(clock=clock, min_interval_seconds=1.0)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=1.0)
         backend.lookup(38.7, -9.1, max_wait_seconds=0)
 
         outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0.5)
 
-        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=1))
+        assert outcome == GeocodingOutcome(None, gate_clock.now() + timedelta(seconds=1))
         assert len(responses.calls) == 1
-        assert slept == []
+        assert gate_clock.waits == []
 
     @responses.activate
-    def test_reverse_gives_up_on_a_wait_past_its_bound(self, slept):
+    def test_reverse_gives_up_on_a_wait_past_its_bound(self, gate_clock):
         responses.add(responses.GET, URL, json=PORTUGAL)
-        backend = _geocoder(min_interval_seconds=geocoding_http._REVERSE_MAX_WAIT_SECONDS + 1)
+        backend = _geocoder(clock=gate_clock, min_interval_seconds=geocoding_http._REVERSE_MAX_WAIT_SECONDS + 1)
         backend.reverse(38.7, -9.1)
 
         assert backend.reverse(38.7, -9.1) is None
         assert len(responses.calls) == 1
-        assert slept == []
+        assert gate_clock.waits == []
 
     @responses.activate
     def test_an_unreachable_state_defers_without_sending(self, caplog):
@@ -775,7 +784,7 @@ class TestTheRateGate:
                 raise StateBackendUnavailableError("down")
 
         clock = FixedClock()
-        backend = _geocoder(state=_Down(), clock=clock, min_interval_seconds=1.0)
+        backend = _geocoder(state=_Down(clock), clock=clock, min_interval_seconds=1.0)
 
         with caplog.at_level("WARNING"):
             outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
@@ -795,7 +804,7 @@ class TestTheRateGate:
                 raise ValueError("Redis refused the state operation: WRONGTYPE")
 
         clock = FixedClock()
-        backend = _geocoder(state=_Corrupt(), clock=clock, min_interval_seconds=1.0)
+        backend = _geocoder(state=_Corrupt(clock), clock=clock, min_interval_seconds=1.0)
 
         with caplog.at_level("WARNING"):
             outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
@@ -810,20 +819,6 @@ class TestTheRateGate:
     def test_a_max_wait_out_of_range_is_refused(self, max_wait):
         with pytest.raises(ValueError, match="max_wait_seconds"):
             _geocoder().lookup(38.7, -9.1, max_wait_seconds=max_wait)
-
-
-@pytest.fixture
-def gate_clock(monkeypatch):
-    """One instant for the geocoder's clock and the memory gate's monotonic clock, advanced together.
-
-    Each wait is recorded instead of slept.
-    """
-    clock = FixedClock()
-    start = clock.now()
-    clock.waits = []
-    monkeypatch.setattr(geocoding_http.time, "sleep", clock.waits.append)
-    monkeypatch.setattr(geocoding_http.time, "monotonic", lambda: 1000.0 + (clock.now() - start).total_seconds())
-    return clock
 
 
 def _advance_to(clock, moment):
@@ -880,7 +875,7 @@ class TestBookedLookups:
     @responses.activate
     def test_an_upstream_back_off_holds_a_booked_lookup_until_it_ends(self, gate_clock):
         responses.add(responses.GET, URL, json=PORTUGAL)
-        state = MemoryState()
+        state = MemoryState(gate_clock)
         backend = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
         peer = _geocoder(clock=gate_clock, state=state, min_interval_seconds=1.0)
         backend.lookup(38.7, -9.1, max_wait_seconds=0)
@@ -912,8 +907,8 @@ class TestLookupOutcomes:
         return FixedClock()
 
     @pytest.fixture
-    def state(self):
-        return MemoryState()
+    def state(self, clock):
+        return MemoryState(clock)
 
     @pytest.fixture
     def backend(self, clock, state):
@@ -983,7 +978,7 @@ class TestLookupOutcomes:
                 raise StateBackendUnavailableError("down")
 
         responses.add(responses.GET, URL, status=429, headers={"Retry-After": "120"}, json={})
-        backend = _geocoder(clock=clock, state=_ReadOnly())
+        backend = _geocoder(clock=clock, state=_ReadOnly(clock))
 
         with caplog.at_level("WARNING"):
             outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
