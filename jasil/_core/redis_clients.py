@@ -56,6 +56,26 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def is_unreachable(error: Exception) -> bool:
+    """Say whether ``error`` means Redis could not be reached for now, rather than that it refused the call.
+
+    A lost, refused or timed-out connection, a server still loading its dataset and an exhausted connection pool
+    are an outage that ends on its own. redis-py also files a refused login (``AuthenticationError``,
+    ``AuthorizationError``, ``ExternalAuthProviderError``) under ``ConnectionError``; no wait fixes those, so they
+    are not an outage, nor is any other ``RedisError``.
+
+    Args:
+        error: The exception a Redis call raised.
+
+    Returns:
+        True when Redis was unreachable.
+    """
+    import redis.exceptions as errors
+
+    refused_login = errors.AuthenticationError | errors.AuthorizationError | errors.ExternalAuthProviderError
+    return isinstance(error, errors.ConnectionError | errors.TimeoutError) and not isinstance(error, refused_login)
+
+
 # Redis matches ``SCAN``/``KEYS`` patterns with glob semantics (``stringmatchlen``),
 # where a backslash escapes the character after it.
 _GLOB_METACHARACTERS = frozenset("\\*?[]")

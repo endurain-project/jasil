@@ -8,6 +8,15 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.24.2] - 2026-11-24
+
+### Changed
+
+- **An unreachable Redis is logged as a warning, not an error**, as an unreachable database is since 0.23. A lost, refused or timed-out connection, or a server still loading its dataset, counts as unreachable; a refused login does not. See [When Redis is unreachable](docs/observability.md#when-redis-is-unreachable).
+  - The Redis event bus consumer logs "Event bus consumer cannot reach Redis; retrying" at WARNING, once per outage and without a traceback, instead of "Event bus consumer poll failed" at ERROR. Any other failure keeps that ERROR and its traceback, now also when it follows an outage in the same streak, so a consumer group lost while Redis was down is no longer logged only at DEBUG. An outage that follows another failure still logs its WARNING.
+  - A stream entry the consumer cannot ack because Redis is unreachable is logged at WARNING without a traceback.
+  - The HTTP geocoder logs a rate gate it cannot read, and an upstream back-off it cannot share, at WARNING when the state backend is unavailable. The Redis state backend reports a refused command (`NOPERM`, `READONLY`, out of memory) as unavailable too, so those are WARNINGs there. A rate-gate value the state refuses to read (`ValueError`) stays an ERROR.
+
 ## [0.24.1] - 2026-11-24
 
 ### Fixed

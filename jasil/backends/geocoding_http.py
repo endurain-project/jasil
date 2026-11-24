@@ -355,11 +355,17 @@ class HttpGeocoding:
                 time.sleep(slot.wait_seconds)
                 return self._backed_off_until()
             return None
-        except (StateBackendUnavailableError, ValueError) as error:
+        except StateBackendUnavailableError as error:
+            # An outage: the lookup is deferred, and the next try reads the gate once the state is back.
+            logger.warning(
+                "Reverse-geocoding via %s could not read its rate gate - %s", self._service, type(error).__name__
+            )
+        except ValueError as error:
+            # A gate value the state refuses to read, which no wait fixes.
             logger.error(
                 "Reverse-geocoding via %s could not read its rate gate - %s", self._service, type(error).__name__
             )
-            return self._clock.now() + timedelta(seconds=_RETRY_BACKOFF_SECONDS)
+        return self._clock.now() + timedelta(seconds=_RETRY_BACKOFF_SECONDS)
 
     def _backed_off_until(self) -> datetime | None:
         """Return when the upstream's longest back-off ends, while one lasts."""
@@ -382,7 +388,7 @@ class HttpGeocoding:
             try:
                 self._state.index_add(self._back_off_key, repr(until), until, ttl_seconds=math.ceil(seconds))
             except StateBackendUnavailableError as error:
-                logger.error(
+                logger.warning(
                     "Reverse-geocoding via %s could not share the upstream's back-off - %s",
                     self._service,
                     type(error).__name__,

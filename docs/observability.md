@@ -499,6 +499,25 @@ It returns True for:
   `OperationalError` with a client error number (2000–2999). A deadlock or a lock-wait
   timeout is a server error and stays False.
 
+### When Redis is unreachable
+
+The same rule holds for Redis. A lost, refused or timed-out connection, or a
+server still loading its dataset, is logged as a WARNING without a traceback:
+
+- The Redis event bus consumer logs "Event bus consumer cannot reach Redis;
+  retrying" once per outage, with the exception's class name in `error`, and
+  "Event bus consumer recovered" at INFO once a poll succeeds. An entry it cannot
+  ack in an outage stays pending and is logged at WARNING too.
+- The HTTP geocoder logs a rate gate it cannot read, or an upstream back-off it
+  cannot share, because the state backend is unavailable, and defers the lookup.
+
+In the event bus, a refused login, a lost consumer group (`NOGROUP`, which means
+Redis came back without its data) and any other Redis error keep their ERROR and
+traceback. The geocoder sees Redis only through the state backend, which reports
+every Redis failure but a refused value as unavailable, so a refused command
+(`NOPERM`, `READONLY`, out of memory) is a WARNING there too. Only a rate-gate
+value the state cannot read keeps its ERROR.
+
 One worth routing deliberately: `jasil._core.network` logs every time the SSRF
 allowlist permits a private destination, at INFO for a CIDR entry and at WARNING
 for a hostname entry. That is an audit trail — it tells you what the exception is
