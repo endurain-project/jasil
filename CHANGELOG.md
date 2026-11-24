@@ -8,6 +8,8 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-24
+
 **Breaking for a host that implements `ClockProvider` itself**: the protocol has a new method, `sleep`. Under `jasil.testing.install_test_platform`, `memory://` state now stands still until the test advances the clock; see **Upgrading**.
 
 ### Added
