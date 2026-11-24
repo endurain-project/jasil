@@ -164,9 +164,11 @@ def build_platform(
     Args:
         settings: The configuration to build from. Defaults to the settings the
             host installed via ``jasil.settings.configure``.
-        clock: Time source to wire into the platform and the backends that stamp
-            time (mail ``Date``). Defaults to :class:`SystemClock`; a test
-            helper passes a controllable one.
+        clock: Time source to wire into the platform and every backend that
+            reads the time: mail's ``Date``, in-memory state expiry and rate
+            gates, local upload sessions, the geocoder's waits and the retry of
+            a runtime source. Defaults to :class:`SystemClock`; a test helper
+            passes a controllable one.
         sources: Callables returning the current mail and/or geocoding settings.
             For a capability with a source, ``settings.mail`` / ``settings.geocoding``
             are ignored and ``Platform.mail`` / ``Platform.geocoding`` follow the
@@ -201,14 +203,14 @@ def build_platform(
     mail = _build_runtime_mail(settings, clock, sources.mail) if sources.mail else _build_mail(settings, clock)
     with redis_clients.track_acquisitions() as shared_redis:
         try:
-            state = _build_state(settings)
+            state = _build_state(settings, clock)
             # After the state, which holds its rate gate. It never raises for a bad setting: it disables itself.
             geocoding = (
                 _build_runtime_geocoding(settings, state, clock, sources.geocoding)
                 if sources.geocoding
                 else _build_geocoding(settings, state, clock)
             )
-            storage = _build_storage(settings)
+            storage = _build_storage(settings, clock)
             events = _build_events(settings, recorder)
             lock = _build_lock(settings)
             realtime = _build_realtime(settings)
@@ -265,17 +267,17 @@ def _unsupported_scheme(setting: str, uri: str) -> ValueError:
     return ValueError(f"{setting} is not a scheme://... URI")
 
 
-def _build_state(settings: JasilSettings) -> StateProvider:
+def _build_state(settings: JasilSettings, clock: ClockProvider) -> StateProvider:
     state_uri = settings.resolved_state_uri
     scheme, _, _ = state_uri.partition("://")
     if scheme == "memory":
-        return MemoryState()
+        return MemoryState(clock)
     if scheme in ("redis", "rediss", "unix"):
         return RedisState.from_uri(state_uri)
     raise _unsupported_scheme("state_uri", state_uri)
 
 
-def _build_storage(settings: JasilSettings) -> StorageProvider:
+def _build_storage(settings: JasilSettings, clock: ClockProvider) -> StorageProvider:
     storage_uri = settings.resolved_storage_uri
     scheme, _, rest = storage_uri.partition("://")
     if scheme == "local":
@@ -284,6 +286,7 @@ def _build_storage(settings: JasilSettings) -> StorageProvider:
         return LocalStorage(
             rest or settings.data_dir,
             url_prefix=settings.storage.local_url_prefix,
+            clock=clock,
             legacy_layout=settings.storage.local_legacy_layout,
             plain_areas=settings.storage.local_plain_areas,
         )
@@ -402,7 +405,7 @@ def _build_runtime_mail(
             logger.warning("Inconsistent deployment wiring: %s", issue)
         return _build_mail(replace(settings, mail=fresh), clock)
 
-    return ReloadingMail(source, build)
+    return ReloadingMail(source, build, clock)
 
 
 def _build_geocoding(

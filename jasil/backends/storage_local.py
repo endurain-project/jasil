@@ -8,7 +8,6 @@ import math
 import os
 import shutil
 import stat
-import time
 from collections.abc import Iterator, Sequence
 from contextlib import suppress
 from pathlib import Path
@@ -26,6 +25,7 @@ from jasil._core.storage_keys import (
 )
 from jasil._core.storage_streams import ExactSizeReader, non_seekable_reader, validate_stream_range
 from jasil.providers import (
+    ClockProvider,
     ObjectStat,
     PartRef,
     ServeFile,
@@ -115,6 +115,8 @@ class LocalStorage:
             under the same name (another letter case or Unicode normalization).
             The filesystem must support hard links, which publish a new object
             atomically; without them writes to these areas fail.
+        clock: Stamps a resumable upload session's creation time, which
+            :meth:`cleanup_uploads` compares with its cutoff.
     """
 
     def __init__(
@@ -122,10 +124,12 @@ class LocalStorage:
         base_dir: str,
         url_prefix: str = "",
         *,
+        clock: ClockProvider,
         legacy_layout: bool = False,
         plain_areas: frozenset[str] = frozenset(),
     ) -> None:
         self._base = Path(base_dir)
+        self._clock = clock
         self._url_prefix = url_prefix.rstrip("/")
         self._legacy_layout = legacy_layout
         self._plain_areas = plain_areas
@@ -746,7 +750,7 @@ class LocalStorage:
             max_parts=_UPLOAD_MAX_PARTS,
         )
         session_directory = self._validate_upload_session(session)
-        created_epoch = time.time()
+        created_epoch = self._clock.now().timestamp()
         manifest = {
             "version": 1,
             "area": area,

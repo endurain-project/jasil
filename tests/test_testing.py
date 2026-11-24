@@ -19,7 +19,14 @@ import jasil.testing as jasil_testing
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.storage_local import LocalStorage
 from jasil.profile import DeploymentProfile, JobWorkerMode
-from jasil.providers import ClockProvider, MailError, MailMessage, MailNotConfiguredError, ServeFile
+from jasil.providers import (
+    ClockProvider,
+    MailError,
+    MailMessage,
+    MailNotConfiguredError,
+    ServeFile,
+    SlotReservation,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -144,6 +151,23 @@ class TestTestMail:
     def test_it_starts_at_a_timezone_aware_instant(self):
         assert jasil_testing.FixedClock().now().tzinfo is not None
 
+    def test_sleeping_moves_the_clock_instead_of_blocking(self):
+        """A wait on the platform clock spends the test's time, not the suite's."""
+        clock = jasil_testing.FixedClock()
+        start, before = clock.now(), clock.monotonic()
+
+        clock.sleep(1.5)
+
+        assert clock.now() == start + timedelta(seconds=1.5)
+        assert clock.monotonic() - before == pytest.approx(1.5)
+
+    def test_a_negative_sleep_is_refused_as_time_sleep_refuses_it(self):
+        clock = jasil_testing.FixedClock()
+
+        with pytest.raises(ValueError, match="sleep length must be non-negative"):
+            clock.sleep(-1)
+        assert clock.now() == jasil_testing.DEFAULT_NOW
+
 
 class TestInstallTestPlatform:
     def test_it_assembles_process_local_backends(self, tmp_path):
@@ -179,6 +203,27 @@ class TestInstallTestPlatform:
 
     def test_a_default_clock_is_installed(self, tmp_path):
         assert isinstance(jasil_testing.install_test_platform(tmp_path).clock, jasil_testing.FixedClock)
+
+    def test_state_expiry_follows_the_installed_clock(self, tmp_path):
+        """A host test lets a key lapse by advancing the clock, not by sleeping."""
+        clock = jasil_testing.FixedClock()
+        platform = jasil_testing.install_test_platform(tmp_path, clock=clock)
+        platform.state.set("k", b"v", ttl_seconds=10)
+
+        clock.advance(11)
+
+        assert platform.state.get("k") is None
+
+    def test_a_booked_rate_gate_turn_is_taken_once_the_clock_reaches_it(self, tmp_path):
+        clock = jasil_testing.FixedClock()
+        platform = jasil_testing.install_test_platform(tmp_path, clock=clock)
+        platform.state.reserve_send("gate", 1.0, max_wait_seconds=0)
+        booked = platform.state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="job-1")
+        assert booked == SlotReservation(False, 1.0)
+
+        clock.advance(booked.wait_seconds)
+
+        assert platform.state.reserve_send("gate", 1.0, max_wait_seconds=0, booking="job-1") == SlotReservation(True, 0)
 
     def test_extra_settings_are_honoured(self, tmp_path):
         platform = jasil_testing.install_test_platform(

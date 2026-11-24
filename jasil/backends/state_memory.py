@@ -4,13 +4,12 @@ import heapq
 import math
 import re
 import threading
-import time
 from collections.abc import Iterator
 
 import jasil._core.state_keys as state_keys
-from jasil.providers import SlotReservation, TieredFailureOutcome
+from jasil.providers import ClockProvider, SlotReservation, TieredFailureOutcome
 
-#: An index: each member's score and its expiry deadline on the monotonic clock.
+#: An index: each member's score and its expiry deadline on the clock's monotonic reading.
 type _Index = dict[str, tuple[float, float]]
 
 _WRONG_TYPE = "the key holds an index, not a plain value"
@@ -44,21 +43,29 @@ class MemoryState:
     the expired ones at most once per :data:`SWEEP_INTERVAL_SECONDS`. Indexes live in
     a dict of their own; a key is never in both.
 
+    Every expiry and both rate gates are measured on the monotonic reading of the
+    clock it is given, and the lockout deadline of :meth:`record_tiered_failure`
+    on its wall time, so a test drives them by advancing that clock.
+
     Correct for the ``local`` profile (single process). Not shared across
     workers/replicas — the deployment fail-fast rejects using it under a
     distributed or multi-worker profile. Access is guarded by a lock because
     FastAPI runs sync handlers in a threadpool.
+
+    Args:
+        clock: The time source for expiry, the rate gates and the lockout gate.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: ClockProvider) -> None:
+        self._clock = clock
         self._data: dict[str, tuple[bytes, float | None]] = {}
         self._indexes: dict[str, _Index] = {}
         self._lock = threading.Lock()
-        self._next_sweep = time.monotonic() + SWEEP_INTERVAL_SECONDS
+        self._next_sweep = clock.monotonic() + SWEEP_INTERVAL_SECONDS
 
     def _sweep_if_due(self) -> None:
         """Drop expired keys and index members, at most once per :data:`SWEEP_INTERVAL_SECONDS`; call under the lock."""
-        now = time.monotonic()
+        now = self._clock.monotonic()
         if now < self._next_sweep:
             return
         self._next_sweep = now + SWEEP_INTERVAL_SECONDS
@@ -67,9 +74,8 @@ class MemoryState:
         for key in list(self._indexes):
             self._live_index(key)
 
-    @staticmethod
-    def _is_expired(expiry: float | None) -> bool:
-        return expiry is not None and expiry <= time.monotonic()
+    def _is_expired(self, expiry: float | None) -> bool:
+        return expiry is not None and expiry <= self._clock.monotonic()
 
     def _stored_value(self, key: str) -> bytes | None:
         """Return the unexpired plain value for *key*, evicting it if it has expired."""
@@ -97,7 +103,7 @@ class MemoryState:
         index = self._indexes.get(key)
         if index is None:
             return None
-        now = time.monotonic()
+        now = self._clock.monotonic()
         for member in [member for member, (_score, expiry) in index.items() if expiry <= now]:
             del index[member]
         if not index:
@@ -125,7 +131,7 @@ class MemoryState:
         _check_ttl(ttl_seconds)
         with self._lock:
             self._sweep_if_due()
-            expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
+            expiry = self._clock.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._indexes.pop(key, None)  # a plain value replaces an index, as Redis SET does
             self._data[key] = (value, expiry)
 
@@ -148,7 +154,7 @@ class MemoryState:
             if not _INT64_MIN <= new_value <= _INT64_MAX:
                 raise ValueError("increment or decrement would overflow")
             if ttl_seconds is not None:
-                expiry: float | None = time.monotonic() + ttl_seconds
+                expiry: float | None = self._clock.monotonic() + ttl_seconds
             elif current_bytes is not None:
                 expiry = self._data[key][1]  # preserve the existing expiry
             else:
@@ -164,7 +170,7 @@ class MemoryState:
             # A live index takes the key, as any existing key refuses Redis SET NX.
             if self._live_index(key) is not None or self._stored_value(key) is not None:
                 return False
-            expiry = time.monotonic() + ttl_seconds if ttl_seconds is not None else None
+            expiry = self._clock.monotonic() + ttl_seconds if ttl_seconds is not None else None
             self._data[key] = (value, expiry)
             return True
 
@@ -190,7 +196,7 @@ class MemoryState:
         with self._lock:
             if self._live_value(key) != expected:
                 return False
-            self._data[key] = (expected, time.monotonic() + ttl_seconds)
+            self._data[key] = (expected, self._clock.monotonic() + ttl_seconds)
             return True
 
     def delete_prefix(self, prefix: str) -> int:
@@ -222,11 +228,11 @@ class MemoryState:
         return iter(live_keys)
 
     def reserve_slot(self, key: str, interval_seconds: float, *, max_wait_seconds: float) -> SlotReservation:
-        """Reserve the gate's next free slot under the instance lock, on the monotonic clock in microseconds."""
+        """Reserve the gate's next free slot under the instance lock, on the clock's monotonic microseconds."""
         interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
         with self._lock:
             self._sweep_if_due()
-            now = math.floor(time.monotonic() * 1_000_000)
+            now = math.floor(self._clock.monotonic() * 1_000_000)
             last = self._live_value(key)
             slot = now if last is None else max(now, _parse_integer(last) + interval)
             wait = slot - now
@@ -238,7 +244,7 @@ class MemoryState:
     def reserve_send(
         self, key: str, interval_seconds: float, *, max_wait_seconds: float, booking: str | None = None
     ) -> SlotReservation:
-        """Clear a send or book a slot under the instance lock, on the monotonic clock in microseconds."""
+        """Clear a send or book a slot under the instance lock, on the clock's monotonic microseconds."""
         interval, max_wait = state_keys.slot_microseconds(interval_seconds, max_wait_seconds)
         booked_key = None
         if booking is not None:
@@ -247,7 +253,7 @@ class MemoryState:
         sent_key = state_keys.last_send_key(key)
         with self._lock:
             self._sweep_if_due()
-            now = math.floor(time.monotonic() * 1_000_000)
+            now = math.floor(self._clock.monotonic() * 1_000_000)
             pointer = self._live_integer(key)
             sent = self._live_integer(sent_key)
             booked = None if booked_key is None else self._live_integer(booked_key)
@@ -283,7 +289,7 @@ class MemoryState:
         return None if raw is None else _parse_integer(raw)
 
     def _store_integer(self, key: str, value: int, *, expires_at: int) -> None:
-        """Store a gate value expiring at ``expires_at`` on the monotonic clock in microseconds; under the lock."""
+        """Store a gate value expiring at ``expires_at`` on the clock's monotonic microseconds; under the lock."""
         self._data[key] = (str(value).encode(), state_keys.to_seconds(expires_at))
 
     def index_add(self, key: str, member: str, score: float, ttl_seconds: int) -> None:
@@ -295,7 +301,7 @@ class MemoryState:
             index = self._index_for(key)
             if index is None:
                 index = self._indexes[key] = {}
-            index[member] = (float(score), time.monotonic() + ttl_seconds)
+            index[member] = (float(score), self._clock.monotonic() + ttl_seconds)
 
     def index_remove(self, key: str, member: str) -> None:
         """Remove ``member`` from the index, dropping the index once it is empty."""
@@ -328,7 +334,7 @@ class MemoryState:
         counter_ttl_seconds: int,
     ) -> TieredFailureOutcome:
         """Count one occurrence and close the gate, atomically under the instance lock."""
-        now = int(time.time())
+        now = int(self._clock.now().timestamp())
         with self._lock:
             self._sweep_if_due()
             # Already locked: return the current count without incrementing, so a
@@ -346,7 +352,7 @@ class MemoryState:
             count = (_parse_integer(counter_bytes) if counter_bytes is not None else 0) + 1
             if count > _INT64_MAX:
                 raise ValueError("increment or decrement would overflow")
-            self._data[counter_key] = (str(count).encode(), time.monotonic() + counter_ttl_seconds)
+            self._data[counter_key] = (str(count).encode(), self._clock.monotonic() + counter_ttl_seconds)
 
             lock_seconds = 0
             for threshold, tier_lock_seconds in tiers:  # ascending; last match wins
@@ -355,7 +361,7 @@ class MemoryState:
 
             if lock_seconds > 0:
                 gate_until = now + lock_seconds
-                self._data[gate_key] = (str(gate_until).encode(), time.monotonic() + lock_seconds)
+                self._data[gate_key] = (str(gate_until).encode(), self._clock.monotonic() + lock_seconds)
                 return TieredFailureOutcome(count, gate_until, True)
             return TieredFailureOutcome(count, None, False)
 

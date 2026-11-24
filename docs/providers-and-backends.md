@@ -70,7 +70,7 @@ from jasil import SlotReservation
 
 slot = platform.state.reserve_slot("upstream:gate", 0.5, max_wait_seconds=5)
 if slot.reserved:
-    time.sleep(slot.wait_seconds)
+    platform.clock.sleep(slot.wait_seconds)
     call_the_upstream()
 ```
 
@@ -115,7 +115,6 @@ interval.
   A backlog that books far ahead also delays a caller that cannot defer.
 
 ```python
-import time
 from datetime import timedelta
 
 from jasil.jobs import DeferJob
@@ -123,7 +122,7 @@ from jasil.jobs import DeferJob
 slot = platform.state.reserve_send("upstream:gate", 1.0, max_wait_seconds=0, booking=event.event_id)
 if not slot.reserved:
     raise DeferJob(platform.clock.now() + timedelta(seconds=slot.wait_seconds))
-time.sleep(slot.wait_seconds)  # at most one interval
+platform.clock.sleep(slot.wait_seconds)  # at most one interval
 call_the_upstream()
 ```
 
@@ -436,7 +435,9 @@ Sessions do not expire automatically. Call
 `cleanup_uploads(older_than_epoch=cutoff)` from host-owned maintenance to abort
 uploads initiated before an epoch cutoff; it returns the number removed. The
 cutoff is based on initiation time, not the last uploaded part, so choose a
-window longer than any valid upload. Cleanup attempts every eligible session
+window longer than any valid upload. Local storage takes the initiation time
+from the platform clock; S3 takes it from the manifest's `LastModified`, which
+the S3 server sets. Cleanup attempts every eligible session
 before reporting a provider-neutral backend failure; retry the pass after the
 backend recovers. S3 cleanup covers every multipart upload
 registered by a JASIL session manifest and leaves `save_stream`, managed copy,
@@ -662,13 +663,23 @@ interrupted: JASIL sees the loss only when it releases the lock, and logs it at
 
 ## ClockProvider
 
-`SystemClock` returns timezone-aware UTC from `now()` and `time.monotonic()` from `monotonic()`. It
-exists so time can be injected in tests without patching `datetime` globally — the modules that stamp or compare
-rows take "now" from the platform. The two state backends are the exception:
-`MemoryState` and `RedisState` read the process clock for expiry and for the
-lockout gate in `record_tiered_failure`, so a test of their expiry patches the
-clock the backend module reads. `reserve_slot` on Redis reads the server's clock
-(`TIME`); fakeredis answers `TIME` from `time.time()`.
+`SystemClock` returns timezone-aware UTC from `now()` and `time.monotonic()` from `monotonic()`, and blocks in
+`time.sleep` for `sleep(seconds)`. A host that supplies its own clock implements all three. The clock exists so time
+can be injected in tests without patching `datetime` or `time` globally. The modules that stamp or compare rows take
+"now" from the platform, and so does every in-process backend `build_platform` builds:
+
+- `memory://` state, for key and index expiry, the `reserve_slot` and `reserve_send` gates, and the lockout deadline
+  of `record_tiered_failure`;
+- local storage, for the initiation time of a resumable upload session;
+- the HTTP geocoder, for the wait before its turn;
+- a mail or geocoding source, for the retry of settings that could not be verified.
+
+`jasil.testing.FixedClock` advances instead of blocking in `sleep`, so a test moves through all of these with
+`advance`.
+
+`RedisState` does not take the clock. It sends the deadlines of its indexes and of the `record_tiered_failure`
+lockout from the process clock (`time.time()`), and its rate gates read the server's clock (`TIME`). fakeredis
+expires keys and answers `TIME` from `time.time()`, so a test of Redis timing patches `time.time`.
 
 ## GeocodingProvider
 
@@ -736,7 +747,7 @@ shares one budget:
 
 Each lookup costs one `index_range` of the back-off and, with a rate limit, one
 [`reserve_send`](#rate-gates) before it sends. A request that waits for its slot
-sleeps in the calling thread.
+sleeps in the calling thread, through the platform clock's `sleep`.
 
 ### Booking a turn instead of sleeping
 

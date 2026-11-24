@@ -8,7 +8,7 @@ storage, events, locks, a clock - instead of on Redis, S3, or Postgres directly.
 Complete aggregate protocols keep URI-selected backends interchangeable, so the
 same code runs single-process on a laptop and multi-replica in production.
 
-!!! warning "Status: 0.24.2"
+!!! warning "Status: 0.25.0"
     The API is still settling. Expect breaking changes on minor versions until
     `1.0.0`; see [API stability](api-stability.md).
 
@@ -174,9 +174,10 @@ def jasil(tmp_path):
 ```
 
 `install_test_platform` roots local storage inside `tmp_path`, installs a
-`FixedClock` so lease expiry, retry backoff and retention windows can be
-exercised without sleeping, and — the part that is easy to forget — *publishes*
-the platform, without which every `publish` raises.
+`FixedClock` so lease expiry, retry backoff, retention windows, `memory://`
+state expiry and rate-gate turns can be exercised without sleeping, and — the
+part that is easy to forget — *publishes* the platform, without which every
+`publish` raises.
 
 Map the models once for the whole session, though. `reset_all` deliberately
 leaves the declarative base alone: JASIL's model modules capture it at import

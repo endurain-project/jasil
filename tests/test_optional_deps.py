@@ -186,7 +186,7 @@ class TestMissingExtrasAtBuildTime:
         monkeypatch.setitem(sys.modules, "boto3", None)
 
         with pytest.raises(ImportError, match=r"pip install 'jasil\[s3\]'"):
-            container._build_storage(settings.JasilSettings(storage_uri="s3://bucket"))
+            container._build_storage(settings.JasilSettings(storage_uri="s3://bucket"), container.SystemClock())
 
 
 @pytest.mark.parametrize("module", ["jasil.jobs.service", "jasil.retention", "jasil.audit.maintenance"])

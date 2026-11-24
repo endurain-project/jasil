@@ -18,15 +18,17 @@ import fakeredis
 import pytest
 
 import jasil._core.state_keys as state_keys
+from jasil.backends.clock_system import SystemClock
 from jasil.backends.state_memory import MemoryState
 from jasil.backends.state_redis import RedisState
 from jasil.providers import SlotReservation, StateBackendUnavailableError, StateProvider, TieredFailureOutcome
+from jasil.testing import FixedClock
 
 
 @pytest.fixture(params=["memory", "redis"])
 def state(request) -> StateProvider:
     if request.param == "memory":
-        return MemoryState()
+        return MemoryState(SystemClock())
     return RedisState(fakeredis.FakeStrictRedis(decode_responses=False))
 
 
@@ -607,7 +609,7 @@ class TestIndexConcurrency:
         return {f"w{w}-{n}" for w in range(self.WRITERS) for n in range(0, self.MEMBERS_PER_WRITER, 2)}
 
     def test_threads_sharing_a_memory_backend(self):
-        state = MemoryState()
+        state = MemoryState(SystemClock())
 
         self._run_writers([state] * self.WRITERS)
 
@@ -719,7 +721,7 @@ class TestSlotConcurrency:
         return sorted(waits)
 
     def test_threads_sharing_a_memory_backend(self, clock):
-        waits = self._reserve_concurrently([MemoryState()] * self.CALLERS)
+        waits = self._reserve_concurrently([MemoryState(SystemClock())] * self.CALLERS)
 
         assert waits == pytest.approx([0.1 * n for n in range(self.CALLERS)])
 
@@ -887,7 +889,7 @@ class TestSendConcurrency:
         assert [result.wait_seconds for result in results] == pytest.approx([0.1 * n for n in range(self.CALLERS)])
 
     def test_threads_sharing_a_memory_backend(self, clock):
-        self._assert_distinct(self._book_concurrently([MemoryState()] * self.CALLERS))
+        self._assert_distinct(self._book_concurrently([MemoryState(SystemClock())] * self.CALLERS))
 
     def test_connections_sharing_a_redis_server(self, clock):
         server = fakeredis.FakeServer()
@@ -994,7 +996,7 @@ class TestRedisIndexLayout:
 
 class TestMemoryIndexSweep:
     def test_a_write_sweeps_index_members_that_expired_unread(self, clock):
-        state = MemoryState()
+        state = MemoryState(SystemClock())
         state.index_add("idx", "a", 1.0, ttl_seconds=10)
 
         clock["seconds"] += 61
@@ -1043,56 +1045,54 @@ class TestMemoryBackendExpiry:
     """Expiry mechanics, driven by a fake clock rather than by sleeping."""
 
     @pytest.fixture
-    def clock(self, monkeypatch):
-        current = {"now": 1000.0}
-        monkeypatch.setattr("jasil.backends.state_memory.time.monotonic", lambda: current["now"])
-        return current
+    def clock(self):
+        return FixedClock()
 
     def test_a_value_expires_once_its_ttl_elapses(self, clock):
-        state = MemoryState()
+        state = MemoryState(clock)
         state.set("k", b"value", ttl_seconds=10)
 
-        clock["now"] += 11
+        clock.advance(11)
 
         assert state.get("k") is None
 
     def test_a_value_without_a_ttl_never_expires(self, clock):
-        state = MemoryState()
+        state = MemoryState(clock)
         state.set("k", b"value")
 
-        clock["now"] += 10_000
+        clock.advance(10_000)
 
         assert state.get("k") == b"value"
 
     def test_an_expired_key_frees_its_slot_for_set_if_absent(self, clock):
-        state = MemoryState()
+        state = MemoryState(clock)
         state.set_if_absent("lock", b"first", ttl_seconds=10)
 
-        clock["now"] += 11
+        clock.advance(11)
 
         assert state.set_if_absent("lock", b"second") is True
 
     def test_delete_prefix_counts_only_the_keys_that_were_still_alive(self, clock):
         """Redis never lists an expired key, so the count must not include one the sweep has not dropped yet."""
-        state = MemoryState()
+        state = MemoryState(clock)
         state.set("p:gone", b"x", ttl_seconds=10)
         state.set("p:kept", b"x")
 
-        clock["now"] += 11
+        clock.advance(11)
 
         assert state.delete_prefix("p:") == 1
         assert state.get("p:kept") is None
 
     @pytest.mark.parametrize("stored", [b" 5", b"1_0", b"5 ", b"+5", b"05", b"\xd9\xa5", b"1.5", b""])
     def test_incr_refuses_what_redis_would_not_parse(self, stored):
-        state = MemoryState()
+        state = MemoryState(FixedClock())
         state.set("k", stored)
 
         with pytest.raises(ValueError, match="not an integer"):
             state.incr("k")
 
     def test_incr_parses_negative_integers(self):
-        state = MemoryState()
+        state = MemoryState(FixedClock())
         state.set("k", b"-3")
 
         assert state.incr("k", 5) == 2
@@ -1100,23 +1100,22 @@ class TestMemoryBackendExpiry:
     def test_incr_preserves_an_existing_expiry(self, clock):
         """Re-arming the TTL on every increment would let a steady stream of
         failures keep a rate-limit window alive forever."""
-        state = MemoryState()
+        state = MemoryState(clock)
         state.incr("counter", ttl_seconds=10)
 
         state.incr("counter")
-        clock["now"] += 11
+        clock.advance(11)
 
         assert state.get("counter") is None
 
-    def test_an_elapsed_lockout_lifts_and_can_lock_again(self, monkeypatch):
+    def test_an_elapsed_lockout_lifts_and_can_lock_again(self, clock):
         """The gate is wall-clock; once it passes the caller is let back in, and
         the surviving counter means the next failure re-locks at once."""
-        state = MemoryState()
+        state = MemoryState(clock)
         tiers = ((1, 60),)
         locked = state.record_tiered_failure("counter", "gate", tiers, 900)
         assert locked.newly_locked is True
-        real_time = time.time
-        monkeypatch.setattr("jasil.backends.state_memory.time.time", lambda: real_time() + 61)
+        clock.advance(61)
 
         outcome = state.record_tiered_failure("counter", "gate", tiers, 900)
 
@@ -1126,33 +1125,33 @@ class TestMemoryBackendExpiry:
 
     def test_a_write_sweeps_keys_that_expired_unread(self, clock):
         """Rate-limit keys are written once and never read again; left in place they would grow without bound."""
-        state = MemoryState()
+        state = MemoryState(clock)
         for n in range(100):
             state.set(f"rate:{n}", b"1", ttl_seconds=10)
         state.set("kept", b"1")
 
-        clock["now"] += 61
+        clock.advance(61)
         state.set("new", b"1")
 
         assert sorted(state._data) == ["kept", "new"]
 
     def test_the_sweep_runs_at_most_once_a_minute(self, clock):
-        state = MemoryState()
-        clock["now"] += 61
+        state = MemoryState(clock)
+        clock.advance(61)
         state.set("first", b"1")  # sweeps an empty store, and starts the next minute
         state.set("short", b"1", ttl_seconds=1)
 
-        clock["now"] += 2
+        clock.advance(2)
         state.set("second", b"1")
 
         assert "short" in state._data
 
     def test_expired_keys_are_not_listed(self, clock):
-        state = MemoryState()
+        state = MemoryState(clock)
         state.set("session:a", b"1", ttl_seconds=10)
         state.set("session:b", b"2")
 
-        clock["now"] += 11
+        clock.advance(11)
 
         assert list(state.iter_keys("session:")) == ["session:b"]
 
@@ -1261,4 +1260,4 @@ class TestRedisBackendErrorTranslation:
             RedisState(client).incr("k")
 
     def test_the_memory_backend_never_raises_the_provider_error(self):
-        assert MemoryState().get("absent") is None
+        assert MemoryState(SystemClock()).get("absent") is None
