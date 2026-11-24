@@ -44,7 +44,9 @@ how long it took, and why it failed:
     except the `queued` row staged beside the outbox row, which joins the
     producer's transaction in a savepoint. A database hiccup degrades
     observability rather than breaking event processing — the trail is never the
-    source of truth.
+    source of truth. A database that becomes unavailable during the `queued` write
+    is raised to the producer instead: the savepoint goes with its connection, and
+    so does the producer's transaction.
 
 Because the durable route bypasses the bus, an event handed to the outbox is
 recorded `queued` explicitly. Otherwise the dashboard would go dark exactly when

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 import jasil.event_log.crud as event_log_crud
 import jasil.orm as jasil_orm
+from jasil._core.db_outage import is_database_unavailable
 from jasil.events import Event
 from jasil.providers import ClockProvider
 
@@ -63,7 +64,8 @@ class EventLogRecorder:
         The row joins the caller's open transaction, so it commits or rolls back
         with the outbox row staged beside it. The write runs in a savepoint so a
         storage error is logged and swallowed without poisoning the caller's
-        transaction.
+        transaction. An unavailable database is raised instead: the savepoint
+        cannot outlive its connection, so the caller's transaction is gone too.
 
         Args:
             event: The event envelope staged for durable delivery.
@@ -75,6 +77,8 @@ class EventLogRecorder:
         Raises:
             sqlalchemy.exc.SQLAlchemyError: When flushing the caller's own pending changes fails. That is the
                 caller's error, not an event_log one.
+            sqlalchemy.exc.DBAPIError: When the database became unavailable during the event_log write
+                (:func:`jasil.orm.is_database_unavailable` is true for it).
         """
         # The caller's own pending rows are flushed first and outside the best-effort part: a constraint violation
         # of theirs is theirs to see, not an event_log failure to log and swallow, and it must not be left to
@@ -84,6 +88,8 @@ class EventLogRecorder:
             with db.begin_nested():
                 event_log_crud.record_queued(event, db, now=self._clock.now(), commit=False)
         except Exception as error:  # observability must never break the producer
+            if is_database_unavailable(error):
+                raise
             logger.warning("event_log record_queued_in failed: %r", error)
 
     @contextmanager

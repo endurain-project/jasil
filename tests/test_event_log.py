@@ -423,6 +423,30 @@ class TestRecorder:
         assert "record_queued_in failed" in caplog.text
         assert db.get(EventLog, event.event_id).status == "queued"
 
+    def test_a_connection_lost_during_the_session_staged_write_is_raised(self, recorder, db, db_engine):
+        """The savepoint cannot outlive its connection: once it is gone, so is the caller's transaction."""
+        from sqlalchemy import event as sa_event
+        from sqlalchemy.exc import OperationalError
+
+        lost = "server closed the connection unexpectedly"
+
+        def lose_connection_on_the_event_log_insert(conn, cursor, statement, parameters, context, executemany):
+            if statement.startswith("INSERT INTO jasil_event_log"):
+                raise conn.dialect.loaded_dbapi.OperationalError(lost)
+
+        def report_a_disconnect(context):
+            # The driver's message for a reset connection differs per dialect; SQLAlchemy invalidates on this flag.
+            if str(context.original_exception) == lost:
+                context.is_disconnect = True
+
+        sa_event.listen(db_engine, "before_cursor_execute", lose_connection_on_the_event_log_insert)
+        sa_event.listen(db_engine, "handle_error", report_a_disconnect)
+
+        with pytest.raises(OperationalError) as raised:
+            recorder.record_queued_in(_event(), db)
+
+        assert raised.value.connection_invalidated
+
     def test_the_callers_own_failing_write_is_not_swallowed_as_an_event_log_failure(self, recorder, db):
         """Only the event_log row is best-effort: a caller's constraint violation must surface as itself."""
         from sqlalchemy.exc import IntegrityError
