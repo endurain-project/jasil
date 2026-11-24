@@ -8,6 +8,12 @@ What counts as a breaking change — and what does not — is defined in [API st
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-11-24
+
+### Fixed
+
+- **A database lost while staging the `queued` event-log row is raised to the producer.** `record_queued_in` swallowed every error of its savepoint write, including a lost connection. The producer's transaction was gone with the connection, so its commit raised `PendingRollbackError`, which `jasil.orm.is_database_unavailable` does not report as an outage. An error for which `is_database_unavailable` is true now propagates from `publish_committing`, `publish_on_commit` and their batch forms as itself, usually an `OperationalError` (`publish` with a `db` logs and swallows it, like any other failure). Any other event-log error is still logged and swallowed.
+
 ## [0.24.0] - 2026-11-23
 
 This release lets durable jobs and geocoding ride out a dependency that is down or rate-limited, rather than spend their retries on it. A storage or database outage defers a durable job instead of using up its attempts, and a geocoding lookup can book its rate-limit turn instead of sleeping for it. **It is breaking for a host that implements `StateProvider` itself**: the protocol has a new method, `reserve_send`, and such a backend must add it (and stops passing `isinstance(backend, StateProvider)` until it does). Hosts that use the built-in backends need no change apart from running migration `rev0013`; see **Upgrading**.
