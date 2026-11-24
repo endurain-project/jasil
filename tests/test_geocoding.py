@@ -777,12 +777,34 @@ class TestTheRateGate:
         clock = FixedClock()
         backend = _geocoder(state=_Down(), clock=clock, min_interval_seconds=1.0)
 
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
 
         assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=geocoding_http._RETRY_BACKOFF_SECONDS))
         assert len(responses.calls) == 0
-        assert "StateBackendUnavailableError" in caplog.text
+        [record] = caplog.records
+        assert record.levelname == "WARNING"
+        assert "StateBackendUnavailableError" in record.getMessage()
+
+    @responses.activate
+    def test_an_unreadable_rate_gate_is_an_error(self, caplog):
+        """Redis refusing the gate's value (``WRONGTYPE``) is a ``ValueError``, which no wait fixes."""
+
+        class _Corrupt(MemoryState):
+            def reserve_send(self, key, interval_seconds, *, max_wait_seconds, booking=None):
+                raise ValueError("Redis refused the state operation: WRONGTYPE")
+
+        clock = FixedClock()
+        backend = _geocoder(state=_Corrupt(), clock=clock, min_interval_seconds=1.0)
+
+        with caplog.at_level("WARNING"):
+            outcome = backend.lookup(38.7, -9.1, max_wait_seconds=5)
+
+        assert outcome == GeocodingOutcome(None, clock.now() + timedelta(seconds=geocoding_http._RETRY_BACKOFF_SECONDS))
+        assert len(responses.calls) == 0
+        [record] = caplog.records
+        assert record.levelname == "ERROR"
+        assert "ValueError" in record.getMessage()
 
     @pytest.mark.parametrize("max_wait", [-1.0, math.inf, math.nan])
     def test_a_max_wait_out_of_range_is_refused(self, max_wait):
@@ -963,11 +985,13 @@ class TestLookupOutcomes:
         responses.add(responses.GET, URL, status=429, headers={"Retry-After": "120"}, json={})
         backend = _geocoder(clock=clock, state=_ReadOnly())
 
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             outcome = backend.lookup(38.7, -9.1, max_wait_seconds=0)
 
         assert outcome == GeocodingOutcome(None, self._after(clock, 120))
-        assert "StateBackendUnavailableError" in caplog.text
+        warnings = [record for record in caplog.records if "back-off" in record.getMessage()]
+        assert [record.levelname for record in warnings] == ["WARNING"]
+        assert "StateBackendUnavailableError" in warnings[0].getMessage()
 
     @responses.activate
     @pytest.mark.parametrize("status", [500, 502, 504])

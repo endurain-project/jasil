@@ -289,3 +289,32 @@ class TestGlobEscape:
 
         assert redis_clients.delete_matching_keys(client, f"{redis_clients.glob_escape('*')}*") == 0
         assert client.exists("session:a") == 1
+
+
+class TestIsUnreachable:
+    """An unreachable Redis is an outage; a refused login or command is not, as no wait fixes it."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            redis.exceptions.ConnectionError("Connection closed by server."),
+            redis.exceptions.TimeoutError("Timeout reading from socket"),
+            redis.exceptions.BusyLoadingError("Redis is loading the dataset in memory"),
+            redis.exceptions.MaxConnectionsError("Too many connections"),
+        ],
+    )
+    def test_a_lost_or_refused_connection_is_unreachable(self, error):
+        assert redis_clients.is_unreachable(error)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            redis.exceptions.AuthenticationError("invalid password"),
+            redis.exceptions.AuthorizationError("not authorized"),
+            redis.exceptions.ExternalAuthProviderError("problem with LDAP service"),
+            redis.exceptions.ResponseError("NOGROUP No such key 'events' or consumer group 'workers'"),
+            redis.exceptions.RedisError("something else"),
+        ],
+    )
+    def test_any_other_redis_error_is_not(self, error):
+        assert not redis_clients.is_unreachable(error)

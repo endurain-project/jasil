@@ -171,6 +171,7 @@ class RedisStreamEventBus:
     def _run(self, stop: threading.Event) -> None:
         group_missing = False
         failures = 0
+        error_logged = False
         while not stop.is_set():
             try:
                 if group_missing:
@@ -180,13 +181,22 @@ class RedisStreamEventBus:
                 if failures:
                     logger.info("Event bus consumer recovered after %d failed poll(s)", failures)
                     failures = 0
+                    error_logged = False
             except redis_clients.RedisError as error:
                 # A Redis restarted without persistence, or flushed, loses the group; XADD recreates only the
                 # stream, so every read fails until the group is created again.
                 group_missing = isinstance(error, redis_clients.ResponseError) and str(error).startswith("NOGROUP")
-                # The first failure of a streak is the one worth a traceback; the repeats only say it goes on.
-                if failures == 0:
+                # An unreachable Redis is an outage, worth one warning per streak. The first other failure of a
+                # streak is a defect worth a traceback, even after an outage (a Redis back without its data lost
+                # the group); the repeats only say it goes on.
+                unreachable = redis_clients.is_unreachable(error)
+                if not unreachable and not error_logged:
                     logger.error("Event bus consumer poll failed", exc_info=error)
+                    error_logged = True
+                elif unreachable and failures == 0:
+                    logger.warning(
+                        "Event bus consumer cannot reach Redis; retrying", extra={"error": type(error).__name__}
+                    )
                 else:
                     logger.debug("Event bus consumer poll failed again (%d in a row): %r", failures + 1, error)
                 stop.wait(timeout=backoff_delay(failures, base=_RETRY_BASE_SECONDS, maximum=_RETRY_MAX_SECONDS))
@@ -219,7 +229,14 @@ class RedisStreamEventBus:
         try:
             self._client.xack(self._stream, self._group, entry_id)
         except redis_clients.RedisError as error:
-            logger.error("Event bus could not ack stream entry %s; it stays pending", entry_id, exc_info=error)
+            if redis_clients.is_unreachable(error):
+                logger.warning(
+                    "Event bus could not ack stream entry %s; it stays pending, as Redis is unreachable",
+                    entry_id,
+                    extra={"error": type(error).__name__},
+                )
+            else:
+                logger.error("Event bus could not ack stream entry %s; it stays pending", entry_id, exc_info=error)
 
 
 def _call_each(handlers: list[Callable[[Event], None]], event: Event) -> None:
